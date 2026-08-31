@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>名医辨证对照</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<style>
+  :root {
+    --bg: #f7f7fa;
+    --panel: #ffffff;
+    --border: #e2e3e8;
+    --text: #24262b;
+    --muted: #6b6f7a;
+    --accent: #3b5bdb;
+    --danger: #c0392b;
+    --warn-bg: #fff4e5;
+    --warn-border: #e08a2b;
+    --purple-bg: #efe7fb;
+    --purple-border: #8b6fd9;
+    --purple-text: #4b2e9e;
+    --ye: #1d9e75;
+    --wu: #d85a30;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    padding: 20px 24px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    margin: 0 0 4px;
+    font-size: 22px;
+    font-weight: 600;
+  }
+  header .disclaimer {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 20px 24px 60px;
+  }
+  #graph-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px;
+    margin-bottom: 16px;
+  }
+  #cy {
+    width: 100%;
+    height: 460px;
+    border-radius: 6px;
+    background: #fbfbfd;
+  }
+  #cy-empty {
+    height: 460px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  #divergence-banner {
+    display: none;
+    background: #fff4e5;
+    border: 1px solid var(--warn-border);
+    color: #8a4b12;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13.5px;
+    margin-bottom: 16px;
+  }
+  #divergence-banner.show { display: block; }
+  #input-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 20px;
+  }
+  #complaint {
+    width: 100%;
+    min-height: 84px;
+    resize: vertical;
+    font-size: 14px;
+    font-family: inherit;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+    color: var(--text);
+  }
+  #complaint:focus { border-color: var(--accent); }
+  .input-row {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+  }
+  #status-text {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  #submit-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 9px 22px;
+    font-size: 14px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  #submit-btn:disabled {
+    background: #a9b6ec;
+    cursor: not-allowed;
+  }
+  #error-box {
+    display: none;
+    background: #fdecea;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13.5px;
+    margin-bottom: 16px;
+    white-space: pre-wrap;
+  }
+  #error-box.show { display: block; }
+  #results {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 780px) {
+    #results { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card h2 {
+    margin: 0 0 10px;
+    font-size: 17px;
+  }
+  .card .field {
+    font-size: 13.5px;
+    margin-bottom: 6px;
+    line-height: 1.5;
+  }
+  .card .field b {
+    color: var(--muted);
+    font-weight: 500;
+    margin-right: 4px;
+  }
+  .hallucination-warning {
+    background: #fdecea;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 8px 0;
+    font-weight: 600;
+  }
+  details {
+    margin-top: 10px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+  }
+  summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--accent);
+  }
+  .detail-block {
+    font-size: 13px;
+    color: var(--text);
+    margin-top: 8px;
+    line-height: 1.6;
+  }
+  .detail-block .label {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 6px;
+  }
+  .ref-item {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>名医辨证对照</h1>
+  <div class="disclaimer">教学与研究用途，非诊断工具，不能替代执业医师</div>
+</header>
+
+<main>
+  <div id="divergence-banner"></div>
+  <div id="error-box"></div>
+
+  <div id="graph-panel">
+    <div id="cy"></div>
+  </div>
+
+  <div id="input-panel">
+    <textarea id="complaint" placeholder="请输入患者主诉，例如：胃脘胀痛，食后加重，嗳气泛酸，舌淡红苔薄白，脉弦。"></textarea>
+    <div class="input-row">
+      <span id="status-text"></span>
+      <button id="submit-btn">辨证</button>
+    </div>
+  </div>
+
+  <div id="results"></div>
+</main>
+
+<script>
+const PHYSICIAN_COLORS = { ye_tianshi: "#1D9E75", wu_jutong: "#D85A30" };
+const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640 };
+const Y_MIN = 60, Y_MAX = 460;
+
+let cy = null;
+
+function evenY(index, total) {
+  if (total <= 1) return (Y_MIN + Y_MAX) / 2;
+  return Y_MIN + (Y_MAX - Y_MIN) * (index / (total - 1));
+}
+
+function computeLayout(nodes) {
+  const positions = {};
+  const byLayer = { 0: [], 1: [], 2: [], 3: [] };
+  for (const n of nodes) byLayer[n.data.layer].push(n);
+
+  for (const layer of [0, 1, 2]) {
+    const items = byLayer[layer];
+    items.forEach((n, i) => {
+      positions[n.data.id] = { x: LAYER_X[layer], y: evenY(i, items.length) };
+    });
+  }
+
+  // layer 3 药物：按医家分上下两组，中间留 40px 间隔，避免节点挤成一列
+  const physOrder = [];
+  for (const n of byLayer[2]) {
+    if (!physOrder.includes(n.data.phys)) physOrder.push(n.data.phys);
+  }
+  const herbsByPhys = {};
+  for (const n of byLayer[3]) {
+    (herbsByPhys[n.data.phys] = herbsByPhys[n.data.phys] || []).push(n);
+  }
+  const gap = 40;
+  const bandCount = physOrder.length || 1;
+  const bandHeight = (Y_MAX - Y_MIN - gap * (bandCount - 1)) / bandCount;
+  physOrder.forEach((phys, bandIdx) => {
+    const bandTop = Y_MIN + bandIdx * (bandHeight + gap);
+    const items = herbsByPhys[phys] || [];
+    items.forEach((n, i) => {
+      const y = items.length <= 1 ? bandTop + bandHeight / 2 : bandTop + (bandHeight * i) / (items.length - 1);
+      positions[n.data.id] = { x: LAYER_X[3], y };
+    });
+  });
+
+  return positions;
+}
+
+function buildStylesheet() {
+  const style = [
+    {
+      selector: "node",
+      style: {
+        shape: "round-rectangle",
+        label: "data(label)",
+        "text-valign": "center",
+        "text-halign": "center",
+        "font-size": 11,
+        color: "#24262b",
+        "background-color": "#f4f4f6",
+        "border-width": 1,
+        "border-color": "#c7c9d1",
+        padding: "6px",
+        width: "label",
+        height: "label",
+        "text-wrap": "wrap",
+        "text-max-width": "90px",
+      },
+    },
+    {
+      selector: 'node[layer = 0][state = "unexplained"]',
+      style: {
+        "background-color": "#fff4e5",
+        "border-color": "#e08a2b",
+        "border-style": "dashed",
+        "border-width": 2,
+      },
+    },
+    {
+      selector: "node[layer = 1]",
+      style: {
+        "background-color": "#efe7fb",
+        "border-color": "#8b6fd9",
+        color: "#4b2e9e",
+      },
+    },
+    {
+      selector: "edge",
+      style: {
+        width: 1.4,
+        "line-color": "#d3d5db",
+        "target-arrow-color": "#d3d5db",
+        "target-arrow-shape": "triangle",
+        "curve-style": "bezier",
+        "arrow-scale": 0.7,
+        opacity: 0.85,
+      },
+    },
+  ];
+  for (const [phys, color] of Object.entries(PHYSICIAN_COLORS)) {
+    style.push({
+      selector: `node[layer > 1][phys = "${phys}"]`,
+      style: { "background-color": color, "border-color": color, color: "#ffffff" },
+    });
+    style.push({
+      selector: `edge[phys = "${phys}"]`,
+      style: { "line-color": color, "target-arrow-color": color },
+    });
+  }
+  return style;
+}
+
+function renderGraph(graph) {
+  const el = document.getElementById("cy");
+  const positions = computeLayout(graph.nodes);
+
+  const elements = [
+    ...graph.nodes.map((n) => ({ data: n.data, position: positions[n.data.id] })),
+    ...graph.edges.map((e) => ({ data: e.data })),
+  ];
+
+  if (cy) cy.destroy();
+  cy = cytoscape({
+    container: el,
+    elements,
+    style: buildStylesheet(),
+    layout: { name: "preset" },
+    userZoomingEnabled: true,
+    userPanningEnabled: true,
+    boxSelectionEnabled: false,
+  });
+  cy.fit(undefined, 24);
+}
+
+function renderDivergence(divergence) {
+  const banner = document.getElementById("divergence-banner");
+  if (divergence && divergence.same === false) {
+    banner.textContent = "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";
+    banner.classList.add("show");
+  } else {
+    banner.classList.remove("show");
+  }
+}
+
+function refListHtml(refs) {
+  if (!refs || refs.length === 0) return '<div class="ref-item">（无检索结果）</div>';
+  return refs
+    .map(([caseId, score]) => `<div class="ref-item">${caseId}　相似度 ${score}</div>`)
+    .join("");
+}
+
+function cardHtml(result) {
+  const color = PHYSICIAN_COLORS[result.physician] || "#333";
+  const s3 = result.s3;
+  const hallucinationHtml = result.hallucinated && result.hallucinated.length > 0
+    ? `<div class="hallucination-warning">⚠ 检测到可能的幻觉引用：模型引用了检索结果之外的医案 id（${result.hallucinated.join("、")}），请勿采信该结论中的引用。</div>`
+    : "";
+
+  return `
+    <div class="card">
+      <h2 style="color:${color}">${result.physician_name}</h2>
+      <div class="field"><b>证型</b>${escapeHtml(s3.syndrome)}</div>
+      <div class="field"><b>治法</b>${escapeHtml(s3.treatment_principle)}</div>
+      <div class="field"><b>方剂</b>${escapeHtml(s3.formula || "（未明确）")}</div>
+      <div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>
+      ${hallucinationHtml}
+      <details>
+        <summary>推理过程与引用详情</summary>
+        <div class="detail-block">
+          <div class="label">推理过程</div>
+          <div>${escapeHtml(s3.reasoning)}</div>
+          <div class="label">引用医案 id</div>
+          <div>${escapeHtml((s3.cited_case_ids || []).join("、") || "（无）")}</div>
+          <div class="label">检索结果与相似度</div>
+          ${refListHtml(result.refs)}
+          ${s3.note ? `<div class="label">备注</div><div>${escapeHtml(s3.note)}</div>` : ""}
+        </div>
+      </details>
+    </div>
+  `;
+}
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderResults(results) {
+  document.getElementById("results").innerHTML = results.map(cardHtml).join("");
+}
+
+function showError(message) {
+  const box = document.getElementById("error-box");
+  box.textContent = message;
+  box.classList.add("show");
+}
+
+function clearError() {
+  const box = document.getElementById("error-box");
+  box.classList.remove("show");
+  box.textContent = "";
+}
+
+async function submitConsult() {
+  const complaint = document.getElementById("complaint").value.trim();
+  if (!complaint) {
+    showError("请先输入患者主诉。");
+    return;
+  }
+
+  const btn = document.getElementById("submit-btn");
+  const status = document.getElementById("status-text");
+  btn.disabled = true;
+  btn.textContent = "推理中…";
+  status.textContent = "预计需要 15–25 秒，请耐心等待";
+  clearError();
+
+  try {
+    const resp = await fetch("/api/consult", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ complaint }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`服务返回错误（HTTP ${resp.status}）：${text}`);
+    }
+    const data = await resp.json();
+    renderDivergence(data.divergence);
+    renderResults(data.results);
+    renderGraph(data.graph);
+  } catch (err) {
+    showError(`请求失败：${err.message || err}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "辨证";
+    status.textContent = "";
+  }
+}
+
+document.getElementById("submit-btn").addEventListener("click", submitConsult);
+</script>
+
+</body>
+</html>
