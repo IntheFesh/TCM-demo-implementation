@@ -107,41 +107,49 @@ def clean(lines):
     return t.strip()
 
 
-def ok(t):
+def ok(t, max_len=1200):
+    """返回 (质量分, 拒绝理由)。分数 > 0 表示通过，此时理由固定为 "ok"；
+    否则理由是下面这些标签之一，供 --stats-only 统计"卡在哪一关"用。
+    max_len 可调是为了能在不改代码的情况下测试"放宽长度上限"这个假设。"""
     n = len(t)
-    if not (100 <= n <= 1200):            # 上限从 420 放宽到 1200：多诊案更长
-        return -1
+    if n < 100:
+        return -1, "too_short"
+    if n > max_len:
+        return -1, "too_long"
     if t.count("。") + t.count(",") < 2:
-        return -1
+        return -1, "too_few_punctuation"
     if re.match(r"^按", t):               # 只拒绝「按」开头（按语被误当成案首）
-        return -1
+        return -1, "starts_with_an_yu"
     head = t.split("\n")[0]
     if len(head) < 12:                    # 首行过短多半是切碎了
-        return -1
+        return -1, "head_too_short"
     # 需要有药物行: 空格分隔的多个短词
     lines = t.split("\n")
     di = next((i for i, l in enumerate(lines[1:], 1)
                if len(l.split()) >= 4 and len(l) < 100), None)
     if di is None:
-        return -1
+        return -1, "no_drug_line"
     if len("".join(lines[:di])) > 300:   # 药物行之前全是议论
-        return -1
-    return 200 + min(n, 400)
+        return -1, "discussion_before_drug_line_too_long"
+    return 200 + min(n, 400), "ok"
 
 
-def collect(pid, cfg, books_dir="."):
-    """纯正则扫描，返回全部满足 ok() 的候选案：(follow_hint, 质量分, 门类, 正文)。
-    零 LLM 调用。"""
+def collect(pid, cfg, books_dir=".", max_len=1200):
+    """纯正则扫描，返回 (候选案列表, 拒绝理由计数)。
+    候选案：(follow_hint, 质量分, 门类, 正文)。零 LLM 调用。"""
     src_path = pathlib.Path(books_dir) / cfg["src"]
     candidates = []
+    reject_reasons = Counter()
     for title, body in sections(read(src_path), cfg["gates"]):
         for lines in split_cases(body, cfg["start"]):
             full_lines = keep_full_case(lines)
             t = clean(full_lines)
-            s = ok(t)
+            s, reason = ok(t, max_len=max_len)
             if s > 0:
                 candidates.append((follow_hint(full_lines), s, title, t))
-    return candidates
+            else:
+                reject_reasons[reason] += 1
+    return candidates, reject_reasons
 
 
 def select(candidates, want, n_gates):
@@ -182,9 +190,14 @@ def select(candidates, want, n_gates):
     return chosen, per
 
 
-def print_stats(pid, candidates, chosen, per):
+def print_stats(pid, candidates, chosen, per, reject_reasons=None):
     n_hinted = sum(1 for fh, _, _ in chosen if fh > 0)
-    print(f"{pid}: 候选 {len(candidates)} 案 → 采用 {len(chosen)} 案  门类分布 {per}")
+    n_rejected = sum(reject_reasons.values()) if reject_reasons else 0
+    print(f"{pid}: 候选 {len(candidates)} 案（另有 {n_rejected} 案被拒） → 采用 {len(chosen)} 案  门类分布 {per}")
+    if reject_reasons:
+        print("  拒绝理由分布（按次数降序）：")
+        for reason, n in reject_reasons.most_common():
+            print(f"    {reason:<38} {n:>4}")
     print(f"  采用案里 follow_hint>0 的数量：{n_hinted} / {len(chosen)}")
     hist = Counter(fh for fh, _, _ in chosen)
     if hist:
@@ -197,10 +210,10 @@ def print_stats(pid, candidates, chosen, per):
     return n_hinted
 
 
-def run(pid, cfg, want=30, outdir="out", books_dir="."):
-    candidates = collect(pid, cfg, books_dir=books_dir)
+def run(pid, cfg, want=30, outdir="out", books_dir=".", max_len=1200):
+    candidates, reject_reasons = collect(pid, cfg, books_dir=books_dir, max_len=max_len)
     chosen, per = select(candidates, want, len(cfg["gates"]))
-    print_stats(pid, candidates, chosen, per)
+    print_stats(pid, candidates, chosen, per, reject_reasons)
 
     d = pathlib.Path(outdir) / pid
     d.mkdir(parents=True, exist_ok=True)
@@ -212,11 +225,11 @@ def run(pid, cfg, want=30, outdir="out", books_dir="."):
     return chosen
 
 
-def stats_only(pid, cfg, want=30, books_dir="."):
+def stats_only(pid, cfg, want=30, books_dir=".", max_len=1200):
     """纯正则、零 LLM 调用、不写任何文件的离线闸门检查。"""
-    candidates = collect(pid, cfg, books_dir=books_dir)
+    candidates, reject_reasons = collect(pid, cfg, books_dir=books_dir, max_len=max_len)
     chosen, per = select(candidates, want, len(cfg["gates"]))
-    return print_stats(pid, candidates, chosen, per)
+    return print_stats(pid, candidates, chosen, per, reject_reasons)
 
 
 if __name__ == "__main__":
@@ -226,16 +239,17 @@ if __name__ == "__main__":
     parser.add_argument("--books-dir", default=".",
                          help="古籍原文 txt 所在目录（默认当前目录）")
     parser.add_argument("--want", type=int, default=30, help="每位医家目标采用案数")
+    parser.add_argument("--max-len", type=int, default=1200, help="ok() 的字数上限")
     args = parser.parse_args()
 
     if args.stats_only:
         results = {}
         for pid, cfg in BOOKS.items():
-            results[pid] = stats_only(pid, cfg, want=args.want, books_dir=args.books_dir)
+            results[pid] = stats_only(pid, cfg, want=args.want, books_dir=args.books_dir, max_len=args.max_len)
         print("\n=== G1 闸门判据：叶天士、吴鞠通各自 follow_hint>0 的采用案 ≥25 ===")
         for pid, n in results.items():
             verdict = "PASS" if n >= 25 else "FAIL"
             print(f"  {pid}: {n}  [{verdict}]")
     else:
         for pid, cfg in BOOKS.items():
-            run(pid, cfg, want=args.want, books_dir=args.books_dir)
+            run(pid, cfg, want=args.want, books_dir=args.books_dir, max_len=args.max_len)
