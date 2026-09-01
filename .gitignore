@@ -2,7 +2,9 @@
 __pycache__/
 *.pyc
 cases.json
+extract_warnings.json
 *.jsonl
+out/
 .venv/
 venv/
 .pytest_cache/

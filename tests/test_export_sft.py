@@ -6,6 +6,7 @@ from offline.export_sft import filter_public_domain, to_samples
 def _case(**overrides) -> CaseRecord:
     base = dict(
         case_id="ye_tianshi-001",
+        case_group_id="ye_tianshi-001",
         physician="ye_tianshi",
         raw="朱 初因面肿……",
         symptoms=["面肿", "喘"],

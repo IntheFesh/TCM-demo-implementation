@@ -50,6 +50,7 @@ def _fake_cases() -> list[CaseRecord]:
     return [
         CaseRecord(
             case_id="ye_tianshi-001",
+            case_group_id="ye_tianshi-001",
             physician="ye_tianshi",
             raw="原文",
             symptoms=["纳差"],
@@ -60,6 +61,7 @@ def _fake_cases() -> list[CaseRecord]:
         ),
         CaseRecord(
             case_id="wu_jutong-001",
+            case_group_id="wu_jutong-001",
             physician="wu_jutong",
             raw="原文",
             symptoms=["纳差"],

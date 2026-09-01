@@ -16,6 +16,7 @@ def test_dense_retriever_raises_clear_error_when_cases_json_missing(tmp_path):
 def test_case_to_text_includes_symptoms_and_tongue_pulse():
     case = CaseRecord(
         case_id="ye_tianshi-001",
+        case_group_id="ye_tianshi-001",
         physician="ye_tianshi",
         raw="原文",
         symptoms=["纳差", "乏力"],
@@ -32,6 +33,7 @@ def test_case_to_text_includes_symptoms_and_tongue_pulse():
 def test_case_to_text_handles_missing_tongue_pulse():
     case = CaseRecord(
         case_id="ye_tianshi-002",
+        case_group_id="ye_tianshi-002",
         physician="ye_tianshi",
         raw="原文",
         symptoms=["纳差"],

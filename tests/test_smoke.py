@@ -3,7 +3,7 @@ import pytest
 from pydantic import ValidationError
 
 from core.llm import render, strip_code_fence
-from core.schemas import ElementHit, S3Syndrome
+from core.schemas import CaseSequence, ElementHit, S3Syndrome
 
 
 def test_element_hit_rejects_empty_supporting_symptoms():
@@ -14,6 +14,11 @@ def test_element_hit_rejects_empty_supporting_symptoms():
             supporting_symptoms=[],
             confidence="high",
         )
+
+
+def test_case_sequence_rejects_empty_visits():
+    with pytest.raises(ValidationError):
+        CaseSequence(visits=[])
 
 
 def test_s3_syndrome_rejects_empty_cited_case_ids():
