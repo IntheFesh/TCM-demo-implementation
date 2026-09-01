@@ -22,13 +22,25 @@ class VisitStructured(CaseStructured):
 
     visit_index: int = 0  # 0=初诊
     visit_marker: str | None = None  # 原文里标识这一诊的字样（「又」「初三日」等），初诊为 None
+    visit_date: str | None = None  # 原文日期原样摘录（如「乙酉五月二十一日」），不做归一化解析
     response_to_prior: str | None = None  # 上一诊治疗后的反应（「服七帖而效」），初诊为 None
 
 
 class CaseSequence(BaseModel):
-    """一个病人的完整诊次序列，是 s0_extract_case 现在的输出形状。"""
+    """一个病人的完整诊次序列。"""
 
     visits: list[VisitStructured] = Field(min_length=1)
+
+
+class SegmentPatients(BaseModel):
+    """s0_extract_case 现在的输出形状。R1 的粗段（见 offline/split_cases.py）不保证
+    只含一个病人，切分病人边界这件事交给模型做，一段可能有零个、一个或多个病人。
+
+    patients 允许是空列表——粗段有可能整段都是编者按语或纯议论（比如挨着按语被
+    粘连进来的情况），这时诚实报告"这段没有病人"是合法输出，跟 S2Elements.elements
+    可以为空是同一个道理，不要因为"看起来应该有内容"就诱导模型编一个病人出来。"""
+
+    patients: list[CaseSequence] = Field(default_factory=list)
 
 
 class CaseRecord(VisitStructured):

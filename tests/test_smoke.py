@@ -3,7 +3,7 @@ import pytest
 from pydantic import ValidationError
 
 from core.llm import render, strip_code_fence
-from core.schemas import CaseSequence, ElementHit, S3Syndrome
+from core.schemas import CaseSequence, ElementHit, S3Syndrome, SegmentPatients
 
 
 def test_element_hit_rejects_empty_supporting_symptoms():
@@ -19,6 +19,13 @@ def test_element_hit_rejects_empty_supporting_symptoms():
 def test_case_sequence_rejects_empty_visits():
     with pytest.raises(ValidationError):
         CaseSequence(visits=[])
+
+
+def test_segment_patients_allows_empty_patients():
+    # 故意和上面那条相反：一个粗段可能整段都是编者按语，没有病人是合法输出，
+    # 不能把它也当成"防幻觉约束"加 min_length=1，否则会逼模型编一个病人出来。
+    result = SegmentPatients(patients=[])
+    assert result.patients == []
 
 
 def test_s3_syndrome_rejects_empty_cited_case_ids():

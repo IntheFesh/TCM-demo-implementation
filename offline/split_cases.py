@@ -1,12 +1,18 @@
-"""从公版古籍切出医案（保留完整诊次序列）。源: xiaopangxia/TCM-Ancient-Books
+"""从公版古籍切出"粗段"，交给 LLM（offline/extract_cases.py 的 s0 步骤）判断段内
+到底有几个病人、每个病人几诊。源: xiaopangxia/TCM-Ancient-Books
 
-R1 改造：不再只保留初诊段——复诊序列（同一病人 初诊→二诊→三诊 的证型演变）是
-本项目的核心研究对象，旧版 first_visit() 会把它整段丢掉。现在改成保留整案，
-诊次的拆分交给 offline/extract_cases.py 里的 LLM 步骤去做（因为三本书的复诊
-标记形态完全不同，正则切不干净，只能当提示用）。
+R1 用案首正则（YE_START/WU_START）硬切案边界，R1 的 --stats-only 诊断发现这条路
+走不通：吴鞠通全书密度只有叶天士的 1/5.24（708 字/段 vs 135 字/段），案首正则漏切
+掉大量案首体例（纪年开头、官职头衔指代病人等），把多个病人焊成一段——而这类体例
+"族婶母""一叟""通廷尉"层出不穷，手写穷举是无底洞。
 
---stats-only 是纯正则、零 LLM 调用的离线前置闸门：跑一遍就知道"这本书带复诊
-标记的案够不够多"，不需要等到接了真实模型才发现数据不够。
+这一版改变方向：正则不再决定案边界，只负责两件事——
+  1. 把正文切成喂给模型的"粗段"（按空行 + 长度上限，宁可粘连不可切碎）
+  2. 在粗段里找 head_hints（疑似病人标识）和 follow_hints（疑似复诊标记）作为
+     提示 + 事后交叉校验用，不再是判定依据
+
+这和 R1 对复诊标记的处理是同一个思路：正则从"裁判"降级成"提示"，真正的边界
+判断交给 LLM。head_hints 的正则刻意写得宽松（宁可多报），因为它现在只是线索。
 """
 import argparse
 import re
@@ -14,21 +20,36 @@ import pathlib
 import unicodedata
 from collections import Counter
 
-# 案起始: ①姓+（年龄/氏）  ②姓+空格  ③某(氏/年龄)
-YE_START = re.compile(r"^[一-龥](（[^）]{1,8}）|\s)")
-WU_START = re.compile(r"^[一-龥]{1,3}(氏)?\s+([一二三四五六七八九十百]+岁|[甲乙丙丁戊己庚辛壬癸][^\s]*年)")
-# 复诊标记（行首）：叶天士用「又」，吴鞠通用干支/序数日期
+# ---------- head_hints：疑似病人标识（宽松，只做提示 + 交叉校验，不做判据） ----------
+HEAD_HINT_PATTERNS = [
+    ("姓名岁数", re.compile(r"[一-龥]{1,3}(氏)?\s+([一二三四五六七八九十百]+岁|[甲乙丙丁戊己庚辛壬癸][^\s]{0,6}年)")),
+    ("单字姓氏", re.compile(r"(?:^|\n)[一-龥](（[^）]{1,8}）|\s)")),  # 叶天士式：单字姓+（年龄/氏）或空格
+    ("纪年", re.compile(r"[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]年")),
+    ("称谓", re.compile(r"一(人|妇人|妇|叟|童子|少年|老者|媪)")),
+    ("族称", re.compile(r"(族|堂)[一-龥]{1,3}|某氏")),
+    # 常见清代官职/尊称，不追求穷举——这份列表本来就只是提示，漏掉的交给 LLM 判断
+    ("头衔", re.compile(r"(太史|太守|通判|廷尉|观察|大令|明府|茂才|孝廉|封翁|方伯|太仆|中丞|少宰|光禄)")),
+]
+
+# ---------- follow_hints：疑似复诊标记（沿用 R1 的 FOLLOW / FOLLOW_KEYWORDS） ----------
 FOLLOW = re.compile(r"^(又|[初廿卅一二三四五六七八九十]+[日月]|[正一二三四五六七八九十腊]+月)")
-# 复诊关键词（不要求行首，叙事体的书复诊常年嵌在句子中间）
 FOLLOW_KEYWORDS = re.compile(r"复诊|二诊|三诊|服\S{0,3}剂")
 
+TAIL = re.compile(r"^(徐评|案中|<目录>|<篇名>)")
+
 BOOKS = {
-    "ye_tianshi": dict(src="367-临证指南医案.txt",
-                       gates=["胃脘痛", "脾胃", "木乘土", "噎膈反胃", "呕吐", "痞", "痰饮", "肿胀", "积聚"],
-                       start=YE_START),
-    "wu_jutong":  dict(src="361-吴鞠通医案.txt",
-                       gates=["胃痛", "脾胃", "呕吐", "反胃", "噎", "泄泻", "痞", "痰饮", "肿胀", "积聚", "滞下"],
-                       start=WU_START),
+    "ye_tianshi": dict(
+        src="367-临证指南医案.txt",
+        gates=["胃脘痛", "脾胃", "木乘土", "噎膈反胃", "呕吐", "痞", "痰饮", "肿胀", "积聚"],
+        concat_gates=False,  # 密度高（135 字/段），逐门类分别切，没必要跨门类拼接
+    ),
+    "wu_jutong": dict(
+        src="361-吴鞠通医案.txt",
+        gates=["胃痛", "脾胃", "呕吐", "反胃", "噎", "泄泻", "痞", "痰饮", "肿胀", "积聚", "滞下"],
+        concat_gates=True,  # 密度低、案首体例杂：先按门类过滤太早，门类边界处的病人
+                            # 会被 <篇名> 硬切断（"脾胃病人焊在温病病人后面"是边界内的事，
+                            # 这里至少先把所有命中门类拼成一条连续正文再切，缓解门类间的截断）
+    ),
 }
 
 
@@ -48,56 +69,6 @@ def sections(text, gates):
     return out
 
 
-def split_cases(body, start_re):
-    """按 start_re 找案边界。关键点：一行如果同时像案首（匹配 start_re）又像复诊
-    标记（匹配 FOLLOW，比如"又 服前方"——单字"又"+空格，正好落进 YE_START 的
-    "单字+空格"模式），要按复诊处理、并入当前案，而不是被误判成新案的开头。
-    不这样做的后果是：叶天士的"又"字复诊行会把一个多诊病人切成好几个假案，
-    其中除了第一段（真正的初诊），其余每段都只有一两行，长度不到 100 字，
-    会在 ok() 的长度下限那关被直接拒掉——复诊内容看似"跑没了"，其实是在这里
-    就被错误地拆散了，keep_full_case() 根本救不回来。"""
-    cases, cur = [], []
-    for line in body.split("\n"):
-        s = line.strip()
-        if not s:
-            continue
-        if start_re.match(s) and not FOLLOW.match(s):
-            if cur:
-                cases.append(cur)
-            cur = [s]
-        elif cur:
-            cur.append(s)
-    if cur:
-        cases.append(cur)
-    return cases
-
-
-TAIL = re.compile(r"^(徐评|案中|<目录>|<篇名>)")
-
-
-def keep_full_case(lines):
-    """保留整案，只截断篇末按语——不再截断复诊段。复诊序列是本项目的核心研究对象，
-    旧版 first_visit() 在这里把它们整段丢了，是 R1 要修的 bug。"""
-    out = []
-    for i, l in enumerate(lines):
-        if TAIL.match(l):
-            break
-        if re.search(r"[（(][一-龥]{2,4}[）)]\s*$", l) and len(l) > 30 and i > 2:
-            break                      # 编者署名结尾的按语
-        out.append(l)
-    return out
-
-
-def follow_hint(lines):
-    """粗算一个案里的复诊迹象强度：命中 FOLLOW 正则的行数 + 命中复诊关键词的次数。
-    只是排序用的启发式分数（决定谁被优先选中），不参与 ok() 的合法性判定。
-    一行同时命中两者会被计两次，这里不追求精确计数，只追求"分越高复诊迹象越强"。"""
-    line_hits = sum(1 for l in lines if FOLLOW.match(l))
-    text = "\n".join(lines)
-    keyword_hits = len(FOLLOW_KEYWORDS.findall(text))
-    return line_hits + keyword_hits
-
-
 def clean(lines):
     t = "\n".join(lines)
     t = t.replace("\\x", "")  # 原书用 \x按∶\x 这类标记表示强调，是转录产物，不是正文
@@ -107,149 +78,138 @@ def clean(lines):
     return t.strip()
 
 
-def ok(t, max_len=1200):
-    """返回 (质量分, 拒绝理由)。分数 > 0 表示通过，此时理由固定为 "ok"；
-    否则理由是下面这些标签之一，供 --stats-only 统计"卡在哪一关"用。
-    max_len 可调是为了能在不改代码的情况下测试"放宽长度上限"这个假设。"""
-    n = len(t)
-    if n < 100:
-        return -1, "too_short"
-    if n > max_len:
-        return -1, "too_long"
-    if t.count("。") + t.count(",") < 2:
-        return -1, "too_few_punctuation"
-    if re.match(r"^按", t):               # 只拒绝「按」开头（按语被误当成案首）
-        return -1, "starts_with_an_yu"
-    head = t.split("\n")[0]
-    if len(head) < 12:                    # 首行过短多半是切碎了
-        return -1, "head_too_short"
-    # 需要有药物行: 空格分隔的多个短词
-    lines = t.split("\n")
-    di = next((i for i, l in enumerate(lines[1:], 1)
-               if len(l.split()) >= 4 and len(l) < 100), None)
-    if di is None:
-        return -1, "no_drug_line"
-    if len("".join(lines[:di])) > 300:   # 药物行之前全是议论
-        return -1, "discussion_before_drug_line_too_long"
-    return 200 + min(n, 400), "ok"
+def chunk_chapter(body, max_len=1500, soft_min=400):
+    """把一段门类正文切成粗段：优先在空行处断开，撞长度上限则强制断开。
+    宁可粘连（多个病人挤一段）也不可切碎（把一个病人切两半）——精确边界现在
+    交给 LLM，这里只负责切成能喂模型的大小。
 
+    经验证：这三本书里空行很稀疏（叶天士/吴鞠通的 gates 范围内都只占 3.5%~4.2%
+    的行，且不是逐病人分隔），所以实际上长度上限才是主导机制，空行只是偶尔生效
+    的"顺便断在这里更好"，不要预期它能承担主要的分段职责。
 
-def collect(pid, cfg, books_dir=".", max_len=1200):
-    """纯正则扫描，返回 (候选案列表, 拒绝理由计数)。
-    候选案：(follow_hint, 质量分, 门类, 正文)。零 LLM 调用。"""
-    src_path = pathlib.Path(books_dir) / cfg["src"]
-    candidates = []
-    reject_reasons = Counter()
-    for title, body in sections(read(src_path), cfg["gates"]):
-        for lines in split_cases(body, cfg["start"]):
-            full_lines = keep_full_case(lines)
-            t = clean(full_lines)
-            s, reason = ok(t, max_len=max_len)
-            if s > 0:
-                candidates.append((follow_hint(full_lines), s, title, t))
-            else:
-                reject_reasons[reason] += 1
-    return candidates, reject_reasons
-
-
-def select(candidates, want, n_gates):
-    """优先无上限地选出全部 follow_hint>0 的候选，不够 want 时才用 follow_hint=0
-    的候选按门类上限补足。
-
-    门类上限（cap）原本是为了在"质量分数"这一个维度下保证门类覆盖面，不让某个
-    大门类把配额占满。但现在的首要目标是 follow_hint>0 的案，这类案本来就稀缺
-    （比如吴鞠通"痰饮"门类集中了大部分复诊案），如果对它们也套用 cap，会把明明
-    存在的复诊案挡在外面、换成没有复诊信号的案去填门类配额——这正是这一版最先
-    踩到的坑，不能不修就往下走。"""
-    hinted = sorted((c for c in candidates if c[0] > 0), key=lambda c: (-c[0], -c[1]))
-    unhinted = sorted((c for c in candidates if c[0] == 0), key=lambda c: -c[1])
-
-    per, chosen, seen = {}, [], set()
-
-    def take(c):
-        fh, s, title, t = c
-        if t[:30] in seen:
-            return
-        seen.add(t[:30])
-        per[title] = per.get(title, 0) + 1
-        chosen.append((fh, title, t))
-
-    for c in hinted:
-        if len(chosen) >= want:
-            break
-        take(c)
-
-    cap = max(2, want // n_gates + 2)
-    for c in unhinted:
-        if len(chosen) >= want:
-            break
-        if per.get(c[2], 0) >= cap:
+    返回 list[list[str]]（每个粗段的原始行列表，未 clean），方便复用 clean()。"""
+    lines = body.split("\n")
+    segments, cur, cur_len = [], [], 0
+    for line in lines:
+        s = line.strip()
+        if TAIL.match(s):
+            continue  # 编者按语/结构标记，整行丢弃，不进入任何段
+        if not s:
+            if cur and cur_len >= soft_min:
+                segments.append(cur)
+                cur, cur_len = [], 0
             continue
-        take(c)
-
-    return chosen, per
-
-
-def print_stats(pid, candidates, chosen, per, reject_reasons=None):
-    n_hinted = sum(1 for fh, _, _ in chosen if fh > 0)
-    n_rejected = sum(reject_reasons.values()) if reject_reasons else 0
-    print(f"{pid}: 候选 {len(candidates)} 案（另有 {n_rejected} 案被拒） → 采用 {len(chosen)} 案  门类分布 {per}")
-    if reject_reasons:
-        print("  拒绝理由分布（按次数降序）：")
-        for reason, n in reject_reasons.most_common():
-            print(f"    {reason:<38} {n:>4}")
-    print(f"  采用案里 follow_hint>0 的数量：{n_hinted} / {len(chosen)}")
-    hist = Counter(fh for fh, _, _ in chosen)
-    if hist:
-        max_fh = max(hist)
-        print("  follow_hint 分布直方图（采用案）：")
-        for v in range(0, max_fh + 1):
-            n = hist.get(v, 0)
-            if n:
-                print(f"    {v:>2} : {n:>3}  {'#' * n}")
-    return n_hinted
+        cur.append(s)
+        cur_len += len(s)
+        if cur_len >= max_len:
+            segments.append(cur)
+            cur, cur_len = [], 0
+    if cur:
+        segments.append(cur)
+    return segments
 
 
-def run(pid, cfg, want=30, outdir="out", books_dir=".", max_len=1200):
-    candidates, reject_reasons = collect(pid, cfg, books_dir=books_dir, max_len=max_len)
-    chosen, per = select(candidates, want, len(cfg["gates"]))
-    print_stats(pid, candidates, chosen, per, reject_reasons)
+def find_head_hints(text):
+    hits = []
+    for kind, pat in HEAD_HINT_PATTERNS:
+        for m in pat.finditer(text):
+            hits.append({"pos": m.start(), "matched": m.group(0).strip(), "kind": kind})
+    hits.sort(key=lambda h: h["pos"])
+    return hits
+
+
+def find_follow_hints(text):
+    hits = []
+    offset = 0
+    for line in text.split("\n"):
+        m = FOLLOW.match(line)
+        if m:
+            hits.append({"pos": offset, "matched": m.group(0)})
+        offset += len(line) + 1  # +1 补回 split 时吃掉的换行符
+    for m in FOLLOW_KEYWORDS.finditer(text):
+        hits.append({"pos": m.start(), "matched": m.group(0)})
+    hits.sort(key=lambda h: h["pos"])
+    return hits
+
+
+def collect_segments(pid, cfg, books_dir=".", max_len=1500):
+    """纯正则扫描，返回这位医家的全部粗段：
+    [{seg_id, physician, text, char_len, head_hints, follow_hints}, ...]。零 LLM 调用。"""
+    text = read(pathlib.Path(books_dir) / cfg["src"])
+    secs = sections(text, cfg["gates"])
+
+    if cfg.get("concat_gates"):
+        combined = "\n".join(body for _, body in secs)
+        chunks = chunk_chapter(combined, max_len=max_len)
+    else:
+        chunks = []
+        for _, body in secs:
+            chunks.extend(chunk_chapter(body, max_len=max_len))
+
+    segments = []
+    for i, lines in enumerate(chunks):
+        t = clean(lines)
+        if not t:
+            continue
+        segments.append({
+            "seg_id": f"{pid}-{i:04d}",
+            "physician": pid,
+            "text": t,
+            "char_len": len(t),
+            "head_hints": find_head_hints(t),
+            "follow_hints": find_follow_hints(t),
+        })
+    return segments
+
+
+def print_segment_stats(pid, segments):
+    n = len(segments)
+    hint_counts = [len(seg["head_hints"]) for seg in segments]
+    follow_counts = [len(seg["follow_hints"]) for seg in segments]
+    total_hints = sum(hint_counts)
+    total_follow = sum(follow_counts)
+    n_ge2 = sum(1 for c in hint_counts if c >= 2)
+    max_c = max(hint_counts) if hint_counts else 0
+    lens = sorted(seg["char_len"] for seg in segments)
+    median_len = lens[len(lens) // 2] if lens else 0
+
+    print(f"{pid}: 粗段总数 {n}  字数中位数 {median_len}")
+    print(f"  head_hints 总数 {total_hints}（总数/段数 = {total_hints / n:.2f}）")
+    print(f"  head_hints>=2 的段：{n_ge2} / {n} ({n_ge2 / n * 100:.1f}%)  最大值 {max_c}")
+    print(f"  follow_hints 总数 {total_follow}（总数/段数 = {total_follow / n:.2f}）")
+    print("  head_hints 数量分布：")
+    dist = Counter(hint_counts)
+    for v in sorted(dist):
+        bar = "#" * min(dist[v], 60)
+        print(f"    {v:>2} : {dist[v]:>4}  {bar}")
+    return {"n_segments": n, "total_head_hints": total_hints, "n_ge2": n_ge2, "max_hints": max_c}
+
+
+def write_segments(pid, segments, outdir="out"):
+    import json
 
     d = pathlib.Path(outdir) / pid
     d.mkdir(parents=True, exist_ok=True)
-    for f in d.glob("*.txt"):
+    for f in d.glob("*.json"):
         f.unlink()
-    for i, (fh, title, t) in enumerate(chosen, 1):
-        (d / f"{i:03d}.txt").write_text(t + "\n", encoding="utf-8")
-    print(f"  已写出 {len(chosen)} 个文件到 {d}/")
-    return chosen
-
-
-def stats_only(pid, cfg, want=30, books_dir=".", max_len=1200):
-    """纯正则、零 LLM 调用、不写任何文件的离线闸门检查。"""
-    candidates, reject_reasons = collect(pid, cfg, books_dir=books_dir, max_len=max_len)
-    chosen, per = select(candidates, want, len(cfg["gates"]))
-    return print_stats(pid, candidates, chosen, per, reject_reasons)
+    for seg in segments:
+        (d / f"{seg['seg_id']}.json").write_text(
+            json.dumps(seg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    print(f"  已写出 {len(segments)} 个粗段到 {d}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="从古籍原文切出医案（保留完整诊次序列）")
+    parser = argparse.ArgumentParser(description="从古籍原文切出粗段（病人/诊次边界交给 LLM 判断）")
     parser.add_argument("--stats-only", action="store_true",
                          help="只跑正则统计，不写文件，不需要网络/LLM")
     parser.add_argument("--books-dir", default=".",
                          help="古籍原文 txt 所在目录（默认当前目录）")
-    parser.add_argument("--want", type=int, default=30, help="每位医家目标采用案数")
-    parser.add_argument("--max-len", type=int, default=1200, help="ok() 的字数上限")
+    parser.add_argument("--max-len", type=int, default=1500, help="粗段字数上限")
     args = parser.parse_args()
 
-    if args.stats_only:
-        results = {}
-        for pid, cfg in BOOKS.items():
-            results[pid] = stats_only(pid, cfg, want=args.want, books_dir=args.books_dir, max_len=args.max_len)
-        print("\n=== G1 闸门判据：叶天士、吴鞠通各自 follow_hint>0 的采用案 ≥25 ===")
-        for pid, n in results.items():
-            verdict = "PASS" if n >= 25 else "FAIL"
-            print(f"  {pid}: {n}  [{verdict}]")
-    else:
-        for pid, cfg in BOOKS.items():
-            run(pid, cfg, want=args.want, books_dir=args.books_dir, max_len=args.max_len)
+    for pid, cfg in BOOKS.items():
+        segments = collect_segments(pid, cfg, books_dir=args.books_dir, max_len=args.max_len)
+        print_segment_stats(pid, segments)
+        if not args.stats_only:
+            write_segments(pid, segments)

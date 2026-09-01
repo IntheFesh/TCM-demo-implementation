@@ -1,73 +1,117 @@
 """offline/extract_cases.py 的离线测试：假 LLM 后端，不需要网络。
 
-手写 3 个 CaseSequence 当模型返回，端到端跑一遍 main()，覆盖单诊、三诊、
-以及 LLM 切诊次数与正则估计对不上（触发交叉校验警告）三种场景。
+数据现在是"粗段"（data/{physician}/*.json，由 offline.split_cases 生成），一段
+可能有 0/1/多个病人。手写几个 SegmentPatients 当模型返回，端到端跑一遍 main()，
+覆盖：单段单病人单诊、单段单病人多诊、单段多病人、零病人段、两种交叉校验。
 """
 import json
 
 import offline.extract_cases as extract_cases
-from core.schemas import CaseSequence, VisitStructured
+from core.schemas import CaseSequence, SegmentPatients, VisitStructured
 
 
 class FakeLLM:
-    """按 system 提示词里嵌的标记文本，分派预设的 CaseSequence 返回值。"""
+    """按 system 提示词里嵌的标记文本，分派预设的 SegmentPatients 返回值。"""
 
-    def __init__(self, sequences_by_marker: dict[str, CaseSequence]):
-        self.sequences_by_marker = sequences_by_marker
+    def __init__(self, results_by_marker: dict[str, SegmentPatients]):
+        self.results_by_marker = results_by_marker
         self.calls = 0
 
     def generate(self, system, user, schema, temperature=0.0, **kwargs):
         self.calls += 1
-        for marker, seq in self.sequences_by_marker.items():
+        for marker, result in self.results_by_marker.items():
             if marker in system:
-                return seq
-        raise AssertionError("无法从 system 提示词匹配到预设的 CaseSequence")
+                return result
+        raise AssertionError("无法从 system 提示词匹配到预设的 SegmentPatients")
 
 
-def _write_case(data_root, physician, stem, text):
+def _write_segment(data_root, physician, seg_id, text, head_hints=None, follow_hints=None):
     d = data_root / physician
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"{stem}.txt").write_text(text, encoding="utf-8")
+    segment = {
+        "seg_id": seg_id,
+        "physician": physician,
+        "text": text,
+        "char_len": len(text),
+        "head_hints": head_hints or [],
+        "follow_hints": follow_hints or [],
+    }
+    (d / f"{seg_id}.json").write_text(json.dumps(segment, ensure_ascii=False), encoding="utf-8")
 
 
-def test_full_pipeline_expands_visits_and_flags_mismatch(tmp_path, monkeypatch):
+def test_full_pipeline_multi_patient_segment_and_cross_validation(tmp_path, monkeypatch):
     data_root = tmp_path / "data"
     out_path = tmp_path / "cases.json"
     warnings_path = tmp_path / "extract_warnings.json"
 
-    # 案 001：单诊，原文没有复诊标记 —— regex 估计 1 诊，LLM 也说 1 诊，一致
-    single_raw = "TESTCASE001 朱 初诊胃脘痛。柴胡 白芍。"
-    _write_case(data_root, "ye_tianshi", "001", single_raw)
-    seq_single = CaseSequence(visits=[
-        VisitStructured(visit_index=0, symptoms=["胃脘痛"], herbs=["柴胡", "白芍"]),
-    ])
-
-    # 案 002：三诊，原文有两个「又」标记 —— regex 估计 3 诊，LLM 也说 3 诊，一致
-    triple_raw = (
-        "TESTCASE002 李 初诊呕吐。半夏 生姜。\n"
-        "又 呕吐减轻。茯苓。\n"
-        "又 诸症皆平。甘草。"
+    # 段 0000：单病人单诊，head_hints=1 与 LLM 病人数一致
+    _write_segment(
+        data_root, "ye_tianshi", "ye_tianshi-0000",
+        "TESTSEG0000 朱 初诊胃脘痛。柴胡 白芍。",
+        head_hints=[{"pos": 12, "matched": "朱 ", "kind": "单字姓氏"}],
     )
-    _write_case(data_root, "ye_tianshi", "002", triple_raw)
-    seq_triple = CaseSequence(visits=[
-        VisitStructured(visit_index=0, symptoms=["呕吐"], herbs=["半夏", "生姜"]),
-        VisitStructured(visit_index=1, visit_marker="又", response_to_prior="呕吐减轻", herbs=["茯苓"]),
-        VisitStructured(visit_index=2, visit_marker="又", response_to_prior="诸症皆平", herbs=["甘草"]),
+    result_0000 = SegmentPatients(patients=[
+        CaseSequence(visits=[VisitStructured(visit_index=0, symptoms=["胃脘痛"], herbs=["柴胡", "白芍"])]),
     ])
 
-    # 案 003：原文没有任何复诊标记（regex 估计 1 诊），但 LLM 判断为 3 诊 —— 应触发交叉校验警告
-    mismatch_raw = "TESTCASE003 王 反复呕吐三年。半夏 陈皮。"
-    _write_case(data_root, "wu_jutong", "003", mismatch_raw)
-    seq_mismatch = CaseSequence(visits=[
-        VisitStructured(visit_index=0, symptoms=["呕吐"]),
-        VisitStructured(visit_index=1),
-        VisitStructured(visit_index=2),
+    # 段 0001：单病人三诊（两个复诊标记）
+    _write_segment(
+        data_root, "ye_tianshi", "ye_tianshi-0001",
+        "TESTSEG0001 李 初诊呕吐。半夏 生姜。\n又 呕吐减轻。茯苓。\n又 诸症皆平。甘草。",
+        head_hints=[{"pos": 12, "matched": "李 ", "kind": "单字姓氏"}],
+        follow_hints=[{"pos": 30, "matched": "又"}, {"pos": 45, "matched": "又"}],
+    )
+    result_0001 = SegmentPatients(patients=[
+        CaseSequence(visits=[
+            VisitStructured(visit_index=0, symptoms=["呕吐"], herbs=["半夏", "生姜"]),
+            VisitStructured(visit_index=1, visit_marker="又", response_to_prior="呕吐减轻", herbs=["茯苓"]),
+            VisitStructured(visit_index=2, visit_marker="又", response_to_prior="诸症皆平", herbs=["甘草"]),
+        ]),
+    ])
+
+    # 段 0002：粘连段，两个病人各一诊（head_hints=2，LLM 也切出 2 个病人，一致）
+    _write_segment(
+        data_root, "wu_jutong", "wu_jutong-0002",
+        "TESTSEG0002 车 五十五岁 肠痈误下。乌药散。\n乙酉年 治通廷尉久疝。巴豆霜。",
+        head_hints=[
+            {"pos": 12, "matched": "车 五十五岁", "kind": "姓名岁数"},
+            {"pos": 30, "matched": "乙酉年", "kind": "纪年"},
+        ],
+    )
+    result_0002 = SegmentPatients(patients=[
+        CaseSequence(visits=[VisitStructured(visit_index=0, symptoms=["肠痈"], herbs=["乌药散"])]),
+        CaseSequence(visits=[VisitStructured(visit_index=0, symptoms=["久疝"], herbs=["巴豆霜"])]),
+    ])
+
+    # 段 0003：纯按语，零病人 —— 合法输出，不应被强迫编一个病人
+    _write_segment(
+        data_root, "wu_jutong", "wu_jutong-0003",
+        "TESTSEG0003 徐评：此案议论精当，足资取法，别无新意。",
+        head_hints=[],
+    )
+    result_0003 = SegmentPatients(patients=[])
+
+    # 段 0004：patient_count 交叉校验不一致（head_hints=4，LLM 只切出 1 个病人）
+    _write_segment(
+        data_root, "wu_jutong", "wu_jutong-0004",
+        "TESTSEG0004 一段密集提及多个称谓但 LLM 判断只有一个病人的文本。",
+        head_hints=[
+            {"pos": 1, "matched": "一人", "kind": "称谓"},
+            {"pos": 5, "matched": "族婶", "kind": "族称"},
+            {"pos": 9, "matched": "堂侄", "kind": "族称"},
+            {"pos": 13, "matched": "太守", "kind": "头衔"},
+        ],
+    )
+    result_0004 = SegmentPatients(patients=[
+        CaseSequence(visits=[VisitStructured(visit_index=0, symptoms=["泄泻"])]),
     ])
 
     fake_llm = FakeLLM({
-        "TESTCASE001": seq_single,
-        "TESTCASE002": seq_triple,
-        "TESTCASE003": seq_mismatch,
+        "TESTSEG0000": result_0000,
+        "TESTSEG0001": result_0001,
+        "TESTSEG0002": result_0002,
+        "TESTSEG0003": result_0003,
+        "TESTSEG0004": result_0004,
     })
 
     monkeypatch.setattr(extract_cases, "DATA_ROOT", data_root)
@@ -78,44 +122,60 @@ def test_full_pipeline_expands_visits_and_flags_mismatch(tmp_path, monkeypatch):
     extract_cases.main(argv=[])
 
     records = json.loads(out_path.read_text(encoding="utf-8"))
-    assert len(records) == 1 + 3 + 3  # 三个案分别展开成 1、3、3 条 CaseRecord
+    # 1 诊 + 3 诊 + (1+1) 诊 + 0 诊 + 1 诊 = 7 条 CaseRecord
+    assert len(records) == 1 + 3 + 2 + 0 + 1
 
     ids = {r["case_id"] for r in records}
-    # case_id 格式 {physician}-{案号}-{诊次}
-    assert "ye_tianshi-001-0" in ids
-    assert {"ye_tianshi-002-0", "ye_tianshi-002-1", "ye_tianshi-002-2"} <= ids
+    # case_id 格式 {physician}-{seg_id}-p{病人序号}-{诊次}
+    assert "ye_tianshi-ye_tianshi-0000-p0-0" in ids
+    assert {"ye_tianshi-ye_tianshi-0001-p0-0", "ye_tianshi-ye_tianshi-0001-p0-1", "ye_tianshi-ye_tianshi-0001-p0-2"} <= ids
+
+    # 粘连段里的两个病人必须有不同的 case_group_id，不能被合并成一个人
+    by_id = {r["case_id"]: r for r in records}
+    p0_group = by_id["wu_jutong-wu_jutong-0002-p0-0"]["case_group_id"]
+    p1_group = by_id["wu_jutong-wu_jutong-0002-p1-0"]["case_group_id"]
+    assert p0_group != p1_group
 
     # prev_case_id 链式关系：第 0 诊为 None，第 i 诊指向第 i-1 诊
-    by_id = {r["case_id"]: r for r in records}
-    assert by_id["ye_tianshi-002-0"]["prev_case_id"] is None
-    assert by_id["ye_tianshi-002-1"]["prev_case_id"] == "ye_tianshi-002-0"
-    assert by_id["ye_tianshi-002-2"]["prev_case_id"] == "ye_tianshi-002-1"
+    assert by_id["ye_tianshi-ye_tianshi-0001-p0-0"]["prev_case_id"] is None
+    assert by_id["ye_tianshi-ye_tianshi-0001-p0-1"]["prev_case_id"] == "ye_tianshi-ye_tianshi-0001-p0-0"
+    assert by_id["ye_tianshi-ye_tianshi-0001-p0-2"]["prev_case_id"] == "ye_tianshi-ye_tianshi-0001-p0-1"
 
-    # case_group_id 同序列内一致
-    group_ids = {r["case_group_id"] for cid, r in by_id.items() if cid.startswith("ye_tianshi-002-")}
-    assert group_ids == {"ye_tianshi-002"}
+    # 零病人段：不报错、不编病人，直接没有对应的 CaseRecord
+    assert not any("0003" in cid for cid in ids)
 
-    # 交叉校验不一致的案写进 extract_warnings.json，而不是静默通过或丢弃
+    # 交叉校验：段 0004 应该触发 patient_count 不一致（LLM=1 vs head_hints=4，差 3 >= 2）
     warnings = json.loads(warnings_path.read_text(encoding="utf-8"))
-    assert len(warnings) == 1
-    assert warnings[0]["case_group_id"] == "wu_jutong-003"
-    assert warnings[0]["llm_visit_count"] == 3
-    assert warnings[0]["regex_visit_estimate"] == 1
-    # 不一致不等于丢弃：003 案的三诊记录仍然都写进了 cases.json
-    assert {"wu_jutong-003-0", "wu_jutong-003-1", "wu_jutong-003-2"} <= ids
+    checks = {(w["seg_id"], w["check"]) for w in warnings}
+    assert ("wu_jutong-0004", "patient_count") in checks
+    w0004 = next(w for w in warnings if w["seg_id"] == "wu_jutong-0004" and w["check"] == "patient_count")
+    assert w0004["llm_count"] == 1
+    assert w0004["regex_count"] == 4
+
+    # 一致的段不应该产生任何警告
+    assert not any(w["seg_id"] == "ye_tianshi-0000" for w in warnings)
+    assert not any(w["seg_id"] == "wu_jutong-0002" for w in warnings)
 
 
-def test_no_warning_when_visit_counts_agree(tmp_path, monkeypatch):
+def test_visit_total_cross_validation_triggers_independently(tmp_path, monkeypatch):
+    """诊次总量校验要能单独触发，即使病人数校验通过。"""
     data_root = tmp_path / "data"
     out_path = tmp_path / "cases.json"
     warnings_path = tmp_path / "extract_warnings.json"
 
-    single_raw = "TESTCASE 张 单诊胃痛。陈皮 半夏。"
-    _write_case(data_root, "wu_jutong", "010", single_raw)
-    seq = CaseSequence(visits=[VisitStructured(visit_index=0, symptoms=["胃痛"])])
+    _write_segment(
+        data_root, "wu_jutong", "wu_jutong-0005",
+        "TESTSEG0005 王 乙酉五月二十一日 呕吐不食。\n二十三日 呕止。\n廿五日 能食。\n廿七日 诸症皆平。",
+        head_hints=[{"pos": 12, "matched": "王 ", "kind": "单字姓氏"}],
+        # 段内标了 3 个复诊标记，head_hints(1) + follow_hints(3) = 4
+        follow_hints=[{"pos": 30, "matched": "二十三日"}, {"pos": 40, "matched": "廿五日"}, {"pos": 50, "matched": "廿七日"}],
+    )
+    # LLM 只切出 1 诊（漏了三次复诊），总诊次 1 vs 正则估计 4，差 3 >= 2
+    result = SegmentPatients(patients=[
+        CaseSequence(visits=[VisitStructured(visit_index=0, symptoms=["呕吐"])]),
+    ])
 
-    fake_llm = FakeLLM({"TESTCASE": seq})
-
+    fake_llm = FakeLLM({"TESTSEG0005": result})
     monkeypatch.setattr(extract_cases, "DATA_ROOT", data_root)
     monkeypatch.setattr(extract_cases, "OUT_PATH", out_path)
     monkeypatch.setattr(extract_cases, "WARNINGS_PATH", warnings_path)
@@ -124,4 +184,8 @@ def test_no_warning_when_visit_counts_agree(tmp_path, monkeypatch):
     extract_cases.main(argv=[])
 
     warnings = json.loads(warnings_path.read_text(encoding="utf-8"))
-    assert warnings == []
+    w = next(w for w in warnings if w["seg_id"] == "wu_jutong-0005" and w["check"] == "visit_total")
+    assert w["llm_count"] == 1
+    assert w["regex_count"] == 4
+    # patient_count 这一项应该是一致的（LLM=1 vs head_hints=1），不该出现
+    assert not any(w["seg_id"] == "wu_jutong-0005" and w["check"] == "patient_count" for w in warnings)
