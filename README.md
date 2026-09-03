@@ -161,6 +161,10 @@ uvicorn api.main:app --reload
 `count_support()` 在零 case 节点情况下的真实计算结果；等真实模型跑完抽取、案例
 节点写入图之后，重跑 `offline/graph_stats.py` 会自动开始出现非零 λ1，不需要改代码。
 
+**下一步的优先级不是继续往图谱/权重上加功能，是找能访问真实模型的机器把
+`offline/extract_cases.py` 跑通、生成真正的 `cases.json`**——K1/K2 的架构已经
+比实际数据超前一整层了，详见 [`data/SOURCES.md`](data/SOURCES.md) 第 7 节第 8 条。
+
 ## 数据来源与版权
 
 详见 [`data/SOURCES.md`](data/SOURCES.md)。简要结论：
