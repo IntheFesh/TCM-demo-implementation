@@ -34,13 +34,26 @@ def root() -> RedirectResponse:
 def api_consult(req: ConsultRequest) -> dict:
     outcome = consult(req.complaint)
     s1: S1Normalize = outcome["s1"]
-    results = outcome["results"]
 
+    if outcome["rejected"]:
+        # 安全否决命中：S2/S3 从未被调用，没有 results 可以拼图，直接返回空图。
+        return {
+            "s1": s1.model_dump(),
+            "rejected": True,
+            "reject_reason": outcome["reject_reason"],
+            "results": [],
+            "divergence": None,
+            "graph": {"nodes": [], "edges": []},
+        }
+
+    results = outcome["results"]
     graph = to_graph(s1, results)
     assert_graph_edges_valid(graph)
 
     return {
         "s1": s1.model_dump(),
+        "rejected": False,
+        "reject_reason": None,
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
         "graph": graph,

@@ -20,6 +20,7 @@ from core.elements import ELEMENTS
 from core.llm import get_llm, load_prompt, render
 from core.physicians import PHYSICIANS
 from core.retrieval import get_retriever
+from core.safety import check_safety
 from core.schemas import CaseRecord, S1Normalize, S2Elements, S3Syndrome
 
 
@@ -107,6 +108,18 @@ def run_physician(s1: S1Normalize, physician: str, physician_name: str) -> dict:
 def consult(complaint: str) -> dict:
     s1 = normalize(complaint)
 
+    # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
+    # 不产出任何方药。不要把这道检查挪到 run_physician 内部或结果的 note 字段。
+    reject_reason = check_safety(s1.symptoms)
+    if reject_reason is not None:
+        return {
+            "s1": s1,
+            "results": [],
+            "divergence": None,
+            "rejected": True,
+            "reject_reason": reject_reason,
+        }
+
     results = [
         run_physician(s1, physician, info["name"]) for physician, info in PHYSICIANS.items()
     ]
@@ -120,7 +133,13 @@ def consult(complaint: str) -> dict:
         "method": "exact_string_match",
     }
 
-    return {"s1": s1, "results": results, "divergence": divergence}
+    return {
+        "s1": s1,
+        "results": results,
+        "divergence": divergence,
+        "rejected": False,
+        "reject_reason": None,
+    }
 
 
 if __name__ == "__main__":
@@ -133,6 +152,7 @@ if __name__ == "__main__":
 
     n_divergent = 0
     n_hallucinated = 0
+    n_rejected = 0
     durations = []
 
     for i, complaint in enumerate(queries, 1):
@@ -142,6 +162,13 @@ if __name__ == "__main__":
         durations.append(elapsed)
 
         print(f"\n[{i}] 主诉：{complaint}")
+
+        if outcome["rejected"]:
+            n_rejected += 1
+            print(f"  [安全拦截] {outcome['reject_reason']}")
+            print(f"  耗时：{elapsed:.1f}s")
+            continue
+
         for r in outcome["results"]:
             s3 = r["s3"]
             print(
@@ -159,7 +186,8 @@ if __name__ == "__main__":
         print(f"  耗时：{elapsed:.1f}s")
 
     print("\n=== 统计 ===")
-    print(f"分歧例数：{n_divergent}/{len(queries)}")
-    print(f"幻觉例数：{n_hallucinated}/{len(queries)}")
+    print(f"安全拦截例数：{n_rejected}/{len(queries)}")
+    print(f"分歧例数：{n_divergent}/{len(queries) - n_rejected}（分母排除被拦截的例数）")
+    print(f"幻觉例数：{n_hallucinated}/{len(queries) - n_rejected}（分母排除被拦截的例数）")
     if durations:
         print(f"平均耗时：{sum(durations) / len(durations):.1f}s")

@@ -29,7 +29,24 @@ def _fake_outcome() -> dict:
             "hallucinated": [],
         }
     ]
-    return {"s1": s1, "results": results, "divergence": {"same": True, "method": "exact_string_match"}}
+    return {
+        "s1": s1,
+        "results": results,
+        "divergence": {"same": True, "method": "exact_string_match"},
+        "rejected": False,
+        "reject_reason": None,
+    }
+
+
+def _fake_rejected_outcome() -> dict:
+    s1 = S1Normalize(symptoms=["解黑色柏油样便"], tongue="淡", pulse="细数", unmapped=[])
+    return {
+        "s1": s1,
+        "results": [],
+        "divergence": None,
+        "rejected": True,
+        "reject_reason": "检测到危重症状信号（柏油样便），本 demo 不适用于此类情况，请立即就医。",
+    }
 
 
 def test_health():
@@ -57,3 +74,17 @@ def test_consult_endpoint_returns_graph_with_valid_edges(monkeypatch):
     for e in body["graph"]["edges"]:
         assert e["data"]["source"] in node_ids
         assert e["data"]["target"] in node_ids
+    assert body["rejected"] is False
+
+
+def test_consult_endpoint_returns_rejection_without_calling_to_graph(monkeypatch):
+    monkeypatch.setattr(api_main, "consult", lambda complaint: _fake_rejected_outcome())
+    client = TestClient(api_main.app)
+    resp = client.post("/api/consult", json={"complaint": "近日解黑色柏油样便"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rejected"] is True
+    assert "柏油样便" in body["reject_reason"]
+    assert body["results"] == []
+    assert body["divergence"] is None
+    assert body["graph"] == {"nodes": [], "edges": []}

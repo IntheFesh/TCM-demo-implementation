@@ -5,17 +5,19 @@ from core.schemas import CaseRecord, ElementHit, S1Normalize, S2Elements, S3Synd
 
 
 class FakeLLM:
-    """按 schema 类型返回预设响应，同时记录调用次数方便断言 S1 只跑一次。"""
+    """按 schema 类型返回预设响应，同时记录调用次数方便断言 S1 只跑一次
+    （以及安全否决命中时 S2/S3 一次都不调用）。"""
 
-    def __init__(self, s3_by_physician: dict[str, S3Syndrome]):
+    def __init__(self, s3_by_physician: dict[str, S3Syndrome], s1: S1Normalize | None = None):
         self.s3_by_physician = s3_by_physician
+        self.s1 = s1 or S1Normalize(symptoms=["纳差", "乏力"], tongue="淡红", pulse="细弱", unmapped=[])
         self.calls: list[str] = []
         self._current_physician: str | None = None
 
     def generate(self, system: str, user: str, schema, temperature: float = 0.0, **kwargs):
         self.calls.append(schema.__name__)
         if schema is S1Normalize:
-            return S1Normalize(symptoms=["纳差", "乏力"], tongue="淡红", pulse="细弱", unmapped=[])
+            return self.s1
         if schema is S2Elements:
             return S2Elements(
                 elements=[
@@ -144,3 +146,42 @@ def test_hallucination_detected_when_cited_id_not_in_refs(monkeypatch):
     wu_result = next(r for r in outcome["results"] if r["physician"] == "wu_jutong")
     assert ye_result["hallucinated"] == ["ye_tianshi-999"]
     assert wu_result["hallucinated"] == []
+
+
+def test_normal_consult_reports_not_rejected(monkeypatch):
+    s3_ye = S3Syndrome(
+        syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+        cited_case_ids=["ye_tianshi-001"],
+    )
+    s3_wu = S3Syndrome(
+        syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+        cited_case_ids=["wu_jutong-001"],
+    )
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    outcome = chain.consult("纳差乏力")
+
+    assert outcome["rejected"] is False
+    assert outcome["reject_reason"] is None
+
+
+def test_consult_rejects_before_s2_on_danger_symptoms(monkeypatch):
+    """CLAUDE.md 要求安全否决必须发生在 S2 之前：命中危重症状时，S2Elements
+    和 S3Syndrome 一次都不应该被调用，results 必须是空的，不产出任何方药。"""
+    danger_s1 = S1Normalize(
+        symptoms=["胃脘疼痛", "解黑色柏油样便", "头晕心慌"], tongue="淡", pulse="细数", unmapped=[]
+    )
+    fake_llm = FakeLLM({}, s1=danger_s1)
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    outcome = chain.consult("胃脘疼痛数月，近日解黑色柏油样便，头晕心慌，面色苍白，倦怠乏力，舌淡，脉细数。")
+
+    assert outcome["rejected"] is True
+    assert "柏油样便" in outcome["reject_reason"]
+    assert outcome["results"] == []
+    assert outcome["divergence"] is None
+    # 一次都不消耗后续的 S2/S3 调用——只应该有 S1Normalize 这一次调用
+    assert fake_llm.calls == ["S1Normalize"]

@@ -458,6 +458,13 @@ async function submitConsult() {
       throw new Error(`服务返回错误（HTTP ${resp.status}）：${text}`);
     }
     const data = await resp.json();
+    if (data.rejected) {
+      showError(`⚠ ${data.reject_reason}`);
+      renderDivergence(null);
+      renderResults([]);
+      renderGraph(data.graph);
+      return;
+    }
     renderDivergence(data.divergence);
     renderResults(data.results);
     renderGraph(data.graph);
