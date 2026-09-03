@@ -134,11 +134,20 @@ CORPUS_GATE_KEYWORDS = [
 def check_corpus_coverage(
     defs: list[SyndromeDefinition], gate_keywords: list[str] = CORPUS_GATE_KEYWORDS
 ) -> dict:
-    """字面子串匹配，不是语义匹配——故意保守：只查 location + cardinal_symptoms
-    这两个"定义性"字段（strict），宁可多报"未覆盖"让人工核实，也不要因为模糊
-    匹配漏报真正的空白。同时给一个 broad 版本（额外查 nature/secondary_symptoms/
-    name/definition）作对照，用来区分"这门类是真空白"还是"只是措辞差异、其实
-    在次症或病机描述里提到了"——两者都要报，不能只报一个让人误判。"""
+    """语义匹配，经由 core.syndrome_norm 的 SYNONYMS 表——不是字面子串匹配。
+    第一版（R1 期间）直接拿 gate 关键词做字面子串匹配，把"水肿"/"木旺乘土"
+    /"土虚木乘"/"大便溏稀"/"胃脘隐痛"这类古籍门类名和标准用语的等价写法全部
+    判成未覆盖，报出一堆假阴性。现在两边都先过 SYNONYMS 归一化再比较概念，
+    归一化逻辑只在 core/syndrome_norm.py 一处维护，这里不再重复一套字面规则。
+
+    仍然保留 strict/broad 两档：strict 只查 location + cardinal_symptoms
+    这两个"定义性"字段，broad 额外查 nature/secondary_symptoms/name/definition。
+    两档都要报——用来区分"这门类是真空白"还是"只是在次症或病机描述里提到，
+    没写进主症"，不能只报一个让人误判。"""
+    from core.syndrome_norm import canonical, normalize
+
+    canonical_keywords = [canonical(kw) for kw in gate_keywords]
+
     strict_hits: dict[str, list[str]] = {kw: [] for kw in gate_keywords}
     broad_hits: dict[str, list[str]] = {kw: [] for kw in gate_keywords}
 
@@ -148,10 +157,12 @@ def check_corpus_coverage(
             d.location + d.nature + d.cardinal_symptoms + d.secondary_symptoms
             + [d.name, d.definition]
         )
-        for kw in gate_keywords:
-            if kw in strict_text:
+        strict_concepts = normalize(strict_text)
+        broad_concepts = normalize(broad_text)
+        for kw, canon in zip(gate_keywords, canonical_keywords):
+            if canon in strict_concepts:
                 strict_hits[kw].append(d.code)
-            if kw in broad_text:
+            if canon in broad_concepts:
                 broad_hits[kw].append(d.code)
 
     return {

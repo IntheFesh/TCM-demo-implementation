@@ -182,4 +182,35 @@ def test_check_corpus_coverage_fully_uncovered_keyword():
     coverage = check_corpus_coverage([d], gate_keywords=["积聚"])
     assert coverage["strict_uncovered"] == ["积聚"]
     assert coverage["broad_uncovered"] == ["积聚"]
+
+
+def test_check_corpus_coverage_uses_synonyms_not_literal_substring():
+    """回归测试：R1 期间的字面子串匹配会把这些全判成未覆盖——"水肿"不是"肿胀"的
+    子串、"大便溏稀"不是"泄泻"的子串、"胃脘隐痛"不是"胃痛"的子串。改成走
+    core.syndrome_norm 的 SYNONYMS 归一化后，这几条都应该被正确识别。"""
+    d = _sample_definition(
+        location=["脾", "胃"],
+        cardinal_symptoms=["大便溏稀", "胃脘隐痛"],
+        secondary_symptoms=["水肿"],
+        nature=["气虚"],
+        definition="一个不直接提「肿胀」「泄泻」「胃痛」这几个字面词的定义。",
+    )
+    coverage = check_corpus_coverage([d], gate_keywords=["肿胀", "泄泻", "胃痛"])
+    # 泄泻、胃痛在 cardinal_symptoms 里，应该是 strict 命中
+    assert "泄泻" in coverage["strict_hits"]
+    assert "胃痛" in coverage["strict_hits"]
+    # 肿胀只在 secondary_symptoms（水肿）里，strict 对不上、broad 能找到
+    assert "肿胀" in coverage["strict_uncovered"]
+    assert "肿胀" in coverage["wording_gap_only"]
+
+
+def test_check_corpus_coverage_gate_keyword_itself_can_be_a_variant():
+    """gate_keywords 传进来的写法本身也可能是变体（比如"胃脘痛"而不是"胃痛"），
+    要先转成 canonical 名再比较，不能假设传入的关键词已经是 canonical 形式。"""
+    d = _sample_definition(
+        location=["胃"], cardinal_symptoms=["胃痛明显"],
+        secondary_symptoms=[], nature=["气滞"],
+    )
+    coverage = check_corpus_coverage([d], gate_keywords=["胃脘痛"])
+    assert "胃脘痛" in coverage["strict_hits"]
     assert coverage["wording_gap_only"] == []
