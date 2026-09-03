@@ -60,10 +60,22 @@ class CaseRecord(VisitStructured):
 
 
 class SyndromeDefinition(BaseModel):
-    """图谱骨架的数据单元，来自 GB/T 16751.2（或次选的中医诊断学教材、
-    最差情况下的人工最小骨架，见 source 字段）。这不是 LLM 输出 schema，
-    是人工核对录入 data/standard/syndromes.jsonl 用的，所以没有 min_length=1
-    这类防幻觉约束——防幻觉的关键在录入环节本身"不编造"，不在这里加字段约束。"""
+    """图谱骨架的数据单元。这不是 LLM 输出 schema，是人工核对录入
+    data/standard/syndromes.jsonl 用的，所以没有 min_length=1 这类防幻觉约束——
+    防幻觉的关键在录入环节本身"不编造"，不在这里加字段约束。
+
+    source 的六档是按可信度分层，不是按"是不是国标"二分：GB/T 16751.2 全文目前
+    拿不到（网页版可在线读、不可批量下载），实际数据来自 WFCMS 等国际标准组织、
+    同行评审论文、团体标准公示稿、教材/科普站点等 7 个独立可核验来源交叉确认，
+    档次从高到低：
+      gb_standard        国标原文（目前没有任何条目用这档，因为拿不到全文）
+      official_consensus 国际标准组织 / 国家级专科共识发布，带正式编码
+      group_standard     团体标准公示稿
+      journal            同行评审期刊论文（可能带 GB/T 15657 官方编码，但没有
+                          独立的标准号）
+      secondary_verified 教材/科普站点等二手来源，但内容与主流教材交叉确认一致
+      manual             最差情况：没有可核实来源支撑的人工最小骨架
+    """
 
     code: str
     name: str
@@ -75,7 +87,18 @@ class SyndromeDefinition(BaseModel):
     cardinal_symptoms: list[str] = Field(default_factory=list)  # 主症
     secondary_symptoms: list[str] = Field(default_factory=list)  # 次症
     tongue_pulse: str | None = None
-    source: Literal["gb_standard", "textbook", "manual"]
+    source: Literal[
+        "gb_standard",
+        "official_consensus",
+        "group_standard",
+        "journal",
+        "secondary_verified",
+        "manual",
+    ]
+    # ICD-11（含 WHO 传统医学模块 TM2）编码。目前唯一能做跨术语体系映射的锚点，
+    # 只有极少数条目的来源本身给出了这个编码，绝大多数留空——不要为了填满这个
+    # 字段去反查/编一个编码出来。
+    icd11_code: str | None = None
 
 
 # ---------- 在线：结构化推理链 SRC ----------

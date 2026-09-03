@@ -8,7 +8,7 @@ import networkx as nx
 
 from core.graph.store import NetworkXStore
 from core.schemas import SyndromeDefinition
-from offline.build_graph import build_graph
+from offline.build_graph import build_graph, check_corpus_coverage
 
 
 def test_add_and_get_node():
@@ -145,3 +145,41 @@ def test_is_a_subgraph_has_no_cycle():
     ]
     is_a_subgraph = nx.DiGraph(is_a_edges)
     assert nx.is_directed_acyclic_graph(is_a_subgraph)
+
+
+def test_syndrome_definition_accepts_new_source_tiers():
+    # 六档可信度分层都要能通过校验，不只是最初的 gb_standard/textbook/manual 三档
+    for source in ("gb_standard", "official_consensus", "group_standard", "journal", "secondary_verified", "manual"):
+        _sample_definition(source=source)
+
+
+def test_syndrome_definition_icd11_code_optional():
+    without = _sample_definition()
+    assert without.icd11_code is None
+    with_code = _sample_definition(icd11_code="SF70")
+    assert with_code.icd11_code == "SF70"
+
+
+def test_check_corpus_coverage_strict_only_checks_location_and_cardinal():
+    # "呕吐" 只出现在 secondary_symptoms 里，不该被 strict 算命中，
+    # 但要出现在 wording_gap_only（宽泛能找到，不是真空白）
+    d = _sample_definition(
+        location=["脾", "胃"], cardinal_symptoms=["脘腹痞满或疼痛"],
+        secondary_symptoms=["恶心或呕吐"],
+    )
+    coverage = check_corpus_coverage([d], gate_keywords=["呕吐", "痞"])
+    assert "呕吐" in coverage["strict_uncovered"]
+    assert "呕吐" in coverage["wording_gap_only"]
+    assert "痞" in coverage["strict_hits"]  # "脘腹痞满或疼痛" 里有"痞"
+
+
+def test_check_corpus_coverage_fully_uncovered_keyword():
+    d = _sample_definition(
+        location=["脾", "胃"], cardinal_symptoms=["脘腹痞满或疼痛"],
+        secondary_symptoms=[], nature=["气滞"],
+        definition="一个完全不提这个门类的定义。",
+    )
+    coverage = check_corpus_coverage([d], gate_keywords=["积聚"])
+    assert coverage["strict_uncovered"] == ["积聚"]
+    assert coverage["broad_uncovered"] == ["积聚"]
+    assert coverage["wording_gap_only"] == []

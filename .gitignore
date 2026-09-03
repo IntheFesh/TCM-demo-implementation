@@ -4,6 +4,8 @@ __pycache__/
 cases.json
 extract_warnings.json
 *.jsonl
+!data/standard/*.jsonl
+data/graph.json
 out/
 .venv/
 venv/
