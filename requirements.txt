@@ -5,4 +5,5 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 sentence-transformers>=3.0
 numpy>=1.26
+networkx>=3.2
 pytest>=8.0

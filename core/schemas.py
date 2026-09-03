@@ -56,6 +56,28 @@ class CaseRecord(VisitStructured):
     prev_case_id: str | None = None
 
 
+# ---------- 知识图谱：证候定义（人工核对录入，不是 LLM 输出） ----------
+
+
+class SyndromeDefinition(BaseModel):
+    """图谱骨架的数据单元，来自 GB/T 16751.2（或次选的中医诊断学教材、
+    最差情况下的人工最小骨架，见 source 字段）。这不是 LLM 输出 schema，
+    是人工核对录入 data/standard/syndromes.jsonl 用的，所以没有 min_length=1
+    这类防幻觉约束——防幻觉的关键在录入环节本身"不编造"，不在这里加字段约束。"""
+
+    code: str
+    name: str
+    is_category: bool  # True=类目词，国标明确写了"不适用于临床诊断"，S3 不能输出它
+    parent: str | None = None  # is_a 层级的父节点 code
+    definition: str
+    location: list[str] = Field(default_factory=list)  # 病位证素
+    nature: list[str] = Field(default_factory=list)  # 病性证素
+    cardinal_symptoms: list[str] = Field(default_factory=list)  # 主症
+    secondary_symptoms: list[str] = Field(default_factory=list)  # 次症
+    tongue_pulse: str | None = None
+    source: Literal["gb_standard", "textbook", "manual"]
+
+
 # ---------- 在线：结构化推理链 SRC ----------
 
 
