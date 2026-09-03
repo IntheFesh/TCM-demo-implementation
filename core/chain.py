@@ -18,13 +18,9 @@ import time
 
 from core.elements import ELEMENTS
 from core.llm import get_llm, load_prompt, render
+from core.physicians import PHYSICIANS
 from core.retrieval import get_retriever
 from core.schemas import CaseRecord, S1Normalize, S2Elements, S3Syndrome
-
-PHYSICIANS: dict[str, str] = {
-    "ye_tianshi": "叶天士",
-    "wu_jutong": "吴鞠通",
-}
 
 
 def _format_case_line(case: CaseRecord) -> str:
@@ -112,7 +108,7 @@ def consult(complaint: str) -> dict:
     s1 = normalize(complaint)
 
     results = [
-        run_physician(s1, physician, name) for physician, name in PHYSICIANS.items()
+        run_physician(s1, physician, info["name"]) for physician, info in PHYSICIANS.items()
     ]
 
     syndromes = {r["physician"]: r["s3"].syndrome for r in results}

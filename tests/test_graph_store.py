@@ -93,6 +93,25 @@ def test_save_and_load_roundtrip(tmp_path):
     assert neighbors[0][0] == "b"
 
 
+def test_save_and_load_roundtrip_preserves_edge_source_attribute(tmp_path):
+    """回归测试：networkx node_link_data 默认用 "source"/"target" 当边端点的
+    结构字段名，跟我们自己边上的 source 属性（provenance）撞名——不显式改用
+    别的结构字段名，save() 会把 provenance 静默覆盖成端点 node id，load()
+    回来这条边直接没有 source 键了。"""
+    store = NetworkXStore()
+    store.add_node("a", node_type="symptom", name="胃脘痛")
+    store.add_node("b", node_type="element", name="胃")
+    store.add_edge("a", "b", edge_type="indicates", source="gb_standard")
+
+    path = tmp_path / "graph.json"
+    store.save(path)
+    loaded = NetworkXStore()
+    loaded.load(path)
+
+    neighbors = loaded.neighbors("a", edge_type="indicates")
+    assert neighbors[0][1]["source"] == "gb_standard"
+
+
 def _sample_definition(**overrides) -> SyndromeDefinition:
     base = dict(
         code="S001",

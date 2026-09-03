@@ -76,17 +76,35 @@ class NetworkXStore:
                 result.append(node_id)
         return result
 
+    # node_link_data 默认用 "source"/"target" 当边端点的结构字段名——跟我们自己
+    # 每条边都有的 source 属性（provenance：gb_standard/case/textbook 等）撞名。
+    # 不改用别的字段名的话，save() 时我们自己的 source 属性会被端点 id 静默覆盖，
+    # load() 回来后这条边的 provenance 直接丢失（边上完全没有 source 键）——
+    # 而 provenance 正是这个项目防幻觉设计要追的东西，丢了不能算无关小事。
+    # 用 _node_src/_node_dst 当结构字段名，把 "source" 让给我们自己的属性。
+    _LINK_SOURCE_KEY = "_node_src"
+    _LINK_TARGET_KEY = "_node_dst"
+
     def save(self, path: Path) -> None:
         import networkx as nx
 
-        data = nx.node_link_data(self.g, edges="edges")
+        data = nx.node_link_data(
+            self.g, edges="edges", source=self._LINK_SOURCE_KEY, target=self._LINK_TARGET_KEY
+        )
         Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load(self, path: Path) -> None:
         import networkx as nx
 
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        self._g = nx.node_link_graph(data, edges="edges", multigraph=True, directed=True)
+        self._g = nx.node_link_graph(
+            data,
+            edges="edges",
+            multigraph=True,
+            directed=True,
+            source=self._LINK_SOURCE_KEY,
+            target=self._LINK_TARGET_KEY,
+        )
 
 
 class Neo4jStore:

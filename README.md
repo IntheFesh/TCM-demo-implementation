@@ -141,6 +141,25 @@ uvicorn api.main:app --reload
 | `offline/split_cases.py` | 见上文"离线路径"。`--stats-only` 是零 LLM 调用的正则前置闸门 |
 | `offline/extract_cases.py` | 见上文"只需要 key 的路径" |
 | `offline/export_sft.py` | 从 `cases.json` 派生 alpaca 格式的 SFT 训练样本 `sft.jsonl`（`python -m offline.export_sft`）。现在数据量不够训练，这一步只是把管道建好，并在代码层面强制过滤掉 `copyright_status == "copyrighted"` 的记录 |
+| `offline/build_graph.py` | 从 `data/standard/syndromes.jsonl` 建知识图谱骨架（symptom/element/syndrome 三类节点，`python -m offline.build_graph`），并打印语料库门类覆盖检查 |
+| `offline/graph_stats.py` | K2：给图里的 indicates 边算并写回医家级四层收缩权重，打印节点/边分布、λ1 分布等统计（`python -m offline.graph_stats`）——**λ 相关的数字务必看下面"知识图谱权重（K2）"一节的 λ2 说明再解读** |
+
+## 知识图谱权重（K2）
+
+`offline/graph_stats.py` 给每条 indicates（症状→证素）边算一个四层收缩权重：
+医家层 → 学派层 → 全局层 → 标准先验层，越往医家层数据越少就越往后收缩，标准先验
+（`syndromes.jsonl` 里的 `is_cardinal`）保证任何数据量下权重都有定义。
+
+> **λ2（学派层）当前是假信号，不要引用它做任何跨学派结论。**
+> 当前仅 1 个学派（2 位医家：叶天士、吴鞠通均为温病学派），λ2 学派层与医家层高度
+> 共线，其数值不构成独立信号，等 A2 加入第二学派后需重新评估。凡是本项目里出现的
+> λ 分布图/表，只要没有单独标注"已含第二学派"，都受这条限制约束。
+
+另外，这个仓库的 sandbox 环境没有网络访问真实 LLM API，所以图里还没有真实
+`case` 节点（`offline/extract_cases.py` 抽取医案需要真实模型调用）——`λ1`（医家层
+权重）目前对所有边都是 0，权重全部退化到标准先验层。这不是占位符或估计值，是
+`count_support()` 在零 case 节点情况下的真实计算结果；等真实模型跑完抽取、案例
+节点写入图之后，重跑 `offline/graph_stats.py` 会自动开始出现非零 λ1，不需要改代码。
 
 ## 数据来源与版权
 
