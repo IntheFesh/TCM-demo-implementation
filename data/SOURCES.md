@@ -69,7 +69,17 @@
 
 ## 5. 切分方法与可复现性
 
-`offline/split_cases.py` 可完整复现本次结果，也可调整参数扩展：
+> **本节以下内容描述的是 R1 阶段「候选池 + `--want` 配额」版本的
+> `split_cases.py`，那一版已经被 commit `3f9c477`（"Replace case-boundary
+> regex with coarse-segment + LLM-resolved splitting"）取代——现在的
+> `offline/split_cases.py` 不再有 `select()`/`--want`/候选评分这一整套机制，
+> 下面的 `--want 30` 命令现在会直接报 `argparse` 参数错误。这段历史内容
+> 保留是因为它解释了当前 `data/ye_tianshi/`、`data/wu_jutong/` 里那 30+30
+> 个 `.txt` 是怎么选出来的（就是用这一版跑出来、再人工整理成 `.txt` 的），
+> 不代表现在能照着这些命令重新跑一遍。当前版本的真实用法、以及它和这批
+> 历史 `.txt` 之间现在具体差在哪，见第 7 节第 8 条。**
+
+`offline/split_cases.py`（R1 版本，已被取代）当时的复现命令：
 
 ```bash
 # 需先下载原始 txt 到某个目录（GitHub raw 可直接 curl，见 README「离线路径」）
@@ -80,7 +90,7 @@ python -m offline.split_cases --books-dir <目录> --want 30
 病人 初诊→二诊→三诊 的证型演变）是本项目做纵向证型转移研究的核心数据，旧版
 `first_visit()` 会把它整段截断丢弃。
 
-**切分规则**（现行版本）：
+**切分规则**（R1 版本，已被取代——见本节开头说明）：
 1. 按 `<篇名>` 定位目标门类
 2. 案边界：叶天士用「单字姓氏 +（年龄/氏）或空格」，吴鞠通用「姓氏 + 年龄 + 干支日期」；
    一行如果同时像案首又像复诊标记（比如「又 服前方」——单字「又」+ 空格，正好落进
@@ -106,6 +116,14 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
 诊疗"——真正的诊次切分交给 `offline/extract_cases.py` 里的 LLM 步骤做（三本书的
 复诊标记形态差太多，正则切不准，只能当 prompt 里的提示）。这一步尚未用真实模型
 验证过，是接下来最需要盯的地方。
+
+**当前版本（`3f9c477` 之后）怎么用：** 没有 `--want`，只有 `--stats-only`、
+`--books-dir`、`--max-len` 三个参数；不做候选评分/挑选，对命中 `gates` 的正文
+无条件切出全部粗段。`--stats-only` 现在输出的是粗段总数/字数中位数/head_hints
+和 follow_hints 的分布，不是"候选数/采用数"——不写文件、零 LLM 调用；不带
+`--stats-only` 则把粗段写成 `out/{physician}/*.json`。这些粗段还不是最终的
+病人级案例，要挪进 `data/{physician}/` 交给 `offline/extract_cases.py` 的 LLM
+步骤才能展开成 `CaseRecord`。详细阻塞点和操作顺序见第 7 节第 8 条。
 
 ## 6. 测试主诉
 
@@ -163,12 +181,39 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
      `group_standard` 1、`secondary_verified` 6、`manual` 1（`gb_standard`
      仍是 0）。
 8. **这个 sandbox 从未跑过真实的 `offline/extract_cases.py`。** 没有网络访问
-   真实 LLM API，`data/*_cases.json` 目前不存在——K1（知识图谱骨架）和 K2
-   （医家级收缩权重）的架构都已经在没有真实医案数据的前提下写完并通过测试，
-   这是刻意的（先把可替换的骨架搭对，权重层随时能接真实数据），但也意味着
+   真实 LLM API，`cases.json` 目前不存在——K1（知识图谱骨架）和 K2（医家级收缩
+   权重）的架构都已经在没有真实医案数据的前提下写完并通过测试，这是刻意的
+   （先把可替换的骨架搭对，权重层随时能接真实数据），但也意味着
    `core/graph/weights.py` 的 `count_support()` 现在对任何医家永远返回空 dict，
    `offline/graph_stats.py` 打印的 λ1 分布永远全 0（见该脚本的警告文案）。
+
    **K2 代码收尾之后，下一步的优先级不是继续往图谱/权重上加功能，是找一台能
-   访问真实模型的机器把 `offline/extract_cases.py` 跑通、把 `cases.json` 真正
-   生成出来**——不然 K1/K2 会持续在"架构已经比数据超前一整层"的状态里空转，
-   后面每加一层新功能都是在验证不了的地基上继续叠。
+   访问真实模型的机器，把样本量缺口（60/100，见第 7 节第 1 条）和 `cases.json`
+   缺失这两件事在同一次本地会话里一起解决**，不是先跑 `extract_cases.py` 再说：
+   样本量卡在 30+30 不是"抽取次数不够"，是更上游的候选案数量/切分口径问题，
+   光跑 `extract_cases.py` 解决不了。分两步：
+
+   - **8a. 先重跑 `offline/split_cases.py`，看新的粗段/hint 统计，判断素材
+     够不够撑到每位医家 ≥50 案。** 但这里有个本轮才发现的架构不一致，动手前
+     必须先弄清楚：现在跑 `python -m offline.split_cases --books-dir <目录>
+     --want 30` 会直接报错——`--want` 参数已经在 R1 的粗段化改造
+     （commit `3f9c477`）里删掉了，`README.md`/本文件第 5 节里的示例命令是
+     改造前留下的旧文档，没有跟着代码改，这次一并改成当前真实可用的调用方式
+     （见下方第 5 节的更正说明）。新版 `split_cases.py` 不再有"候选池 + want
+     配额"这个筛选阶段——它现在对匹配 `gates` 的正文无条件切出全部粗段，
+     不做候选评分/挑选。所以"扩大样本量"不再是改一个 `--want` 数字这么
+     简单：能调的是 `gates`（门类范围）和 `--max-len`（粗段长度上限），这两个
+     决定有多少原始素材进入下一步；**真正决定"最后能拿到多少个病人"的是
+     `extract_cases.py` 里的 LLM 判断**（一个粗段里到底有几个病人、几诊），
+     不再是切分阶段预设的配额。跑 `--stats-only` 拿到的粗段数/hint 分布只能
+     判断"素材是不是明显不够"，不能像旧版那样直接读出"候选池 vs 采用数"。
+   - **8b. 确认素材足够（或已按需要调整 gates/max-len）后，`out/{pid}/*.json`
+     要挪进 `data/{pid}/`，`extract_cases.py` 才认得到。** 这也是本轮发现的
+     阻塞点：`offline/extract_cases.py` 现在读的是 `data/{physician}/*.json`
+     （`iter_segment_files()`），但 `data/ye_tianshi/`、`data/wu_jutong/`
+     目前只有 30 个 `.txt`（旧架构手动整理出的候选案原文，从没被真实模型
+     结构化过），一个 `.json` 粗段文件都没有。也就是说**现在直接跑
+     `extract_cases.py` 不会处理这 60 个 `.txt`，会因为找不到 `.json` 而
+     实际上什么也不抽**。这两个 `.txt` 目录要不要保留、`.json` 挪进去之后
+     两种文件并存会不会造成混淆，这是要在本地会话里现场决定的事，这里不
+     替你先做决定，只是把这个阻塞点标出来，免得真到本地跑的时候才发现。

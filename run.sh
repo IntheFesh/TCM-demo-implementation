@@ -2,12 +2,13 @@
 # 一键运行脚本：建虚拟环境 -> 装依赖 -> （按需，离线）重切医案数据 -> （按需，需要 key）
 # 离线抽取医案 -> 启动服务。
 #
-# "重切数据"和"抽取医案"是两件独立的事，分别对应"要不要网络"和"要不要 API key"
-# 两条独立的轴，用法见 README「数据准备：离线 / 需要 key 两条路径」：
+# 注意：「重切数据」和「抽取医案」现在是先后依赖关系，不是两条独立支线——
+# split_cases.py 只切"粗段"，extract_cases.py 的 LLM 步骤才是真正判断病人/诊次
+# 的地方，后者要读前者的输出。用法见 README「数据准备」一节：
 #   ./run.sh                              本地默认端口 8000 启动
 #   PORT=8080 ./run.sh                    指定端口
 #   ./run.sh --skip-extract               跳过自动抽取医案（cases.json 已存在或想手动控制时用）
-#   ./run.sh --resplit-data=<书所在目录>   离线路径：纯正则重切 data/，不需要 API key
+#   ./run.sh --resplit-data=<书所在目录>   纯正则重切出粗段，不需要 API key
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -35,13 +36,17 @@ pip install -q -r requirements.txt
 echo "== 3/5 离线重切医案数据（可选，不需要 API key）=="
 if [ -n "$RESPLIT_BOOKS_DIR" ]; then
   echo "--resplit-data=$RESPLIT_BOOKS_DIR，纯正则跑一遍闸门统计 + 重新切分……"
+  echo "（--want 参数已在 R1 之后的粗段化改造里删掉，split_cases.py 现在不做候选"
+  echo "  评分/配额挑选，对命中门类的正文无条件切出全部粗段，见 data/SOURCES.md 第 7 节第 8 条）"
   python -m offline.split_cases --stats-only --books-dir "$RESPLIT_BOOKS_DIR"
-  python -m offline.split_cases --books-dir "$RESPLIT_BOOKS_DIR" --want 30
-  echo "已写出 out/ye_tianshi/、out/wu_jutong/。"
-  echo "这一步不会自动覆盖 data/——确认切分质量没问题后，手动执行："
-  echo "  rm -rf data/ye_tianshi data/wu_jutong && mv out/ye_tianshi out/wu_jutong data/"
+  python -m offline.split_cases --books-dir "$RESPLIT_BOOKS_DIR"
+  echo "已写出 out/ye_tianshi/、out/wu_jutong/（粗段 .json，还不是最终病人级案例）。"
+  echo "extract_cases.py 读的是 data/{physician}/*.json——把粗段挪过去（跟现有 .txt"
+  echo "共存没问题，extract_cases.py 只看 .json），确认没问题后手动执行："
+  echo "  cp out/ye_tianshi/*.json data/ye_tianshi/ && cp out/wu_jutong/*.json data/wu_jutong/"
 else
-  echo "未传 --resplit-data，跳过（data/ 下已有切好的医案，多数情况下不需要这一步）"
+  echo "未传 --resplit-data，跳过（data/ 下已有 R1 阶段切好的候选案原文 .txt，"
+  echo "但 extract_cases.py 现在认的是 .json 粗段——数据准备详见 README「数据准备」一节）"
 fi
 
 echo "== 4/5 检查配置与医案抽取（需要 API key）=="

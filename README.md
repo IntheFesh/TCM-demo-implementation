@@ -83,21 +83,27 @@ PORT=8080 ./run.sh       # 换端口
 
 `run.sh` 是幂等的，重复执行安全；`.env` 一旦存在就不会被覆盖。
 
-## 数据准备：离线 / 需要 key 两条路径
+## 数据准备：split_cases.py → extract_cases.py 两步流水线
 
-两个离线脚本处理的是两件不同的事，分别对应"要不要网络"和"要不要 API key"两条
-独立的轴，不是谁必须等谁：
+> **这两步现在是先后依赖关系，不是两条互相独立的路径。** 早期文档把它们
+> 写成"离线路径 / 只需要 key 的路径"两条可以分别跳过的支线，那是 R1 阶段
+> 「候选池 + `--want` 配额」版 `split_cases.py` 的产物——那一版直接选出最终
+> 病人案例，写好的 `.txt` 能直接进 `data/`，两步确实互不依赖。R1 之后
+> （commit `3f9c477`）`split_cases.py` 改成只切"粗段"，真正的病人/诊次判断
+> 挪到 `extract_cases.py` 的 LLM 步骤——所以现在必须先有 `split_cases.py`
+> 的粗段输出，`extract_cases.py` 才有东西可读。详细原因和当前阻塞点见
+> `data/SOURCES.md` 第 7 节第 8 条。
 
 |  | 需要网络 | 需要 API key | 做什么 |
 |---|---|---|---|
-| `offline/split_cases.py` | 是（下书） | **否** | 从古籍原文正则切出医案 txt，写到 `data/{physician}/` |
-| `offline/extract_cases.py` | 是（调 API） | **是** | 用 LLM 把 `data/{physician}/*.txt` 结构化成 `cases.json` |
+| `offline/split_cases.py` | 是（下书） | **否** | 从古籍原文切出"粗段"，写到 `out/{physician}/*.json`——还不是最终的病人级案例 |
+| `offline/extract_cases.py` | 是（调 API） | **是** | 读 `data/{physician}/*.json`（粗段，需要先从 `out/` 挪过去），用 LLM 展开成病人级 `CaseRecord`，写 `cases.json` |
 
-**仓库里 `data/` 下的 30+30 个 txt 已经是切好的结果**，多数情况下你不需要重新跑
-`split_cases.py`——直接跳到下面"只需要 key 的路径"即可。只有在想扩大样本量、
-调整切分口径、或换书目时才需要重新切。
-
-### 离线路径（不需要 API key，只需要网络下书或本地已有书）
+**仓库里 `data/` 下现有的 30+30 个 `.txt`，是 R1 阶段那一版跑出来后人工整理的
+候选案原文，不是当前 `extract_cases.py` 认得的格式（它找的是 `.json`）**，
+也从没有被真实模型结构化过。`data/{physician}/` 目前一个 `.json` 粗段文件都
+没有——直接跑 `extract_cases.py` 不会处理这 60 个 `.txt`，只会因为找不到
+`.json` 什么都不抽。所以现在这两步必须按顺序做：
 
 ```bash
 # 三本古籍原文没有随仓库分发（体积大、且属于可独立获取的公开数据）。
@@ -106,27 +112,29 @@ curl -o 367.txt "https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books
 curl -o 361.txt "https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/361-%E5%90%B4%E9%9E%A0%E9%80%9A%E5%8C%BB%E6%A1%88.txt"
 mkdir -p books && mv 367.txt "books/367-临证指南医案.txt" && mv 361.txt "books/361-吴鞠通医案.txt"
 
-# 先跑纯正则的离线闸门确认切分口径（秒级，不写任何文件）：
+# 1. 先跑纯正则的离线闸门看粗段/hint 统计（秒级，不写任何文件，不需要网络访问 LLM）：
 python -m offline.split_cases --stats-only --books-dir books
+# 判断素材够不够撑到目标样本量，不够就调 gates（split_cases.py 里的门类范围）
+# 或 --max-len 再看一次，这一步不再有 --want 配额可调（R1 版才有，已被取代）
 
-# 确认没问题再重新生成 data/（会覆盖 out/{physician}/，需要你再手动挪进 data/）：
-python -m offline.split_cases --books-dir books --want 30
-```
+# 2. 确认没问题再真正切出粗段（写到 out/{physician}/*.json）：
+python -m offline.split_cases --books-dir books
+# 3. 把粗段挪进 data/（跟现有 .txt 共存没问题，extract_cases.py 只看 .json）：
+cp -r out/ye_tianshi/*.json data/ye_tianshi/
+cp -r out/wu_jutong/*.json data/wu_jutong/
 
-切分规则、`--stats-only` 判据、候选池大小见 `data/SOURCES.md` 第 5 节。
-
-### 只需要 key 的路径（不需要重新切数据）
-
-```bash
 pip install -r requirements.txt
 cp .env.example .env   # 填好 LLM_API_KEY
 
+# 4. LLM 把粗段展开成病人级 CaseRecord：
 python -m offline.extract_cases --limit 3   # 先小批量看结构化质量
 python -m offline.extract_cases             # 确认无误再跑全量，生成 cases.json
 
 uvicorn api.main:app --reload
 # 打开 http://localhost:8000
 ```
+
+切分规则（含 R1 版本的历史记录和当前版本的真实用法）见 `data/SOURCES.md` 第 5 节。
 
 `extract_cases.py` 会把 LLM 切出的诊次数和正则估计的诊次数做交叉校验，差 ≥2 的
 案不会被丢弃，但会记进 `extract_warnings.json`，跑完全量后建议人工过一遍这个文件。
@@ -138,8 +146,8 @@ uvicorn api.main:app --reload
 
 | 脚本 | 作用 |
 |---|---|
-| `offline/split_cases.py` | 见上文"离线路径"。`--stats-only` 是零 LLM 调用的正则前置闸门 |
-| `offline/extract_cases.py` | 见上文"只需要 key 的路径" |
+| `offline/split_cases.py` | 见上文"数据准备"第 1-2 步。`--stats-only` 是零 LLM 调用的正则前置闸门 |
+| `offline/extract_cases.py` | 见上文"数据准备"第 4 步 |
 | `offline/export_sft.py` | 从 `cases.json` 派生 alpaca 格式的 SFT 训练样本 `sft.jsonl`（`python -m offline.export_sft`）。现在数据量不够训练，这一步只是把管道建好，并在代码层面强制过滤掉 `copyright_status == "copyrighted"` 的记录 |
 | `offline/build_graph.py` | 从 `data/standard/syndromes.jsonl` 建知识图谱骨架（symptom/element/syndrome 三类节点，`python -m offline.build_graph`），并打印语料库门类覆盖检查 |
 | `offline/graph_stats.py` | K2：给图里的 indicates 边算并写回医家级四层收缩权重，打印节点/边分布、λ1 分布等统计（`python -m offline.graph_stats`）——**λ 相关的数字务必看下面"知识图谱权重（K2）"一节的 λ2 说明再解读** |
@@ -209,15 +217,19 @@ API key 的环境里直接跑，覆盖：
 （约几百 MB），只发生一次，之后会走本地缓存。
 
 **报错说 `cases.json` 不存在？**
-先运行 `python -m offline.extract_cases`（或直接用 `./run.sh`，它会自动检测并跑这一
-步）。检索层（`core/retrieval.py`）在 `cases.json` 缺失时会给出明确的报错提示。
+`python -m offline.extract_cases` 需要先有 `data/{physician}/*.json`（粗段）才能
+生成它——目前仓库里没有这些 `.json`（现有的 `data/` 下 30+30 个 `.txt` 是旧架构
+留下的候选案原文，`extract_cases.py` 认不出它们），必须先按上文"数据准备"的
+1-3 步跑 `split_cases.py` 并把粗段挪进 `data/{physician}/`，再跑第 4 步。
+检索层（`core/retrieval.py`）在 `cases.json` 缺失时会给出明确的报错提示，但报错
+本身不会告诉你要先跑 `split_cases.py`——这是当前架构下容易踩的坑，见
+`data/SOURCES.md` 第 7 节第 8 条。
 
 **古籍原文从哪下载？网络受限怎么办？**
-见上文"离线路径"的 `curl` 命令，走的是 `raw.githubusercontent.com`。如果你的网络环境
+见上文"数据准备"的 `curl` 命令，走的是 `raw.githubusercontent.com`。如果你的网络环境
 连不上 GitHub 但能访问其他地方，`xiaopangxia/TCM-Ancient-Books` 仓库里的
 `367-临证指南医案.txt` / `361-吴鞠通医案.txt` 也可以手动下载后放进任意目录，用
-`--books-dir` 指给 `split_cases.py`。多数情况下你其实不需要这一步——仓库里的
-`data/` 已经是切好的结果，只有想重新切分或扩大样本量时才需要原始古籍全文。
+`--books-dir` 指给 `split_cases.py`。
 
 **`extract_warnings.json` 是什么，要不要管？**
 `offline/extract_cases.py` 会把 LLM 判断的诊次数和正则估计的诊次数对比，差距
