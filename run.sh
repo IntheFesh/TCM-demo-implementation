@@ -68,8 +68,18 @@ if [ -z "${LLM_API_KEY:-}" ] && [ "${LLM_MODE:-api}" = "api" ]; then
   echo "如只想先看前端页面可以忽略；要跑通辨证功能请先在 .env 中填好 LLM_API_KEY。"
 fi
 
+N_SEGMENTS=$(find data -mindepth 2 -maxdepth 2 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+
 if [ ! -f cases.json ]; then
-  if [ "$SKIP_EXTRACT" = "1" ]; then
+  if [ "$N_SEGMENTS" = "0" ]; then
+    # 真实 bug 曾在这里：extract_cases.py 找不到 data/{physician}/*.json 时
+    # 会正常退出、写出一个空的 cases.json——不报错，会被下面的 "if ... ; then"
+    # 误判成"抽取完成"。先在这里挡住，而不是等抽取"成功"了才发现是空的。
+    echo "cases.json 不存在，且 data/{physician}/ 下没有粗段 .json（extract_cases.py"
+    echo "读的就是这个）——直接跑抽取只会得到一个空 cases.json，不会报错也不会提醒你。"
+    echo "先按 README「快速开始」第 3 步跑 split_cases.py 并把粗段挪进 data/{physician}/，"
+    echo "再重新执行 ./run.sh。"
+  elif [ "$SKIP_EXTRACT" = "1" ]; then
     echo "cases.json 不存在，且传入了 --skip-extract，跳过自动抽取。"
     echo "检索/辨证功能在 cases.json 生成前无法使用，请手动运行："
     echo "  python -m offline.extract_cases"
@@ -77,7 +87,7 @@ if [ ! -f cases.json ]; then
     echo "cases.json 不存在，但 LLM_API_KEY 未配置，无法自动抽取。"
     echo "请先配置 .env，再手动运行：python -m offline.extract_cases"
   else
-    echo "cases.json 不存在，开始离线抽取 data/ 下的医案（约 60 诊次，需调用 LLM，可能需要几分钟）……"
+    echo "cases.json 不存在，开始离线抽取 data/ 下的 $N_SEGMENTS 个粗段（需调用 LLM，可能需要几分钟）……"
     if python -m offline.extract_cases; then
       echo "医案抽取完成。extract_warnings.json 里如果有内容，建议人工过一遍。"
     else

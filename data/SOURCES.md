@@ -82,7 +82,7 @@
 `offline/split_cases.py`（R1 版本，已被取代）当时的复现命令：
 
 ```bash
-# 需先下载原始 txt 到某个目录（GitHub raw 可直接 curl，见 README「离线路径」）
+# 需先下载原始 txt 到某个目录（GitHub raw 可直接 curl，见 README「快速开始」第 3.1 步）
 python -m offline.split_cases --books-dir <目录> --want 30
 ```
 
