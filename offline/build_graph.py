@@ -114,6 +114,11 @@ def build_graph(defs: list[SyndromeDefinition]) -> NetworkXStore:
                 store.add_edge(
                     sym_id,
                     elem_id,
+                    # key 里必须带 code：同一对 (症状, 证素) 会被多条证候定义各写
+                    # 一次（「纳呆 提示 胃」SP-02/SP-03/SP-05 都写了），共用
+                    # key="indicates" 的话后写的会盖掉先写的，via_syndrome 和
+                    # is_cardinal 一起丢。
+                    edge_key=f"indicates::{d.code}",
                     edge_type="indicates",
                     source=d.source,
                     via_syndrome=d.code,
@@ -246,7 +251,10 @@ def main(argv: list[str] | None = None) -> None:
     filtered = filter_by_keywords(defs, args.filter_keywords)
     store = build_graph(filtered)
 
-    if args.cases_path and args.cases_path.exists():
+    # 空文件也算"没有医案"：--help 里写着 `--cases-path /dev/null` 可以跳过挂医案，
+    # 但 /dev/null 是存在的，只判 exists() 会走进 attach_cases 然后在 json.load
+    # 上崩掉——文档里给的用法直接跑不通。
+    if args.cases_path and args.cases_path.is_file() and args.cases_path.stat().st_size > 0:
         cstats = attach_cases(store, args.cases_path)
         print(
             f"挂入医案：{cstats['cases']} 条 case 节点，"
@@ -255,7 +263,7 @@ def main(argv: list[str] | None = None) -> None:
             f"对不齐 {cstats['syndrome_unmatched']}）"
         )
     else:
-        print(f"未挂入医案（{args.cases_path} 不存在），图中无 case 节点，λ1 将全为 0")
+        print(f"未挂入医案（{args.cases_path} 不存在或为空），图中无 case 节点，λ1 将全为 0")
 
     store.save(args.out)
 

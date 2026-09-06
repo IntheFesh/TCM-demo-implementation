@@ -14,9 +14,10 @@ from typing import Protocol
 
 class GraphStore(Protocol):
     def add_node(self, node_id: str, **attrs) -> None: ...
-    def add_edge(self, src: str, dst: str, **attrs) -> None: ...
+    def add_edge(self, src: str, dst: str, *, edge_key: str | None = None, **attrs) -> None: ...
     def get_node(self, node_id: str) -> dict | None: ...
     def neighbors(self, node_id: str, edge_type: str | None = None) -> list[tuple[str, dict]]: ...
+    def in_neighbors(self, node_id: str, edge_type: str | None = None) -> list[tuple[str, dict]]: ...
     def find_nodes(self, node_type: str, **filters) -> list[str]: ...
     def save(self, path: Path) -> None: ...
     def load(self, path: Path) -> None: ...
@@ -28,10 +29,10 @@ class NetworkXStore:
 
     用 MultiDiGraph 是因为同一对 (src, dst) 节点之间可能同时存在多种关系
     （比如一个 case 节点既 evidences 一个 syndrome，理论上也可能有别的关系）。
-    add_edge 用 edge_type 当 multi-edge 的 key：同一个 (src, dst, edge_type)
+    add_edge 默认用 edge_type 当 multi-edge 的 key：同一个 (src, dst, edge_type)
     三元组重复调用 add_edge 是"更新这条边的属性"而不是"新增一条重复边"——
     K2 给 indicates 边加 weight_by_physician 就是靠这个语义实现的，不是靠
-    先查后改。
+    先查后改。需要在同一对节点间保留多条同类型边时，传 edge_key 显式区分。
     """
 
     def __init__(self) -> None:
@@ -48,9 +49,17 @@ class NetworkXStore:
     def add_node(self, node_id: str, **attrs) -> None:
         self.g.add_node(node_id, **attrs)
 
-    def add_edge(self, src: str, dst: str, **attrs) -> None:
-        edge_type = attrs.get("edge_type")
-        self.g.add_edge(src, dst, key=edge_type, **attrs)
+    def add_edge(self, src: str, dst: str, *, edge_key: str | None = None, **attrs) -> None:
+        """edge_key 显式指定 multi-edge 的 key，不传则用 edge_type（默认语义见类文档）。
+
+        什么时候必须传：同一对 (src, dst) 之间存在多条同类型、但来源不同的边。
+        indicates 就是这种——「纳呆 提示 胃」这件事 SP-02/SP-03/SP-05 三条证候
+        各说了一次，是三条独立的出处，不是同一条边被写了三遍。不区分 key 的话
+        后写的会静默盖掉先写的，via_syndrome 和 is_cardinal 一起丢
+        （实测丢掉 323 条事实里的 29 条，其中 4 条连主症/次症标注都被改写）。
+        丢的还恰好是跨证候共现的症状——那正是辨别证候时最有信息量的一批。
+        """
+        self.g.add_edge(src, dst, key=edge_key or attrs.get("edge_type"), **attrs)
 
     def get_node(self, node_id: str) -> dict | None:
         if node_id not in self.g:
@@ -65,6 +74,20 @@ class NetworkXStore:
             if edge_type is not None and data.get("edge_type") != edge_type:
                 continue
             out.append((dst, dict(data)))
+        return out
+
+    def in_neighbors(self, node_id: str, edge_type: str | None = None) -> list[tuple[str, dict]]:
+        """反向邻居。图里的边都是单向的（symptom->element->syndrome），只有出边
+        的话"这个证候由哪些证素构成""这个证素被哪些症状提示"这两类问题就查不了——
+        G1 的 query_graph 工具正是要回答它们。放进 GraphStore 协议而不是让调用方
+        直接摸 NetworkXStore._g：绕过协议就等于把存储实现焊死在业务代码里。"""
+        if node_id not in self.g:
+            return []
+        out = []
+        for src, _, data in self.g.in_edges(node_id, data=True):
+            if edge_type is not None and data.get("edge_type") != edge_type:
+                continue
+            out.append((src, dict(data)))
         return out
 
     def find_nodes(self, node_type: str, **filters) -> list[str]:
@@ -119,13 +142,16 @@ class Neo4jStore:
     def add_node(self, node_id: str, **attrs) -> None:
         raise NotImplementedError("Neo4jStore 未实现，正式阶段部署 Neo4j 时补全")
 
-    def add_edge(self, src: str, dst: str, **attrs) -> None:
+    def add_edge(self, src: str, dst: str, *, edge_key: str | None = None, **attrs) -> None:
         raise NotImplementedError("Neo4jStore 未实现，正式阶段部署 Neo4j 时补全")
 
     def get_node(self, node_id: str) -> dict | None:
         raise NotImplementedError("Neo4jStore 未实现，正式阶段部署 Neo4j 时补全")
 
     def neighbors(self, node_id: str, edge_type: str | None = None) -> list[tuple[str, dict]]:
+        raise NotImplementedError("Neo4jStore 未实现，正式阶段部署 Neo4j 时补全")
+
+    def in_neighbors(self, node_id: str, edge_type: str | None = None) -> list[tuple[str, dict]]:
         raise NotImplementedError("Neo4jStore 未实现，正式阶段部署 Neo4j 时补全")
 
     def find_nodes(self, node_type: str, **filters) -> list[str]:

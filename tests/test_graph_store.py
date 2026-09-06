@@ -67,6 +67,66 @@ def test_add_edge_same_type_updates_not_duplicates():
     assert neighbors[0][1]["weight"] == 0.9
 
 
+def test_add_edge_explicit_key_keeps_parallel_edges():
+    """同一对节点之间、同一类型、来源不同的多条边必须都留下。默认 key=edge_type
+    的语义（上一个用例）在这里会静默丢数据，所以 add_edge 收 edge_key。"""
+    store = NetworkXStore()
+    store.add_node("a", node_type="symptom")
+    store.add_node("b", node_type="element")
+    store.add_edge("a", "b", edge_key="indicates::S1", edge_type="indicates",
+                   source="gb_standard", via_syndrome="S1", is_cardinal=True)
+    store.add_edge("a", "b", edge_key="indicates::S2", edge_type="indicates",
+                   source="gb_standard", via_syndrome="S2", is_cardinal=False)
+    neighbors = store.neighbors("a", edge_type="indicates")
+    assert len(neighbors) == 2
+    assert {d["via_syndrome"] for _, d in neighbors} == {"S1", "S2"}
+    assert {d["is_cardinal"] for _, d in neighbors} == {True, False}
+
+
+def test_in_neighbors_returns_incoming_edges():
+    """图里的边都是单向的（symptom->element->syndrome）。没有 in_neighbors 的话
+    「这个证候由哪些证素构成」查不出任何东西——G1 的 query_graph 依赖它。"""
+    store = NetworkXStore()
+    store.add_node("e", node_type="element")
+    store.add_node("s", node_type="syndrome")
+    store.add_edge("e", "s", edge_type="composes", source="gb_standard")
+    assert store.neighbors("s") == []
+    incoming = store.in_neighbors("s")
+    assert [src for src, _ in incoming] == ["e"]
+    assert store.in_neighbors("s", edge_type="indicates") == []
+    assert store.in_neighbors("不存在的节点") == []
+
+
+def test_parallel_indicates_edges_survive_save_load(tmp_path):
+    store = NetworkXStore()
+    store.add_node("a", node_type="symptom")
+    store.add_node("b", node_type="element")
+    for code in ("S1", "S2", "S3"):
+        store.add_edge("a", "b", edge_key=f"indicates::{code}", edge_type="indicates",
+                       source="gb_standard", via_syndrome=code, is_cardinal=False)
+    path = tmp_path / "g.json"
+    store.save(path)
+    loaded = NetworkXStore()
+    loaded.load(path)
+    assert {d["via_syndrome"] for _, d in loaded.neighbors("a")} == {"S1", "S2", "S3"}
+
+
+def test_build_graph_keeps_one_indicates_edge_per_syndrome():
+    """一个症状被两条证候定义共用、且两条证候共享同一个证素时，图里必须留下
+    两条边。之前共用 key="indicates" 时后写的会盖掉先写的——真实数据上丢掉
+    323 条事实里的 29 条，其中 4 条连主症/次症标注都被改写。"""
+    defs = [
+        _sample_definition(code="S1", name="甲证", location=["脾"], nature=[],
+                           cardinal_symptoms=["纳呆"], secondary_symptoms=[]),
+        _sample_definition(code="S2", name="乙证", location=["脾"], nature=[],
+                           cardinal_symptoms=[], secondary_symptoms=["纳呆"]),
+    ]
+    store = build_graph(defs)
+    edges = store.neighbors("symptom::纳呆", edge_type="indicates")
+    assert len(edges) == 2
+    assert {(d["via_syndrome"], d["is_cardinal"]) for _, d in edges} == {("S1", True), ("S2", False)}
+
+
 def test_find_nodes_by_type_and_filter():
     store = NetworkXStore()
     store.add_node("syndrome::S001", node_type="syndrome", is_category=False)

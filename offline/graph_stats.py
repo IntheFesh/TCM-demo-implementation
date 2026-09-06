@@ -4,9 +4,10 @@
 当前仅 1 个学派（2 位医家），λ2 学派层与医家层高度共线，其数值不构成独立信号，
 等 A2 加入第二学派后需重新评估。
 
-**λ1（医家层）恒为 0——原因已实测确认：**
-图中已挂入 839 条真实 case 节点（offline/build_graph.py 的 attach_cases），
-但 count_support() 仍返回空 dict。原因不是缺数据，是术语体系对不上：
+**λ1（医家层）恒为 0——两种成因，打印时按当前图的实际内容二选一（见 lambda1_note）：**
+成因一，图里根本没有 case 节点（sandbox 里没有 cases.json 时就是这种）。
+成因二，挂了 839 条真实 case 节点（offline/build_graph.py 的 attach_cases），
+count_support() 仍返回空 dict——不是缺数据，是术语体系对不上：
 839 条医案仅 91 条标注证型，这 91 条中 0 条能匹配国标证候名；症状端
 1433 种表述与国标 93 个症状节点字面重合仅 8 种（0.6%）。因此 evidences
 边为 0，无边可数，权重全部退化到标准先验层（λ4=1）。
@@ -31,15 +32,41 @@ LAMBDA2_WARNING = (
     "其数值不构成独立信号，等 A2 加入第二学派后需重新评估"
 )
 
-NO_CASE_DATA_NOTE = (
-    "λ1 为 0 的原因不是缺少 case 节点——图中已挂入 839 条真实医案节点。"
-    "真实原因是 case 无法与标准证候对齐：839 条医案仅 91 条标注了证型，"
-    "而这 91 条中 0 条能匹配国标证候名（医案用「胃阳虚」「悬饮」「关格」等"
-    "古籍用词，标准侧为「肝胃不和证」「脾胃湿热证」等，命名体系不同）。"
-    "症状端同样：医案 1433 种表述与国标 93 个症状节点字面重合仅 8 种（0.6%）。"
-    "因此 evidences 边为 0，count_support 无边可数，权重全部退化到标准先验层。"
-    "这是清代医案与现代国标术语体系差异的客观结果，不是实现缺陷。"
-)
+# λ1=0 有两种完全不同的成因，说明文字必须跟着当前这张图的实际内容走。
+# 原来只有一段文字、且无条件打印，在没挂医案的图上会输出「图中已挂入 839 条真实
+# 医案节点」——跟紧挨着它打印的「节点类型分布里没有 case」直接矛盾。一段自相矛盾的
+# 说明比没有说明更糟：读报告的人会拿它当"医案与国标对不上"的证据，而这张图里
+# 根本没有医案可对。
+
+
+def _no_case_nodes_note() -> str:
+    return (
+        "本次加载的图里没有 case 节点（cases.json 不存在或未挂入），"
+        "count_support 无边可数，λ1 必然为 0。这不构成「医案与国标术语对不上」的"
+        "证据——那个结论来自挂入医案之后的实测，本次运行没有复现它。"
+        "要复现：先跑 offline/extract_cases.py 生成 cases.json，"
+        "再跑 offline/build_graph.py 让 attach_cases 把医案挂进图。"
+    )
+
+
+def _case_nodes_unaligned_note(n_cases: int, n_evidences: int) -> str:
+    return (
+        f"λ1 为 0 的原因不是缺少 case 节点——图中已挂入 {n_cases} 条真实医案节点，"
+        f"但 case->syndrome 的 evidences 边只有 {n_evidences} 条。"
+        "真实原因是 case 无法与标准证候对齐：医案用「胃阳虚」「悬饮」「关格」等"
+        "古籍用词，标准侧为「肝胃不和证」「脾胃湿热证」等，命名体系不同；"
+        "症状端同样对不上（此前一次 839 条医案的实测：仅 91 条标注证型、其中 0 条"
+        "匹配国标证候名，1433 种症状表述与国标 93 个症状节点字面重合仅 8 种）。"
+        "evidences 边为 0 时 count_support 无边可数，权重全部退化到标准先验层。"
+        "这是清代医案与现代国标术语体系差异的客观结果，不是实现缺陷。"
+    )
+
+
+def lambda1_note(stats: dict) -> str:
+    n_cases = stats["node_type_counts"].get("case", 0)
+    if n_cases == 0:
+        return _no_case_nodes_note()
+    return _case_nodes_unaligned_note(n_cases, stats["edge_type_counts"].get("evidences", 0))
 
 
 def _count_by(items, key_fn) -> dict:
@@ -117,7 +144,7 @@ def print_stats(stats: dict) -> None:
     print(f"\n【警告】{LAMBDA2_WARNING}")
 
     print(f"\n=== λ1（医家层权重）分布，共 {stats['indicates_edge_count']} 条 indicates 边 ===")
-    print(f"说明：{NO_CASE_DATA_NOTE}")
+    print(f"说明：{lambda1_note(stats)}")
     for pid, histogram in stats["lambda1_histogram"].items():
         name = PHYSICIANS.get(pid, {}).get("name", pid)
         print(f"  {name}（{pid}）：{histogram}")
