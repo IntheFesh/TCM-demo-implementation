@@ -214,6 +214,52 @@
     border: 1px solid #d3d5db; border-radius: 6px; font-family: inherit;
   }
   .ghost-btn:hover { background: #fff; border-color: #a9acb5; }
+  #evidence-panel {
+    position: fixed; top: 0; right: 0; width: 380px; max-width: 92vw; height: 100vh;
+    box-sizing: border-box;
+    background: #fff; border-left: 1px solid #e2e3e8; box-shadow: -4px 0 18px rgba(0,0,0,0.06);
+    transform: translateX(100%); transition: transform .22s ease-out;
+    z-index: 50; display: flex; flex-direction: column;
+  }
+  #evidence-panel.open { transform: translateX(0); }
+  #evidence-head {
+    display: flex; min-width: 0; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid #eceef2; flex: 0 0 auto;
+  }
+  #evidence-title {
+    font-weight: 600; font-size: 14px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  #evidence-close {
+    border: none; background: transparent; font-size: 22px; line-height: 1;
+    cursor: pointer; color: #8b8e96; padding: 0 4px;
+  }
+  #evidence-close:hover { color: #24262b; }
+  #evidence-body {
+    padding: 14px 16px; overflow-y: auto; overflow-x: hidden;
+    flex: 1 1 auto; font-size: 13px;
+    /* 医案原文是连续中文、case_id 是长串，不强制断行会把 fixed 面板撑宽，
+       表现为面板左缘跑到页面中间、右缘溢出屏幕 */
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  #evidence-body * { max-width: 100%; box-sizing: border-box; }
+  .ev-sec { margin-bottom: 16px; }
+  .ev-sec > .label { font-size: 11px; color: #8b8e96; margin-bottom: 5px; }
+  .ev-case {
+    border: 1px solid #e6e7eb; border-radius: 6px; padding: 9px 10px; margin-bottom: 9px;
+  }
+  .ev-case .cid { font-weight: 600; font-size: 12px; }
+  .ev-case .meta { font-size: 11px; color: #8b8e96; margin: 3px 0 5px; }
+  .ev-raw {
+    background: #f7f7f9; border-left: 2px solid #c7c9d1; padding: 7px 9px;
+    font-size: 12px; line-height: 1.7; color: #4a4d55;
+    max-height: 90px; overflow: hidden; position: relative;
+  }
+  .ev-raw.expanded { max-height: none; }
+  .ev-more {
+    font-size: 11px; color: #3b6fd8; cursor: pointer; margin-top: 4px; display: inline-block;
+  }
+  #cy .cy-clickable { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -245,8 +291,17 @@
   </div>
 
   <div id="results"></div>
+
   <div id="manifest-footer" style="margin:18px 0 8px;font-size:11px;color:#9a9da5;text-align:center;"></div>
 </main>
+<aside id="evidence-panel">
+    <div id="evidence-head">
+      <span id="evidence-title"></span>
+      <button id="evidence-close" title="关闭">×</button>
+    </div>
+    <div id="evidence-body"></div>
+  </aside>
+
 
 <script>
 // 配色由 /api/consult 响应里的 result.color 提供（源头是 core/physicians.py）。
@@ -420,6 +475,10 @@ function ensureCanvas() {
     userPanningEnabled: true,
     boxSelectionEnabled: false,
   });
+  cy.on("tap", "node", (evt) => openEvidence(evt.target.id()));
+  cy.on("tap", (evt) => {
+    if (evt.target === cy) closeEvidence();
+  });
   return cy;
 }
 
@@ -491,6 +550,112 @@ function skipAnimation() {
 }
 
 let lastGraph = null;
+
+// 节点 id -> 该节点对应的证据。图上只有 id 和 label，医家的 refs 在
+// data.results 里，点击时要能反查，所以每次响应回来先建一张索引。
+let EVIDENCE = {};
+
+function buildEvidenceIndex(data) {
+  EVIDENCE = {};
+  const put = (id, payload) => {
+    if (!EVIDENCE[id]) EVIDENCE[id] = { title: payload.title, sections: [] };
+    EVIDENCE[id].sections.push(payload);
+  };
+
+  for (const r of data.results || []) {
+    const s2 = r.s2 || {};
+    const s3 = r.s3 || {};
+
+    put(`syn::${r.physician}`, {
+      title: `${s3.syndrome || "证型"}　·　${r.physician_name}`,
+      physician_name: r.physician_name,
+      color: r.color,
+      reasoning: s3.reasoning,
+      note: s3.note,
+      treatment: s3.treatment_principle,
+      formula: s3.formula,
+      refs: r.refs || [],
+    });
+
+    for (const hit of s2.elements || []) {
+      put(`elem::${hit.element}`, {
+        title: `证素　${hit.element}`,
+        physician_name: r.physician_name,
+        color: r.color,
+        element_kind: hit.kind === "location" ? "病位" : "病性",
+        confidence: hit.confidence,
+        supporting: hit.supporting_symptoms || [],
+      });
+      for (const sym of hit.supporting_symptoms || []) {
+        put(`sym::${sym}`, {
+          title: `症状　${sym}`,
+          physician_name: r.physician_name,
+          color: r.color,
+          explained_by: hit.element,
+          confidence: hit.confidence,
+        });
+      }
+    }
+
+    for (const herb of (s3.herbs || []).slice(0, 6)) {
+      put(`herb::${r.physician}::${herb}`, {
+        title: `用药　${herb}`,
+        physician_name: r.physician_name,
+        color: r.color,
+        formula: s3.formula,
+        treatment: s3.treatment_principle,
+        refs: (r.refs || []).filter((x) => (x.herbs || []).some((h) => h.includes(herb) || herb.includes(h))),
+      });
+    }
+  }
+}
+
+function evidenceSectionHtml(s) {
+  const rows = [];
+  if (s.element_kind) rows.push(`<div class="meta">${s.element_kind}　置信度 ${s.confidence}</div>`);
+  if (s.explained_by) rows.push(`<div class="meta">由证素「${escapeHtml(s.explained_by)}」解释　置信度 ${s.confidence}</div>`);
+  if (s.supporting && s.supporting.length) {
+    rows.push(`<div class="label">支撑症状</div><div>${escapeHtml(s.supporting.join("、"))}</div>`);
+  }
+  if (s.treatment) rows.push(`<div class="label">治法</div><div>${escapeHtml(s.treatment)}</div>`);
+  if (s.formula) rows.push(`<div class="label">方剂</div><div>${escapeHtml(s.formula)}</div>`);
+  if (s.reasoning) rows.push(`<div class="label">推理过程</div><div>${escapeHtml(s.reasoning)}</div>`);
+  if (s.note) rows.push(`<div class="label">备注</div><div>${escapeHtml(s.note)}</div>`);
+
+  if (s.refs && s.refs.length) {
+    const cases = s.refs
+      .map((r, i) => {
+        const raw = r.excerpt || "";
+        const long = raw.length > 110;
+        return `<div class="ev-case">
+          <div class="cid">${escapeHtml(r.case_id)}</div>
+          <div class="meta">${r.visit_label}　相似度 ${r.score}${r.syndrome ? "　证：" + escapeHtml(r.syndrome) : ""}</div>
+          <div>${escapeHtml((r.symptoms || []).slice(0, 5).join("；"))}</div>
+          ${raw ? `<div class="ev-raw" id="raw-${i}-${Math.random().toString(36).slice(2, 7)}">${escapeHtml(raw)}</div>
+            ${long ? '<span class="ev-more" onclick="this.previousElementSibling.classList.toggle(\'expanded\'); this.textContent = this.textContent === \'展开全文\' ? \'收起\' : \'展开全文\';">展开全文</span>' : ""}` : ""}
+        </div>`;
+      })
+      .join("");
+    rows.push(`<div class="label">引用医案（${s.refs.length}）</div>${cases}`);
+  }
+
+  return `<div class="ev-sec">
+    <div style="font-weight:600;color:${s.color || "#333"};margin-bottom:6px;">${escapeHtml(s.physician_name)}</div>
+    ${rows.join("")}
+  </div>`;
+}
+
+function openEvidence(nodeId) {
+  const e = EVIDENCE[nodeId];
+  if (!e) return;
+  document.getElementById("evidence-title").textContent = e.title;
+  document.getElementById("evidence-body").innerHTML = e.sections.map(evidenceSectionHtml).join("");
+  document.getElementById("evidence-panel").classList.add("open");
+}
+
+function closeEvidence() {
+  document.getElementById("evidence-panel").classList.remove("open");
+}
 
 function renderDivergence(divergence) {
   const banner = document.getElementById("divergence-banner");
@@ -628,6 +793,7 @@ async function submitConsult() {
     document.getElementById("manifest-footer").textContent = m
       ? `${m.model}　prompt ${m.prompt_version}　语料 ${m.cases_sha256 || "?"}　${m.llm_calls} 次调用　${(m.elapsed_ms / 1000).toFixed(1)}s`
       : "";
+    buildEvidenceIndex(data);
     lastGraph = data.graph;
     const dropped = data.graph.dropped_edges || 0;
     const note = document.getElementById("graph-note");
@@ -653,6 +819,16 @@ async function submitConsult() {
 document.getElementById("submit-btn").addEventListener("click", submitConsult);
 document.getElementById("skip-btn").addEventListener("click", skipAnimation);
 document.getElementById("replay-btn").addEventListener("click", replayGraph);
+// 保险起见运行时把面板挂到 body 末尾：只要祖先里有任何 transform/filter，
+// position:fixed 就会相对该祖先定位而不是视口，面板会跑到页面中间去。
+{
+  const _p = document.getElementById("evidence-panel");
+  if (_p && _p.parentElement !== document.body) document.body.appendChild(_p);
+}
+document.getElementById("evidence-close").addEventListener("click", closeEvidence);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeEvidence();
+});
 </script>
 
 </body>
