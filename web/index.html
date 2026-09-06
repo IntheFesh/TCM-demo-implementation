@@ -279,7 +279,8 @@
       <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
     </div>
     <div id="cy"></div>
-    <div id="graph-note" style="display:none;position:absolute;bottom:8px;left:14px;font-size:12px;color:#9a6b2f;"></div>
+    <div id="residual-note" style="display:none;position:absolute;bottom:26px;left:14px;font-size:12px;color:#C2410C;"></div>
+  <div id="graph-note" style="display:none;position:absolute;bottom:8px;left:14px;font-size:12px;color:#9a6b2f;"></div>
   </div>
 
   <div id="input-panel">
@@ -418,6 +419,22 @@ function buildStylesheet() {
         "text-wrap": "wrap",
         "text-max-width": "90px",
       },
+    },
+    {
+      selector: 'node[layer = 0][state = "residual"]',
+      style: {
+        "background-color": "#fdf1ea",
+        "border-color": "#C2410C",
+        "border-width": 2,
+      },
+    },
+    {
+      selector: "node[residual]",
+      style: { "border-color": "#C2410C", "border-width": 2, "border-style": "dashed" },
+    },
+    {
+      selector: "edge[residual]",
+      style: { "line-color": "#C2410C", "target-arrow-color": "#C2410C", "line-style": "dashed" },
     },
     {
       selector: 'node[layer = 0][state = "unexplained"]',
@@ -794,6 +811,22 @@ async function submitConsult() {
       ? `${m.model}　prompt ${m.prompt_version}　语料 ${m.cases_sha256 || "?"}　${m.llm_calls} 次调用　${(m.elapsed_ms / 1000).toFixed(1)}s`
       : "";
     buildEvidenceIndex(data);
+    const res = data.residual;
+    const rnote = document.getElementById("residual-note");
+    if (rnote) {
+      if (res && res.triggered) {
+        const before = Math.round(res.coverage_before * 100);
+        const after = Math.round(res.coverage_after * 100);
+        const gained = (res.newly_explained || []).join("、");
+        rnote.innerHTML = `残差辨证：初轮解释率 ${before}% → ${after}%` +
+          (gained ? `，补充解释「${escapeHtml(gained)}」` : "") +
+          (res.still_unexplained && res.still_unexplained.length
+            ? `；仍未解释「${escapeHtml(res.still_unexplained.join("、"))}」` : "");
+        rnote.style.display = "block";
+      } else {
+        rnote.style.display = "none";
+      }
+    }
     lastGraph = data.graph;
     const dropped = data.graph.dropped_edges || 0;
     const note = document.getElementById("graph-note");

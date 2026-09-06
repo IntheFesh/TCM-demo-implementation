@@ -61,7 +61,8 @@ def api_consult(req: ConsultRequest) -> dict:
         }
 
     results = outcome["results"]
-    graph = to_graph(s1, results)
+    residual = outcome.get("residual")
+    graph = to_graph(s1, results, outcome.get("s2"), residual)
     assert_graph_edges_valid(graph)
 
     return {
@@ -70,9 +71,19 @@ def api_consult(req: ConsultRequest) -> dict:
         "reject_reason": None,
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
+        "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
+        "residual": _serialize_residual(residual),
         "graph": graph,
         "manifest": outcome.get("manifest"),
     }
+
+
+def _serialize_residual(residual: dict | None) -> dict | None:
+    if not residual:
+        return None
+    out = dict(residual)
+    out["s2"] = residual["s2"].model_dump()
+    return out
 
 
 def _serialize_result(r: dict) -> dict:
@@ -98,7 +109,7 @@ def _serialize_result(r: dict) -> dict:
 MAX_HERBS_PER_PHYSICIAN = 6
 
 
-def to_graph(s1: S1Normalize, results: list[dict]) -> dict:
+def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | None = None) -> dict:
     """构造 Cytoscape 格式的图：{nodes: [{"data": {...}}], edges: [{"data": {...}}]}。
 
     四层：症状(0) -> 证素(1) -> 证型(2) -> 药物(3)。
@@ -132,9 +143,27 @@ def to_graph(s1: S1Normalize, results: list[dict]) -> dict:
         for hit in r["s2"].elements:
             explained_symptoms.update(hit.supporting_symptoms)
 
+    # 两个来源：模型明确列进 unexplained_symptoms 的，和没被任何证素引用的。
+    # 取并集——两者不总是一致，宁可多标一个也不要漏掉系统没说清的症状。
+    declared_unexplained = set(getattr(s2, "unexplained_symptoms", None) or [])
+    residual_explained = set((residual or {}).get("newly_explained") or [])
+
     for sym in s1.symptoms:
-        state = "explained" if sym in explained_symptoms else "unexplained"
+        if sym in explained_symptoms and sym not in declared_unexplained:
+            state = "explained"
+        elif sym in residual_explained:
+            state = "residual"  # 初轮没解释，残差辨证补上了
+        else:
+            state = "unexplained"
         add_node(f"sym::{sym}", label=sym, layer=0, state=state)
+
+    # 残差辨证新推出的证素，单独标出来（兼夹证的证素）
+    if residual:
+        for hit in residual["s2"].elements:
+            elem_id = f"elem::{hit.element}"
+            add_node(elem_id, label=hit.element, layer=1, kind=hit.kind, residual=True)
+            for sym in hit.supporting_symptoms:
+                add_edge(f"sym::{sym}", elem_id, residual=True)
 
     for r in results:
         physician = r["physician"]

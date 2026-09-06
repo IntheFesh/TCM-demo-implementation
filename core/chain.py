@@ -29,6 +29,13 @@ from core.schemas import CaseRecord, S1Normalize, S2Elements, S3Syndrome
 # 如实说明"的处理分支。
 MIN_RETRIEVAL_SCORE = 0.70
 
+# 残差辨证触发阈值：未解释症状 >=2 条 且 占比 >=30% 时，用这些症状再跑一轮，
+# 看能不能构成兼夹证。S2 共享之后未解释症状是全局唯一一份，所以残差也只跑一次，
+# 结果两位医家共用——这比原方案（每位医家各跑一轮）省一半调用，也更一致。
+RESIDUAL_MIN_COUNT = 2
+RESIDUAL_THRESHOLD = 0.30
+RESIDUAL_MAX_ROUNDS = 1
+
 
 _PAREN_RE = re.compile(r"[（(][^）)]*[）)]")
 _DOSE_RE = re.compile(r"[一二三四五六七八九十百半\d.]+(?:钱|两|分|克|g|枚|片|条|支|具|个|茶匙|杯)\s*$")
@@ -217,6 +224,48 @@ def _build_manifest(elapsed_ms: int, llm_calls: int) -> dict:
     }
 
 
+def run_residual(s1: S1Normalize, s2: S2Elements) -> dict | None:
+    """残差辨证：拿 S2 明确列出的未解释症状再跑一轮证素推断。
+
+    这是"系统知道自己哪里没说清楚"的落点——不做的话 unexplained_symptoms
+    只是个统计数字，界面上看不出系统承认了什么。
+    """
+    # 不能只信 unexplained_symptoms 字段——模型经常漏填它，
+    # 实测有症状明明没被任何证素引用、该字段却是空的。
+    # 取并集：字段声明的 + 实际没被任何 supporting_symptoms 提到的。
+    declared = set(s2.unexplained_symptoms or [])
+    referenced = {
+        sym for hit in s2.elements for sym in hit.supporting_symptoms
+    }
+    actual = {s for s in s1.symptoms if s not in referenced}
+    unexplained = sorted(declared | actual, key=lambda x: s1.symptoms.index(x) if x in s1.symptoms else 999)
+    total = len(s1.symptoms) or 1
+    if len(unexplained) < RESIDUAL_MIN_COUNT:
+        return None
+    if len(unexplained) / total < RESIDUAL_THRESHOLD:
+        return None
+
+    residual_s1 = S1Normalize(
+        symptoms=unexplained, tongue=s1.tongue, pulse=s1.pulse, unmapped=[]
+    )
+    s2r = infer_elements(residual_s1)
+    newly = [
+        sym
+        for hit in s2r.elements
+        for sym in hit.supporting_symptoms
+        if sym in unexplained
+    ]
+    return {
+        "triggered": True,
+        "input_symptoms": unexplained,
+        "s2": s2r,
+        "newly_explained": sorted(set(newly)),
+        "still_unexplained": [s for s in unexplained if s not in set(newly)],
+        "coverage_before": round((total - len(unexplained)) / total, 3),
+        "coverage_after": round((total - len(unexplained) + len(set(newly))) / total, 3),
+    }
+
+
 def consult(complaint: str) -> dict:
     _t0 = time.time()
     s1 = normalize(complaint)
@@ -237,6 +286,7 @@ def consult(complaint: str) -> dict:
         }
 
     s2 = infer_elements(s1)
+    residual = run_residual(s1, s2)
     results = [
         run_physician(s1, s2, physician, info["name"])
         for physician, info in PHYSICIANS.items()
@@ -281,9 +331,11 @@ def consult(complaint: str) -> dict:
         "divergence": divergence,
         "rejected": False,
         "reject_reason": None,
+        "s2": s2,
+        "residual": residual,
         # S1 一次 + S2 一次 + 每位医家 S3 一次
         "manifest": _build_manifest(
-            int((time.time() - _t0) * 1000), 2 + len(results)
+            int((time.time() - _t0) * 1000), 2 + len(results) + (1 if residual else 0)
         ),
     }
 
