@@ -49,6 +49,43 @@ def extract_segment(segment: dict) -> SegmentPatients:
     return get_llm().generate(system=system, user="", schema=SegmentPatients)
 
 
+def slice_excerpt(raw: str, visits: list, idx: int) -> str | None:
+    """从整段 raw 里切出第 idx 诊对应的片段。
+
+    纯字符串定位，不调 LLM。按 visit_marker 在原文里的位置切：
+      第 0 诊 -> 段首到第一个 marker
+      第 i 诊 -> 本诊 marker 到下一诊 marker（或段尾）
+    marker 为 None 或定位失败时返回 None——宁可留空，不要给错的片段。
+    """
+    markers = [(i, v.visit_marker) for i, v in enumerate(visits) if v.visit_marker]
+    positions = []
+    search_from = 0
+    for i, mk in markers:
+        pos = raw.find(mk, search_from)
+        if pos >= 0:
+            positions.append((i, pos))
+            search_from = pos + len(mk)
+
+    if not positions:
+        # 整段只有一诊时，整段就是它的片段
+        return raw if len(visits) == 1 else None
+
+    pos_map = dict(positions)
+    ordered = [p for _, p in positions]
+
+    if idx == 0 and idx not in pos_map:
+        end = ordered[0] if ordered else len(raw)
+        return raw[:end].strip() or None
+
+    if idx not in pos_map:
+        return None
+
+    start = pos_map[idx]
+    later = [p for p in ordered if p > start]
+    end = later[0] if later else len(raw)
+    return raw[start:end].strip() or None
+
+
 def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
     """把一个粗段的 SegmentPatients 展开成多条 CaseRecord。一个粗段可能有 0/1/多个病人，
     每个病人自己的 case_group_id 用 {physician}-{seg_id}-p{病人序号} 区分，
@@ -57,7 +94,9 @@ def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
     raw = segment["text"]
     records: list[CaseRecord] = []
     for p_idx, sequence in enumerate(result.patients):
-        group_id = f"{physician}-{segment['seg_id']}-p{p_idx}"
+        # seg_id 本身已含 physician 前缀（如 ye_tianshi-0031），不要再拼一次，
+        # 否则 case_id 变成 ye_tianshi-ye_tianshi-0031-p6-0
+        group_id = f"{segment['seg_id']}-p{p_idx}"
         prev_id: str | None = None
         # 兜底：LLM 偶尔会把多个病人判成"1个病人N诊"且 visit_index 全为 0，
         # 导致同组内 case_id 重复。case_id 是检索引用/图谱边/证据链的主键，
@@ -71,6 +110,7 @@ def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
                 case_id=case_id,
                 physician=physician,
                 raw=raw,
+                raw_excerpt=slice_excerpt(raw, sequence.visits, _v_pos),
                 case_group_id=group_id,
                 prev_case_id=prev_id,
                 **visit.model_dump(),

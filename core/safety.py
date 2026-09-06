@@ -28,10 +28,31 @@ DANGER_KEYWORDS: list[str] = [
 ]
 
 
+# 口语化表述：患者不会说"吐血"，只会说"吐了血""吐了两次血"。
+# 纯子串匹配对付不了中间插字，用正则允许关键动词与宾语之间有少量字符。
+DANGER_PATTERNS: list[tuple[str, str]] = [
+    (r"(吐|呕|咯|咳)[^，。；\s]{0,4}血", "呕血"),
+    (r"(大?便|拉|排)[^，。；\s]{0,4}(黑|发黑|柏油)", "黑便"),
+    (r"(便|拉|排)[^，。；\s]{0,4}血", "便血"),
+    (r"(腹|肚)[^，。；\s]{0,3}(剧痛|绞痛|痛得|痛到)", "剧烈腹痛"),
+    (r"(神志|意识)[^，。；\s]{0,4}(不清|模糊|丧失)", "意识改变"),
+]
+
+
 def check_safety(symptoms: list[str]) -> str | None:
     """symptoms 是 S1 标准化后的症状列表（在 S2 之前调用）。命中任一关键词
     就返回可以直接展示给用户的拒绝理由；没有命中则返回 None，放行进入 S2。"""
-    hits = [kw for text in symptoms for kw in DANGER_KEYWORDS if kw in text]
+    import re
+
+    # 关键词表和正则表可能对同一段文本双重命中（"呕血"既是字面词、
+    # 也匹配 (吐|呕|咯|咳).{0,4}血）。正则的 label 用的是关键词表里的同名词，
+    # 靠 dict.fromkeys 去重即可——不要因为两套机制都命中就报两遍。
+    hits: list[str] = []
+    for text in symptoms:
+        hits.extend(kw for kw in DANGER_KEYWORDS if kw in text)
+        for pattern, label in DANGER_PATTERNS:
+            if re.search(pattern, text):
+                hits.append(label)
     if not hits:
         return None
     matched = "、".join(dict.fromkeys(hits))  # 去重且保持命中顺序

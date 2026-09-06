@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.chain import consult
+from core.physicians import PHYSICIANS
 from core.schemas import S1Normalize
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -61,9 +62,16 @@ def api_consult(req: ConsultRequest) -> dict:
 
 
 def _serialize_result(r: dict) -> dict:
+    info = PHYSICIANS.get(r["physician"], {})
     return {
         "physician": r["physician"],
         "physician_name": r["physician_name"],
+        # 配色从 physicians.py 出，前端不要再写死一份——加第三位医家时
+        # 只改注册表一处。
+        "color": info.get("color", "#666666"),
+        "book": info.get("book"),
+        "years": info.get("years"),
+        "school": info.get("school"),
         "s2": r["s2"].model_dump(),
         "s3": r["s3"].model_dump(),
         "refs": r["refs"],

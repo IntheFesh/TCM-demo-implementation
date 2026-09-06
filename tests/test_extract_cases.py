@@ -127,19 +127,19 @@ def test_full_pipeline_multi_patient_segment_and_cross_validation(tmp_path, monk
 
     ids = {r["case_id"] for r in records}
     # case_id 格式 {physician}-{seg_id}-p{病人序号}-{诊次}
-    assert "ye_tianshi-ye_tianshi-0000-p0-0" in ids
-    assert {"ye_tianshi-ye_tianshi-0001-p0-0", "ye_tianshi-ye_tianshi-0001-p0-1", "ye_tianshi-ye_tianshi-0001-p0-2"} <= ids
+    assert "ye_tianshi-0000-p0-0" in ids
+    assert {"ye_tianshi-0001-p0-0", "ye_tianshi-0001-p0-1", "ye_tianshi-0001-p0-2"} <= ids
 
     # 粘连段里的两个病人必须有不同的 case_group_id，不能被合并成一个人
     by_id = {r["case_id"]: r for r in records}
-    p0_group = by_id["wu_jutong-wu_jutong-0002-p0-0"]["case_group_id"]
-    p1_group = by_id["wu_jutong-wu_jutong-0002-p1-0"]["case_group_id"]
+    p0_group = by_id["wu_jutong-0002-p0-0"]["case_group_id"]
+    p1_group = by_id["wu_jutong-0002-p1-0"]["case_group_id"]
     assert p0_group != p1_group
 
     # prev_case_id 链式关系：第 0 诊为 None，第 i 诊指向第 i-1 诊
-    assert by_id["ye_tianshi-ye_tianshi-0001-p0-0"]["prev_case_id"] is None
-    assert by_id["ye_tianshi-ye_tianshi-0001-p0-1"]["prev_case_id"] == "ye_tianshi-ye_tianshi-0001-p0-0"
-    assert by_id["ye_tianshi-ye_tianshi-0001-p0-2"]["prev_case_id"] == "ye_tianshi-ye_tianshi-0001-p0-1"
+    assert by_id["ye_tianshi-0001-p0-0"]["prev_case_id"] is None
+    assert by_id["ye_tianshi-0001-p0-1"]["prev_case_id"] == "ye_tianshi-0001-p0-0"
+    assert by_id["ye_tianshi-0001-p0-2"]["prev_case_id"] == "ye_tianshi-0001-p0-1"
 
     # 零病人段：不报错、不编病人，直接没有对应的 CaseRecord
     assert not any("0003" in cid for cid in ids)

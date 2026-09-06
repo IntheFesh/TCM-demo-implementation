@@ -43,7 +43,7 @@ class FakeRetriever(Retriever):
     def __init__(self, cases: list[CaseRecord]):
         self.cases = cases
 
-    def search(self, query: str, physician: str, k: int = 3):
+    def search(self, query, physician, k=3, min_score=0.0):
         hits = [c for c in self.cases if c.physician == physician][:k]
         return [(c, 0.9) for c in hits]
 
@@ -75,7 +75,19 @@ def _fake_cases() -> list[CaseRecord]:
     ]
 
 
-def test_s1_runs_exactly_once_for_two_physicians(monkeypatch):
+def test_shared_stages_run_once_per_physician_stages_run_twice(monkeypatch):
+    """S1 和 S2 全局各只跑一次，S3 每位医家一次。
+
+    S1 只跑一次是硬约束：跑两次会得到两份不同的症状列表，构图时症状节点
+    id 对不上，边指向不存在的节点（CLAUDE.md 已知的坑）。
+
+    S2 只跑一次是后来的决定：s2_elements.yaml 里没有 $name 占位符，模型
+    不知道自己在为哪位医家推断，temperature=0 下逐医家各跑一次只会得到
+    几乎相同的结果。医家条件化发生在 S3（通过检索到的该医家医案），
+    S2 是客观的证素抽取，图上证素层本来也是所有医家共享同一批节点。
+
+    这三个数字任何一个变了都要先想清楚为什么，不要直接改期望值。
+    """
     s3_ye = S3Syndrome(
         syndrome="脾胃气虚",
         reasoning="纳差乏力，脉细弱",
@@ -95,7 +107,7 @@ def test_s1_runs_exactly_once_for_two_physicians(monkeypatch):
     outcome = chain.consult("纳差乏力")
 
     assert fake_llm.calls.count("S1Normalize") == 1
-    assert fake_llm.calls.count("S2Elements") == 2
+    assert fake_llm.calls.count("S2Elements") == 1
     assert fake_llm.calls.count("S3Syndrome") == 2
     assert len(outcome["results"]) == 2
 

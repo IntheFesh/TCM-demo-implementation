@@ -13,18 +13,30 @@ CASES_PATH = Path(__file__).resolve().parent.parent / "cases.json"
 class Retriever(ABC):
     @abstractmethod
     def search(
-        self, query: str, physician: str, k: int = 3
+        self, query: str, physician: str, k: int = 3, min_score: float = 0.0
     ) -> list[tuple[CaseRecord, float]]:
-        """返回 [(医案, 相似度), ...]，按相似度降序，只在给定医家的医案里排序。"""
+        """返回 [(医案, 相似度), ...]，按相似度降序，只在给定医家的医案里排序。
+        min_score 以下的结果不返回——宁可给空列表让 S3 知道"没有相关医案"，
+        也不要塞三条不相关的案子进 prompt 逼模型模仿。"""
         raise NotImplementedError
 
 
 def _case_to_text(case: CaseRecord) -> str:
-    """把结构化医案编码成一段紧凑文本用于向量化。"""
+    """把结构化医案编码成一段紧凑文本用于向量化。
+
+    复诊段要跟初诊区分开：复诊原文常只写"服药后如何"，症状极简
+    （"肿胀未除""汗至眉上"），如果和初诊平等编码，检索时会大量命中
+    这些碎片——实测吴鞠通的 top-3 曾全是第 6/11 诊，一条初诊都没有。
+    把治疗反应拼进文本，让复诊段的向量落在"疗效描述"而不是"主诉"附近。
+    """
     symptoms = "；".join(case.symptoms) if case.symptoms else "（无记录症状）"
     tongue = case.tongue or "未记"
     pulse = case.pulse or "未记"
-    return f"{symptoms}。舌{tongue}，脉{pulse}"
+    base = f"{symptoms}。舌{tongue}，脉{pulse}"
+    if case.visit_index and case.visit_index > 0:
+        resp = case.response_to_prior or "（未记疗效）"
+        return f"复诊第{case.visit_index + 1}诊。前次治疗后：{resp}。现症：{base}"
+    return base
 
 
 class DenseRetriever(Retriever):
@@ -55,8 +67,13 @@ class DenseRetriever(Retriever):
             texts, normalize_embeddings=True, convert_to_numpy=True
         )
 
+    # 初诊在排序时的加成。复诊段症状简短、内容是疗效描述，
+    # 作为"该医家如何辨证"的参考价值低于初诊，但不完全排除——
+    # 长序列里的中段复诊有时正好记录了证型转变。
+    INITIAL_VISIT_BOOST = 1.08
+
     def search(
-        self, query: str, physician: str, k: int = 3
+        self, query: str, physician: str, k: int = 3, min_score: float = 0.0
     ) -> list[tuple[CaseRecord, float]]:
         self._ensure_encoded()
 
@@ -68,12 +85,18 @@ class DenseRetriever(Retriever):
             [query], normalize_embeddings=True, convert_to_numpy=True
         )[0]
 
-        scored = [
-            (i, float(self._embeddings[i] @ query_vec)) for i in idxs
-        ]
+        scored = []
+        for i in idxs:
+            raw_score = float(self._embeddings[i] @ query_vec)
+            if raw_score < min_score:
+                continue
+            vi = self._cases[i].visit_index or 0
+            rank_score = raw_score * (self.INITIAL_VISIT_BOOST if vi == 0 else 1.0)
+            # 排序用加权分，返回给上层的仍是真实相似度，不要把加成混进展示值
+            scored.append((i, rank_score, raw_score))
+
         scored.sort(key=lambda x: -x[1])
-        top = scored[:k]
-        return [(self._cases[i], score) for i, score in top]
+        return [(self._cases[i], raw) for i, _rank, raw in scored[:k]]
 
 
 _retriever_singleton: Retriever | None = None

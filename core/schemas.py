@@ -54,6 +54,9 @@ class CaseRecord(VisitStructured):
     case_group_id: str
     # 上一诊的 case_id，初诊为 None；诊次内的链式关系靠这个字段还原，不靠 visit_index 推断
     prev_case_id: str | None = None
+    # 该诊次在 raw 里对应的片段。raw 是整个粗段（同一段的多个诊次共享，
+    # 内容完全相同），前端证据链侧栏需要的是"这一诊对应原文哪几行"。
+    raw_excerpt: str | None = None
 
 
 # ---------- 知识图谱：证候定义（人工核对录入，不是 LLM 输出） ----------

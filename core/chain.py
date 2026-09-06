@@ -14,6 +14,7 @@ S1 必须只跑一次：如果对每位医家各跑一次，两次输出的症�
 """
 from __future__ import annotations
 
+import re
 import time
 
 from core.elements import ELEMENTS
@@ -23,13 +24,71 @@ from core.retrieval import get_retriever
 from core.safety import check_safety
 from core.schemas import CaseRecord, S1Normalize, S2Elements, S3Syndrome
 
+# 检索相似度下限。实测正常匹配在 0.85-0.90，低于 0.70 基本是"库里没有相关案子"，
+# 此时给空列表比塞三条不相关的更诚实——S3 prompt 里已有"参考医案差异较大时
+# 如实说明"的处理分支。
+MIN_RETRIEVAL_SCORE = 0.70
+
+
+_PAREN_RE = re.compile(r"[（(][^）)]*[）)]")
+_DOSE_RE = re.compile(r"[一二三四五六七八九十百半\d.]+(?:钱|两|分|克|g|枚|片|条|支|具|个|茶匙|杯)\s*$")
+
+# 炮制前缀/后缀：同一味药在不同医家笔下写法不同（广皮=陈皮、炙草=炙甘草），
+# 不归一的话药物集合比对会把同一味药算成两味，Jaccard 被系统性推高——
+# 实测出现过两边实际用药大量重合、Jaccard 却算成 1.0 的情况。
+_HERB_AFFIX = re.compile(r"^(炒|焦|生|制|炙|姜|酒|醋|盐|煨|煅|蜜|清|净|广|川|云|北|南|东|西)+")
+_HERB_SUFFIX = re.compile(r"(汁|炭|末|粉|片|块|皮尖)$")
+
+HERB_ALIASES: dict[str, str] = {
+    "广皮": "陈皮", "橘皮": "陈皮", "新会皮": "陈皮",
+    "炙草": "甘草", "炙甘草": "甘草", "生甘草": "甘草", "粉甘草": "甘草",
+    "云苓": "茯苓", "白苓": "茯苓", "茯苓块": "茯苓", "茯苓皮": "茯苓", "赤苓": "茯苓",
+    "川连": "黄连", "真云连": "黄连", "山连": "黄连", "雅连": "黄连",
+    "北沙参": "沙参", "南沙参": "沙参",
+    "白扁豆": "扁豆", "生扁豆": "扁豆",
+    "半夏曲": "半夏", "姜半夏": "半夏", "制半夏": "半夏", "法半夏": "半夏",
+    "小枳实": "枳实", "淡吴萸": "吴茱萸", "吴萸": "吴茱萸",
+    "老浓朴": "厚朴", "浓朴": "厚朴",
+    "焦六曲": "神曲", "六曲": "神曲", "建曲": "神曲",
+    "焦山楂": "山楂", "生山楂": "山楂",
+    "潞党参": "党参", "台党参": "党参",
+    "冬术": "白术", "於术": "白术",
+}
+
+
+def normalize_herb(herb: str) -> str:
+    """把药名归一到可比对的形式：剥括号注释、剥剂量、查别名表、剥炮制前后缀。
+
+    顺序重要：先剥括号（"旋覆花二钱（包煎）"的括号在剂量之后，
+    不先剥掉的话 $ 锚点匹配不到剂量），再剥剂量，最后才做别名归一。
+    """
+    s = _PAREN_RE.sub("", herb).strip()
+    s = _DOSE_RE.sub("", s).strip()
+    if not s:
+        return ""
+    if s in HERB_ALIASES:
+        return HERB_ALIASES[s]
+    stripped = _HERB_SUFFIX.sub("", _HERB_AFFIX.sub("", s)).strip()
+    if stripped in HERB_ALIASES:
+        return HERB_ALIASES[stripped]
+    # 剥完只剩一个字多半剥过头了（"生姜"->"姜"），保留原形
+    return stripped if len(stripped) >= 2 else s
+
+
+def strip_dose(herb: str) -> str:
+    """保留旧名，内部走 normalize_herb。"""
+    return normalize_herb(herb)
+
 
 def _format_case_line(case: CaseRecord) -> str:
     """把一个参考医案压缩成一行，喂给 S3 prompt。"""
     symptoms = "；".join(case.symptoms) if case.symptoms else "无"
     herbs = "、".join(case.herbs) if case.herbs else "无"
+    vi = case.visit_index or 0
+    visit_desc = "初诊" if vi == 0 else f"第{vi + 1}诊"
     fields = [
         f"id={case.case_id}",
+        f"诊次={visit_desc}",
         f"症状={symptoms}",
         f"舌={case.tongue or '未记'}",
         f"脉={case.pulse or '未记'}",
@@ -61,10 +120,15 @@ def normalize(complaint: str) -> S1Normalize:
     return get_llm().generate(system=system, user="", schema=S1Normalize)
 
 
-def run_physician(s1: S1Normalize, physician: str, physician_name: str) -> dict:
-    symptoms_text = "；".join(s1.symptoms)
+def infer_elements(s1: S1Normalize) -> S2Elements:
+    """S2 证素推断。全局只跑一次，所有医家共用——理由同 S1：
 
-    # S2 证素推断
+    s2_elements.yaml 的占位符里没有 $name，模型根本不知道自己在为哪位医家推断，
+    temperature=0 下对每位医家各跑一次只会得到几乎相同的结果，白花调用。
+    设计上医家条件化发生在 S3（通过检索到的该医家医案），S2 是客观的证素抽取。
+    图上证素层本来也是所有医家共享同一批节点（api/main.py 的 elem:: 去重）。
+    """
+    symptoms_text = "；".join(s1.symptoms)
     s2_prompt = load_prompt("s2_elements")
     s2_system = render(
         s2_prompt["system"],
@@ -73,12 +137,37 @@ def run_physician(s1: S1Normalize, physician: str, physician_name: str) -> dict:
         tongue=s1.tongue or "未记",
         pulse=s1.pulse or "未记",
     )
-    s2: S2Elements = get_llm().generate(system=s2_system, user="", schema=S2Elements)
+    return get_llm().generate(system=s2_system, user="", schema=S2Elements)
+
+
+def run_physician(
+    s1: S1Normalize, s2: S2Elements, physician: str, physician_name: str
+) -> dict:
+    symptoms_text = "；".join(s1.symptoms)
 
     # 检索该医家 top-3 医案
     query = f"{symptoms_text}。舌{s1.tongue or '未记'}，脉{s1.pulse or '未记'}"
-    hits = get_retriever().search(query, physician, k=3)
-    refs = [(case.case_id, round(score, 3)) for case, score in hits]
+    hits = get_retriever().search(query, physician, k=3, min_score=MIN_RETRIEVAL_SCORE)
+    # refs 要给前端证据链侧栏用：只给 (id, score) 的话，用户看到
+    # ye_tianshi-0031-p6-0 完全不知道那是什么医案，"可追溯"这个卖点就断在这里。
+    refs = [
+        {
+            "case_id": case.case_id,
+            "score": round(score, 3),
+            "visit_index": case.visit_index or 0,
+            "visit_label": "初诊" if not case.visit_index else f"第{case.visit_index + 1}诊",
+            "symptoms": case.symptoms or [],
+            "tongue": case.tongue,
+            "pulse": case.pulse,
+            "syndrome": case.syndrome,
+            "treatment_principle": case.treatment_principle,
+            "formula": case.formula,
+            "herbs": case.herbs or [],
+            # 该诊次对应的原文片段（不是整段粗段）
+            "excerpt": case.raw_excerpt,
+        }
+        for case, score in hits
+    ]
     refs_text = "\n".join(_format_case_line(case) for case, _ in hits) or "（无可用参考医案）"
 
     # S3 证候+治法+方
@@ -92,7 +181,7 @@ def run_physician(s1: S1Normalize, physician: str, physician_name: str) -> dict:
     )
     s3: S3Syndrome = get_llm().generate(system=s3_system, user="", schema=S3Syndrome)
 
-    ref_ids = {case_id for case_id, _ in refs}
+    ref_ids = {r["case_id"] for r in refs}
     hallucinated = [cid for cid in s3.cited_case_ids if cid not in ref_ids]
 
     return {
@@ -110,7 +199,9 @@ def consult(complaint: str) -> dict:
 
     # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
     # 不产出任何方药。不要把这道检查挪到 run_physician 内部或结果的 note 字段。
-    reject_reason = check_safety(s1.symptoms)
+    # 三处都要查：S1 可能把"最近吐了两次血"这类病史陈述归进 unmapped
+    # （s1_normalize.yaml 明确要求含糊的病史表述放 unmapped），只查 symptoms 会漏。
+    reject_reason = check_safety([complaint] + s1.symptoms + s1.unmapped)
     if reject_reason is not None:
         return {
             "s1": s1,
@@ -120,17 +211,43 @@ def consult(complaint: str) -> dict:
             "reject_reason": reject_reason,
         }
 
+    s2 = infer_elements(s1)
     results = [
-        run_physician(s1, physician, info["name"]) for physician, info in PHYSICIANS.items()
+        run_physician(s1, s2, physician, info["name"])
+        for physician, info in PHYSICIANS.items()
     ]
 
     syndromes = {r["physician"]: r["s3"].syndrome for r in results}
     values = list(syndromes.values())
     same = len(set(values)) <= 1
+
+    # 字符串比对会把"脾胃气虚，运化失健"和"脾虚湿困，中焦不运"判为分歧，
+    # 哪怕两者治法、方剂一字不差（实测 10 条主诉分歧率 9/9，指标无区分度）。
+    # 改用药物集合的 Jaccard 距离作为主指标：用药是医家风格最实在的落点，
+    # 而证型命名的差异很大程度上只是措辞。
+    herb_sets = [
+        {h for h in (normalize_herb(x) for x in (r["s3"].herbs or [])) if h}
+        for r in results
+    ]
+    if len(herb_sets) >= 2 and any(herb_sets):
+        inter = set.intersection(*herb_sets)
+        union = set.union(*herb_sets)
+        herb_jaccard = 1.0 - (len(inter) / len(union)) if union else 0.0
+        shared_herbs = sorted(inter)
+    else:
+        herb_jaccard = None
+        shared_herbs = []
+
+    tp_sets = [set(r["s3"].treatment_principle or "") for r in results]
+    tp_same = len(set(r["s3"].treatment_principle for r in results)) <= 1
+
     divergence = {
         "same": same,
-        # 目前是按证型名称精确比对的粗判，正式版会换成 JS 散度等语义层面的分歧度量。
         "method": "exact_string_match",
+        # 0=用药完全一致，1=毫无重叠
+        "herb_jaccard": round(herb_jaccard, 3) if herb_jaccard is not None else None,
+        "shared_herbs": shared_herbs,
+        "treatment_principle_same": tp_same,
     }
 
     return {
@@ -180,7 +297,14 @@ if __name__ == "__main__":
                 print(f"    [幻觉] 引用了检索结果之外的医案 id：{r['hallucinated']}")
 
         div = outcome["divergence"]
-        print(f"  分歧：{div['same'] is False}（{div['method']}）")
+        hj = div.get("herb_jaccard")
+        tp = "治法一致" if div.get("treatment_principle_same") else "治法不同"
+        shared = div.get("shared_herbs") or []
+        print(
+            f"  分歧：证型{'不同' if div['same'] is False else '相同'}｜{tp}｜"
+            f"药物Jaccard={hj if hj is not None else 'NA'}"
+            f"｜共用药={('、'.join(shared[:6]) or '无')}"
+        )
         if not div["same"]:
             n_divergent += 1
         print(f"  耗时：{elapsed:.1f}s")

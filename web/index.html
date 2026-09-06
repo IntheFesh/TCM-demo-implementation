@@ -199,6 +199,21 @@
     font-size: 12.5px;
     color: var(--muted);
   }
+  .ref-excerpt {
+    margin-top: 4px; padding: 6px 8px; background: #f7f7f9;
+    border-left: 2px solid #c7c9d1; font-size: 12px; line-height: 1.6; color: #4a4d55;
+  }
+  .ref-sym { margin-top: 2px; font-size: 12px; color: #6b6e76; }
+  #graph-panel { position: relative; }
+  #graph-toolbar {
+    position: absolute; top: 10px; right: 12px; z-index: 5; display: flex; gap: 6px;
+  }
+  .ghost-btn {
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+    background: rgba(255,255,255,0.92); color: #4a4d55;
+    border: 1px solid #d3d5db; border-radius: 6px; font-family: inherit;
+  }
+  .ghost-btn:hover { background: #fff; border-color: #a9acb5; }
 </style>
 </head>
 <body>
@@ -213,6 +228,10 @@
   <div id="error-box"></div>
 
   <div id="graph-panel">
+    <div id="graph-toolbar">
+      <button class="ghost-btn" id="skip-btn" title="立即显示终态">⏭ 跳过动画</button>
+      <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
+    </div>
     <div id="cy"></div>
   </div>
 
@@ -228,7 +247,9 @@
 </main>
 
 <script>
-const PHYSICIAN_COLORS = { ye_tianshi: "#1D9E75", wu_jutong: "#D85A30" };
+// 配色由 /api/consult 响应里的 result.color 提供（源头是 core/physicians.py）。
+// 这里只保留图渲染用的运行时缓存，每次响应回来时填充。
+let PHYSICIAN_COLORS = {};
 const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640 };
 const Y_MIN = 60, Y_MAX = 460;
 
@@ -239,19 +260,42 @@ function evenY(index, total) {
   return Y_MIN + (Y_MAX - Y_MIN) * (index / (total - 1));
 }
 
-function computeLayout(nodes) {
+function computeLayout(nodes, edges) {
   const positions = {};
   const byLayer = { 0: [], 1: [], 2: [], 3: [] };
   for (const n of nodes) byLayer[n.data.layer].push(n);
 
-  for (const layer of [0, 1, 2]) {
+  // layer 0 保持原始顺序（症状顺序有语义，是 S1 抽取的顺序）
+  byLayer[0].forEach((n, i) => {
+    positions[n.data.id] = { x: LAYER_X[0], y: evenY(i, byLayer[0].length) };
+  });
+
+  // layer 1/2 按"上游邻居的平均位置"排序（重心排序），减少边交叉。
+  // 不做这一步的话，层内顺序取决于节点数组的原始顺序，
+  // 上下游顺序不一致时边会交叉成 X。
+  const yOf = (id) => (positions[id] ? positions[id].y : null);
+  for (const layer of [1]) {
     const items = byLayer[layer];
-    items.forEach((n, i) => {
-      positions[n.data.id] = { x: LAYER_X[layer], y: evenY(i, items.length) };
+    const bary = new Map();
+    for (const n of items) {
+      const ys = [];
+      for (const e of edges) {
+        if (e.data.target === n.data.id) {
+          const y = yOf(e.data.source);
+          if (y !== null) ys.push(y);
+        }
+      }
+      bary.set(n.data.id, ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Number.MAX_SAFE_INTEGER);
+    }
+    const sorted = [...items].sort((a, b) => bary.get(a.data.id) - bary.get(b.data.id));
+    sorted.forEach((n, i) => {
+      positions[n.data.id] = { x: LAYER_X[layer], y: evenY(i, sorted.length) };
     });
   }
 
-  // layer 3 药物：按医家分上下两组，中间留 40px 间隔，避免节点挤成一列
+  // layer 2 证型：按医家分上下两带，与 layer 3 的药物带对齐。
+  // 不能用重心排序——两位医家的证型上游证素高度重叠，重心值接近，
+  // 排序结果近乎随机，会把两个证型甩到画布上下两端，边被迫斜穿全图。
   const physOrder = [];
   for (const n of byLayer[2]) {
     if (!physOrder.includes(n.data.phys)) physOrder.push(n.data.phys);
@@ -261,6 +305,24 @@ function computeLayout(nodes) {
     (herbsByPhys[n.data.phys] = herbsByPhys[n.data.phys] || []).push(n);
   }
   const gap = 40;
+
+  // layer 2 按同一套医家带排布，保证证型与它的药物在同一水平区间
+  const synByPhys = {};
+  for (const n of byLayer[2]) {
+    (synByPhys[n.data.phys] = synByPhys[n.data.phys] || []).push(n);
+  }
+  const bandCount2 = physOrder.length || 1;
+  const bandHeight2 = (Y_MAX - Y_MIN - gap * (bandCount2 - 1)) / bandCount2;
+  physOrder.forEach((phys, bandIdx) => {
+    const bandTop = Y_MIN + bandIdx * (bandHeight2 + gap);
+    const items = synByPhys[phys] || [];
+    items.forEach((n, i) => {
+      const y = items.length <= 1
+        ? bandTop + bandHeight2 / 2
+        : bandTop + (bandHeight2 * i) / (items.length - 1);
+      positions[n.data.id] = { x: LAYER_X[2], y };
+    });
+  });
   const bandCount = physOrder.length || 1;
   const bandHeight = (Y_MAX - Y_MIN - gap * (bandCount - 1)) / bandCount;
   physOrder.forEach((phys, bandIdx) => {
@@ -339,31 +401,105 @@ function buildStylesheet() {
   return style;
 }
 
-function renderGraph(graph) {
-  const el = document.getElementById("cy");
-  const positions = computeLayout(graph.nodes);
-
-  const elements = [
-    ...graph.nodes.map((n) => ({ data: n.data, position: positions[n.data.id] })),
-    ...graph.edges.map((e) => ({ data: e.data })),
-  ];
-
-  if (cy) cy.destroy();
+function ensureCanvas() {
+  // 画布只建一次。生长动画需要 cy.add() 往已有画布上分批追加元素，
+  // 每次 destroy 重建就没有"增量"可言了。
+  if (cy) return cy;
   cy = cytoscape({
-    container: el,
-    elements,
+    container: document.getElementById("cy"),
+    elements: [],
     style: buildStylesheet(),
     layout: { name: "preset" },
     userZoomingEnabled: true,
     userPanningEnabled: true,
     boxSelectionEnabled: false,
   });
+  return cy;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+let growToken = 0; // 每次新的生长自增，旧的循环据此提前退出
+
+async function growGraph(graph, { animate = true } = {}) {
+  ensureCanvas();
+  // 配色随医家变化（physicians.py 是唯一源），每次重新应用样式表
+  cy.style(buildStylesheet());
+  cy.elements().remove();
+
+  const positions = computeLayout(graph.nodes, graph.edges);
+  const nodesByLayer = { 0: [], 1: [], 2: [], 3: [] };
+  for (const n of graph.nodes) nodesByLayer[n.data.layer].push(n);
+
+  const myToken = ++growToken;
+  const addNode = (n) =>
+    cy.add({ group: "nodes", data: n.data, position: positions[n.data.id] });
+
+  // 某一层的节点加完之后，把两端都已存在的边补上
+  const addReadyEdges = () => {
+    const present = new Set(cy.nodes().map((n) => n.id()));
+    for (const e of graph.edges) {
+      const { source, target } = e.data;
+      if (!present.has(source) || !present.has(target)) continue;
+      if (cy.edges(`[source = "${source}"][target = "${target}"]`).length) continue;
+      cy.add({ group: "edges", data: e.data });
+    }
+  };
+
+  if (!animate) {
+    for (const layer of [0, 1, 2, 3]) nodesByLayer[layer].forEach(addNode);
+    addReadyEdges();
+    cy.fit(undefined, 24);
+    return;
+  }
+
+  const STAGGER = { 0: 60, 1: 50, 2: 90, 3: 40 };
+  for (const layer of [0, 1, 2, 3]) {
+    for (const n of nodesByLayer[layer]) {
+      if (myToken !== growToken) return; // 被新一次生长取代，停掉旧循环
+      const el = addNode(n);
+      el.style("opacity", 0);
+      el.animate({ style: { opacity: 1 } }, { duration: 240, easing: "ease-out" });
+      await sleep(STAGGER[layer]);
+    }
+    if (myToken !== growToken) return;
+    addReadyEdges();
+    await sleep(120);
+  }
   cy.fit(undefined, 24);
 }
 
+// 保留旧名，默认不带动画——改动画开关只在一处，调用方不用改。
+function renderGraph(graph) {
+  return growGraph(graph, { animate: true });
+}
+
+function replayGraph() {
+  if (lastGraph) growGraph(lastGraph, { animate: true });
+}
+
+function skipAnimation() {
+  if (lastGraph) growGraph(lastGraph, { animate: false });
+}
+
+let lastGraph = null;
+
 function renderDivergence(divergence) {
   const banner = document.getElementById("divergence-banner");
-  if (divergence && divergence.same === false) {
+  if (divergence && divergence.herb_jaccard !== null && divergence.herb_jaccard !== undefined) {
+    const j = divergence.herb_jaccard;
+    const shared = divergence.shared_herbs || [];
+    const tp = divergence.treatment_principle_same ? "治法一致" : "治法不同";
+    let level;
+    if (j <= 0.3) level = "用药高度重合";
+    else if (j <= 0.7) level = "用药部分重合";
+    else level = "用药基本不重合";
+    const sharedText = shared.length ? `，共用 ${shared.join("、")}` : "";
+    banner.textContent = `${tp}；${level}（药物 Jaccard 距离 ${j}${sharedText}）`;
+    banner.classList.add("show");
+  } else if (divergence && divergence.same === false) {
     banner.textContent = "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";
     banner.classList.add("show");
   } else {
@@ -372,9 +508,22 @@ function renderDivergence(divergence) {
 }
 
 function refListHtml(refs) {
-  if (!refs || refs.length === 0) return '<div class="ref-item">（无检索结果）</div>';
+  if (!refs || refs.length === 0) {
+    return '<div class="ref-item">（无相关医案，相似度均低于阈值）</div>';
+  }
   return refs
-    .map(([caseId, score]) => `<div class="ref-item">${caseId}　相似度 ${score}</div>`)
+    .map((r) => {
+      const syn = r.syndrome ? `　证：${escapeHtml(r.syndrome)}` : "";
+      const sym = (r.symptoms || []).slice(0, 4).join("；");
+      const ex = r.excerpt
+        ? `<div class="ref-excerpt">${escapeHtml(r.excerpt.slice(0, 120))}${r.excerpt.length > 120 ? "…" : ""}</div>`
+        : "";
+      return `<div class="ref-item">
+        <b>${escapeHtml(r.case_id)}</b>　${r.visit_label}　相似度 ${r.score}${syn}
+        <div class="ref-sym">${escapeHtml(sym)}</div>
+        ${ex}
+      </div>`;
+    })
     .join("");
 }
 
@@ -465,6 +614,11 @@ async function submitConsult() {
       renderGraph(data.graph);
       return;
     }
+    PHYSICIAN_COLORS = {};
+    for (const r of data.results) {
+      if (r.color) PHYSICIAN_COLORS[r.physician] = r.color;
+    }
+    lastGraph = data.graph;
     renderDivergence(data.divergence);
     renderResults(data.results);
     renderGraph(data.graph);
@@ -478,6 +632,8 @@ async function submitConsult() {
 }
 
 document.getElementById("submit-btn").addEventListener("click", submitConsult);
+document.getElementById("skip-btn").addEventListener("click", skipAnimation);
+document.getElementById("replay-btn").addEventListener("click", replayGraph);
 </script>
 
 </body>
