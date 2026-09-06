@@ -329,3 +329,96 @@ def test_thermal_warning_surfaces_without_regeneration(monkeypatch):
     assert "寒热方向可能相悖" in ye["safety_output"]["thermal_warning"]
     assert ye["safety_output"]["revised"] is False
     assert fake.retry_prompts == []
+
+
+# ---------- G2：use_react 开关 ----------
+
+class ReActFakeLLM(FakeLLM):
+    """在 FakeLLM 基础上驱动 ReAct 循环：查一次图谱就 finish。
+    同时把每次 S3 收到的 system 提示词存下来，用于断言"不开 ReAct 时
+    prompt 跟改造前逐字节一致"。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.s3_systems: list[str] = []
+        self._react_step = 0
+
+    def generate(self, system, user, schema, temperature=0.0, **kwargs):
+        from core.schemas import ReActStep
+
+        if schema is ReActStep:
+            self.calls.append("ReActStep")
+            self._react_step += 1
+            if self._react_step % 2 == 1:
+                return ReActStep(thought="先看看证素对应哪些证候",
+                                 action="query_graph", action_input={"node": "纳呆"})
+            return ReActStep(thought="够了", action="finish")
+        if schema is S3Syndrome:
+            self.s3_systems.append(system)
+        return super().generate(system, user, schema, temperature, **kwargs)
+
+
+def _react_setup(monkeypatch):
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"], herbs=["党参", "白术"])
+    s3_wu = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["wu_jutong-001"], herbs=["党参", "白术"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    import core.react as react_mod
+    monkeypatch.setattr(react_mod, "get_llm", lambda: fake_llm)
+    return fake_llm
+
+
+def test_react_off_by_default_leaves_s3_prompt_untouched(monkeypatch):
+    """不开 ReAct 时 S3 的提示词里不能多出任何东西——多一个字，
+    use_react 的 A/B 就混进了 prompt 变化这个额外变量。"""
+    fake_llm = _react_setup(monkeypatch)
+    outcome = chain.consult("纳差乏力", use_react=False)
+
+    assert fake_llm.calls.count("ReActStep") == 0
+    assert all(r["react_trace"] is None for r in outcome["results"])
+    assert all("取证过程" not in s for s in fake_llm.s3_systems)
+    assert outcome["manifest"]["use_react"] is False
+    assert outcome["manifest"]["llm_calls"] == 4  # S1 + S2 + S3×2
+
+
+def test_react_on_appends_evidence_and_counts_its_calls(monkeypatch):
+    fake_llm = _react_setup(monkeypatch)
+    outcome = chain.consult("纳差乏力", use_react=True)
+
+    traces = [r["react_trace"] for r in outcome["results"]]
+    assert all(t is not None and t.terminated_by == "finish" for t in traces)
+    assert all("取证过程" in s for s in fake_llm.s3_systems)
+    assert outcome["manifest"]["use_react"] is True
+    # 4 次原有调用 + 每位医家 2 步 ReAct。漏算的话 manifest 报的调用数
+    # 会低于实际花费，拿它算成本或比 use_react 的代价就都是错的。
+    assert outcome["manifest"]["llm_calls"] == 4 + sum(t.llm_calls for t in traces) == 8
+
+
+def test_react_does_not_weaken_the_hallucination_check(monkeypatch):
+    """ReAct 的取证结果里可能出现别的 case id。引用白名单仍然只认检索到的 refs，
+    这条一旦松掉，整个防幻觉设计就从 ReAct 这个新入口漏了。"""
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-999"])
+    s3_wu = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["wu_jutong-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    import core.react as react_mod
+    monkeypatch.setattr(react_mod, "get_llm", lambda: fake_llm)
+
+    outcome = chain.consult("纳差乏力", use_react=True)
+    ye = next(r for r in outcome["results"] if r["physician"] == "ye_tianshi")
+    assert ye["hallucinated"] == ["ye_tianshi-999"]
+    assert "cited_case_ids" in fake_llm.s3_systems[0], "附加证据里要重申引用白名单"
+
+
+def test_use_react_none_reads_environment(monkeypatch):
+    fake_llm = _react_setup(monkeypatch)
+    monkeypatch.setenv("USE_REACT", "1")
+    assert chain.consult("纳差乏力")["manifest"]["use_react"] is True
+    monkeypatch.setenv("USE_REACT", "0")
+    assert chain.consult("纳差乏力")["manifest"]["use_react"] is False

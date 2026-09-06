@@ -129,6 +129,49 @@ class S2Elements(BaseModel):
     unexplained_symptoms: list[str] = Field(default_factory=list)
 
 
+# ---------- 在线：ReAct（G2） ----------
+
+
+class ReActStep(BaseModel):
+    """ReAct 单步的 LLM 输出。
+
+    thought 的 min_length=1 是有意的：允许空 thought，循环会退化成一串没有理由的
+    工具调用，"可解释"这条就没了，事后也没法判断它为什么选这个工具。
+
+    action 用裸 str 而不是 Literal[工具名...]：模型写了不存在的工具名时，用
+    Literal 会让 pydantic 校验失败、走 generate() 的三次重试，一个笔误烧掉 3 次
+    调用；用 str 则由 react 循环把"没有这个工具，可用的是……"当成 observation
+    回灌，只花 1 次。这跟 core/tools.py "工具永不抛异常给调用方"是同一条思路。
+    """
+
+    thought: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    action_input: dict = Field(default_factory=dict)
+
+
+class ReActStepRecord(BaseModel):
+    """一步的完整记录。这不是 LLM 输出，是循环自己记的账，所以没有防幻觉约束。"""
+
+    step: int
+    thought: str
+    action: str
+    action_input: dict = Field(default_factory=dict)
+    observation: str
+    # 这一步发生了什么异常情况：工具名不存在、参数不合法、和前面某步完全重复
+    note: str | None = None
+
+
+class ReActTrace(BaseModel):
+    steps: list[ReActStepRecord] = Field(default_factory=list)
+    # finish=模型自己说够了；ask_user=它要追问；max_steps=撞上限；
+    # no_progress=连续重复同一个调用；error=LLM 调用本身失败。
+    # 这五种要分开记：撞 max_steps 说明 prompt 没让模型知道什么时候算够了，
+    # 跟"它想清楚了主动收尾"是完全不同的结论，混成一个"结束了"就看不出来。
+    terminated_by: Literal["finish", "ask_user", "max_steps", "no_progress", "error"]
+    pending_question: str | None = None
+    llm_calls: int = 0
+
+
 class S3Syndrome(BaseModel):
     syndrome: str
     reasoning: str

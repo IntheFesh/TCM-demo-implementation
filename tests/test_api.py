@@ -88,3 +88,26 @@ def test_consult_endpoint_returns_rejection_without_calling_to_graph(monkeypatch
     assert body["results"] == []
     assert body["divergence"] is None
     assert body["graph"] == {"nodes": [], "edges": [], "dropped_edges": 0}
+
+
+def test_serialize_result_passes_react_trace_through():
+    """开了 ReAct 只把结论传给前端等于白跑——取证轨迹要如实带出去。"""
+    from api.main import _serialize_result
+    from core.schemas import ReActStepRecord, ReActTrace, S2Elements, S3Syndrome
+
+    trace = ReActTrace(
+        steps=[ReActStepRecord(step=1, thought="查一下", action="query_graph",
+                               action_input={"node": "纳呆"}, observation="{}")],
+        terminated_by="finish", llm_calls=1,
+    )
+    base = {
+        "physician": "ye_tianshi", "physician_name": "叶天士",
+        "s2": S2Elements(), "s3": S3Syndrome(
+            syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+            cited_case_ids=["ye_tianshi-001"]),
+        "refs": [], "hallucinated": [], "safety_output": None,
+    }
+    assert _serialize_result({**base, "react_trace": None})["react_trace"] is None
+    out = _serialize_result({**base, "react_trace": trace})["react_trace"]
+    assert out["terminated_by"] == "finish"
+    assert out["steps"][0]["action"] == "query_graph"

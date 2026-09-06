@@ -121,6 +121,9 @@ def _serialize_result(r: dict) -> dict:
         "hallucinated": r["hallucinated"],
         # X2 输出侧安全校验结果，前端据此挂红/黄标签
         "safety_output": r.get("safety_output"),
+        # G2 取证轨迹。不开 ReAct 时是 None；开了要如实带出来——ReAct 的卖点
+        # 就是"能看见它查了什么"，只把结论传出去等于白跑。
+        "react_trace": r["react_trace"].model_dump() if r.get("react_trace") else None,
     }
 
 

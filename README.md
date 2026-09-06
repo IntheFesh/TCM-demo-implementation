@@ -203,6 +203,30 @@ python -m offline.graph_stats
 重跑 `graph_stats.py` 会自动出现非零 λ1，不需要改代码。详见 `data/SOURCES.md`
 第 7 节。
 
+## ReAct 取证模式（进阶功能，默认关）
+
+默认路径是 S1→S2→检索→S3 四步直出。打开 `USE_REACT=1` 之后，S3 之前会多一轮
+ReAct 取证：模型自己决定查什么（查国标图谱、查标准证候定义、查医案三元组、
+算残差、或者向患者提问），最多 5 步，查到的东西作为附加证据接在 S3 提示词后面。
+
+```bash
+USE_REACT=1 ./run.sh          # 或 uvicorn api.main:app --reload
+```
+
+要点：
+
+- **最终输出的 schema 没变**，还是 `S3Syndrome`，`cited_case_ids` 仍然只能引用
+  检索到的参考医案 id。ReAct 只负责补证据，不负责下结论——让模型在最后一步
+  直接吐结论，等于把防幻觉校验搬进一个更长更容易跑偏的上下文里。
+- **不开 ReAct 时 S3 的提示词跟改造前逐字节一致**，所以 `use_react` 开/关可以
+  直接做 A/B，不会混进 prompt 变化这个额外变量。
+- **代价是调用数**。每位医家多花 1–5 次调用，`manifest.llm_calls` 会如实计入，
+  `manifest.use_react` 记这次开没开。拿调用数算成本时看这两个字段。
+- 结束原因分五种记在 `react_trace.terminated_by`：`finish`（模型自己判断够了）、
+  `ask_user`（它要追问）、`max_steps`（撞上限）、`no_progress`（连续重复同一个
+  调用）、`error`（LLM 调用失败）。**撞 max_steps 不等于正常结束**——它说明
+  提示词没让模型知道什么时候算够了，看统计时这两者必须分开。
+
 ## 数据来源与版权
 
 详见 [`data/SOURCES.md`](data/SOURCES.md)。简要结论：

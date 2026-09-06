@@ -20,6 +20,7 @@ from core import herbs as _herbs
 from core.elements import ELEMENTS, LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
 from core.physicians import PHYSICIANS
+from core.react import format_trace_for_s3, react_enabled, run_react
 from core.retrieval import get_retriever
 from core.safety import check_safety
 from core.safety_output import (
@@ -113,7 +114,11 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
 
 
 def run_physician(
-    s1: S1Normalize, s2: S2Elements, physician: str, physician_name: str
+    s1: S1Normalize,
+    s2: S2Elements,
+    physician: str,
+    physician_name: str,
+    use_react: bool = False,
 ) -> dict:
     symptoms_text = "；".join(s1.symptoms)
 
@@ -151,6 +156,18 @@ def run_physician(
         symptoms=symptoms_text,
         refs=refs_text,
     )
+    # G2：开了 ReAct 就先跑一轮取证，把查到的东西追加到 S3 prompt 后面。
+    # 只追加、不改 s3_syndrome.yaml——不开 ReAct 时 prompt 要跟改造前逐字节一致，
+    # 否则 use_react 的 A/B 里混进了 prompt 变化这个额外变量。
+    trace = None
+    if use_react:
+        trace = run_react(
+            name=physician_name,
+            symptoms=symptoms_text,
+            elements_summary=_format_elements_summary(s2),
+        )
+        s3_system = s3_system + format_trace_for_s3(trace)
+
     s3: S3Syndrome = get_llm().generate(system=s3_system, user="", schema=S3Syndrome)
 
     # X2 输出侧安全：十八反十九畏命中就把冲突写进 prompt 重开一次。
@@ -188,10 +205,11 @@ def run_physician(
             "thermal_warning": thermal_warning,
             "revised": revised,
         },
+        "react_trace": trace,
     }
 
 
-def _build_manifest(elapsed_ms: int, llm_calls: int) -> dict:
+def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
     import hashlib
@@ -211,6 +229,7 @@ def _build_manifest(elapsed_ms: int, llm_calls: int) -> dict:
         # 非默认后端时非 None。带着走，报告里就不会漏标"这个数不可比"。
         "comparability_warning": llm.comparability_warning(),
         "prompt_version": "v1",
+        "use_react": use_react,
         "cases_sha256": cases_sha,
         "elapsed_ms": elapsed_ms,
         "llm_calls": llm_calls,
@@ -259,8 +278,12 @@ def run_residual(s1: S1Normalize, s2: S2Elements) -> dict | None:
     }
 
 
-def consult(complaint: str) -> dict:
+def consult(complaint: str, use_react: bool | None = None) -> dict:
+    """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
+    测试和 A/B 脚本靠它固定条件，不受环境影响。"""
     _t0 = time.time()
+    if use_react is None:
+        use_react = react_enabled()
     s1 = normalize(complaint)
 
     # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
@@ -275,7 +298,7 @@ def consult(complaint: str) -> dict:
             "divergence": None,
             "rejected": True,
             "reject_reason": reject_reason,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1),
+            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react),
         }
 
     s2 = infer_elements(s1)
@@ -307,11 +330,11 @@ def consult(complaint: str) -> dict:
             ),
             "coverage": round(coverage, 3),
             "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000), 2 + (1 if residual else 0)
+                int((time.time() - _t0) * 1000), 2 + (1 if residual else 0), use_react
             ),
         }
     results = [
-        run_physician(s1, s2, physician, info["name"])
+        run_physician(s1, s2, physician, info["name"], use_react=use_react)
         for physician, info in PHYSICIANS.items()
     ]
 
@@ -366,7 +389,11 @@ def consult(complaint: str) -> dict:
             2
             + len(results)
             + (1 if residual else 0)
-            + sum(1 for r in results if r["safety_output"]["revised"]),
+            + sum(1 for r in results if r["safety_output"]["revised"])
+            # ReAct 的每一步都是一次真实调用，必须计进来：漏算的话 manifest 报的
+            # 调用数会低于实际花费，拿它算成本或比 use_react 开关的代价就都是错的。
+            + sum(r["react_trace"].llm_calls for r in results if r["react_trace"]),
+            use_react,
         ),
     }
 
