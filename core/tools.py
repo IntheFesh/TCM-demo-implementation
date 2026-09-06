@@ -15,7 +15,7 @@
    秒级全量跑完、不需要网络，靠的就是这一条。
 
 数据依赖的现状（不要误读）：
-  - `data/graph.json` 国标层（123 节点 / 348 边）是全的，query_graph、
+  - `data/graph.json` 国标层（123 节点 / 377 边）是全的，query_graph、
     check_residual、question_candidates 都能真实工作。
   - `cases.json`（医案检索库）和 `data/case_triples.jsonl`（医案三元组，X3 产出）
     在这个 sandbox 里都没有，search_cases / query_case_graph 会如实返回
@@ -577,6 +577,18 @@ def phrase_question(symptom: str) -> str:
     return f"有没有{symptom}？"
 
 
+def is_safety_relevant(symptom: str) -> bool:
+    """这个症状一旦为"有"，会不会触发 S2 之前的安全否决？
+
+    追问循环把答案收回来之后必须先跑 check_safety 再更新后验——否则会出现
+    "患者答了有黑便，系统继续辨证开方"这种事，把安全否决在 S2 之前的约束
+    从后门绕过去了。判据复用 core.safety 的关键词/正则表，不另建一张。
+    """
+    from core.safety import check_safety
+
+    return check_safety([symptom]) is not None
+
+
 def _entropy(probs) -> float:
     return -sum(p * math.log2(p) for p in probs if p > 0)
 
@@ -702,14 +714,19 @@ def question_candidates(
     if not posterior or not symptom_weights:
         return _shiwen_fallback(k, asked_set, "图里没有可用的证候假设空间或 indicates 边")
 
-    known = set(known_symptoms or [])
+    # 排除已知症状用的是 check_residual 那套片段匹配器，不另写一套字面规则——
+    # 同一个模块里两套"这条症状算不算已经知道了"的判断迟早会分叉。
+    # 它只做字面匹配，患者换个说法（「大便溏薄」vs 标准里的「大便稀溏」）就漏，
+    # 这个缺口的根因是缺一层术语映射，见 data/SOURCES.md 第 7 节第 10 条。
+    known_ids = {
+        sym_id
+        for ks in (known_symptoms or [])
+        for sym_id in _match_graph_symptoms(store, ks)
+    }
+    known_names = {(store.get_node(i) or {}).get("name") for i in known_ids}
     pool = [
         name for name in symptom_weights
-        if name not in asked_set
-        and name not in known
-        # 患者原话包含标准症状名时也算已知（「胃脘胀满或疼痛」vs 患者说的
-        # 「胃脘胀满」），否则会问一个人家刚说过的症状
-        and not any(name in ks or ks in name for ks in known)
+        if name not in asked_set and name not in known_names
     ]
     if not pool:
         return _shiwen_fallback(k, asked_set, "图里的标准症状已全部问过或已由患者陈述")
@@ -752,6 +769,10 @@ def question_candidates(
             "if_yes_top": index[top_yes]["name"],
             "if_no_top": index[top_no]["name"],
             "prior_entropy": round(prior_entropy, 4),
+            # 回答"有"会命中安全否决层的问题（吐血、便血、黑便……）。信息增益上
+            # 它们是合法候选，但答案绝不能被当成普通症状喂回证候后验——必须先过
+            # check_safety。判据直接复用 core/safety.py 的表，不在这里另抄一份。
+            "safety_relevant": is_safety_relevant(name),
         })
 
     if not scored:

@@ -13,6 +13,7 @@ from core import tools
 from core.graph.store import NetworkXStore
 from core.tools import (
     MIN_INFORMATION_GAIN,
+    is_safety_relevant,
     SHIWEN_QUESTIONS,
     TOOLS,
     ask_user,
@@ -455,6 +456,41 @@ def test_known_symptom_substring_also_excluded():
     """患者说「胃脘胀满」，就不该再问「有没有胃脘胀满或疼痛？」。"""
     out = question_candidates(["肝", "胃", "气滞"], k=5, known_symptoms=["胃脘胀满"])
     assert "胃脘胀满或疼痛" not in [c["symptom"] for c in out]
+
+
+def test_safety_relevant_flag_uses_the_safety_layer():
+    """一旦患者答"有"就会触发 S2 之前安全否决的问题，必须被标出来——G3 收到
+    答案后要先跑 check_safety 再更新后验，不能当成普通症状喂回去。判据复用
+    core/safety.py 的表，这里只钉住"确实被标出来了"。"""
+    assert is_safety_relevant("吐血色红或紫黯，常夹食物残渣") is True
+    assert is_safety_relevant("便血") is True
+    assert is_safety_relevant("口干或口苦") is False
+
+    out = question_candidates(["胃", "阴虚", "津伤", "热"], k=5)
+    flags = {c["symptom"]: c["safety_relevant"] for c in out if c["source"] == "graph_ig"}
+    assert any(flags.values()), "胃热壅盛证的吐血主症应当进候选并被标为安全相关"
+    assert not all(flags.values())
+
+
+def test_fallback_entries_carry_no_safety_flag_key_confusion():
+    """后备条目没有对应的标准症状，safety_relevant 也就无从谈起——
+    保持 graph_ig 分支独有，避免下游拿一个恒为 False 的假字段做判断。"""
+    out = question_candidates([], None, k=1)
+    assert "safety_relevant" not in out[0] or out[0].get("symptom") is not None
+
+
+def test_known_symptom_exclusion_reuses_residual_matcher():
+    """排除已知症状和 check_residual 用的是同一个片段匹配器。同一个模块里两套
+    "这条症状算不算已经知道了"的判断迟早分叉，所以这条钉住它们一致。"""
+    known = ["大便溏薄"]
+    excluded = {c["symptom"] for c in question_candidates(["脾", "气虚", "湿"], k=20,
+                                                          known_symptoms=known)}
+    matched = {
+        (tools.get_graph_store().get_node(i) or {}).get("name")
+        for i in tools._match_graph_symptoms(tools.get_graph_store(), "大便溏薄")
+    }
+    assert matched, "「大便溏薄」应当能匹配到图里的标准症状节点"
+    assert not (matched & excluded), f"匹配器认得的症状不该还出现在候选里：{matched & excluded}"
 
 
 def test_deterministic():

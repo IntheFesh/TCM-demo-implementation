@@ -187,6 +187,11 @@ python -m offline.build_graph
 python -m offline.graph_stats
 ```
 
+`core/tools.py`（智能体工具层）里的 `query_graph`、`check_residual`、
+`question_candidates` 读的就是这两步产出的 `data/graph.json`。图没建的时候它们
+不会崩，但会退化：前两个返回带 `error` 的结果，`question_candidates` 退到十问歌
+固定顺序。要看到基于信息增益的追问，先跑上面两条命令。
+
 > **λ2（学派层）当前是假信号，不要引用它做任何跨学派结论。**
 > 当前仅 1 个学派（2 位医家：叶天士、吴鞠通均为温病学派），λ2 学派层与医家层高度
 > 共线，其数值不构成独立信号，等加入第二学派后需重新评估。凡是本项目里出现的
