@@ -60,6 +60,21 @@ def api_consult(req: ConsultRequest) -> dict:
             "manifest": outcome.get("manifest"),
         }
 
+    if outcome.get("insufficient"):
+        return {
+            "s1": outcome["s1"].model_dump(),
+            "rejected": False,
+            "insufficient": True,
+            "insufficient_reason": outcome["insufficient_reason"],
+            "coverage": outcome.get("coverage"),
+            "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
+            "residual": _serialize_residual(outcome.get("residual")),
+            "results": [],
+            "divergence": None,
+            "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
+            "manifest": outcome.get("manifest"),
+        }
+
     results = outcome["results"]
     residual = outcome.get("residual")
     graph = to_graph(s1, results, outcome.get("s2"), residual)
@@ -71,6 +86,9 @@ def api_consult(req: ConsultRequest) -> dict:
         "reject_reason": None,
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
+        "insufficient": False,
+        "insufficient_reason": None,
+        "coverage": outcome.get("coverage"),
         "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
         "residual": _serialize_residual(residual),
         "graph": graph,

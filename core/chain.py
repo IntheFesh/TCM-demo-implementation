@@ -287,6 +287,36 @@ def consult(complaint: str) -> dict:
 
     s2 = infer_elements(s1)
     residual = run_residual(s1, s2)
+
+    # 证素层为空 = 结构化推理没有落点。此时若继续跑 S3，模型会绕开证素
+    # 直接"看主诉猜证型"（实测「胸闷气短」这类信息量过低的主诉，S2 返回空证素，
+    # S3 仍给出完整证型和方药，推理过程里自己写着"证素分析未给出明确结论，
+    # 然从症状推之"）。那样 S1->S2->S3 的分步设计就退化成了单步问答，
+    # 而且输出的方药没有任何可追溯的依据。宁可如实说信息不足。
+    explained = {sym for hit in s2.elements for sym in hit.supporting_symptoms}
+    residual_explained = set((residual or {}).get("newly_explained") or [])
+    coverage = len(explained | residual_explained) / (len(s1.symptoms) or 1)
+
+    if not s2.elements and not (residual and residual["s2"].elements):
+        return {
+            "s1": s1,
+            "results": [],
+            "divergence": None,
+            "rejected": False,
+            "reject_reason": None,
+            "s2": s2,
+            "residual": residual,
+            "insufficient": True,
+            "insufficient_reason": (
+                "现有症状不足以推断证素，无法进行有依据的辨证。"
+                "请补充更多信息：起病与加重缓解的诱因、疼痛或不适的性质与部位、"
+                "饮食与二便情况、寒热喜恶、舌象与脉象。"
+            ),
+            "coverage": round(coverage, 3),
+            "manifest": _build_manifest(
+                int((time.time() - _t0) * 1000), 2 + (1 if residual else 0)
+            ),
+        }
     results = [
         run_physician(s1, s2, physician, info["name"])
         for physician, info in PHYSICIANS.items()
@@ -313,7 +343,6 @@ def consult(complaint: str) -> dict:
         herb_jaccard = None
         shared_herbs = []
 
-    tp_sets = [set(r["s3"].treatment_principle or "") for r in results]
     tp_same = len(set(r["s3"].treatment_principle for r in results)) <= 1
 
     divergence = {
@@ -333,6 +362,9 @@ def consult(complaint: str) -> dict:
         "reject_reason": None,
         "s2": s2,
         "residual": residual,
+        "insufficient": False,
+        "insufficient_reason": None,
+        "coverage": round(coverage, 3),
         # S1 一次 + S2 一次 + 每位医家 S3 一次
         "manifest": _build_manifest(
             int((time.time() - _t0) * 1000), 2 + len(results) + (1 if residual else 0)

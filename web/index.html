@@ -519,15 +519,47 @@ async function growGraph(graph, { animate = true } = {}) {
   const addNode = (n) =>
     cy.add({ group: "nodes", data: n.data, position: positions[n.data.id] });
 
-  // 某一层的节点加完之后，把两端都已存在的边补上
-  const addReadyEdges = () => {
+  // 某一层的节点加完之后，把两端都已存在的边补上。
+  // grow=true 时用 line-dash-offset 做"生长"：先把边整条画成一段虚线
+  // （dash 长度 = 边长），offset 从边长动到 0，看上去就是从起点延伸到终点，
+  // 动完再切回 solid。Cytoscape 的元素不是 DOM，只能用 cy.animate()，
+  // CSS transition 对它无效。
+  const addReadyEdges = (grow = false) => {
     const present = new Set(cy.nodes().map((n) => n.id()));
+    const added = [];
     for (const e of graph.edges) {
       const { source, target } = e.data;
       if (!present.has(source) || !present.has(target)) continue;
       if (cy.edges(`[source = "${source}"][target = "${target}"]`).length) continue;
-      cy.add({ group: "edges", data: e.data });
+      added.push(cy.add({ group: "edges", data: e.data }));
     }
+    if (!grow) return added;
+
+    for (const el of added) {
+      let len = 260;
+      try {
+        const s = el.source().position();
+        const t = el.target().position();
+        len = Math.max(40, Math.hypot(t.x - s.x, t.y - s.y));
+      } catch (_) {}
+      el.style({
+        "line-style": "dashed",
+        "line-dash-pattern": [len, len],
+        "line-dash-offset": len,
+        "target-arrow-shape": "none",
+      });
+      el.animate(
+        { style: { "line-dash-offset": 0 } },
+        {
+          duration: 420,
+          easing: "ease-out",
+          complete: () => {
+            el.removeStyle("line-style line-dash-pattern line-dash-offset target-arrow-shape");
+          },
+        }
+      );
+    }
+    return added;
   };
 
   if (!animate) {
@@ -547,8 +579,8 @@ async function growGraph(graph, { animate = true } = {}) {
       await sleep(STAGGER[layer]);
     }
     if (myToken !== growToken) return;
-    addReadyEdges();
-    await sleep(120);
+    addReadyEdges(true);
+    await sleep(360); // 让边基本长完再进下一层，否则层层重叠看不清
   }
   cy.fit(undefined, 24);
 }
