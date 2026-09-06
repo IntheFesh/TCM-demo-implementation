@@ -175,6 +175,57 @@ def check_corpus_coverage(
     }
 
 
+def attach_cases(store: NetworkXStore, cases_path: Path) -> dict:
+    """把 cases.json 里的医案作为 case 节点挂进图。
+
+    这是 K2 的另一半——K1 只建了"标准 -> 骨架"（symptom/element/syndrome），
+    医案这条管道当时因为 sandbox 没有真实 cases.json 而没写。
+
+    重要：case 节点的价值主要不在 count_support/λ1。实测清代医案的症状表述
+    与国标术语字面重合率极低（1433 种表述 vs 93 个标准症状节点，仅 8 种一致，
+    且都不是高频词），证型体系同样几乎不相交（839 条医案仅 91 条有证型，
+    且多为"胃阳虚""悬饮""关格"这类古籍用词）。所以 evidences 边能建的很少，
+    λ1 预期接近 0，这是数据的客观性质，不是代码缺陷。
+
+    case 节点真正要服务的是：检索语料（K3）、ReAct 的 search_cases 工具（G2）、
+    前端证据链侧栏（F1）——这些只需要 case 节点存在并按 physician 可查，
+    不要求它跟标准证候对齐。
+    """
+    with cases_path.open("r", encoding="utf-8") as f:
+        cases = json.load(f)
+
+    syn_name_to_id = {
+        data["name"]: node_id
+        for node_id, data in store.g.nodes(data=True)
+        if data.get("node_type") == "syndrome"
+    }
+
+    stats = {"cases": 0, "evidences_edges": 0, "syndrome_matched": 0, "syndrome_unmatched": 0}
+    for c in cases:
+        case_id = f"case::{c['case_id']}"
+        store.add_node(
+            case_id,
+            node_type="case",
+            physician=c["physician"],
+            symptoms=c.get("symptoms") or [],
+            syndrome=c.get("syndrome"),
+            case_group_id=c.get("case_group_id"),
+            visit_index=c.get("visit_index"),
+        )
+        stats["cases"] += 1
+
+        syn = c.get("syndrome")
+        if syn:
+            target = syn_name_to_id.get(syn)
+            if target:
+                store.add_edge(case_id, target, edge_type="evidences", source="case")
+                stats["evidences_edges"] += 1
+                stats["syndrome_matched"] += 1
+            else:
+                stats["syndrome_unmatched"] += 1
+    return stats
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="从 syndromes.jsonl 建知识图谱骨架")
     parser.add_argument(
@@ -185,11 +236,27 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--standard-path", type=Path, default=STANDARD_PATH)
     parser.add_argument("--out", type=Path, default=GRAPH_OUT_PATH)
+    parser.add_argument(
+        "--cases-path", type=Path, default=Path("cases.json"),
+        help="医案 cases.json 路径；存在则挂入 case 节点，传 --cases-path /dev/null 可跳过",
+    )
     args = parser.parse_args(argv)
 
     defs = load_syndrome_definitions(args.standard_path)
     filtered = filter_by_keywords(defs, args.filter_keywords)
     store = build_graph(filtered)
+
+    if args.cases_path and args.cases_path.exists():
+        cstats = attach_cases(store, args.cases_path)
+        print(
+            f"挂入医案：{cstats['cases']} 条 case 节点，"
+            f"evidences 边 {cstats['evidences_edges']} 条"
+            f"（证型可对齐 {cstats['syndrome_matched']}，"
+            f"对不齐 {cstats['syndrome_unmatched']}）"
+        )
+    else:
+        print(f"未挂入医案（{args.cases_path} 不存在），图中无 case 节点，λ1 将全为 0")
+
     store.save(args.out)
 
     print(f"读入 {len(defs)} 条证候定义，过滤后 {len(filtered)} 条")

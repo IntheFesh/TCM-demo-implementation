@@ -12,3 +12,11 @@ venv/
 .pytest_cache/
 *.egg-info/
 .DS_Store
+
+# vim 交换文件（可能含 .env 里的 key）
+*.swp
+*.swo
+*.swn
+*.swm
+# 古籍原文，从 GitHub 公开仓库可下载，不入版本控制
+books/

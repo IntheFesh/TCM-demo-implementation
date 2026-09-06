@@ -59,8 +59,14 @@ def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
     for p_idx, sequence in enumerate(result.patients):
         group_id = f"{physician}-{segment['seg_id']}-p{p_idx}"
         prev_id: str | None = None
-        for visit in sequence.visits:
-            case_id = f"{group_id}-{visit.visit_index}"
+        # 兜底：LLM 偶尔会把多个病人判成"1个病人N诊"且 visit_index 全为 0，
+        # 导致同组内 case_id 重复。case_id 是检索引用/图谱边/证据链的主键，
+        # 唯一性必须由代码保证，不能依赖 LLM 每次都判对。
+        _seen_idx = [v.visit_index for v in sequence.visits]
+        _idx_dup = len(_seen_idx) != len(set(_seen_idx))
+        for _v_pos, visit in enumerate(sequence.visits):
+            _suffix = _v_pos if _idx_dup else visit.visit_index
+            case_id = f"{group_id}-{_suffix}"
             record = CaseRecord(
                 case_id=case_id,
                 physician=physician,
@@ -72,6 +78,23 @@ def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
             records.append(record)
             prev_id = case_id
     return records
+
+
+def check_visit_index_dup(segment: dict, result: SegmentPatients) -> list[dict]:
+    """检出 visit_index 重复（已在 expand_segment 用序号兜底）的病人组。
+    不静默修掉——这是数据质量信号，统计需要知道有多少条走了兜底。"""
+    out = []
+    for p_idx, sequence in enumerate(result.patients):
+        idxs = [v.visit_index for v in sequence.visits]
+        if len(idxs) != len(set(idxs)):
+            out.append({
+                "seg_id": segment["seg_id"],
+                "check": "visit_index_dup",
+                "patient": p_idx,
+                "n_visits": len(idxs),
+                "note": "visit_index 重复，case_id 已用枚举序号兜底",
+            })
+    return out
 
 
 def cross_validate(segment: dict, result: SegmentPatients) -> list[dict]:
@@ -107,7 +130,7 @@ def extract_one(seg_path: Path) -> tuple[list[CaseRecord], list[dict]]:
     segment = json.loads(seg_path.read_text(encoding="utf-8"))
     result = extract_segment(segment)
     records = expand_segment(segment, result)
-    warnings = cross_validate(segment, result)
+    warnings = cross_validate(segment, result) + check_visit_index_dup(segment, result)
     return records, warnings
 
 
