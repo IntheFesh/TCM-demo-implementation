@@ -271,7 +271,11 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     - **系统现在没有「这条症状已被患者否认」的表示。** 主诉 5 的患者说了
       「口不渴」，`S1Normalize.symptoms` 把它当成一条普通症状收着，追问层看不出
       这是一个否定回答，于是照样把「有没有口干或口苦」排在第 1。G3 的
-      history 契约必须能记否定答案，否则这一类重复问不掉。
+      history 契约必须能记否定答案，否则这一类重复问不掉。**定下来的形状**：
+      history 项从 `{question, answer}` 扩成
+      `{question, answer, asserted: list[str], denied: list[str]}`，
+      `asserted`/`denied` 由 G3 在收到回答后解析（一次轻量 LLM 调用或规则匹配），
+      `question_candidates` 的候选池要同时排除这两个集合。
 
     本轮做过但**没有效果**的尝试，记下来免得以后重做：把候选池的排除规则从
     「字面双向包含」改成复用 `check_residual` 的片段匹配器。10 条主诉的输出
