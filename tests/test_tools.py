@@ -112,6 +112,18 @@ def test_query_graph_missing_node_returns_empty():
     out = query_graph("这个症状图里绝对没有")
     assert out["found"] is False
     assert out["neighbors"] == []
+    assert out["near_matches"] == []
+
+
+def test_query_graph_missing_node_suggests_near_matches():
+    """实测：真实模型查「口苦」查不到就放弃了，而图里有「口干或口苦」。
+    只回一句"没有这个节点"会把它逼进死胡同，必须给出可以重查的近似名。"""
+    out = query_graph("口苦")
+    assert out["found"] is False
+    assert "口干或口苦" in out["near_matches"]
+    assert "near_matches" in out["note"]
+    # 给出来的名字必须真的能查到，否则等于换个地方把模型带死
+    assert query_graph(out["near_matches"][0])["found"] is True
 
 
 def test_query_graph_symptom_returns_indicates_out_edges():

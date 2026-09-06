@@ -216,8 +216,23 @@ def query_graph(node: str, edge_type: str | None = None,
         return {"found": False, "error": f"图谱文件不存在：{GRAPH_PATH}，先跑 offline/build_graph.py"}
     node_id = _resolve_node(store, node)
     if node_id is None:
-        return {"found": False, "query": node, "neighbors": [],
-                "note": "图中没有这个节点。国标层只收了脾胃门 93 个标准症状，患者原话往往不在其中。"}
+        # 只回一句"没有这个节点"会把模型逼进死胡同：实测它查「口苦」查不到就
+        # 放弃了，而图里明明有「口干或口苦」。用 check_residual 那套片段匹配器
+        # 给出近似节点，让它下一步能直接改用正确的名字重查。
+        near = [
+            (store.get_node(i) or {}).get("name")
+            for i in _match_graph_symptoms(store, node)
+        ]
+        return {
+            "found": False,
+            "query": node,
+            "neighbors": [],
+            "near_matches": [n for n in near if n][:10],
+            "note": (
+                "图中没有这个节点。国标层只收了脾胃门 93 个标准症状，患者原话往往"
+                "不在其中——如果 near_matches 非空，改用其中一个名字重查。"
+            ),
+        }
     attrs = store.get_node(node_id) or {}
     # 出边和入边都要给：图里的边都是单向的（symptom->element->syndrome），
     # 只给出边的话「这个证候由哪些证素构成」永远查不到。
