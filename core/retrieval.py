@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -56,9 +57,19 @@ class DenseRetriever(Retriever):
         self._model = None  # 惰性加载，避免 import 阶段就下载/加载模型
         self._embeddings = None  # 惰性编码，随 _model 一起初始化
 
+    _encode_lock = threading.Lock()
+
     def _ensure_encoded(self) -> None:
+        # 冷启动时两个并发请求会各加载一份模型（几百 MB × 2）。
+        # 双重检查：锁外先判一次避免每次请求都抢锁，锁内再判一次防竞态。
         if self._model is not None:
             return
+        with self._encode_lock:
+            if self._model is not None:
+                return
+            self._load()
+
+    def _load(self) -> None:
         from sentence_transformers import SentenceTransformer
 
         self._model = SentenceTransformer("BAAI/bge-small-zh-v1.5")

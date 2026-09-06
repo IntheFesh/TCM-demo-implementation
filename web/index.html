@@ -135,7 +135,7 @@
     margin-bottom: 16px;
     white-space: pre-wrap;
   }
-  #error-box.show { display: block; }
+  #error-box.show { display: block; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; }
   #results {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -233,6 +233,7 @@
       <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
     </div>
     <div id="cy"></div>
+    <div id="graph-note" style="display:none;position:absolute;bottom:8px;left:14px;font-size:12px;color:#9a6b2f;"></div>
   </div>
 
   <div id="input-panel">
@@ -244,6 +245,7 @@
   </div>
 
   <div id="results"></div>
+  <div id="manifest-footer" style="margin:18px 0 8px;font-size:11px;color:#9a9da5;text-align:center;"></div>
 </main>
 
 <script>
@@ -263,10 +265,14 @@ function evenY(index, total) {
 function computeLayout(nodes, edges) {
   const positions = {};
   const byLayer = { 0: [], 1: [], 2: [], 3: [] };
-  for (const n of nodes) byLayer[n.data.layer].push(n);
+  for (const n of nodes) {
+    const L = Number(n.data.layer);
+    if (!byLayer[L]) byLayer[L] = [];   // 兜底：layer 不在 0-3 时不要整页崩
+    byLayer[L].push(n);
+  }
 
   // layer 0 保持原始顺序（症状顺序有语义，是 S1 抽取的顺序）
-  byLayer[0].forEach((n, i) => {
+  (byLayer[0] || []).forEach((n, i) => {
     positions[n.data.id] = { x: LAYER_X[0], y: evenY(i, byLayer[0].length) };
   });
 
@@ -275,7 +281,7 @@ function computeLayout(nodes, edges) {
   // 上下游顺序不一致时边会交叉成 X。
   const yOf = (id) => (positions[id] ? positions[id].y : null);
   for (const layer of [1]) {
-    const items = byLayer[layer];
+    const items = byLayer[layer] || [];
     const bary = new Map();
     for (const n of items) {
       const ys = [];
@@ -618,12 +624,25 @@ async function submitConsult() {
     for (const r of data.results) {
       if (r.color) PHYSICIAN_COLORS[r.physician] = r.color;
     }
+    const m = data.manifest;
+    document.getElementById("manifest-footer").textContent = m
+      ? `${m.model}　prompt ${m.prompt_version}　语料 ${m.cases_sha256 || "?"}　${m.llm_calls} 次调用　${(m.elapsed_ms / 1000).toFixed(1)}s`
+      : "";
     lastGraph = data.graph;
+    const dropped = data.graph.dropped_edges || 0;
+    const note = document.getElementById("graph-note");
+    if (dropped > 0) {
+      note.textContent = `有 ${dropped} 条推理连线因症状表述不一致未能显示`;
+      note.style.display = "block";
+    } else {
+      note.style.display = "none";
+    }
     renderDivergence(data.divergence);
     renderResults(data.results);
     renderGraph(data.graph);
   } catch (err) {
-    showError(`请求失败：${err.message || err}`);
+    console.error("consult failed:", err);
+    showError(`请求失败：${err.message || err}\n${(err.stack || "").split("\n").slice(0, 3).join("\n")}`);
   } finally {
     btn.disabled = false;
     btn.textContent = "辨证";

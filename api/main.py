@@ -17,6 +17,18 @@ WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 app = FastAPI(title="名医辨证对照 demo")
 
 
+@app.on_event("startup")
+def _warmup() -> None:
+    """启动时预热检索器，把首请求那几十秒（加载模型 + 编码 839 条医案）
+    挪到启动阶段。失败不阻塞启动——没有 cases.json 时服务仍应能起来。"""
+    try:
+        from core.retrieval import get_retriever
+
+        get_retriever()._ensure_encoded()
+    except Exception as e:  # noqa: BLE001
+        print(f"[warmup] 检索器预热跳过：{e}")
+
+
 class ConsultRequest(BaseModel):
     complaint: str
 
@@ -44,7 +56,8 @@ def api_consult(req: ConsultRequest) -> dict:
             "reject_reason": outcome["reject_reason"],
             "results": [],
             "divergence": None,
-            "graph": {"nodes": [], "edges": []},
+            "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
+            "manifest": outcome.get("manifest"),
         }
 
     results = outcome["results"]
@@ -58,6 +71,7 @@ def api_consult(req: ConsultRequest) -> dict:
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
         "graph": graph,
+        "manifest": outcome.get("manifest"),
     }
 
 
@@ -100,9 +114,15 @@ def to_graph(s1: S1Normalize, results: list[dict]) -> dict:
         seen.add(node_id)
         nodes.append({"data": {"id": node_id, **data}})
 
+    dropped: list[tuple[str, str]] = []
+
     def add_edge(source: str, target: str, **data) -> None:
         # 已知易错点：只有两端节点都已存在才建边，否则前端渲染会指向空节点。
+        # 但静默丢弃会掩盖真实故障——S2 若把 supporting_symptoms 改写了
+        # （"胃脘胀痛"->"脘腹胀痛"），边会整批消失，图上只是看起来"稀疏"，
+        # 没人发现症状层和证素层已经断开。所以要计数并上报。
         if source not in seen or target not in seen:
+            dropped.append((source, target))
             return
         edges.append({"data": {"source": source, "target": target, **data}})
 
@@ -143,15 +163,19 @@ def to_graph(s1: S1Normalize, results: list[dict]) -> dict:
             add_node(herb_id, label=herb, layer=3, phys=physician)
             add_edge(syn_id, herb_id, phys=physician)
 
-    return {"nodes": nodes, "edges": edges}
+    return {"nodes": nodes, "edges": edges, "dropped_edges": len(dropped)}
 
 
 def assert_graph_edges_valid(graph: dict) -> None:
     """断言每条边的两端节点都存在于 nodes 里。已知易错点，务必保留这个检查。"""
+    # 用 raise 不用 assert：python -O 会把 assert 整个优化掉，
+    # 这道检查就在生产模式下静默失效了。
     node_ids = {n["data"]["id"] for n in graph["nodes"]}
     for e in graph["edges"]:
-        assert e["data"]["source"] in node_ids, f"边的 source 不存在：{e}"
-        assert e["data"]["target"] in node_ids, f"边的 target 不存在：{e}"
+        if e["data"]["source"] not in node_ids:
+            raise ValueError(f"边的 source 不存在：{e}")
+        if e["data"]["target"] not in node_ids:
+            raise ValueError(f"边的 target 不存在：{e}")
 
 
 # 静态文件挂在 /app，不要挂在根路径——否则会遮蔽上面的 API 路由。

@@ -87,4 +87,4 @@ def test_consult_endpoint_returns_rejection_without_calling_to_graph(monkeypatch
     assert "柏油样便" in body["reject_reason"]
     assert body["results"] == []
     assert body["divergence"] is None
-    assert body["graph"] == {"nodes": [], "edges": []}
+    assert body["graph"] == {"nodes": [], "edges": [], "dropped_edges": 0}

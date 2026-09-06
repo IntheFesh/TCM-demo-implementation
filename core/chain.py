@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 import time
 
-from core.elements import ELEMENTS
+from core.elements import ELEMENTS, LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
 from core.physicians import PHYSICIANS
 from core.retrieval import get_retriever
@@ -132,7 +132,10 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
     s2_prompt = load_prompt("s2_elements")
     s2_system = render(
         s2_prompt["system"],
-        elements="、".join(ELEMENTS),
+        elements=(
+            f"病位证素（kind 填 location）：{'、'.join(LOCATIONS)}\n"
+            f"  病性证素（kind 填 nature）：{'、'.join(NATURES)}"
+        ),
         symptoms=symptoms_text,
         tongue=s1.tongue or "未记",
         pulse=s1.pulse or "未记",
@@ -194,7 +197,28 @@ def run_physician(
     }
 
 
+def _build_manifest(elapsed_ms: int, llm_calls: int) -> dict:
+    """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
+    竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
+    import hashlib
+    import os
+    from pathlib import Path as _P
+
+    cases_sha = None
+    cp = _P(__file__).resolve().parent.parent / "cases.json"
+    if cp.exists():
+        cases_sha = hashlib.sha256(cp.read_bytes()).hexdigest()[:12]
+    return {
+        "model": os.getenv("LLM_MODEL", "unknown"),
+        "prompt_version": "v1",
+        "cases_sha256": cases_sha,
+        "elapsed_ms": elapsed_ms,
+        "llm_calls": llm_calls,
+    }
+
+
 def consult(complaint: str) -> dict:
+    _t0 = time.time()
     s1 = normalize(complaint)
 
     # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
@@ -209,6 +233,7 @@ def consult(complaint: str) -> dict:
             "divergence": None,
             "rejected": True,
             "reject_reason": reject_reason,
+            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1),
         }
 
     s2 = infer_elements(s1)
@@ -256,6 +281,10 @@ def consult(complaint: str) -> dict:
         "divergence": divergence,
         "rejected": False,
         "reject_reason": None,
+        # S1 一次 + S2 一次 + 每位医家 S3 一次
+        "manifest": _build_manifest(
+            int((time.time() - _t0) * 1000), 2 + len(results)
+        ),
     }
 
 
