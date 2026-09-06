@@ -266,6 +266,16 @@ def test_lookup_standard_not_found_lists_candidates():
     out = lookup_standard("完全不存在的证")
     assert out["found"] is False
     assert len(out["candidates"]) == 17
+    # 结构化对象，不是拼好的 "SP-01 肝胃不和证" 字符串——实测真实模型拿到拼好的
+    # 字符串会把整串当 query 传回来，然后查不到，白烧一步。
+    assert out["candidates"][0] == {"code": "SP-01", "name": "肝胃不和证"}
+    assert "不要把两个拼在一起" in out["hint"]
+
+
+@pytest.mark.parametrize("q", ["SP-01 肝胃不和证", "SP-01肝胃不和证", "肝胃不和证（SP-01）"])
+def test_lookup_standard_accepts_code_plus_name(q):
+    """模型照抄 candidates 回传是最可能的下一步动作，两头都要堵上。"""
+    assert lookup_standard(q)["definition"]["code"] == "SP-01"
 
 
 # ---------- check_residual ----------

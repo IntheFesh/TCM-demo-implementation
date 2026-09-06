@@ -351,18 +351,31 @@ def lookup_standard(query: str) -> dict:
     defs = _load_standard()
     if not defs:
         return {"found": False, "error": f"证候定义文件不存在或为空：{STANDARD_PATH}"}
+    q = query.strip()
     for d in defs:
-        if d.get("code") == query or d.get("name") == query:
+        if d.get("code") == q or d.get("name") == q:
             return {"found": True, "definition": d}
-    partial = [d for d in defs if query in (d.get("name") or "")]
+    # 「SP-01 肝胃不和证」这种"编码+空格+名称"的写法要认。实测真实模型拿到
+    # candidates 之后正是这么回传的——第一版把 candidates 拼成 "CODE NAME" 字符串，
+    # 模型照抄回来却查不到，白烧一步。candidates 现在改成结构化对象（见下），
+    # 这里再兜一层，两头都堵上。
+    for d in defs:
+        code, name = d.get("code") or "", d.get("name") or ""
+        if q in (f"{code} {name}", f"{code}{name}", f"{name}（{code}）"):
+            return {"found": True, "definition": d, "note": "按「编码+名称」的合写形式匹配"}
+    partial = [d for d in defs if q in (d.get("name") or "")]
     if len(partial) == 1:
         return {"found": True, "definition": partial[0], "note": "按名称部分匹配到唯一一条"}
     return {
         "found": False,
         "query": query,
-        # 查不到时给出全部候选名：模型下一步能直接改用正确的名字重查，
-        # 比只回一句"未找到"有用得多。
-        "candidates": [f"{d.get('code')} {d.get('name')}" for d in (partial or defs)],
+        # 查不到时给出候选：模型下一步能直接改用正确的名字重查，比只回一句
+        # "未找到"有用得多。给结构化对象而不是拼好的字符串——拼成
+        # "SP-01 肝胃不和证" 会诱导模型把整串当 query 传回来。
+        "candidates": [
+            {"code": d.get("code"), "name": d.get("name")} for d in (partial or defs)
+        ],
+        "hint": "用 candidates 里的 code 或 name 之一重查，不要把两个拼在一起。",
     }
 
 
