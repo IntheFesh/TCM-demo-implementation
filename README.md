@@ -220,8 +220,11 @@ USE_REACT=1 ./run.sh          # 或 uvicorn api.main:app --reload
   直接吐结论，等于把防幻觉校验搬进一个更长更容易跑偏的上下文里。
 - **不开 ReAct 时 S3 的提示词跟改造前逐字节一致**，所以 `use_react` 开/关可以
   直接做 A/B，不会混进 prompt 变化这个额外变量。
-- **代价是调用数**。每位医家多花 1–5 次调用，`manifest.llm_calls` 会如实计入，
-  `manifest.use_react` 记这次开没开。拿调用数算成本时看这两个字段。
+- **代价是调用数，而且实测是确定的 MAX_STEPS 次，不是"1–5 次"**。6 轮真实冒烟
+  里没有一轮提前收尾（预算 5 步就在第 5 步 finish，预算 3 步就撞 max_steps）。
+  两位医家开 ReAct，S3 阶段从 2 次调用变成 12 次。`manifest.llm_calls` 会如实
+  计入，`manifest.use_react` 记这次开没开——拿调用数算成本时看这两个字段，
+  别按"上限"估。详见 `data/SOURCES.md` 第 11 条。
 - 结束原因分五种记在 `react_trace.terminated_by`：`finish`（模型自己判断够了）、
   `ask_user`（它要追问）、`max_steps`（撞上限）、`no_progress`（连续重复同一个
   调用）、`error`（LLM 调用失败）。**撞 max_steps 不等于正常结束**——它说明
