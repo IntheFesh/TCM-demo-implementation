@@ -251,6 +251,17 @@ def test_generate_injects_schema_into_system():
     assert "JSON Schema" in system_msg
 
 
+def test_generate_pins_field_names_in_schema_hint():
+    """字段名约束加在 schema hint 里（一处覆盖四个 prompt），不加在各个 yaml 里
+    ——yaml 里的手写示例会跟 schemas.py 漂移，schema hint 是自动导出的不会。"""
+    b = ScriptedBackend(['{"ok":true,"note":"n"}'])
+    b.generate("业务提示词", "usr", Tiny)
+    system_msg = b.calls[0][0]["content"]
+    assert "字段名必须与上述 schema 完全一致" in system_msg
+    # 括号里的例子来自实测失败模式，是文档也是约束，别删
+    assert "element" in system_msg and "name" in system_msg
+
+
 # ---------- CLI 错误路径（规则 6/7：不吞异常，完整带出上下文） ----------
 
 def _fake_run_factory(returncode=0, stdout="", stderr=""):

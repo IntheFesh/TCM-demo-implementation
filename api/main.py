@@ -119,6 +119,8 @@ def _serialize_result(r: dict) -> dict:
         "s3": r["s3"].model_dump(),
         "refs": r["refs"],
         "hallucinated": r["hallucinated"],
+        # X2 输出侧安全校验结果，前端据此挂红/黄标签
+        "safety_output": r.get("safety_output"),
     }
 
 

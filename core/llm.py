@@ -98,10 +98,17 @@ class LLMBackend(ABC):
         校验错误一起回灌，要求模型修正。实测这一步是必要的——换模型时字段名
         猜错（比如把 element 写成 name）靠这一轮就能纠正。
         """
+        # 字段名那一句是实测来的：裸 prompt（不注入 schema）下模型 3/3 把
+        # ElementHit.element 写成 name。注入 schema 后 3/3 一次过，所以这句是
+        # 加固不是救命。放在 schema 后面而不是写进各个 prompt 的 yaml：
+        # schema 从 pydantic 自动导出，永远不会跟 schemas.py 漂移；写进 yaml 的
+        # 手写示例会——改了字段名而忘了同步 yaml，示例反而会误导模型。
         schema_hint = (
             f"\n\n你的回答必须是且只能是一个符合以下 JSON Schema 的 JSON 对象，"
             f"不要输出任何解释、前后缀或 markdown 围栏，只输出 JSON 本身：\n"
-            f"{schema.model_json_schema()}"
+            f"{schema.model_json_schema()}\n"
+            f'字段名必须与上述 schema 完全一致，不要改写、不要用同义词'
+            f'（例如 schema 里是 "element" 就不能写成 "name"）。'
         )
         messages = [
             {"role": "system", "content": system + schema_hint},

@@ -14,14 +14,19 @@ S1 必须只跑一次：如果对每位医家各跑一次，两次输出的症�
 """
 from __future__ import annotations
 
-import re
 import time
 
+from core import herbs as _herbs
 from core.elements import ELEMENTS, LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
 from core.physicians import PHYSICIANS
 from core.retrieval import get_retriever
 from core.safety import check_safety
+from core.safety_output import (
+    check_incompatible,
+    check_thermal_consistency,
+    format_conflicts,
+)
 from core.schemas import CaseRecord, S1Normalize, S2Elements, S3Syndrome
 
 # 检索相似度下限。实测正常匹配在 0.85-0.90，低于 0.70 基本是"库里没有相关案子"，
@@ -37,54 +42,11 @@ RESIDUAL_THRESHOLD = 0.30
 RESIDUAL_MAX_ROUNDS = 1
 
 
-_PAREN_RE = re.compile(r"[（(][^）)]*[）)]")
-_DOSE_RE = re.compile(r"[一二三四五六七八九十百半\d.]+(?:钱|两|分|克|g|枚|片|条|支|具|个|茶匙|杯)\s*$")
-
-# 炮制前缀/后缀：同一味药在不同医家笔下写法不同（广皮=陈皮、炙草=炙甘草），
-# 不归一的话药物集合比对会把同一味药算成两味，Jaccard 被系统性推高——
-# 实测出现过两边实际用药大量重合、Jaccard 却算成 1.0 的情况。
-_HERB_AFFIX = re.compile(r"^(炒|焦|生|制|炙|姜|酒|醋|盐|煨|煅|蜜|清|净|广|川|云|北|南|东|西)+")
-_HERB_SUFFIX = re.compile(r"(汁|炭|末|粉|片|块|皮尖)$")
-
-HERB_ALIASES: dict[str, str] = {
-    "广皮": "陈皮", "橘皮": "陈皮", "新会皮": "陈皮",
-    "炙草": "甘草", "炙甘草": "甘草", "生甘草": "甘草", "粉甘草": "甘草",
-    "云苓": "茯苓", "白苓": "茯苓", "茯苓块": "茯苓", "茯苓皮": "茯苓", "赤苓": "茯苓",
-    "川连": "黄连", "真云连": "黄连", "山连": "黄连", "雅连": "黄连",
-    "北沙参": "沙参", "南沙参": "沙参",
-    "白扁豆": "扁豆", "生扁豆": "扁豆",
-    "半夏曲": "半夏", "姜半夏": "半夏", "制半夏": "半夏", "法半夏": "半夏",
-    "小枳实": "枳实", "淡吴萸": "吴茱萸", "吴萸": "吴茱萸",
-    "老浓朴": "厚朴", "浓朴": "厚朴",
-    "焦六曲": "神曲", "六曲": "神曲", "建曲": "神曲",
-    "焦山楂": "山楂", "生山楂": "山楂",
-    "潞党参": "党参", "台党参": "党参",
-    "冬术": "白术", "於术": "白术",
-}
-
-
-def normalize_herb(herb: str) -> str:
-    """把药名归一到可比对的形式：剥括号注释、剥剂量、查别名表、剥炮制前后缀。
-
-    顺序重要：先剥括号（"旋覆花二钱（包煎）"的括号在剂量之后，
-    不先剥掉的话 $ 锚点匹配不到剂量），再剥剂量，最后才做别名归一。
-    """
-    s = _PAREN_RE.sub("", herb).strip()
-    s = _DOSE_RE.sub("", s).strip()
-    if not s:
-        return ""
-    if s in HERB_ALIASES:
-        return HERB_ALIASES[s]
-    stripped = _HERB_SUFFIX.sub("", _HERB_AFFIX.sub("", s)).strip()
-    if stripped in HERB_ALIASES:
-        return HERB_ALIASES[stripped]
-    # 剥完只剩一个字多半剥过头了（"生姜"->"姜"），保留原形
-    return stripped if len(stripped) >= 2 else s
-
-
-def strip_dose(herb: str) -> str:
-    """保留旧名，内部走 normalize_herb。"""
-    return normalize_herb(herb)
+# 药名归一挪到 core/herbs.py 了：core/safety_output.py 也要用它，留在这里会
+# 造成 chain ↔ safety_output 循环导入。这里 re-export，老调用方不受影响。
+HERB_ALIASES = _herbs.HERB_ALIASES
+normalize_herb = _herbs.normalize_herb
+strip_dose = _herbs.strip_dose
 
 
 def _format_case_line(case: CaseRecord) -> str:
@@ -191,6 +153,26 @@ def run_physician(
     )
     s3: S3Syndrome = get_llm().generate(system=s3_system, user="", schema=S3Syndrome)
 
+    # X2 输出侧安全：十八反十九畏命中就把冲突写进 prompt 重开一次。
+    # 只重开一次、不循环——循环会让 llm_calls 变成不可预测的数，
+    # manifest 里那个调用数就没法用来算成本和比较配置了。
+    incompatible = check_incompatible(s3.herbs)
+    revised = False
+    if incompatible:
+        retry_system = s3_system + (
+            f"\n\n【配伍禁忌】上一次拟的方中存在中药十八反十九畏配伍禁忌："
+            f"{format_conflicts(incompatible)}。请重新拟方避开这些配伍，"
+            "其余要求不变。"
+        )
+        s3 = get_llm().generate(system=retry_system, user="", schema=S3Syndrome)
+        revised = True
+        # 重开之后再查一次：还有冲突就保留结果并如实标出来，不再重开。
+        incompatible = check_incompatible(s3.herbs)
+
+    # 寒热一致性只警告不打回（寒热错杂本来就寒热并用，打回会改坏正确的方子）
+    thermal_warning = check_thermal_consistency(s3.syndrome, s3.herbs)
+
+    # 幻觉检查要放在可能的重开之后——查的是最终留下的那版方子
     ref_ids = {r["case_id"] for r in refs}
     hallucinated = [cid for cid in s3.cited_case_ids if cid not in ref_ids]
 
@@ -201,6 +183,11 @@ def run_physician(
         "s3": s3,
         "refs": refs,
         "hallucinated": hallucinated,
+        "safety_output": {
+            "incompatible": incompatible,
+            "thermal_warning": thermal_warning,
+            "revised": revised,
+        },
     }
 
 
@@ -371,9 +358,15 @@ def consult(complaint: str) -> dict:
         "insufficient": False,
         "insufficient_reason": None,
         "coverage": round(coverage, 3),
-        # S1 一次 + S2 一次 + 每位医家 S3 一次
+        # S1 一次 + S2 一次 + 每位医家 S3 一次 + 残差一次 + 配伍禁忌重开若干次。
+        # 重开必须计进来：漏算的话 manifest 报的调用数会低于实际花费，
+        # 拿它算成本或比配置就都是错的。
         "manifest": _build_manifest(
-            int((time.time() - _t0) * 1000), 2 + len(results) + (1 if residual else 0)
+            int((time.time() - _t0) * 1000),
+            2
+            + len(results)
+            + (1 if residual else 0)
+            + sum(1 for r in results if r["safety_output"]["revised"]),
         ),
     }
 

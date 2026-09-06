@@ -174,6 +174,31 @@
     margin: 8px 0;
     font-weight: 600;
   }
+  /* X2 输出侧安全校验：配伍禁忌红、寒热警告黄、已修正小字 */
+  .safety-incompatible {
+    background: #fdecea;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 8px 0;
+    font-weight: 600;
+  }
+  .safety-thermal {
+    background: #fff4e5;
+    border: 1px solid #d18b00;
+    color: #8a5a00;
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 8px 0;
+  }
+  .safety-revised {
+    font-size: 12px;
+    color: var(--muted, #666);
+    margin: 4px 0 0;
+  }
   details {
     margin-top: 10px;
     border-top: 1px dashed var(--border);
@@ -754,6 +779,19 @@ function cardHtml(result) {
     ? `<div class="hallucination-warning">⚠ 检测到可能的幻觉引用：模型引用了检索结果之外的医案 id（${result.hallucinated.join("、")}），请勿采信该结论中的引用。</div>`
     : "";
 
+  // X2：incompatible 非空说明重开一次之后仍有禁忌，这时红标签必须显示——
+  // 它代表"系统尝试修正但没修好"，比没检查更需要让人看到。
+  const so = result.safety_output || {};
+  const incompatibleHtml = so.incompatible && so.incompatible.length > 0
+    ? `<div class="safety-incompatible">⚠ 配伍禁忌：${so.incompatible.map(p => `${escapeHtml(p[0])} 反/畏 ${escapeHtml(p[1])}`).join("；")}</div>`
+    : "";
+  const thermalHtml = so.thermal_warning
+    ? `<div class="safety-thermal">⚠ ${escapeHtml(so.thermal_warning)}</div>`
+    : "";
+  const revisedHtml = so.revised
+    ? `<div class="safety-revised">已因配伍禁忌自动重开一次方</div>`
+    : "";
+
   return `
     <div class="card">
       <h2 style="color:${color}">${result.physician_name}</h2>
@@ -761,6 +799,9 @@ function cardHtml(result) {
       <div class="field"><b>治法</b>${escapeHtml(s3.treatment_principle)}</div>
       <div class="field"><b>方剂</b>${escapeHtml(s3.formula || "（未明确）")}</div>
       <div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>
+      ${incompatibleHtml}
+      ${thermalHtml}
+      ${revisedHtml}
       ${hallucinationHtml}
       <details>
         <summary>推理过程与引用详情</summary>
