@@ -14,6 +14,17 @@ class FakeLLM:
         self.calls: list[str] = []
         self._current_physician: str | None = None
 
+    # manifest 现在从后端问模型名/后端名（不再读 LLM_MODEL 环境变量），
+    # 假后端要跟着实现这三个方法，否则 _build_manifest 会 AttributeError。
+    def model_name(self) -> str:
+        return "fake-model"
+
+    def backend_id(self) -> str:
+        return "fake"
+
+    def comparability_warning(self) -> str | None:
+        return "后端：fake（离线测试用），不产生任何可用于报告的数字。"
+
     def generate(self, system: str, user: str, schema, temperature: float = 0.0, **kwargs):
         self.calls.append(schema.__name__)
         if schema is S1Normalize:

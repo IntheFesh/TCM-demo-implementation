@@ -208,15 +208,21 @@ def _build_manifest(elapsed_ms: int, llm_calls: int) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
     import hashlib
-    import os
     from pathlib import Path as _P
 
     cases_sha = None
     cp = _P(__file__).resolve().parent.parent / "cases.json"
     if cp.exists():
         cases_sha = hashlib.sha256(cp.read_bytes()).hexdigest()[:12]
+
+    # model 从后端问，不从 LLM_MODEL 环境变量读：claude_cli 后端下那个变量
+    # 还是 deepseek-chat，照抄就等于把 Claude 跑的结果标成 DeepSeek 跑的。
+    llm = get_llm()
     return {
-        "model": os.getenv("LLM_MODEL", "unknown"),
+        "model": llm.model_name(),
+        "backend": llm.backend_id(),
+        # 非默认后端时非 None。带着走，报告里就不会漏标"这个数不可比"。
+        "comparability_warning": llm.comparability_warning(),
         "prompt_version": "v1",
         "cases_sha256": cases_sha,
         "elapsed_ms": elapsed_ms,
