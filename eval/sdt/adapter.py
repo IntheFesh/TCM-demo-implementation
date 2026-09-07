@@ -75,7 +75,25 @@ def filter_valid_options(chosen: list[str], options: dict[str, str]) -> list[str
     正确集合里的字母只会增加 wrong_count、拉低分母，一个根本不存在的选项
     永远不可能是对的。丢掉它是格式修正，不是挑答案。**有效字母一个都不丢。**
     """
-    valid = {c.strip().upper() for c in chosen if c and c.strip().upper() in options}
+    import re
+
+    valid: set[str] = set()
+    text_to_key = {v: k for k, v in options.items()}
+    for raw in chosen:
+        if not raw:
+            continue
+        # 模型常把几个字母塞进一个元素（"A;B"、"A、B"、"AB"）或者回选项文本而不是字母。
+        # 原来只认"整个元素恰好等于一个字母"，这些情况会被静默丢成空、该题记 0 分。
+        for piece in re.split(r"[;；,，、/\s]+", raw.strip()):
+            if not piece:
+                continue
+            key = piece.split(":")[0].split("：")[0].strip().upper()
+            if key in options:
+                valid.add(key)
+            elif piece in text_to_key:
+                valid.add(text_to_key[piece])
+            elif re.fullmatch(r"[A-Za-z]{2,}", piece):
+                valid.update(ch for ch in piece.upper() if ch in options)
     return sorted(valid)
 
 

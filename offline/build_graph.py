@@ -128,12 +128,23 @@ def build_graph(defs: list[SyndromeDefinition]) -> NetworkXStore:
     return store
 
 
-# 语料库（data/ye_tianshi、data/wu_jutong）的门类关键词，用来检查
-# syndromes.jsonl 有没有覆盖到语料库实际涉及的病症范围。
-CORPUS_GATE_KEYWORDS = [
-    "肿胀", "痰饮", "木乘土", "噎膈反胃", "呕吐", "泄泻",
-    "便血", "吐血", "痞", "胃痛", "积聚",
-]
+# 语料库门类关键词，用来检查 syndromes.jsonl 有没有覆盖到语料库实际涉及的病症范围。
+# **从 split_cases.BOOKS 的 gates 派生，不再手抄一份**：手抄的那份已经漂移过——含两本书
+# 都没有的门类、缺吴鞠通的「滞下/噎/反胃」和张锡纯的全部门类，覆盖检查报的不是真实
+# 语料范围。便血/吐血单独保留：它们对应 tests/queries.txt 里安全否决那条测试主诉。
+def _corpus_gate_keywords() -> list[str]:
+    from offline.split_cases import BOOKS
+
+    seen: dict[str, None] = {}
+    for cfg in BOOKS.values():
+        for g in cfg["gates"]:
+            seen.setdefault(g, None)
+    for extra in ("便血", "吐血"):
+        seen.setdefault(extra, None)
+    return list(seen)
+
+
+CORPUS_GATE_KEYWORDS = _corpus_gate_keywords()
 
 
 def check_corpus_coverage(

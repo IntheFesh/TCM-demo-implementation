@@ -253,12 +253,19 @@ def test_query_case_graph_survives_bad_lines(tmp_path, monkeypatch):
 
 # ---------- search_cases ----------
 
-def test_search_cases_without_corpus_is_unavailable_not_crash():
+def test_search_cases_without_corpus_is_unavailable_not_crash(monkeypatch):
+    """检索器不可用要变成 available=false，不能崩。用 monkeypatch 固定这个条件：
+    原来直接调 get_retriever()，在有 cases.json 的机器上（HANDOFF 步骤 2 之后）会
+    在 pytest 里真的加载 sentence-transformers、下载模型。"""
+    import core.retrieval as retrieval
+
+    def _no_corpus():
+        raise FileNotFoundError("未找到 cases.json。请先运行 offline.extract_cases")
+
+    monkeypatch.setattr(retrieval, "get_retriever", _no_corpus)
     out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
-    # 这个环境没有 cases.json；有的话就该正常返回
-    assert out.get("available") in (True, False)
-    if out["available"] is False:
-        assert "cases.json" in out["note"]
+    assert out["available"] is False
+    assert "cases.json" in out["note"]
 
 
 # ---------- lookup_standard ----------
@@ -605,3 +612,60 @@ def test_fallback_entries_have_no_fake_numbers(monkeypatch, tmp_path):
 
 def test_min_information_gain_is_a_small_positive_threshold():
     assert 0 < MIN_INFORMATION_GAIN < 1e-3
+
+
+# ---------- 审查修复 ----------
+
+def test_run_tool_turns_tool_exceptions_into_error_dicts(monkeypatch):
+    """工具内部的意外（模型加载失败、文件坏行）不能炸掉整条 ReAct/consult。"""
+    def boom(**kw):
+        raise RuntimeError("模型加载失败")
+
+    monkeypatch.setattr(TOOLS["lookup_standard"], "fn", boom) if False else None
+    spec = TOOLS["lookup_standard"]
+    monkeypatch.setitem(TOOLS, "lookup_standard", type(spec)(
+        name=spec.name, description=spec.description, input_schema=spec.input_schema, fn=boom))
+    out = run_tool("lookup_standard", {"query": "x"})
+    assert "error" in out and "模型加载失败" in out["error"]
+
+
+def test_query_case_graph_skips_non_object_rows_and_rows_without_source_span(tmp_path, monkeypatch):
+    path = tmp_path / "t.jsonl"
+    path.write_text("\n".join([
+        json.dumps({"case_id": "a", "physician": "ye_tianshi", "s": "脘痛", "p": "治以", "o": "疏肝",
+                    "source_span": "原文"}, ensure_ascii=False),
+        "[1, 2]",
+        json.dumps({"case_id": "b", "physician": "ye_tianshi", "s": "脘痛", "p": "治以", "o": "疏肝"},
+                   ensure_ascii=False),  # 缺 source_span
+        json.dumps({"case_id": "c", "physician": "ye_tianshi", "s": "", "p": "x", "o": "",
+                    "source_span": "原文"}, ensure_ascii=False),  # 主宾都空
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(tools, "CASE_TRIPLES_PATH", path)
+    tools.reset_tool_caches()
+    out = query_case_graph(symptom="脘痛")
+    assert out["available"] is True
+    assert [t["case_id"] for t in out["triples"]] == ["a"]
+    assert "无法解析" in out["note"] and "缺 source_span" in out["note"]
+
+
+def test_query_graph_resolves_unique_partial_syndrome_name():
+    """lookup_standard 认「胃阴虚」→「胃阴虚证」，query_graph 也必须认，
+    否则同一个词两个工具给出相反答案（CLAUDE.md 第三次撞墙）。"""
+    assert query_graph("胃阴虚")["found"] is True
+    assert query_graph("胃阴虚")["name"] == "胃阴虚证"
+
+
+def test_generic_fragments_do_not_match_everything():
+    """「疼痛」「胀痛」单独不指向任何具体症状；否则任何含「疼痛」的主诉都会命中
+    三条胃脘疼痛节点。"""
+    store = tools.get_graph_store()
+    names = {store.get_node(i)["name"] for i in tools._match_graph_symptoms(store, "头痛剧烈疼痛")}
+    assert not {n for n in names if "胃脘" in n or "脘腹" in n}
+    # 带部位的片段仍然要能匹配
+    assert "胃脘胀满或疼痛" in {store.get_node(i)["name"] for i in tools._match_graph_symptoms(store, "胃脘胀满")}
+
+
+def test_posterior_and_candidates_use_the_same_physician_weights():
+    a = syndrome_posterior(["胃", "肝"], physician="ye_tianshi")
+    b = syndrome_posterior(["胃", "肝"], physician="wu_jutong")
+    assert set(a) == set(b)  # λ1≡0 时两者数值相同；这里钉的是参数能传进去且不崩

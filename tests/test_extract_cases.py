@@ -189,3 +189,41 @@ def test_visit_total_cross_validation_triggers_independently(tmp_path, monkeypat
     assert w["regex_count"] == 4
     # patient_count 这一项应该是一致的（LLM=1 vs head_hints=1），不该出现
     assert not any(w["seg_id"] == "wu_jutong-0005" and w["check"] == "patient_count" for w in warnings)
+
+
+def test_main_prints_visit_index_dup_warning_without_keyerror(tmp_path, monkeypatch, capsys):
+    """check_visit_index_dup 的告警没有 llm_count/regex_count；原来 main() 直接下标，
+    第一条这种告警就 KeyError，整批结果丢失、cases.json 写不出来。"""
+    import json
+    from offline import extract_cases as ec
+    from core.schemas import CaseRecord
+
+    seg = tmp_path / "data" / "ye_tianshi" / "ye_tianshi-0001.json"
+    seg.parent.mkdir(parents=True)
+    seg.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(ec, "DATA_ROOT", tmp_path / "data")
+    monkeypatch.setattr(ec, "OUT_PATH", tmp_path / "cases.json")
+    monkeypatch.setattr(ec, "WARNINGS_PATH", tmp_path / "warnings.json")
+    rec = CaseRecord(case_id="ye_tianshi-0001-p0-0", case_group_id="ye_tianshi-0001-p0",
+                     physician="ye_tianshi", raw="x")
+    monkeypatch.setattr(ec, "extract_one", lambda p: ([rec], [
+        {"seg_id": "ye_tianshi-0001", "check": "visit_index_dup", "patient": 0, "n_visits": 2,
+         "note": "visit_index 重复"}]))
+    ec.main([])
+    assert (tmp_path / "cases.json").exists()
+    assert "visit_index_dup" in capsys.readouterr().out
+
+
+def test_cross_validate_uses_structural_count_when_present():
+    """张锡纯的粗段带 structural_patient_count；对它 head_hints 无效，必须用结构性判据，
+    且不做 visit_total 校验。"""
+    from offline.extract_cases import cross_validate
+    from core.schemas import CaseSequence, SegmentPatients, VisitStructured
+
+    seg = {"seg_id": "zhang_xichun-0001", "head_hints": [], "follow_hints": [1, 2, 3, 4],
+           "structural_patient_count": 1}
+    one = SegmentPatients(patients=[CaseSequence(visits=[VisitStructured()])])
+    assert cross_validate(seg, one) == []
+    two = SegmentPatients(patients=[CaseSequence(visits=[VisitStructured()]),
+                                    CaseSequence(visits=[VisitStructured()])])
+    assert [w["check"] for w in cross_validate(seg, two)] == ["patient_count"]

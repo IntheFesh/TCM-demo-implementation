@@ -111,6 +111,7 @@ python -m offline.split_cases --books-dir books
 ```bash
 cp out/ye_tianshi/*.json data/ye_tianshi/
 cp out/wu_jutong/*.json data/wu_jutong/
+mkdir -p data/zhang_xichun && cp out/zhang_xichun/*.json data/zhang_xichun/   # 下载了 584 才有
 ```
 
 跟目录里已有的 30+30 个 `.txt` 共存没有问题——下一步的抽取脚本只认 `.json`。

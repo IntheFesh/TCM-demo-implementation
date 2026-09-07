@@ -155,3 +155,15 @@ def test_missing_book_is_skipped_not_a_crash(tmp_path):
     assert not (tmp_path / BOOKS["ye_tianshi"]["src"]).exists()
     # main 里的跳过分支靠 src.exists() 判断，这里直接验证判断依据成立即可
     assert all("src" in cfg for cfg in BOOKS.values())
+
+
+def test_toc_case_segments_drop_structure_marker_lines_and_carry_structural_count(tmp_path):
+    from offline import split_cases
+
+    book = tmp_path / "584-医学衷中参西录.txt"
+    book.write_bytes(ZHANG_SAMPLE.encode("gb18030"))
+    cfg = dict(src=book.name, gates=["肠胃病"], strategy="toc_case", toc_prefix="五、医案")
+    segs = split_cases.collect_segments("zhang_xichun", cfg, books_dir=str(tmp_path))
+    for s in segs:
+        assert "<篇名>" not in s["text"]
+        assert s["structural_patient_count"] == 1

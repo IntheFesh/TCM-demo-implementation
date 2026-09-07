@@ -4,6 +4,8 @@
 import pytest
 
 from core.safety_output import (
+    COLD_HERBS,
+    HOT_HERBS,
     INCOMPATIBLE_PAIRS,
     SHIBAFAN,
     SHIJIUWEI,
@@ -182,3 +184,35 @@ def test_thermal_check_normalizes_herb_names():
 def test_format_conflicts():
     assert format_conflicts([("甘草", "海藻"), ("人参", "五灵脂")]) == \
         "甘草 与 海藻、人参 与 五灵脂"
+
+
+# ---------- 审查修复 ----------
+
+def test_thermal_tables_only_contain_normalized_names():
+    """表里每一项归一后必须等于自身。「生地黄」曾在表里却永远匹配不上——
+    normalize_herb 把「生」剥掉得到「地黄」，表里没有。"""
+    from core.herbs import normalize_herb
+
+    assert [h for h in COLD_HERBS | HOT_HERBS if normalize_herb(h) != h] == []
+
+
+def test_shengdi_counts_as_cold():
+    from core.safety_output import COLD_HERBS  # noqa: F401  (确保导入路径一致)
+
+    w = check_thermal_consistency("脾胃虚寒证", ["生地黄", "黄连", "黄芩", "栀子", "白术", "茯苓"])
+    assert w is not None and "4 味" in w
+
+
+def test_majority_is_relative_to_formula_size():
+    """4 味的方 3 味寒药已经过半；原来阈值写死 3，短方永远触发不了。"""
+    assert check_thermal_consistency("脾胃虚寒证", ["黄连", "黄芩", "栀子", "白术"]) is not None
+    assert check_thermal_consistency("脾胃虚寒证", ["黄连", "黄芩", "白术", "茯苓"]) is None
+
+
+@pytest.mark.parametrize("a,b", [
+    ("熟附子", "姜半夏"), ("附片", "浙贝母"), ("生草", "海藻"), ("粉草", "甘遂"),
+    ("藜芦", "元参"), ("川乌", "白芨"), ("栝蒌", "制附子"), ("花粉", "草乌"), ("象贝", "附子"),
+])
+def test_case_record_spellings_still_trigger_incompatibility(a, b):
+    """医案原文里实际出现、S3 模仿医家风格时很可能照写的别名。"""
+    assert check_incompatible([a, b]) != [], f"{a} 与 {b} 漏检"

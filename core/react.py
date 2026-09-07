@@ -91,6 +91,7 @@ def run_react(
     seen: dict[str, int] = {}
     consecutive_dupes = 0
     llm_calls = 0
+    retrieved: list[str] = []
 
     for step in range(1, max_steps + 1):
         system = render(
@@ -111,7 +112,7 @@ def run_react(
                 observation="", note=f"LLM 调用失败：{e}",
             ))
             llm_calls += 1
-            return ReActTrace(steps=records, terminated_by="error", llm_calls=llm_calls)
+            return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="error", llm_calls=llm_calls)
 
         action = out.action.strip()
 
@@ -120,16 +121,24 @@ def run_react(
                 step=step, thought=out.thought, action=FINISH_ACTION,
                 observation="（模型判断证据已足够，结束取证）",
             ))
-            return ReActTrace(steps=records, terminated_by="finish", llm_calls=llm_calls)
+            return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="finish", llm_calls=llm_calls)
 
         if action == ASK_ACTION:
             result = run_tool(ASK_ACTION, out.action_input)
+            if "error" in result:
+                # 参数不合法（漏了 reason 之类）跟别的工具一样回灌纠正，不能以
+                # ask_user 收尾——那样 terminated_by="ask_user" 却没有问题可问。
+                records.append(ReActStepRecord(
+                    step=step, thought=out.thought, action=ASK_ACTION,
+                    action_input=out.action_input, observation=_observation_text(result),
+                    note="参数不合法",
+                ))
+                continue
             records.append(ReActStepRecord(
                 step=step, thought=out.thought, action=ASK_ACTION,
                 action_input=out.action_input, observation=_observation_text(result),
             ))
-            return ReActTrace(
-                steps=records, terminated_by="ask_user",
+            return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="ask_user",
                 pending_question=result.get("question"), llm_calls=llm_calls,
             )
 
@@ -158,21 +167,22 @@ def run_react(
             ))
             if consecutive_dupes >= 2:
                 # 连着两次原地打转就停：再问下去只会烧调用次数。
-                return ReActTrace(
-                    steps=records, terminated_by="no_progress", llm_calls=llm_calls
+                return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="no_progress", llm_calls=llm_calls
                 )
             continue
         consecutive_dupes = 0
         seen[key] = step
 
         result = run_tool(action, out.action_input)
+        if action == "search_cases":
+            retrieved.extend(c.get("case_id") for c in result.get("cases", []) if c.get("case_id"))
         records.append(ReActStepRecord(
             step=step, thought=out.thought, action=action,
             action_input=out.action_input, observation=_observation_text(result),
             note="参数不合法" if "error" in result else None,
         ))
 
-    return ReActTrace(steps=records, terminated_by="max_steps", llm_calls=llm_calls)
+    return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="max_steps", llm_calls=llm_calls)
 
 
 def format_trace_for_s3(trace: ReActTrace) -> str:
@@ -190,8 +200,10 @@ def format_trace_for_s3(trace: ReActTrace) -> str:
             continue
         args = json.dumps(r.action_input, ensure_ascii=False)
         lines.append(f"- {r.action}({args}) → {r.observation}")
+    if trace.pending_question and trace.pending_answer:
+        lines.append(f"- 向患者追问「{trace.pending_question}」→ 患者答：{trace.pending_answer}")
     lines.append(
-        "注意：cited_case_ids 仍然只能引用上面「参考医案」里给出的 id，"
-        "取证过程里出现的其他 id 不算。"
+        "注意：cited_case_ids 只能引用上面「参考医案」里给出的 id，"
+        "以及取证过程中 search_cases 实际返回过的 id；其他地方出现的 id 不算。"
     )
     return "\n".join(lines)

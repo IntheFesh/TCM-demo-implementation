@@ -40,10 +40,10 @@ if [ -n "$RESPLIT_BOOKS_DIR" ]; then
   echo "  评分/配额挑选，对命中门类的正文无条件切出全部粗段，见 data/SOURCES.md 第 7 节第 8 条）"
   python -m offline.split_cases --stats-only --books-dir "$RESPLIT_BOOKS_DIR"
   python -m offline.split_cases --books-dir "$RESPLIT_BOOKS_DIR"
-  echo "已写出 out/ye_tianshi/、out/wu_jutong/（粗段 .json，还不是最终病人级案例）。"
+  echo "已写出 out/ye_tianshi/、out/wu_jutong/、out/zhang_xichun/（粗段 .json，还不是最终病人级案例；缺书的医家会被跳过）。"
   echo "extract_cases.py 读的是 data/{physician}/*.json——把粗段挪过去（跟现有 .txt"
   echo "共存没问题，extract_cases.py 只看 .json），确认没问题后手动执行："
-  echo "  cp out/ye_tianshi/*.json data/ye_tianshi/ && cp out/wu_jutong/*.json data/wu_jutong/"
+  echo "  for p in ye_tianshi wu_jutong zhang_xichun; do mkdir -p data/\$p && cp out/\$p/*.json data/\$p/; done"
 else
   echo "未传 --resplit-data，跳过（data/ 下已有 R1 阶段切好的候选案原文 .txt，"
   echo "但 extract_cases.py 现在认的是 .json 粗段——数据准备详见 README「数据准备」一节）"

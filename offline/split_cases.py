@@ -175,7 +175,12 @@ def collect_segments(pid, cfg, books_dir=".", max_len=1500):
         # 劈成两段，正是 chunk_chapter 文档里警告的"宁可粘连不可切碎"的反面。
         # 实测 137 案里最长 1858 字、中位 751 字，整块喂模型没有压力。
         secs = sections_by_toc(text, cfg["gates"], cfg["toc_prefix"])
-        chunks = [body.split("\n") for _, body in secs]
+        # 不走 chunk_chapter，TAIL 规则（丢弃 <篇名>/<目录>/编者按语行）要在这里补上，
+        # 否则 43 段每段正文第一行都是 "<篇名>1．……" 这种结构标记
+        chunks = [
+            [l for l in body.split("\n") if not TAIL.match(l.strip())]
+            for _, body in secs
+        ]
     elif cfg.get("concat_gates"):
         secs = sections(text, cfg["gates"])
         combined = "\n".join(body for _, body in secs)
@@ -191,14 +196,19 @@ def collect_segments(pid, cfg, books_dir=".", max_len=1500):
         t = clean(lines)
         if not t:
             continue
-        segments.append({
+        seg = {
             "seg_id": f"{pid}-{i:04d}",
             "physician": pid,
             "text": t,
             "char_len": len(t),
             "head_hints": find_head_hints(t),
             "follow_hints": find_follow_hints(t),
-        })
+        }
+        if cfg.get("strategy") == "toc_case":
+            # 原文自带的病人数判据，交给 extract_cases 的交叉校验用——head_hints
+            # 对这本书无效（见 print_segment_stats 里的说明）
+            seg["structural_patient_count"] = t.count(PATIENT_MARKER)
+        segments.append(seg)
     return segments
 
 

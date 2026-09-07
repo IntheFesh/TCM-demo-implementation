@@ -64,3 +64,38 @@ def test_sample_meta_carries_physician_and_case_id():
         assert s["meta"]["physician_id"] == "ye_tianshi"
         assert s["meta"]["case_id"] == "ye_tianshi-001"
         assert s["meta"]["copyright_status"] == "public_domain"
+
+
+# ---------- 审查修复：T7 的输入必须是这一诊的原文 ----------
+
+def _visit(case_group_id, visit_index, raw_excerpt=None, raw="整段粗段原文，两个病人共享"):
+    from core.schemas import CaseRecord
+
+    return CaseRecord(
+        case_id=f"{case_group_id}-{visit_index}", case_group_id=case_group_id,
+        physician="ye_tianshi", raw=raw, raw_excerpt=raw_excerpt,
+        visit_index=visit_index, symptoms=["纳差"], syndrome="脾虚",
+    )
+
+
+def _t7_inputs(case):
+    return [s["input"] for s in to_samples(case) if s["meta"]["task"] == "T7_抽取"]
+
+
+def test_t7_prefers_the_visit_excerpt_over_the_whole_segment():
+    assert _t7_inputs(_visit("ye_tianshi-0001-p0", 0, raw_excerpt="本诊片段")) == ["本诊片段"]
+
+
+def test_t7_skips_follow_up_visits_without_excerpt():
+    """复诊没有本诊片段时不能退回整段 raw：整段是初诊+复诊共享的，会导出
+    「同一输入、互相矛盾的输出」的样本。"""
+    assert _t7_inputs(_visit("ye_tianshi-0001-p0", 1)) == []
+
+
+def test_t7_skips_second_patient_without_excerpt():
+    """同一粗段里的第二个病人同理：整段 raw 属于两个人。"""
+    assert _t7_inputs(_visit("ye_tianshi-0001-p1", 0)) == []
+
+
+def test_t7_keeps_whole_segment_for_first_patient_initial_visit():
+    assert _t7_inputs(_visit("ye_tianshi-0001-p0", 0)) == ["整段粗段原文，两个病人共享"]

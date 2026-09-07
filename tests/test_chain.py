@@ -4,6 +4,20 @@ from core.retrieval import Retriever
 from core.schemas import CaseRecord, ElementHit, S1Normalize, S2Elements, S3Syndrome
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _pin_two_physicians(monkeypatch):
+    """这里的期望值（llm_calls == 4、S3 跑 2 次、FakeLLM 按「叶天士/吴鞠通」分发）都
+    写死在两位医家上。注册张锡纯之后（HANDOFF 步骤 3）registry 变成三位，这些测试
+    会整批红——那不是 bug，是测试写死了医家数。钉住两位，让 registry 增长与测试解耦。"""
+    from core.physicians import PHYSICIANS as REG
+
+    two = {k: REG[k] for k in ("ye_tianshi", "wu_jutong")}
+    monkeypatch.setattr(chain, "PHYSICIANS", two)
+
+
 class FakeLLM:
     """按 schema 类型返回预设响应，同时记录调用次数方便断言 S1 只跑一次
     （以及安全否决命中时 S2/S3 一次都不调用）。"""
@@ -507,3 +521,178 @@ def test_fast_mode_skips_followup_in_consult(monkeypatch):
     assert outcome["followup"].stopped_by == "fast_mode"
     assert asked == []
     assert fake_llm.calls.count("S2Elements") == 1
+
+
+# ---------- 审查修复 ----------
+
+from core.schemas import S3SyndromeUnreferenced
+
+
+class EmptyRetriever(Retriever):
+    def search(self, query, physician, k=3, min_score=0.0):
+        return []
+
+
+class UnreferencedFakeLLM(ReActFakeLLM):
+    """检索为空时 chain 会改用 S3SyndromeUnreferenced，假后端要认得它。"""
+
+    def generate(self, system, user, schema, temperature=0.0, **kwargs):
+        if schema is S3SyndromeUnreferenced:
+            self.calls.append("S3SyndromeUnreferenced")
+            self.s3_systems.append(system)
+            return S3SyndromeUnreferenced(syndrome="脾胃气虚", reasoning="...",
+                                          treatment_principle="健脾益气", herbs=["党参"])
+        return super().generate(system, user, schema, temperature, **kwargs)
+
+
+def test_empty_retrieval_uses_schema_without_cited_case_ids(monkeypatch):
+    """一条相关医案都没有时，S3Syndrome 的 min_length=1 会逼模型编一个 id。
+    CLAUDE.md 的规定是新建一个不含该字段的 schema，不是放松原来的约束。"""
+    fake_llm = UnreferencedFakeLLM({"叶天士": None, "吴鞠通": None})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: EmptyRetriever())
+    outcome = chain.consult("纳差乏力")
+    assert fake_llm.calls.count("S3Syndrome") == 0
+    assert fake_llm.calls.count("S3SyndromeUnreferenced") == 2
+    for r in outcome["results"]:
+        assert r["no_reference_cases"] is True
+        assert r["hallucinated"] == []
+        assert r["s3"].cited_case_ids == []
+
+
+def test_s3syndrome_min_length_untouched():
+    """防幻觉约束本身一个字不能动。"""
+    import pytest as _pt
+    from pydantic import ValidationError
+
+    with _pt.raises(ValidationError):
+        S3Syndrome(syndrome="x", reasoning="x", treatment_principle="x", cited_case_ids=[])
+
+
+def test_coverage_never_exceeds_one_when_s2_rewrites_symptom_names(monkeypatch):
+    """S2 常把「胃脘胀痛」改写成「脘腹胀痛」；改写后的名字不在 s1 里，
+    直接拿 supporting_symptoms 当分子，coverage 会算成 1.5。"""
+    class RewritingLLM(ReActFakeLLM):
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            if schema is S2Elements:
+                self.calls.append("S2Elements")
+                return S2Elements(elements=[ElementHit(
+                    element="脾", kind="location", confidence="high",
+                    supporting_symptoms=["脘腹胀痛", "纳差", "舌淡"])])
+            return super().generate(system, user, schema, temperature, **kwargs)
+
+    s3 = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                    cited_case_ids=["ye_tianshi-001"])
+    s3w = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                     cited_case_ids=["wu_jutong-001"])
+    fake_llm = RewritingLLM({"叶天士": s3, "吴鞠通": s3w},
+                            s1=S1Normalize(symptoms=["胃脘胀痛", "纳差"], unmapped=[]))
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    outcome = chain.consult("胃脘胀痛纳差")
+    assert outcome["coverage"] == 0.5
+    assert chain.explained_symptoms(outcome["s1"], outcome["s2"]) == {"纳差"}
+
+
+def test_safety_checks_complaint_and_unmapped_not_only_symptoms(monkeypatch):
+    """S1 会把「最近吐了两次血」这类病史归进 unmapped；只查 symptoms 会漏。
+    三处（原始主诉、symptoms、unmapped）分别验证。"""
+    s3 = S3Syndrome(syndrome="x", reasoning="x", treatment_principle="x", cited_case_ids=["ye_tianshi-001"])
+    for s1 in [
+        S1Normalize(symptoms=["纳差"], unmapped=["最近吐了两次血"]),          # 危重词只在 unmapped
+    ]:
+        fake_llm = FakeLLM({"叶天士": s3, "吴鞠通": s3}, s1=s1)
+        monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+        monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+        assert chain.consult("纳差")["rejected"] is True
+    # 危重词只在原始主诉里、S1 一个字都没保留
+    fake_llm = FakeLLM({"叶天士": s3, "吴鞠通": s3}, s1=S1Normalize(symptoms=["纳差"], unmapped=[]))
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    assert chain.consult("纳差，昨天解黑便")["rejected"] is True
+    assert fake_llm.calls.count("S2Elements") == 0
+
+
+def test_insufficient_branch_skips_s3_and_pointless_residual(monkeypatch):
+    """S2 一个证素都没推出来：不跑 S3；残差的输入跟 S2 一字不差，也不再白跑一次。"""
+    class EmptyS2LLM(FakeLLM):
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            if schema is S2Elements:
+                self.calls.append("S2Elements")
+                return S2Elements(elements=[], unexplained_symptoms=["胸闷", "气短"])
+            return super().generate(system, user, schema, temperature, **kwargs)
+
+    fake_llm = EmptyS2LLM({}, s1=S1Normalize(symptoms=["胸闷", "气短"], unmapped=[]))
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    outcome = chain.consult("胸闷气短")
+    assert outcome["insufficient"] is True
+    assert outcome["results"] == []
+    assert fake_llm.calls.count("S3Syndrome") == 0
+    assert fake_llm.calls.count("S2Elements") == 1
+    assert outcome["manifest"]["llm_calls"] == 2
+
+
+def test_herb_jaccard_is_the_primary_divergence_metric(monkeypatch):
+    """分歧主指标是药物集合的 Jaccard 距离（证型名字符串比对无区分度）。
+    归一后相同的写法必须算同一味药。"""
+    s3_ye = S3Syndrome(syndrome="脾虚", reasoning="x", treatment_principle="健脾",
+                       herbs=["党参", "炒白术", "云苓块", "炙甘草"], cited_case_ids=["ye_tianshi-001"])
+    s3_wu = S3Syndrome(syndrome="脾虚湿困", reasoning="x", treatment_principle="健脾",
+                       herbs=["党参", "白术", "茯苓", "甘草", "陈皮", "半夏"], cited_case_ids=["wu_jutong-001"])
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    div = chain.consult("纳差乏力")["divergence"]
+    assert div["shared_herbs"] == ["党参", "甘草", "白术", "茯苓"]
+    assert div["herb_jaccard"] == round(1 - 4 / 6, 3)
+
+
+def test_all_return_paths_share_the_same_keys(monkeypatch):
+    """api/前端按同一份契约读三条路径，缺键就是 KeyError。"""
+    s3 = S3Syndrome(syndrome="x", reasoning="x", treatment_principle="x", cited_case_ids=["ye_tianshi-001"])
+    fake_llm = FakeLLM({"叶天士": s3, "吴鞠通": s3})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    normal = chain.consult("纳差乏力")
+    rejected = chain.consult("纳差，昨天解黑便")
+    followup_rejected = chain.consult("纳差乏力", ask_fn=lambda q: "有，还解了黑便")
+    expected = {"s1", "results", "divergence", "rejected", "reject_reason", "s2",
+                "residual", "followup", "insufficient", "insufficient_reason", "coverage", "manifest"}
+    for outcome in (normal, rejected, followup_rejected):
+        assert expected <= set(outcome), expected - set(outcome)
+
+
+def test_react_ask_user_answer_goes_through_safety_and_reaches_s3(monkeypatch):
+    """ReAct 以 ask_user 收尾时问题要真的问出去；回答先过 check_safety，
+    危重就整体拒绝，正常就作为证据交给 S3。"""
+    from core.schemas import ReActStep
+
+    class AskingLLM(ReActFakeLLM):
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            if schema is ReActStep:
+                self.calls.append("ReActStep")
+                return ReActStep(thought="分不开", action="ask_user",
+                                 action_input={"question": "有没有口苦？", "reason": "r"})
+            return super().generate(system, user, schema, temperature, **kwargs)
+
+    s3 = S3Syndrome(syndrome="x", reasoning="x", treatment_principle="x", cited_case_ids=["ye_tianshi-001"])
+    s3w = S3Syndrome(syndrome="x", reasoning="x", treatment_principle="x", cited_case_ids=["wu_jutong-001"])
+    import core.react as react_mod
+
+    fake_llm = AskingLLM({"叶天士": s3, "吴鞠通": s3w})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(react_mod, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    monkeypatch.setenv("FAST_MODE", "1")  # 关掉 G3 追问，只看 ReAct 那条追问路径
+
+    ok = chain.consult("纳差乏力", use_react=True, ask_fn=lambda q: "没有口苦")
+    assert ok["rejected"] is False
+    assert all("患者答：没有口苦" in s for s in fake_llm.s3_systems)
+    assert all(r["react_trace"].pending_answer == "没有口苦" for r in ok["results"])
+
+    fake_llm.s3_systems.clear()
+    bad = chain.consult("纳差乏力", use_react=True, ask_fn=lambda q: "有，而且解了黑便")
+    assert bad["rejected"] is True and "黑便" in bad["reject_reason"]
+    assert bad["results"] == []
+    assert fake_llm.s3_systems == [], "被拦截后 S3 一次都不能调"

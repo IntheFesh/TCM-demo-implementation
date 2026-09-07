@@ -6,6 +6,20 @@ count_support 在合成 case 节点上的计数逻辑、apply_weights 端到端�
 from core.graph.store import NetworkXStore
 from core.graph.weights import apply_weights, count_support, shrinkage_weight
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _pin_two_physicians(monkeypatch):
+    """同 tests/test_chain.py：期望值写死在两位医家、一个学派上，注册第三位医家后
+    num_schools 变 2、λ2 分支切换，这些测试的数字就不再成立。钉住两位。"""
+    import core.physicians as phys
+    import core.graph.weights as w
+
+    two = {k: phys.PHYSICIANS[k] for k in ("ye_tianshi", "wu_jutong")}
+    monkeypatch.setattr(phys, "PHYSICIANS", two)
+    monkeypatch.setattr(w, "PHYSICIANS", two)
+
 
 def test_shrinkage_weight_n_d_zero_gives_lambda1_zero():
     _, lambdas = shrinkage_weight(0, 0.0, 0, 0.0, 0, 0.0, 0.7, num_schools=1)

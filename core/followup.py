@@ -21,7 +21,7 @@ from typing import Callable
 
 from core.safety import check_safety
 from core.schemas import FollowupResult, HistoryItem
-from core.tools import question_candidates
+from core.tools import is_safety_relevant, question_candidates
 
 MAX_ASK_ROUNDS = 3
 
@@ -101,8 +101,17 @@ def run_followup(
         if answer is None:
             return _result(history, asserted, denied, "no_answer")
 
-        # 安全检查在解析之前，不是之后：命中就整轮终止，答案不进后验、不产出方药。
+        verdict = parse_answer(answer)
+        # 安全检查在写入后验之前，两条路都要堵：回答原文里带危重词
+        # （「有，这两天还解了黑便」），以及**问的本身就是危重症状、患者只答一个「有」**
+        # （「有没有便血？」→「有」）。第二条此前是漏的：question_candidates 算好的
+        # safety_relevant 标记全仓库没有任何消费方，实测答「有」就把「便血」写进了
+        # asserted、S2/S3 照常开方——正是 CLAUDE.md 那条约定要堵的后门。
         reject = check_safety([answer])
+        if reject is None and verdict == "yes" and top.get("symptom") and (
+            top.get("safety_relevant") or is_safety_relevant(top["symptom"])
+        ):
+            reject = check_safety([top["symptom"]])
         if reject is not None:
             history.append(HistoryItem(
                 question=top["question"], answer=answer,
@@ -111,7 +120,6 @@ def run_followup(
             ))
             return _result(history, asserted, denied, "safety", reject_reason=reject)
 
-        verdict = parse_answer(answer)
         item = HistoryItem(
             question=top["question"], answer=answer,
             symptom=top.get("symptom"), topic=top.get("topic"),

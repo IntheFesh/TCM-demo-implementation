@@ -44,10 +44,15 @@ def test_render_handles_braces_in_template():
     assert result == '示例输出：{"symptoms": ["纳差"], "count": 1}'
 
 
-def test_render_missing_var_does_not_raise():
-    result = render("你好 $name，年龄 $age", name="张三")
-    assert "张三" in result
-    assert "$age" in result  # safe_substitute：缺变量原样保留，不抛异常
+def test_render_missing_var_raises():
+    """缺变量必须报错。原来是 safe_substitute 静默保留 "$age"：审查时数过，9 个 yaml
+    的占位符与 9 处 render() 的 kwargs 逐一吻合，没有调用方在用"可选段落"这个口子，
+    留着它只会让将来 yaml 新加的 $var 原样出现在 prompt 里而全部测试照样通过。"""
+    import pytest
+
+    with pytest.raises(KeyError, match="age"):
+        render("你好 $name，年龄 $age", name="张三")
+    assert render("你好 $name", name="张三") == "你好 张三"
 
 
 def test_strip_code_fence_with_json_fence():

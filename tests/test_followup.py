@@ -176,11 +176,27 @@ def test_assertion_and_denial_move_in_opposite_directions():
     assert yes["SP-03"] > no["SP-03"]
 
 
-def test_contradictory_evidence_falls_back_to_uniform_not_nan():
-    """似然全被压到 0 时退回均匀分布。NaN 会让追问循环整个哑掉。"""
-    post = syndrome_posterior([], asserted_symptoms=["不存在的症状A"] * 0,
-                              denied_symptoms=[])
-    assert post and all(p == p for p in post.values())  # 没有 NaN
+def test_contradictory_evidence_stays_a_valid_distribution():
+    """同一条症状既被肯定又被否认（患者改口）时，后验仍然是合法分布：没有 NaN、
+    和为 1、没有负数。审查时发现原来这条测试传的是空列表，声称要测的分支一次都没进。"""
+    post = syndrome_posterior(["胃", "阴虚"], asserted_symptoms=["口干或口苦"],
+                              denied_symptoms=["口干或口苦"])
+    assert post
+    assert all(p == p and p >= 0 for p in post.values())
+    assert abs(sum(post.values()) - 1.0) < 1e-9
+
+
+def test_total_zero_likelihood_falls_back_to_uniform(monkeypatch):
+    """似然真的全被压到 0 的那条分支：把钳位放开让 P_MAX=1，肯定+否认同一主症
+    就会得到 0×1，全部证候归零，此时必须退回均匀分布而不是除零。"""
+    from core import tools as tl
+
+    monkeypatch.setattr(tl, "P_MAX", 1.0)
+    monkeypatch.setattr(tl, "P_UNLISTED", 0.0)
+    post = syndrome_posterior([], asserted_symptoms=["两胁胀满"], denied_symptoms=["两胁胀满"])
+    assert post
+    n = len(post)
+    assert all(abs(p - 1 / n) < 1e-9 for p in post.values())
 
 
 # ---------- 传给 S3 的摘要 ----------
@@ -214,3 +230,38 @@ def test_shiwen_fallback_answer_is_not_attributed_to_a_symptom(monkeypatch):
     assert r.asserted == [] and r.denied == []
     assert r.history[0].topic == "寒热"
     assert r.history[0].symptom is None
+
+
+# ---------- 审查修复：问的本身是危重症状、患者只答「有」 ----------
+
+def test_yes_to_a_dangerous_symptom_question_is_a_safety_stop(monkeypatch):
+    """「有没有便血？」→「有」。回答原文没有危重词，但被问的症状本身是危重信号。
+    审查时实测这条路是通的：safety_relevant 标记算好了却没人消费，「便血」直接
+    写进 asserted，S2/S3 照常开方。"""
+    monkeypatch.setattr(fu, "question_candidates", lambda *a, **k: [{
+        "question": "有没有便血？", "symptom": "便血", "topic": None,
+        "information_gain": 0.5, "source": "graph_ig", "safety_relevant": True,
+    }])
+    r = run_followup(SYMPTOMS, ELEMENTS, lambda q: "有")
+    assert r.stopped_by == "safety"
+    assert "便血" in r.reject_reason
+    assert r.asserted == []
+
+
+def test_no_to_a_dangerous_symptom_question_is_fine(monkeypatch):
+    monkeypatch.setattr(fu, "question_candidates", lambda *a, **k: [{
+        "question": "有没有便血？", "symptom": "便血", "topic": None,
+        "information_gain": 0.5, "source": "graph_ig", "safety_relevant": True,
+    }])
+    r = run_followup(SYMPTOMS, ELEMENTS, lambda q: "没有", max_rounds=1)
+    assert r.stopped_by != "safety"
+    assert r.denied == ["便血"]
+
+
+def test_safety_relevance_is_rechecked_even_without_the_flag(monkeypatch):
+    """候选里没带 safety_relevant 字段（比如别的调用方拼的候选）也要按症状名再查一次。"""
+    monkeypatch.setattr(fu, "question_candidates", lambda *a, **k: [{
+        "question": "有没有呕血？", "symptom": "呕血", "topic": None,
+        "information_gain": 0.5, "source": "graph_ig",
+    }])
+    assert run_followup(SYMPTOMS, ELEMENTS, lambda q: "有").stopped_by == "safety"

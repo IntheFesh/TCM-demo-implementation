@@ -649,6 +649,12 @@ function buildEvidenceIndex(data) {
       treatment: s3.treatment_principle,
       formula: s3.formula,
       refs: r.refs || [],
+      // 侧栏只把模型真正引用了的医案标成"引用"；检索到但没引用的单独列，
+      // 否则幻觉引用在卡片上有红标、侧栏里却把全部检索结果当成结论的依据
+      cited: new Set(s3.cited_case_ids || []),
+      hallucinated: r.hallucinated || [],
+      no_reference_cases: !!r.no_reference_cases,
+      react_trace: r.react_trace || null,
     });
 
     for (const hit of s2.elements || []) {
@@ -696,9 +702,21 @@ function evidenceSectionHtml(s) {
   if (s.reasoning) rows.push(`<div class="label">推理过程</div><div>${escapeHtml(s.reasoning)}</div>`);
   if (s.note) rows.push(`<div class="label">备注</div><div>${escapeHtml(s.note)}</div>`);
 
+  if (s.no_reference_cases) {
+    rows.push(`<div class="label">引用医案</div><div class="meta">未检索到相关医案（相似度均低于阈值），本结论没有医案支撑。</div>`);
+  }
+  if (s.hallucinated && s.hallucinated.length) {
+    rows.push(`<div class="label">⚠ 幻觉引用</div><div class="meta">模型引用了检索结果之外的 id：${escapeHtml(s.hallucinated.join("、"))}</div>`);
+  }
+  if (s.react_trace && s.react_trace.steps && s.react_trace.steps.length) {
+    const steps = s.react_trace.steps.map((st) =>
+      `<div class="meta">第${st.step}步 ${escapeHtml(st.action)}${st.note ? "（" + escapeHtml(st.note) + "）" : ""}：${escapeHtml((st.thought || "").slice(0, 80))}</div>`).join("");
+    rows.push(`<div class="label">取证过程（${escapeHtml(s.react_trace.terminated_by)}，${s.react_trace.llm_calls} 次调用）</div>${steps}`);
+  }
   if (s.refs && s.refs.length) {
-    const cases = s.refs
-      .map((r, i) => {
+    const citedRefs = s.refs.filter((r) => s.cited && s.cited.has(r.case_id));
+    const otherRefs = s.refs.filter((r) => !(s.cited && s.cited.has(r.case_id)));
+    const caseHtml = (r, i) => {
         const raw = r.excerpt || "";
         const long = raw.length > 110;
         return `<div class="ev-case">
@@ -708,9 +726,13 @@ function evidenceSectionHtml(s) {
           ${raw ? `<div class="ev-raw" id="raw-${i}-${Math.random().toString(36).slice(2, 7)}">${escapeHtml(raw)}</div>
             ${long ? '<span class="ev-more" onclick="this.previousElementSibling.classList.toggle(\'expanded\'); this.textContent = this.textContent === \'展开全文\' ? \'收起\' : \'展开全文\';">展开全文</span>' : ""}` : ""}
         </div>`;
-      })
-      .join("");
-    rows.push(`<div class="label">引用医案（${s.refs.length}）</div>${cases}`);
+      };
+    if (s.cited) {
+      if (citedRefs.length) rows.push(`<div class="label">引用医案（${citedRefs.length}）</div>${citedRefs.map(caseHtml).join("")}`);
+      if (otherRefs.length) rows.push(`<div class="label">检索到但未引用（${otherRefs.length}）</div>${otherRefs.map(caseHtml).join("")}`);
+    } else {
+      rows.push(`<div class="label">相关医案（${s.refs.length}）</div>${s.refs.map(caseHtml).join("")}`);
+    }
   }
 
   return `<div class="ev-sec">
@@ -742,7 +764,9 @@ function renderDivergence(divergence) {
     else if (j <= 0.7) level = "用药部分重合";
     else level = "用药基本不重合";
     const sharedText = shared.length ? `，共用 ${shared.join("、")}` : "";
-    banner.textContent = `${tp}；${level}（药物 Jaccard 距离 ${j}${sharedText}）`;
+    // 项目规则：任何数字都必须带对照。ε 噪声地板（同一主诉重复跑的分歧）要在 AutoDL
+    // 上估算，在此之前这个数只能带着"无基准"的说明展示，不能裸露
+    banner.textContent = `${tp}；${level}（药物 Jaccard 距离 ${j}${sharedText}；对照基准 ε 尚未估算，此数暂无参照）`;
     banner.classList.add("show");
   } else if (divergence && divergence.same === false) {
     banner.textContent = "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";
@@ -791,6 +815,15 @@ function cardHtml(result) {
   const revisedHtml = so.revised
     ? `<div class="safety-revised">已因配伍禁忌自动重开一次方</div>`
     : "";
+  const noRefHtml = result.no_reference_cases
+    ? `<div class="safety-thermal">⚠ 未检索到相关医案（相似度均低于阈值）：本结论没有医案支撑，仅供参考</div>`
+    : "";
+  const rt = result.react_trace;
+  const reactHtml = rt && rt.steps && rt.steps.length
+    ? `<div class="label">取证过程（${escapeHtml(rt.terminated_by)}，${rt.llm_calls} 次调用）</div>` +
+      rt.steps.map((st) => `<div>第${st.step}步 ${escapeHtml(st.action)}${st.note ? "（" + escapeHtml(st.note) + "）" : ""}：${escapeHtml((st.thought || "").slice(0, 100))}</div>`).join("") +
+      (rt.pending_question ? `<div>追问患者：${escapeHtml(rt.pending_question)}${rt.pending_answer ? "　答：" + escapeHtml(rt.pending_answer) : "（未获回答）"}</div>` : "")
+    : "";
 
   return `
     <div class="card">
@@ -802,6 +835,7 @@ function cardHtml(result) {
       ${incompatibleHtml}
       ${thermalHtml}
       ${revisedHtml}
+      ${noRefHtml}
       ${hallucinationHtml}
       <details>
         <summary>推理过程与引用详情</summary>
@@ -812,6 +846,7 @@ function cardHtml(result) {
           <div>${escapeHtml((s3.cited_case_ids || []).join("、") || "（无）")}</div>
           <div class="label">检索结果与相似度</div>
           ${refListHtml(result.refs)}
+          ${reactHtml}
           ${s3.note ? `<div class="label">备注</div><div>${escapeHtml(s3.note)}</div>` : ""}
         </div>
       </details>
@@ -829,6 +864,43 @@ function escapeHtml(str) {
 
 function renderResults(results) {
   document.getElementById("results").innerHTML = results.map(cardHtml).join("");
+}
+
+// 被拦截/信息不足的请求也要把上一次正常问诊留下的东西清掉：残差提示、页脚、
+// 证据索引、上一张图。否则「重播」会重绘上一位患者的图。
+function resetSecondaryPanels() {
+  lastGraph = null;
+  EVIDENCE = {};
+  closeEvidence();
+  for (const id of ["residual-note", "graph-note", "followup-note"]) {
+    const el = document.getElementById(id);
+    if (el) { el.textContent = ""; el.style.display = "none"; }
+  }
+  const footer = document.getElementById("manifest-footer");
+  if (footer) footer.textContent = "";
+}
+
+// G3 追问记录。HTTP 路径上现在没有提问渠道（api_consult 不传 ask_fn），所以正常情况
+// 下 followup.stopped_by 是 no_answer、什么都不显示；一旦接上 SSE/表单式追问，
+// 这里就会把问答和否认的症状渲染出来。
+function renderFollowup(followup) {
+  let el = document.getElementById("followup-note");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "followup-note";
+    el.className = "residual-note";
+    const results = document.getElementById("results");
+    results.parentElement.insertBefore(el, results);
+  }
+  if (!followup || !followup.history || followup.history.length === 0) {
+    el.style.display = "none";
+    return;
+  }
+  const qa = followup.history.map((h) =>
+    `<div>问：${escapeHtml(h.question)}　答：${escapeHtml(h.answer)}${h.safety_hit ? "　<b>⚠ 触发安全否决</b>" : ""}</div>`).join("");
+  const denied = (followup.denied || []).length ? `<div>患者明确否认：${escapeHtml(followup.denied.join("、"))}</div>` : "";
+  el.innerHTML = `<div><b>追问（${followup.rounds} 轮，${escapeHtml(followup.stopped_by)}）</b></div>${qa}${denied}`;
+  el.style.display = "block";
 }
 
 function showError(message) {
@@ -868,10 +940,21 @@ async function submitConsult() {
       throw new Error(`服务返回错误（HTTP ${resp.status}）：${text}`);
     }
     const data = await resp.json();
+    resetSecondaryPanels();
     if (data.rejected) {
       showError(`⚠ ${data.reject_reason}`);
       renderDivergence(null);
       renderResults([]);
+      renderFollowup(data.followup);
+      renderGraph(data.graph);
+      return;
+    }
+    if (data.insufficient) {
+      // 信息不足不是错误：系统承认没法有依据地辨证，要把补充信息的提示原样给用户
+      showError(`ℹ ${data.insufficient_reason || "现有症状不足以推断证素，请补充更多信息。"}`);
+      renderDivergence(null);
+      renderResults([]);
+      renderFollowup(data.followup);
       renderGraph(data.graph);
       return;
     }
@@ -911,6 +994,7 @@ async function submitConsult() {
     }
     renderDivergence(data.divergence);
     renderResults(data.results);
+    renderFollowup(data.followup);
     renderGraph(data.graph);
   } catch (err) {
     console.error("consult failed:", err);

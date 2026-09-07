@@ -145,6 +145,20 @@ def cross_validate(segment: dict, result: SegmentPatients) -> list[dict]:
        整段层面做总量校验，比 R1 单病人版本粗，但仍然是一个真实的一致性信号。"""
     warnings = []
     llm_patients = len(result.patients)
+    # 张锡纯的粗段带 structural_patient_count（原文自带的「属性：」身份行数），
+    # 这比 head_hints 可靠得多——那套正则对他的案首体例根本不触发，用它校验
+    # 会把 43 段里十几段记成不一致。有结构性判据就用它，且不做 visit_total 校验
+    # （follow_hints 对这本书同样无效）。
+    structural = segment.get("structural_patient_count")
+    if structural is not None:
+        if llm_patients != structural:
+            warnings.append({
+                "seg_id": segment["seg_id"],
+                "check": "patient_count",
+                "llm_count": llm_patients,
+                "regex_count": structural,
+            })
+        return warnings
     regex_patients = len(segment["head_hints"])
     if abs(llm_patients - regex_patients) >= 2:
         warnings.append({
@@ -204,7 +218,13 @@ def main(argv: list[str] | None = None) -> None:
 
         for w in seg_warnings:
             warnings.append(w)
-            print(f"  [WARN] {w['check']} 不一致：LLM={w['llm_count']}  正则估计={w['regex_count']}")
+            # check_visit_index_dup 的告警没有 llm_count/regex_count 两个键——原来这里
+            # 直接下标，第一条 visit_index_dup 告警就 KeyError，整批结果丢失、
+            # cases.json 写不出来。
+            if "llm_count" in w:
+                print(f"  [WARN] {w['check']} 不一致：LLM={w['llm_count']}  正则估计={w['regex_count']}")
+            else:
+                print(f"  [WARN] {w['check']}：{w.get('note', '')}")
 
     with OUT_PATH.open("w", encoding="utf-8") as f:
         json.dump([r.model_dump() for r in all_records], f, ensure_ascii=False, indent=2)

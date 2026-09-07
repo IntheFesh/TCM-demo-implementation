@@ -89,7 +89,17 @@ def to_samples(case: CaseRecord) -> list[dict]:
             )
         )
 
-    if case.raw:
+    # T7 的输入必须是**这一诊**对应的原文。raw 是整个粗段（同段多个病人、多诊共享、内容
+    # 完全相同），拿它当输入而输出只有一个病人一诊的字段，会导出 N 条"同一输入、互相
+    # 矛盾的输出"的训练样本，而且输出刻意省略输入里明明存在的信息——跟指令里
+    # "原文中没有出现的信息填 null、禁止推断"自相矛盾。有 raw_excerpt 用 raw_excerpt；
+    # 没有的话只在能确定整段就是这一诊（段内第 0 个病人的初诊）时才退回 raw。
+    t7_input = case.raw_excerpt
+    # 没有 -p 后缀的 case_group_id 是旧格式/单病人记录，整段就是这一个病人
+    first_patient = case.case_group_id.endswith("-p0") or "-p" not in case.case_group_id
+    if not t7_input and case.raw and (case.visit_index or 0) == 0 and first_patient:
+        t7_input = case.raw
+    if t7_input:
         structured = {
             "symptoms": case.symptoms,
             "tongue": case.tongue,
@@ -105,7 +115,7 @@ def to_samples(case: CaseRecord) -> list[dict]:
                 task="T7_抽取",
                 instruction="把下面这条古籍医案原文抽取成结构化字段（JSON），"
                 "原文中没有出现的信息填 null 或空列表，禁止推断。",
-                input_text=case.raw,
+                input_text=t7_input,
                 output=json.dumps(structured, ensure_ascii=False),
                 case=case,
             )

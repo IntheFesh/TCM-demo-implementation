@@ -169,6 +169,13 @@ class ReActTrace(BaseModel):
     # 跟"它想清楚了主动收尾"是完全不同的结论，混成一个"结束了"就看不出来。
     terminated_by: Literal["finish", "ask_user", "max_steps", "no_progress", "error"]
     pending_question: str | None = None
+    # ask_user 终止后由 run_physician 通过 ask_fn 问出来的回答（先过 check_safety）。
+    # 没有提问渠道时为 None——那时问题只是被记录，S3 拿不到答案。
+    pending_answer: str | None = None
+    # 取证过程中 search_cases 真实返回过的 case_id。它们和 run_physician 自己检索到的
+    # refs 一样是真实医案，必须并进引用白名单——否则工具描述里承诺「可以引用这里
+    # 返回的 id」，幻觉判定却只认 refs，模型照做反而被判成幻觉。
+    retrieved_case_ids: list[str] = Field(default_factory=list)
     llm_calls: int = 0
 
 
@@ -221,3 +228,26 @@ class S3Syndrome(BaseModel):
     # min_length=1 同理：防幻觉的关键约束，不要改成可选。
     cited_case_ids: list[str] = Field(min_length=1)
     note: str | None = None
+
+
+class S3SyndromeUnreferenced(BaseModel):
+    """检索不到任何相关医案（相似度全部低于阈值，或该医家没有医案）时用的 S3 schema。
+
+    **没有 cited_case_ids 字段。** 这是 CLAUDE.md「某个新场景导致校验失败时，新建一个
+    不含该字段的 schema，不是放松原来的约束」的落地：白名单为空时 S3Syndrome 的
+    min_length=1 会逼模型编一个 id——要么必被判幻觉却照样出方，要么三次校验失败抛
+    LLMError 让整个 consult 崩掉。S3Syndrome 本身一个字没动。
+    """
+
+    syndrome: str
+    reasoning: str
+    treatment_principle: str
+    formula: str | None = None
+    herbs: list[str] = Field(default_factory=list)
+    note: str | None = None
+
+    @property
+    def cited_case_ids(self) -> list[str]:
+        """让下游（幻觉检查、前端）按同一个接口读；这里永远是空——没有可引用的医案。
+        是 property 不是字段：model_dump 里不会出现，api 层负责补一个空列表。"""
+        return []

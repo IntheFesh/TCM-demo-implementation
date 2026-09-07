@@ -272,3 +272,14 @@ def test_run_only_ids_filters_and_rejects_unknown(sdt_dir, tmp_path, monkeypatch
     with pytest.raises(SystemExit, match="不在 Validation 里"):
         run_mod.main(["--sdt-dir", str(sdt_dir), "--split", "Validation",
                       "--solver", "baseline", "--out", str(out), "--only-ids", "病例999"])
+
+
+@pytest.mark.parametrize("chosen,expected", [
+    (["A;B"], ["A", "B"]), (["A、B"], ["A", "B"]), (["AB"], ["A", "B"]),
+    (["A:肝气横逆"], ["A"]), (["肝气横逆"], ["A"]), (["A;Z"], ["A"]), (["b", "", "Z"], ["B"]),
+])
+def test_filter_valid_options_tolerates_common_answer_shapes(chosen, expected):
+    """模型把几个字母塞进一个元素、或回选项文本而不是字母，原来会被静默丢成空、
+    该题记 0 分且无任何记录。"""
+    opts = {"A": "肝气横逆", "B": "胃中失和", "C": "热伤肺络"}
+    assert adapter.filter_valid_options(chosen, opts) == expected

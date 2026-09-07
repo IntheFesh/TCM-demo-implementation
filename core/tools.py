@@ -101,11 +101,14 @@ def _load_case_triples() -> list[dict] | None:
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError:
                 # 坏行跳过不中断：三元组文件是机器生成的，一行坏了不该让整个
                 # 工具不可用；行号留在 note 里给人排查。
                 rows.append({"_bad_line": lineno})
+                continue
+            # 合法 JSON 但不是对象（数组/字符串）同样按坏行处理，否则后面 .get 直接炸
+            rows.append(row if isinstance(row, dict) else {"_bad_line": lineno})
         _case_triples = rows
     return _case_triples
 
@@ -152,7 +155,10 @@ def run_tool(name: str, args: dict) -> dict:
             "error": f"{name} 的参数不合法：{e}",
             "expected_parameters": spec.input_schema.model_json_schema(),
         }
-    return spec.fn(**parsed.model_dump())
+    try:
+        return spec.fn(**parsed.model_dump())
+    except Exception as e:  # noqa: BLE001 - 工具内部的意外（模型加载、文件坏行）不能炸掉整条问诊
+        return {"error": f"{name} 执行失败：{type(e).__name__}: {e}"}
 
 
 # ---------- 1. query_graph ----------
@@ -181,6 +187,14 @@ def _resolve_node(store: NetworkXStore, node: str) -> str | None:
     for node_type in ("syndrome", "symptom", "element"):
         for nid in store.find_nodes(node_type, name=node):
             return nid
+    # 证候名允许唯一的部分匹配（「胃阴虚」→「胃阴虚证」），跟 lookup_standard 的
+    # 规则一致。两个工具对同一个词给出相反答案，是 CLAUDE.md 里列的第三次撞墙。
+    partial = [
+        nid for nid in store.find_nodes("syndrome")
+        if node and node in ((store.get_node(nid) or {}).get("name") or "")
+    ]
+    if len(partial) == 1:
+        return partial[0]
     return None
 
 
@@ -281,9 +295,16 @@ def query_case_graph(symptom: str | None = None, predicate: str | None = None,
         }
     bad_lines = [r["_bad_line"] for r in rows if "_bad_line" in r]
     rows = [r for r in rows if "_bad_line" not in r]
+    # 没有 source_span 的三元组不返回：模块顶部说了，没有原文出处的结论跟凭空
+    # 生成的没区别。丢掉的条数报在 note 里，让人知道抽取那边有问题，不是静默吞。
+    n_no_span = sum(1 for r in rows if not (r.get("source_span") or "").strip())
+    rows = [r for r in rows if (r.get("source_span") or "").strip()]
 
     matched = []
     for r in rows:
+        s, o = r.get("s") or "", r.get("o") or ""
+        if not s and not o:
+            continue  # 主宾都空的行匹配任何 symptom 查询，是脏数据
         if physician is not None and r.get("physician") != physician:
             continue
         if case_id is not None and r.get("case_id") != case_id:
@@ -291,8 +312,8 @@ def query_case_graph(symptom: str | None = None, predicate: str | None = None,
         if predicate is not None and predicate not in (r.get("p") or ""):
             continue
         if symptom is not None:
-            s, o = r.get("s") or "", r.get("o") or ""
-            if symptom not in s and symptom not in o and s not in symptom and o not in symptom:
+            def _rel(x): return bool(x) and (symptom in x or x in symptom)
+            if not (_rel(s) or _rel(o)):
                 continue
         matched.append(r)
 
@@ -312,8 +333,13 @@ def query_case_graph(symptom: str | None = None, predicate: str | None = None,
             for r in matched[:limit]
         ],
     }
+    notes = []
     if bad_lines:
-        out["note"] = f"三元组文件有 {len(bad_lines)} 行无法解析，已跳过（行号：{bad_lines[:10]}）"
+        notes.append(f"三元组文件有 {len(bad_lines)} 行无法解析，已跳过（行号：{bad_lines[:10]}）")
+    if n_no_span:
+        notes.append(f"另有 {n_no_span} 条缺 source_span（原文出处）的三元组被剔除")
+    if notes:
+        out["note"] = "；".join(notes)
     return out
 
 
@@ -327,14 +353,16 @@ class SearchCasesInput(BaseModel):
 
 
 def search_cases(query: str, physician: str, k: int = 3) -> dict:
-    from core.retrieval import get_retriever
+    from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
 
     try:
         retriever = get_retriever()
     except FileNotFoundError as e:
         return {"available": False, "cases": [], "note": str(e)}
 
-    hits = retriever.search(query, physician, k=k)
+    # 跟 run_physician 用同一个相似度下限：这里不设的话，模型会拿到几条相似度 0.3
+    # 的不相关医案并被鼓励去引用它们。
+    hits = retriever.search(query, physician, k=k, min_score=MIN_RETRIEVAL_SCORE)
     return {
         "available": True,
         "cases": [
@@ -402,13 +430,18 @@ class CheckResidualInput(BaseModel):
     elements: list[str] = Field(default_factory=list, description="目前已推断出的证素名列表")
 
 
+# 拆出来的片段里，这些词单独出现时不指向任何具体症状：「疼痛」会让所有含
+# 「疼痛」的患者主诉命中三条胃脘疼痛节点。片段必须带部位或性质才算数。
+_GENERIC_FRAGMENTS = frozenset({"疼痛", "胀痛", "隐痛", "不适", "加重", "减轻", "或", "甚则"})
+
+
 def _symptom_fragments(name: str) -> list[str]:
     """把「胃脘胀满或疼痛」这类含并列项的标准症状名拆成可单独匹配的片段。
     不拆的话患者说「胃脘胀满」就匹配不上整条标准症状名。"""
     parts = [name]
     for sep in ("，", "、", "或", "；"):
         parts = [p for chunk in parts for p in chunk.split(sep)]
-    return [p for p in parts if len(p) >= 2]
+    return [p for p in parts if len(p) >= 2 and p not in _GENERIC_FRAGMENTS]
 
 
 def _match_graph_symptoms(store: NetworkXStore, patient_symptom: str) -> list[str]:
@@ -673,6 +706,7 @@ def syndrome_posterior(
     store: NetworkXStore | None = None,
     asserted_symptoms: list[str] | None = None,
     denied_symptoms: list[str] | None = None,
+    physician: str | None = None,
 ) -> dict[str, float]:
     """P(证候 | 已知证素, 追问答案)。证素为空时退化为均匀先验——那是合理的初始
     状态（还没问出任何东西），不是错误。
@@ -693,7 +727,10 @@ def syndrome_posterior(
     if not index:
         return {}
     current = set(current_elements or [])
-    symptom_weights = _symptom_index(store, None)
+    # 权重按同一位医家取——question_candidates 的似然也按这位医家取，两处不一致
+    # 的话「问这个问题预期得到多少 bit」和「答完后验变成什么」就不再自洽。
+    # 当前 λ1≡0 时各医家权重相同，这个参数没有可观测差异；等医案数据接入后会有。
+    symptom_weights = _symptom_index(store, physician)
 
     scores = {}
     for code, info in index.items():
@@ -775,6 +812,7 @@ def question_candidates(
     posterior = syndrome_posterior(
         current_elements, store,
         asserted_symptoms=asserted_symptoms, denied_symptoms=denied_symptoms,
+        physician=physician,
     )
     symptom_weights = _symptom_index(store, physician)
     if not posterior or not symptom_weights:

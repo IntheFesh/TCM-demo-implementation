@@ -17,7 +17,9 @@ T = TypeVar("T", bound=BaseModel)
 
 PROMPTS_ROOT = Path(__file__).resolve().parent.parent / "prompts"
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
+# 围栏不限定顶头顶尾、语言标记不限大小写：实测模型会写 ```JSON、也会在围栏前后
+# 加一句说明。原来的 ^...$ 锚定在这两种情况下整段原样返回，白烧一次重试。
+_FENCE_RE = re.compile(r"```(?:[A-Za-z]+)?[ \t]*\n?(.*?)\n?```", re.DOTALL)
 
 
 def load_prompt(name: str, version: str = "v1") -> dict:
@@ -27,9 +29,21 @@ def load_prompt(name: str, version: str = "v1") -> dict:
         return yaml.safe_load(f)
 
 
+_PLACEHOLDER_RE = re.compile(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?")
+
+
 def render(template_str: str, **kwargs) -> str:
-    """用 string.Template 渲染。用 safe_substitute 而不是 substitute：
-    prompt 里常有 $var 没被传入的情况（比如可选段落），缺变量时不该抛异常。"""
+    """用 string.Template 渲染，**缺变量直接报错**。
+
+    原来用 safe_substitute 是为"可选段落缺变量时不抛异常"留的口子，但审查时数了一遍：
+    9 个 yaml 的占位符集合与 9 处 render() 的 kwargs 逐一吻合，没有任何调用方在用
+    这个口子。留着它的代价是：将来 yaml 加一个 $var 而调用方漏传，占位符会原样留在
+    prompt 里（模型看到一个字面的 "$refs"），全部测试照样通过——静默 bug。
+    仍用 safe_substitute 做替换本身（模板里若有 $$ 之类不影响），但先检查缺失。
+    """
+    missing = sorted(set(_PLACEHOLDER_RE.findall(template_str)) - set(kwargs))
+    if missing:
+        raise KeyError(f"prompt 模板缺变量：{missing}（调用方传了 {sorted(kwargs)}）")
     return Template(template_str).safe_substitute(**kwargs)
 
 
@@ -37,7 +51,7 @@ def strip_code_fence(text: str) -> str:
     """剥离 LLM 返回里可能带的 markdown 围栏（```json ... ``` 或 ``` ... ```）。
     做成模块级函数是为了能单独单元测试，不依赖网络。"""
     stripped = text.strip()
-    m = _FENCE_RE.match(stripped)
+    m = _FENCE_RE.search(stripped)
     if m:
         return m.group(1).strip()
     return stripped
@@ -120,9 +134,15 @@ class LLMBackend(ABC):
         for attempt in range(self.MAX_ATTEMPTS):
             try:
                 raw = self._complete(messages, temperature, **kwargs)
-                last_raw = raw
+            except Exception as e:  # noqa: BLE001 - 传输类错误：超时/非零退出/API 异常
+                # 这一类没有"上一次输出"可回灌——回灌上一轮的陈旧 raw 或空串只会让
+                # 模型收到文不对题的纠错指令。直接原样重试。
+                last_error = e
+                continue
+            last_raw = raw
+            try:
                 return schema.model_validate_json(strip_code_fence(raw))
-            except Exception as e:  # noqa: BLE001 - 校验错误与调用错误都要走同一条重试路径
+            except Exception as e:  # noqa: BLE001 - 校验错误：把原始输出和错误一起回灌
                 last_error = e
                 if attempt < self.MAX_ATTEMPTS - 1:
                     messages.append({"role": "assistant", "content": last_raw})
@@ -160,6 +180,11 @@ class OpenAICompatBackend(LLMBackend):
             self._client = OpenAI(
                 api_key=os.environ.get("LLM_API_KEY"),
                 base_url=os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
+                # SDK 默认读超时 600s 且自带 2 次静默重试：一次挂起的连接最坏阻塞
+                # 3(SDK)×3(generate)×600s，而且 SDK 的重试不计入 llm_calls，
+                # 让"重试只在基类实现一份"这句话不成立。重试统一交给 generate()。
+                timeout=float(os.environ.get("LLM_TIMEOUT", "120")),
+                max_retries=0,
             )
         return self._client
 
@@ -175,6 +200,9 @@ class OpenAICompatBackend(LLMBackend):
             messages=messages,
             temperature=temperature,
             response_format={"type": "json_object"},
+            # DeepSeek 默认输出上限 4096 token：S0 抽多病人粗段的 JSON 会被截断，
+            # 截断的 JSON 回灌重试也只会以同样方式再截断三次。显式给到模型上限。
+            max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "8192")),
             **kwargs,
         )
         return resp.choices[0].message.content or ""
@@ -202,8 +230,10 @@ class ClaudeCLIBackend(LLMBackend):
     # 纯补全不需要任何工具。逐个列出来而不是靠 --restricted：--restricted 只去掉
     # 执行类工具，Read/Glob 之类还在，模型可能真去读文件，那就不是纯补全了。
     _DISALLOWED_TOOLS = [
-        "Bash", "Edit", "Write", "Read", "Glob", "Grep",
-        "WebFetch", "WebSearch", "Task", "TodoWrite", "NotebookEdit",
+        "Bash", "Edit", "Write", "Read", "Glob", "Grep", "MultiEdit",
+        "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite", "NotebookEdit",
+        "NotebookRead", "BashOutput", "KillShell", "Skill", "SlashCommand",
+        "EnterPlanMode", "ExitPlanMode",
     ]
 
     _SYSTEM_PROMPT = (

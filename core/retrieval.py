@@ -10,6 +10,11 @@ from core.schemas import CaseRecord
 
 CASES_PATH = Path(__file__).resolve().parent.parent / "cases.json"
 
+# 检索相似度下限。实测正常匹配在 0.85-0.90，低于 0.70 基本是"库里没有相关案子"，
+# 此时给空列表比塞三条不相关的更诚实。定义在这里而不是 chain.py：ReAct 的
+# search_cases 工具也要用同一个阈值，而 tools 不能反向 import chain（循环）。
+MIN_RETRIEVAL_SCORE = 0.70
+
 
 class Retriever(ABC):
     @abstractmethod

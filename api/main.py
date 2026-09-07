@@ -125,7 +125,10 @@ def _serialize_result(r: dict) -> dict:
         "years": info.get("years"),
         "school": info.get("school"),
         "s2": r["s2"].model_dump(),
-        "s3": r["s3"].model_dump(),
+        # 检索为空时 s3 是 S3SyndromeUnreferenced，model_dump 里没有 cited_case_ids，
+        # 前端按同一份契约读，这里补成空列表
+        "s3": {**r["s3"].model_dump(), "cited_case_ids": list(r["s3"].cited_case_ids)},
+        "no_reference_cases": r.get("no_reference_cases", False),
         "refs": r["refs"],
         "hallucinated": r["hallucinated"],
         # X2 输出侧安全校验结果，前端据此挂红/黄标签
@@ -169,11 +172,13 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
             return
         edges.append({"data": {"source": source, "target": target, **data}})
 
-    # layer 0 症状：来自共享的 s1.symptoms，state 取决于是否被任一医家的任一证素解释
-    explained_symptoms: set[str] = set()
-    for r in results:
-        for hit in r["s2"].elements:
-            explained_symptoms.update(hit.supporting_symptoms)
+    # layer 0 症状：「已解释」用 core.chain.explained_symptoms 这一处实现——S2 全局共享，
+    # 各医家的 r["s2"] 是同一份，这里不再各自汇总一遍
+    from core.chain import explained_symptoms as _explained
+
+    if s2 is None and results:
+        s2 = results[0]["s2"]  # S2 全局共享，各医家拿到的是同一份
+    explained_symptoms: set[str] = _explained(s1, s2) if s2 is not None else set()
 
     # 两个来源：模型明确列进 unexplained_symptoms 的，和没被任何证素引用的。
     # 取并集——两者不总是一致，宁可多标一个也不要漏掉系统没说清的症状。
@@ -189,7 +194,18 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
             state = "unexplained"
         add_node(f"sym::{sym}", label=sym, layer=0, state=state)
 
-    # 残差辨证新推出的证素，单独标出来（兼夹证的证素）
+    # layer 1 证素与 症状->证素 边：S2 全局共享，只发一遍，不按医家重复。
+    # 原来每位医家各发一遍完全相同的边并打上 phys 标签，前端按 (source,target) 去重
+    # 只画第一条、颜色永远是第一位医家的——第三位医家加入后重复更多、含义更误导。
+    if s2 is not None:
+        for hit in s2.elements:
+            elem_id = f"elem::{hit.element}"
+            add_node(elem_id, label=hit.element, layer=1, kind=hit.kind)
+            for sym in hit.supporting_symptoms:
+                add_edge(f"sym::{sym}", elem_id)
+
+    # 残差辨证新推出的证素，单独标出来（兼夹证的证素）。必须在主证素之后加：
+    # add_node 先到先得，先加残差会把主路径里同名的证素整个标成 residual=True。
     if residual:
         for hit in residual["s2"].elements:
             elem_id = f"elem::{hit.element}"
@@ -200,15 +216,6 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
     for r in results:
         physician = r["physician"]
         pname = r["physician_name"]
-
-        # layer 1 证素：两位医家共用同一节点（去重）
-        for hit in r["s2"].elements:
-            elem_id = f"elem::{hit.element}"
-            add_node(elem_id, label=hit.element, layer=1, kind=hit.kind)
-
-            for sym in hit.supporting_symptoms:
-                sym_id = f"sym::{sym}"
-                add_edge(sym_id, elem_id, phys=physician)
 
         # layer 2 证型
         syn_id = f"syn::{physician}"

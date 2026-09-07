@@ -315,3 +315,89 @@ def test_cli_happy_path_returns_result_text(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _fake_run_factory(0, stdout=payload))
     out = ClaudeCLIBackend().generate("sys", "usr", Tiny)
     assert out.note == "从 CLI 来"
+
+
+# ---------- 审查修复 ----------
+
+def test_transport_errors_retry_without_feeding_back_stale_output():
+    """超时/非零退出这类传输错误没有"上一次输出"可回灌——回灌上一轮的陈旧 raw
+    或空串只会让模型收到文不对题的纠错指令。"""
+    from core.llm import LLMBackend
+    from pydantic import BaseModel
+
+    class Out(BaseModel):
+        a: int
+
+    class Flaky(LLMBackend):
+        def __init__(self):
+            self.seen = []
+
+        def model_name(self): return "m"
+        def backend_id(self): return "t"
+
+        def _complete(self, messages, temperature, **kw):
+            self.seen.append(len(messages))
+            if len(self.seen) == 1:
+                raise TimeoutError("超时")
+            return '{"a": 1}'
+
+    b = Flaky()
+    assert b.generate(system="s", user="u", schema=Out).a == 1
+    assert b.seen == [2, 2], "传输错误后 messages 不该多出回灌的两条"
+
+
+def test_validation_errors_still_feed_back():
+    from core.llm import LLMBackend
+    from pydantic import BaseModel
+
+    class Out(BaseModel):
+        a: int
+
+    class Wrong(LLMBackend):
+        def __init__(self):
+            self.seen = []
+
+        def model_name(self): return "m"
+        def backend_id(self): return "t"
+
+        def _complete(self, messages, temperature, **kw):
+            self.seen.append(len(messages))
+            return '{"a": "x"}' if len(self.seen) == 1 else '{"a": 1}'
+
+    b = Wrong()
+    assert b.generate(system="s", user="u", schema=Out).a == 1
+    assert b.seen == [2, 4]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ('```JSON\n{"a": 1}\n```', '{"a": 1}'),
+    ('好的，结果如下：\n```json\n{"a": 1}\n```\n以上。', '{"a": 1}'),
+    ('```\n{"a": 1}\n```', '{"a": 1}'),
+    ('{"a": 1}', '{"a": 1}'),
+])
+def test_strip_code_fence_variants(text, expected):
+    from core.llm import strip_code_fence
+
+    assert strip_code_fence(text) == expected
+
+
+def test_render_rejects_missing_placeholders_for_every_prompt():
+    """每个 yaml 的占位符集合与调用方传的 kwargs 必须逐一吻合。这里钉住占位符
+    集合本身：yaml 新加一个 $var 而调用方没跟上，这条会先红。"""
+    import re
+    from core.llm import PROMPTS_ROOT, load_prompt
+
+    expected = {
+        "s0_extract_case": {"raw_text", "follow_hints"},
+        "s1_normalize": {"complaint"},
+        "s2_elements": {"elements", "symptoms", "tongue", "pulse"},
+        "s3_syndrome": {"name", "elements_summary", "symptoms", "refs"},
+        "s3_react": {"name", "symptoms", "elements_summary", "tools", "history", "remaining"},
+        "patient_sim": {"profile", "history", "question"},
+        "sdt_extract": {"clinical_data"},
+        "sdt_select": {"reasoning_block", "clinical_data", "pathogenesis_options", "syndrome_options"},
+        "sdt_summary": {"reasoning_block", "clinical_data"},
+    }
+    for path in (PROMPTS_ROOT / "v1").glob("*.yaml"):
+        found = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?", load_prompt(path.stem)["system"]))
+        assert found == expected[path.stem], f"{path.name} 的占位符变了：{found}"

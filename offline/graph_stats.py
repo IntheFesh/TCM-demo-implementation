@@ -27,6 +27,11 @@ from core.physicians import PHYSICIANS, schools
 
 GRAPH_PATH = Path(__file__).resolve().parent.parent / "data" / "graph.json"
 
+LAMBDA2_MULTI_SCHOOL_NOTE = (
+    "已有 2 个学派，λ2 不再被强制归零。但只要某个学派下只有一位医家，该学派层与那位"
+    "医家层统计的仍是同一批数据，λ2 对他不构成独立信号；引用 λ2 前先标注每个学派的医家数"
+)
+
 LAMBDA2_WARNING = (
     "当前仅 1 个学派（2 位医家），λ2 学派层与医家层高度共线，"
     "其数值不构成独立信号，等 A2 加入第二学派后需重新评估"
@@ -141,7 +146,12 @@ def print_stats(stats: dict) -> None:
     print(f"\n=== 孤立节点数（度为 0） ===\n  {stats['isolated_node_count']}")
 
     print(f"\n=== 当前学派数 ===\n  {stats['num_schools']}")
-    print(f"\n【警告】{LAMBDA2_WARNING}")
+    if stats["num_schools"] <= 1:
+        print(f"\n【警告】{LAMBDA2_WARNING}")
+    else:
+        # 第二学派已注册，λ2 第一次有真值——但仍不是可信信号：学派数只有 2、其中一个
+        # 学派只有一位医家，学派层和医家层对那一位来说还是同一批数据。
+        print(f"\n【警告】{LAMBDA2_MULTI_SCHOOL_NOTE}")
 
     print(f"\n=== λ1（医家层权重）分布，共 {stats['indicates_edge_count']} 条 indicates 边 ===")
     print(f"说明：{lambda1_note(stats)}")

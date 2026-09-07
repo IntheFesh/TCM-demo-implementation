@@ -25,6 +25,11 @@
 | A2 粗段切分（三本书） | 15 条 | 纯正则，**这一步不需要 LLM，已经跑完** | 叶 32 / 吴 25 / 张 43 段；张锡纯 43/43 段一段一病人 |
 | SDT 适配器 | 18 条 | 格式验证 0 调用 + 5 条 prompt 质量冒烟（45 次调用） | Test 满分提交得 50.0000/50，格式逐字节正确；Task1 **0 条被改写**，逐字命中 36–38/47 |
 
+整体视察（`data/SOURCES.md` 第 16 条）之后修了 58 处，其中 5 处是安全相关的真漏洞
+（追问答「有」绕过否决、ReAct 的追问从未问出、安全正则误报/漏报、禁忌别名缺失、
+寒热表条目永远匹配不上）。**修复只有离线测试覆盖，没有真实模型复测**——AutoDL 上
+步骤 4/5 跑通后，X2/G2/G3 那几组冒烟值得重跑一遍确认行为没变。
+
 `data/graph.json`（123 节点 / 377 边）已经建好并写入权重，**这一步也不需要 LLM**，
 新环境里重跑 `build_graph` + `graph_stats` 即可复现。
 
@@ -51,7 +56,7 @@
 
 ```bash
 pip install -r requirements.txt
-pytest -q                      # 判据：355 条全绿，秒级跑完
+pytest -q                      # 判据：444 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
 python -c "import openai, os; print(bool(os.environ.get('LLM_API_KEY')))"
 ```
 
@@ -108,8 +113,12 @@ python -m offline.build_graph
 python -m offline.graph_stats
 ```
 
+注册之后 `pytest` 仍应全绿：chain/weights 的测试已钉到两位医家（`tests/test_chain.py`
+`tests/test_weights.py` 顶部的 autouse fixture），registry 增长不影响它们。
+
 判据：
-- `graph_stats` 的「当前学派数」变成 2，**λ2 的强制归零警告不再出现**
+- `graph_stats` 的「当前学派数」变成 2，**λ2 的强制归零警告不再出现**，取而代之
+  的是「已有 2 个学派……某个学派下只有一位医家时 λ2 对他不构成独立信号」的提示
 - λ1 分布：预期**仍然接近全 0**（清代医案术语与国标不对齐，见 `SOURCES.md` 第 8 条）。
   **如果 λ1 真的非 0 了，那是好消息但必须先确认不是 bug**——去看 `count_support`
   数到的是哪些 (症状, 证素) 对，抽查它们在医案里确实成立
@@ -145,7 +154,11 @@ consult(complaint, ask_fn=SimulatedPatient(profile="<病情，只有它自己知
   前者说明追问设计有效，后者说明轮次上限卡住了它
 - **重点看重复提问**：这边实测 8/27（约 30%）的候选问题问的是患者已经说过的症状
   （换了个说法所以匹配不上）。这是术语映射缺口，AutoDL 上要重新测一次比例
-- 追问回答里若出现危重症状，必须整轮终止且不产出方药（`stopped_by="safety"`）
+- 追问回答里若出现危重症状，必须整轮终止且不产出方药（`stopped_by="safety"`）。
+  **两种形式都要验**：回答原文带危重词（「有，还解了黑便」），以及被问的症状本身
+  危重、患者只答一个「有」（「有没有便血？」→「有」）——后者此前是漏的
+- ReAct 开着时（`USE_REACT=1`）它自己的 `ask_user` 追问也会通过同一个 `ask_fn` 问出去，
+  回答先过 `check_safety`；被拦时 `rejected=True` 且 `results` 为空
 
 ### 步骤 6：X3 三元组抽取
 

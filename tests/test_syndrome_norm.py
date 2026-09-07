@@ -34,5 +34,7 @@ def test_normalize_maps_ji_zheng_shorthand_to_ji_ju():
     """SP-13/SP-14（气滞血阻证/瘀血内结证）的定义写的是"属积证初期/中期"，
     不是"积聚"这两个字——"积证"是同一病程分期描述里的简称，要能归一化到
     "积聚"这个 canonical 概念，覆盖检查才能认出这两条属于积聚门类。"""
-    assert canonical("积证") == "积聚"
+    assert canonical("属积证") == "积聚"
     assert "积聚" in normalize("属积证初期，气滞渐及血分。")
+    # 裸的「积证」不能当变体：它是「食积证」「痰积证」的子串，会把食积类证候误归到积聚
+    assert "积聚" not in normalize("食积证")

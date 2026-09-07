@@ -17,6 +17,7 @@ DANGER_KEYWORDS: list[str] = [
     "呕血",
     "吐血",
     "便血",
+    "血便",
     "黑便",
     "柏油样便",
     "大量出血",
@@ -27,16 +28,41 @@ DANGER_KEYWORDS: list[str] = [
     "持续剧痛",
 ]
 
+# 同一件事的两种写法在拒绝文案里只该出现一次：关键词「吐血」和正则的「呕血」
+# 标签会对同一句话双双命中，dict.fromkeys 去不掉这种"不同字面、同一含义"。
+_LABEL_CANON: dict[str, str] = {"吐血": "呕血", "神志不清": "意识改变", "持续剧痛": "剧烈腹痛"}
 
 # 口语化表述：患者不会说"吐血"，只会说"吐了血""吐了两次血"。
 # 纯子串匹配对付不了中间插字，用正则允许关键动词与宾语之间有少量字符。
+#
+# 两处实测出来的误报边界，改正则时别改回去：
+#   - 「血」后面跟 压/虚/糖/脂 的是「血压/血虚/血糖/血脂」，前面是「气」的是「气血」，
+#     都不是出血。原来 `(吐|呕|咯|咳).{0,4}血` 把「咳嗽乏力气血不足」整句拦掉了。
+#   - 「便」前面是 小/顺/即/方/随 的是「小便/顺便/即便/方便/随便」，不是大便。
+#     原来 `(便).{0,4}血` 把「小便黄血压偏高」拦成了便血。
+# 黑便那条把 不/未/无/没 排除在间隔之外，因为问诊回答里「大便不黑」极常见；
+# 呕血/便血那两条**刻意不排除**——「吐了不少血」的「不」是数量词，排除会漏掉真出血。
+# 安全层宁可误报不可漏报，所以只堵有把握的误报。
 DANGER_PATTERNS: list[tuple[str, str]] = [
-    (r"(吐|呕|咯|咳)[^，。；\s]{0,4}血", "呕血"),
-    (r"(大?便|拉|排)[^，。；\s]{0,4}(黑|发黑|柏油)", "黑便"),
-    (r"(便|拉|排)[^，。；\s]{0,4}血", "便血"),
-    (r"(腹|肚)[^，。；\s]{0,3}(剧痛|绞痛|痛得|痛到)", "剧烈腹痛"),
+    (r"(吐|呕|咯|咳)[^，。；\s]{0,4}(?<!气)血(?![压虚糖脂])", "呕血"),
+    (r"(?<![小顺即方随])(大?便|拉|排)[^，。；\s不未无没]{0,4}(黑|发黑|柏油)", "黑便"),
+    (r"黑色[^，。；\s]{0,2}(大便|便|粪)", "黑便"),
+    (r"柏油[^，。；\s]{0,3}(便|粪)", "黑便"),
+    (r"(?<![小顺即方随])(便|拉|排)[^，。；\s]{0,4}(?<!气)血(?![压虚糖脂])", "便血"),
+    (r"(腹|肚)[^，。；\s]{0,3}(剧烈|剧痛|绞痛|痛得|痛到|疼得|疼到|痛不欲生)", "剧烈腹痛"),
+    (r"剧烈[^，。；\s]{0,3}(腹痛|肚子疼|肚痛|腹部)", "剧烈腹痛"),
     (r"(神志|意识)[^，。；\s]{0,4}(不清|模糊|丧失)", "意识改变"),
 ]
+
+# 紧挨在命中位置前面的否定词：「无黑便」「否认呕血」「没有便血」是阴性陈述，
+# 拦掉等于把如实回答"没有"的患者拒之门外。只认**前置**否定，不认命中内部的
+# 「不」（见上面「吐了不少血」的例子）。
+_NEGATION_PREFIXES: tuple[str, ...] = ("无", "否认", "没有", "未见", "不见", "未曾", "从无", "无明显", "无明确")
+
+
+def _negated(text: str, start: int) -> bool:
+    before = text[max(0, start - 3):start]
+    return any(before.endswith(n) for n in _NEGATION_PREFIXES)
 
 
 def check_safety(symptoms: list[str]) -> str | None:
@@ -49,10 +75,16 @@ def check_safety(symptoms: list[str]) -> str | None:
     # 靠 dict.fromkeys 去重即可——不要因为两套机制都命中就报两遍。
     hits: list[str] = []
     for text in symptoms:
-        hits.extend(kw for kw in DANGER_KEYWORDS if kw in text)
+        for kw in DANGER_KEYWORDS:
+            for m in re.finditer(re.escape(kw), text):
+                if not _negated(text, m.start()):
+                    hits.append(_LABEL_CANON.get(kw, kw))
+                    break
         for pattern, label in DANGER_PATTERNS:
-            if re.search(pattern, text):
-                hits.append(label)
+            for m in re.finditer(pattern, text):
+                if not _negated(text, m.start()):
+                    hits.append(label)
+                    break
     if not hits:
         return None
     matched = "、".join(dict.fromkeys(hits))  # 去重且保持命中顺序

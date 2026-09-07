@@ -242,3 +242,42 @@ def test_react_enabled_defaults_off(monkeypatch):
     assert react_enabled() is True
     monkeypatch.setenv("USE_REACT", "0")
     assert react_enabled() is False
+
+
+# ---------- 审查修复 ----------
+
+def test_invalid_ask_user_arguments_are_fed_back_not_terminal(scripted):
+    """ask_user 漏了 reason 时不能以 terminated_by="ask_user" 收尾——那样
+    pending_question 是 None、却没有任何问题可问。跟别的工具一样回灌纠正。"""
+    scripted([
+        ReActStep(thought="想问", action="ask_user", action_input={"question": "有没有口苦？"}),
+        ReActStep(thought="补上 reason", action="ask_user",
+                  action_input={"question": "有没有口苦？", "reason": "分不开"}),
+    ])
+    trace = _run()
+    assert trace.terminated_by == "ask_user"
+    assert trace.pending_question == "有没有口苦？"
+    assert trace.steps[0].note == "参数不合法"
+
+
+def test_search_cases_results_are_collected_into_the_whitelist(scripted, monkeypatch):
+    """工具描述向模型承诺"可以引用这里返回的 id"，这些 id 必须进幻觉判定的白名单。"""
+    monkeypatch.setattr(react, "run_tool", lambda name, args: {
+        "available": True, "cases": [{"case_id": "ye_tianshi-0042-p1-0"}, {"case_id": "ye_tianshi-0043-p1-0"}],
+    } if name == "search_cases" else {"found": False})
+    scripted([
+        ReActStep(thought="找先例", action="search_cases",
+                  action_input={"query": "纳差", "physician": "ye_tianshi"}),
+        ReActStep(thought="够了", action="finish"),
+    ])
+    trace = _run()
+    assert trace.retrieved_case_ids == ["ye_tianshi-0042-p1-0", "ye_tianshi-0043-p1-0"]
+
+
+def test_pending_answer_is_shown_to_s3():
+    trace = ReActTrace(steps=[ReActStepRecord(step=1, thought="t", action="ask_user",
+                                              action_input={"question": "有没有口苦？", "reason": "r"},
+                                              observation="{}")],
+                       terminated_by="ask_user", pending_question="有没有口苦？", pending_answer="没有")
+    text = format_trace_for_s3(trace)
+    assert "有没有口苦？" in text and "患者答：没有" in text
