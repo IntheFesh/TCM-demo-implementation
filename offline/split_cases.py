@@ -50,6 +50,19 @@ BOOKS = {
                             # 会被 <篇名> 硬切断（"脾胃病人焊在温病病人后面"是边界内的事，
                             # 这里至少先把所有命中门类拼成一条连续正文再切，缓解门类间的截断）
     ),
+    # A2 新增。这本书的体例跟前两本根本不同，所以走另一条策略（见 strategy）：
+    # 它有独立成卷的「五、医案」（137 案），每个 <篇名> 恰好是一个病人，书里
+    # 还自带 \x病因\x \x证候\x \x诊断\x \x处方\x \x效果\x \x复诊\x 字段标记。
+    # 也就是说前两本逼出 R2 改造的那个核心难题——"正则找不准案边界，只能粘连着
+    # 交给 LLM 判断"——在这本书上不存在，原文已经把边界标好了。
+    "zhang_xichun": dict(
+        src="584-医学衷中参西录.txt",
+        # 门类名出现在 <目录> 路径里（"五、医案\（五）肠胃病门"），不在 <篇名> 里
+        # ——<篇名> 是案名（"1．虚劳证阳亢阴亏"）。所以 gate 匹配的字段不一样。
+        gates=["肠胃病", "气病", "血病", "痢疾", "霍乱", "大小便病", "肿胀", "黄胆"],
+        strategy="toc_case",
+        toc_prefix="五、医案",
+    ),
 }
 
 
@@ -57,6 +70,26 @@ def read(p):
     # 原文实际编码是 GB18030（GBK 的超集）。对目前这三本书两者解码结果逐字相同
     # （已核对），但 GB18030 能覆盖 GBK 之外的字，换成它没有下行风险。
     return pathlib.Path(p).read_bytes().decode("gb18030", errors="ignore")
+
+
+def sections_by_toc(text, gates, toc_prefix):
+    """按 <目录> 路径过滤，返回 [(目录路径, 正文), ...]，一个 <篇名> 一块。
+
+    跟 sections() 的区别只在 gate 匹配哪个字段：sections() 匹配 <篇名>（前两本书
+    的 <篇名> 就是门类名），这里匹配 <目录> 路径（这本书的门类名在目录里，
+    <篇名> 是案名）。分成两个函数而不是加参数，是因为两本书的 <目录> 语义
+    也不同——前两本的目录层级没有"医案"这一卷，toc_prefix 无从谈起。
+    """
+    out = []
+    for block in re.split(r"<目录>", text)[1:]:
+        path = block.split("\n", 1)[0].strip()
+        if not path.startswith(toc_prefix):
+            continue
+        if not any(g in path for g in gates):
+            continue
+        body = block.split("\n", 1)[1] if "\n" in block else ""
+        out.append((path, body))
+    return out
 
 
 def sections(text, gates):
@@ -136,12 +169,19 @@ def collect_segments(pid, cfg, books_dir=".", max_len=1500):
     """纯正则扫描，返回这位医家的全部粗段：
     [{seg_id, physician, text, char_len, head_hints, follow_hints}, ...]。零 LLM 调用。"""
     text = read(pathlib.Path(books_dir) / cfg["src"])
-    secs = sections(text, cfg["gates"])
 
-    if cfg.get("concat_gates"):
+    if cfg.get("strategy") == "toc_case":
+        # 原文已经按病人分好了块，这里就不再按长度切——切了反而会把一个病人
+        # 劈成两段，正是 chunk_chapter 文档里警告的"宁可粘连不可切碎"的反面。
+        # 实测 137 案里最长 1858 字、中位 751 字，整块喂模型没有压力。
+        secs = sections_by_toc(text, cfg["gates"], cfg["toc_prefix"])
+        chunks = [body.split("\n") for _, body in secs]
+    elif cfg.get("concat_gates"):
+        secs = sections(text, cfg["gates"])
         combined = "\n".join(body for _, body in secs)
         chunks = chunk_chapter(combined, max_len=max_len)
     else:
+        secs = sections(text, cfg["gates"])
         chunks = []
         for _, body in secs:
             chunks.extend(chunk_chapter(body, max_len=max_len))
@@ -162,7 +202,20 @@ def collect_segments(pid, cfg, books_dir=".", max_len=1500):
     return segments
 
 
-def print_segment_stats(pid, segments):
+# 张锡纯每个病人的开头都有一条 "属性：..." 身份行，这是原文自带的结构，
+# 比 head_hints 正则可靠得多——所以 toc_case 策略下用它做"一段几个病人"的判据。
+PATIENT_MARKER = "属性"
+
+
+def structural_patient_check(segments):
+    """数每段里的 属性： 行。返回 (恰好 1 个的段数, 总段数, 分布)。"""
+    from collections import Counter as _C
+
+    counts = [seg["text"].count(PATIENT_MARKER) for seg in segments]
+    return sum(1 for c in counts if c == 1), len(counts), dict(_C(counts))
+
+
+def print_segment_stats(pid, segments, cfg=None):
     n = len(segments)
     hint_counts = [len(seg["head_hints"]) for seg in segments]
     follow_counts = [len(seg["follow_hints"]) for seg in segments]
@@ -182,8 +235,21 @@ def print_segment_stats(pid, segments):
     for v in sorted(dist):
         bar = "#" * min(dist[v], 60)
         print(f"    {v:>2} : {dist[v]:>4}  {bar}")
-    return {"n_segments": n, "total_head_hints": total_hints, "n_ge2": n_ge2, "max_hints": max_c}
+    # head_hints 是照叶天士的案首体例写的（单字姓 + 空格/括号）。张锡纯写的是
+    # "属性:天津陈××,三十五岁,..."——逗号分隔、没有空格，正则一条都不触发。
+    # 所以**跨书比较 head_hints 是无效的**：张锡纯那个 0.07/段 不代表"每段一个
+    # 病人"，只代表"这套正则看不见他的案首"。真正的判据用原文自带的身份行。
+    structural = None
+    if cfg and cfg.get("strategy") == "toc_case":
+        ok, total, dist = structural_patient_check(segments)
+        structural = {"one_patient_segments": ok, "total": total, "distribution": dist}
+        print(f"  [结构性判据] 每段恰好一条「{PATIENT_MARKER}：」身份行：{ok}/{total}"
+              f"　分布={dist}")
+        print("  [注意] 上面的 head_hints 数字对本书无效——正则是按叶天士案首体例写的，"
+              "命中不了「属性:天津陈××,三十五岁」这种写法，不要拿它跨书比较。")
 
+    return {"n_segments": n, "total_head_hints": total_hints, "n_ge2": n_ge2,
+            "max_hints": max_c, "structural": structural}
 
 def write_segments(pid, segments, outdir="out"):
     import json
@@ -208,8 +274,18 @@ if __name__ == "__main__":
     parser.add_argument("--max-len", type=int, default=1500, help="粗段字数上限")
     args = parser.parse_args()
 
+    missing = []
     for pid, cfg in BOOKS.items():
+        src = pathlib.Path(args.books_dir) / cfg["src"]
+        if not src.exists():
+            # 少一本书就跳过这一位医家，不要整个脚本崩掉：BOOKS 里现在有三本，
+            # 只下载了其中一两本是完全正常的使用方式。
+            missing.append((pid, str(src)))
+            continue
         segments = collect_segments(pid, cfg, books_dir=args.books_dir, max_len=args.max_len)
-        print_segment_stats(pid, segments)
+        print_segment_stats(pid, segments, cfg)
         if not args.stats_only:
             write_segments(pid, segments)
+
+    for pid, src in missing:
+        print(f"\n[跳过] {pid}：找不到 {src}。下载命令见 README「快速开始」第 3.1 步。")

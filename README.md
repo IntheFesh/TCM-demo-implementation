@@ -81,8 +81,13 @@ cp .env.example .env
 mkdir -p books
 curl -o 367.txt "https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/367-%E4%B8%B4%E8%AF%81%E6%8C%87%E5%8D%97%E5%8C%BB%E6%A1%88.txt"
 curl -o 361.txt "https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/361-%E5%90%B4%E9%9E%A0%E9%80%9A%E5%8C%BB%E6%A1%88.txt"
+curl -o 584.txt "https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/584-%E5%8C%BB%E5%AD%A6%E8%A1%B7%E4%B8%AD%E5%8F%82%E8%A5%BF%E5%BD%95.txt"
 mv 367.txt "books/367-临证指南医案.txt" && mv 361.txt "books/361-吴鞠通医案.txt"
+mv 584.txt "books/584-医学衷中参西录.txt"
 ```
+
+584（张锡纯《医学衷中参西录》）是 A2 加进来的第三本。只下载前两本也能跑——
+`split_cases.py` 会跳过缺书的医家并提示，不会崩。
 
 连不上 GitHub？见下方[常见问题](#常见问题)。
 
