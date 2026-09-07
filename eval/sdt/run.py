@@ -14,6 +14,7 @@ import json
 import time
 from pathlib import Path
 
+from core.safety import safety_bypassed
 from eval.sdt.adapter import SOLVERS
 from eval.sdt.data import attach_gold, load_split, read_gold, write_submission
 
@@ -34,7 +35,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--ignore-safety-veto", action="store_true",
         help="绕过危重症状拦截。默认不绕——被拦的记录产出空答案得 0 分，那是这套"
-             "系统真实的行为。用这个开关跑出来的分必须单独标注，不能混进主结果。",
+             "系统真实的行为。用这个开关跑出来的分必须单独标注，不能混进主结果。"
+             "不传这个开关时回落到环境变量 EVAL_MODE（同样默认关）。",
     )
     args = ap.parse_args(argv)
 
@@ -49,15 +51,20 @@ def main(argv: list[str] | None = None) -> None:
     if args.limit:
         records = records[: args.limit]
 
-    if args.ignore_safety_veto:
-        print("【警告】已绕过安全否决层。这一轮的分数不代表本系统的实际行为，"
-              "引用时必须标注 ignore_safety_veto=True。")
+    # 传了开关就一定旁路；没传则交给 safety_bypassed 读 EVAL_MODE。传 False 会
+    # 显式压掉环境变量，那样 EVAL_MODE 对 SDT 永远不生效，不是想要的行为。
+    bypass_arg = True if args.ignore_safety_veto else None
+    bypass_effective = safety_bypassed(bypass_arg)
+    if bypass_effective:
+        source = "--ignore-safety-veto" if args.ignore_safety_veto else "环境变量 EVAL_MODE"
+        print(f"【警告】已绕过安全否决层（来自 {source}）。这一轮的分数不代表本系统的"
+              "实际行为，引用时必须标注 ignore_safety_veto=True。")
 
     solver = SOLVERS[args.solver]()
     lines, rejected, calls = [], [], 0
     t0 = time.time()
     for i, r in enumerate(records, 1):
-        answer = solver.solve(r, ignore_safety_veto=args.ignore_safety_veto)
+        answer = solver.solve(r, ignore_safety_veto=bypass_arg)
         lines.append(answer.to_line())
         calls += answer.llm_calls
         if answer.safety_rejected:
@@ -78,7 +85,13 @@ def main(argv: list[str] | None = None) -> None:
         "model": get_llm().model_name(),
         "backend": get_llm().backend_id(),
         "comparability_warning": get_llm().comparability_warning(),
-        "ignore_safety_veto": args.ignore_safety_veto,
+        # 记实际生效值，不是 args 值：EVAL_MODE 生效而没传开关时，args 是 False，
+        # 照抄进 manifest 就等于让"这个数字怎么来的"这份唯一凭据撒谎。
+        "ignore_safety_veto": bypass_effective,
+        "ignore_safety_veto_source": (
+            "--ignore-safety-veto" if args.ignore_safety_veto
+            else ("EVAL_MODE" if bypass_effective else None)
+        ),
         # 被安全层拦下的记录：它们提交的是空答案、得 0 分。这个数必须跟分数
         # 一起报，否则读的人会以为是模型答错了。
         "safety_rejected": rejected,

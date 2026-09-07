@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 from core.llm import get_llm, load_prompt, render
-from core.safety import check_safety
+from core.safety import check_safety, safety_bypassed
 from eval.sdt.data import SdtRecord, to_line
 
 
@@ -111,10 +111,18 @@ class BaselineSolver:
     def reasoning_block(self, record: SdtRecord) -> str:
         return ""
 
-    def solve(self, record: SdtRecord, ignore_safety_veto: bool = False) -> SdtAnswer:
+    def solve(self, record: SdtRecord, ignore_safety_veto: bool | None = None) -> SdtAnswer:
+        """ignore_safety_veto=None 时读环境变量 EVAL_MODE（默认关），显式传布尔值
+        优先——判定实现只有 core.safety.safety_bypassed 一处，SDT 这条链路和
+        core.chain.consult 那条共用它，不各写一套。
+
+        默认值从 False 改成 None 是刻意的：留 False 的话环境变量永远被覆盖成
+        "不旁路"，EVAL_MODE 对 SDT 就是死的。行为上没有回归——不传参时未设
+        EVAL_MODE 仍然是不旁路，跟改之前一致。"""
         answer = SdtAnswer(record_id=record.record_id)
 
-        reject = None if ignore_safety_veto else check_safety([record.clinical_data])
+        # check_safety 照跑，只是命中后要不要中止由 safety_bypassed 决定
+        reject = None if safety_bypassed(ignore_safety_veto) else check_safety([record.clinical_data])
         if reject is not None:
             answer.safety_rejected = reject
             return answer

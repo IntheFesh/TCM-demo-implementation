@@ -74,6 +74,7 @@ def api_consult(req: ConsultRequest) -> dict:
             "s1": s1.model_dump(),
             "rejected": True,
             "reject_reason": outcome["reject_reason"],
+            "safety_flag": outcome.get("safety_flag"),
             "results": [],
             "divergence": None,
             "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
@@ -87,6 +88,7 @@ def api_consult(req: ConsultRequest) -> dict:
         return {
             "s1": outcome["s1"].model_dump(),
             "rejected": False,
+            "safety_flag": outcome.get("safety_flag"),
             "insufficient": True,
             "insufficient_reason": outcome["insufficient_reason"],
             "coverage": outcome.get("coverage"),
@@ -108,6 +110,9 @@ def api_consult(req: ConsultRequest) -> dict:
         "s1": s1.model_dump(),
         "rejected": False,
         "reject_reason": None,
+        # EVAL_MODE 下非空 = 这条主诉本该被安全层拦下，但评测模式让它跑完了。
+        # demo 模式下这个分支的它恒为 None（命中就走上面 rejected 分支了）。
+        "safety_flag": outcome.get("safety_flag"),
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
         "insufficient": False,

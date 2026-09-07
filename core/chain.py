@@ -25,7 +25,7 @@ from core.followup import AskFn, format_followup_for_s3, parse_answer, run_follo
 from core.physicians import PHYSICIANS
 from core.react import format_trace_for_s3, react_enabled, run_react
 from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
-from core.safety import check_safety, mentions_danger
+from core.safety import check_safety, mentions_danger, safety_bypassed
 from core.safety_output import (
     check_incompatible,
     check_thermal_consistency,
@@ -172,8 +172,14 @@ def run_physician(
     use_react: bool = False,
     followup: FollowupResult | None = None,
     ask_fn: AskFn | None = None,
+    bypass_safety: bool = False,
 ) -> dict:
+    """bypass_safety 由 consult() 一次算好后传进来，不在这里各自读一次环境变量
+    ——同一个请求的几个中止点必须用同一个判断，不能一半拦一半不拦。"""
     symptoms_text = "；".join(s1.symptoms)
+    # ReAct 追问命中危重症状时，demo 模式抛 SafetyVeto 中止；EVAL_MODE 下不中止，
+    # 把本该拦截的原因经由返回值带回 consult()（异常没抛，只能走返回值这条路）。
+    react_safety_flag: str | None = None
 
     # 检索该医家 top-3 医案
     query = f"{symptoms_text}。舌{s1.tongue or '未记'}，脉{s1.pulse or '未记'}"
@@ -244,7 +250,9 @@ def run_physician(
                         "请立即就医或拨打急救电话，本次不提供辨证结果。"
                     )
                 if reject is not None:
-                    raise SafetyVeto(reject, llm_calls=trace.llm_calls)
+                    if not bypass_safety:
+                        raise SafetyVeto(reject, llm_calls=trace.llm_calls)
+                    react_safety_flag = reject
                 trace.pending_answer = answer
         s3_system = s3_system + format_trace_for_s3(trace)
 
@@ -287,6 +295,8 @@ def run_physician(
         # "引用了 0 条"静默过去
         "no_reference_cases": not hits,
         "hallucinated": hallucinated,
+        # 只在 EVAL_MODE 下可能非空：demo 模式命中这里就抛 SafetyVeto 了，走不到返回。
+        "safety_flag": react_safety_flag,
         "safety_output": {
             "incompatible": incompatible,
             "thermal_warning": thermal_warning,
@@ -372,16 +382,28 @@ def consult(
     complaint: str,
     use_react: bool | None = None,
     ask_fn: AskFn | None = None,
+    eval_mode: bool | None = None,
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
 
     ask_fn 是追问的提问渠道（真人命令行、患者模拟器、前端各传各的）。不传就
     不追问——没有提问渠道时静默跳过是对的，不是错误。
+
+    eval_mode=None 时读环境变量 EVAL_MODE（默认关），形状跟 use_react 一致。
+    打开之后，**安全检查照跑、命中原因照记进返回值的 safety_flag，但不再中止
+    链路**——评测要量化"安全否决花了多少分"，就得让被拦的那些主诉也走完一遍
+    拿到分数，否则那个代价算不出来。默认关，demo 的拦截红线不受影响。
     """
     _t0 = time.time()
     if use_react is None:
         use_react = react_enabled()
+    # 一次 consult 里只判一次，之后一路用这个布尔值：中途有人改环境变量时，
+    # 同一个请求的四个中止点也不会一半拦一半不拦。
+    bypass = safety_bypassed(eval_mode)
+    # demo 模式下这次请求会被拦截的原因（最早触发的那个）。EVAL_MODE 打开时
+    # 链路继续往下走，但这个字段仍然如实记着"本来会被拦"，两种模式同一套语义。
+    safety_flag: str | None = None
     s1 = normalize(complaint)
 
     # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
@@ -389,7 +411,8 @@ def consult(
     # 三处都要查：S1 可能把"最近吐了两次血"这类病史陈述归进 unmapped
     # （s1_normalize.yaml 明确要求含糊的病史表述放 unmapped），只查 symptoms 会漏。
     reject_reason = check_safety([complaint] + s1.symptoms + s1.unmapped)
-    if reject_reason is not None:
+    safety_flag = safety_flag or reject_reason
+    if reject_reason is not None and not bypass:
         # 键集跟正常路径保持一致：api/前端按同一份契约读，缺键就是 KeyError。
         return {
             "s1": s1,
@@ -397,6 +420,7 @@ def consult(
             "divergence": None,
             "rejected": True,
             "reject_reason": reject_reason,
+            "safety_flag": safety_flag,
             "s2": None, "residual": None, "followup": None,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react),
@@ -413,12 +437,15 @@ def consult(
     if followup.stopped_by == "safety":
         # 追问问出危重症状 = 跟初始主诉命中同一道否决，同样不产出任何方药。
         # CLAUDE.md：追问是安全否决层的后门，这里堵上。
+        safety_flag = safety_flag or followup.reject_reason
+    if followup.stopped_by == "safety" and not bypass:
         return {
             "s1": s1,
             "results": [],
             "divergence": None,
             "rejected": True,
             "reject_reason": followup.reject_reason,
+            "safety_flag": safety_flag,
             "s2": s2,
             "followup": followup,
             "residual": None, "insufficient": False, "insufficient_reason": None, "coverage": None,
@@ -430,10 +457,12 @@ def consult(
         # 双保险：run_followup 已经把危重症状挡在 asserted 之外，这里再查一次是防
         # 将来有人改了 followup 的判据却没意识到这条症状会一路进 S2/S3。
         reject = check_safety(followup.asserted)
-        if reject is not None:
+        safety_flag = safety_flag or reject
+        if reject is not None and not bypass:
             return {
                 "s1": s1, "results": [], "divergence": None,
                 "rejected": True, "reject_reason": reject,
+                "safety_flag": safety_flag,
                 "s2": s2, "followup": followup, "residual": None,
                 "insufficient": False, "insufficient_reason": None, "coverage": None,
                 "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react),
@@ -473,6 +502,7 @@ def consult(
                 "饮食与二便情况、寒热喜恶、舌象与脉象。"
             ),
             "coverage": round(coverage, 3),
+            "safety_flag": safety_flag,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
                 2 + extra_calls + (1 if residual else 0), use_react
@@ -483,7 +513,7 @@ def consult(
         for physician, info in PHYSICIANS.items():
             results.append(run_physician(
                 s1, s2, physician, info["name"], use_react=use_react,
-                followup=followup, ask_fn=ask_fn,
+                followup=followup, ask_fn=ask_fn, bypass_safety=bypass,
             ))
     except SafetyVeto as veto:
         # ReAct 追问问出了危重症状：跟初始主诉命中同一道否决，已经跑完的医家结果
@@ -497,6 +527,7 @@ def consult(
         return {
             "s1": s1, "results": [], "divergence": None,
             "rejected": True, "reject_reason": veto.reason,
+            "safety_flag": safety_flag or veto.reason,
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react),
@@ -505,6 +536,12 @@ def consult(
     syndromes = {r["physician"]: r["s3"].syndrome for r in results}
     values = list(syndromes.values())
     same = len(set(values)) <= 1
+
+    # EVAL_MODE 下 ReAct 的追问可能问出危重症状而没有中止（见 run_physician），
+    # 把那个本该拦截的原因收上来。demo 模式走不到这里——那条路会抛 SafetyVeto。
+    safety_flag = safety_flag or next(
+        (r["safety_flag"] for r in results if r["safety_flag"]), None
+    )
 
     # 字符串比对会把"脾胃气虚，运化失健"和"脾虚湿困，中焦不运"判为分歧，
     # 哪怕两者治法、方剂一字不差（实测 10 条主诉分歧率 9/9，指标无区分度）。
@@ -544,6 +581,7 @@ def consult(
         "divergence": divergence,
         "rejected": False,
         "reject_reason": None,
+        "safety_flag": safety_flag,
         "s2": s2,
         "residual": residual,
         "followup": followup,

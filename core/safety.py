@@ -11,6 +11,8 @@ S2/S3，不产出任何方药，不是在结果的 note 字段里事后提一句
 """
 from __future__ import annotations
 
+import os
+
 # 覆盖这个 demo 脾胃门范围内、临床上需要立即转诊而不是继续辨证的信号：
 # 消化道出血（呕血/黑便/柏油样便/咖啡渣样呕吐物）、意识改变（昏迷/晕厥/不省人事）、
 # 休克体征、持续剧痛。
@@ -146,6 +148,29 @@ def mentions_danger(text: str) -> str | None:
     """
     hits = _scan(text, honor_negation=False)
     return "、".join(dict.fromkeys(hits)) if hits else None
+
+
+def safety_bypassed(explicit: bool | None = None) -> bool:
+    """**这次调用要不要跳过"命中后中止"这个动作**——注意跳过的只是中止，
+    `check_safety()` 本身照跑、命中原因照记，不是不检测了。
+
+    唯一的判定实现，两条链路（`core.chain.consult` 和 `eval.sdt.adapter`）
+    都调它，不各写一套。判定顺序刻意是"显式参数优先，未指定才读环境变量"：
+
+    - 显式参数并发安全。同一个进程里两个请求可以各自指定，互不影响；
+      env var 是全局的，一个评测脚本设了它，同进程跑的 demo 请求会跟着变——
+      那正是安全红线最不能出的事。
+    - 环境变量兜底是为了让整批评测（`eval/run_eval.py` 调 consult、
+      `eval/sdt/run.py` 调 solver）不必逐个调用点改签名。
+
+    形状照抄同文件外 `core.react.react_enabled()` / `consult(use_react=None)`
+    这条本项目已有的约定，不新发明一种。
+
+    **默认关**：不设 EVAL_MODE、不传参数时返回 False，demo 行为一字不变。
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get("EVAL_MODE", "0").lower() in ("1", "true", "yes")
 
 
 def check_safety(symptoms: list[str]) -> str | None:

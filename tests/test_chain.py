@@ -658,7 +658,9 @@ def test_all_return_paths_share_the_same_keys(monkeypatch):
     normal = chain.consult("纳差乏力")
     rejected = chain.consult("纳差，昨天解黑便")
     followup_rejected = chain.consult("纳差乏力", ask_fn=lambda q: "有，还解了黑便")
-    expected = {"s1", "results", "divergence", "rejected", "reject_reason", "s2",
+    # safety_flag 是 EVAL_MODE 旁路引入的新键（这一轮的有意契约变更）：所有分支
+    # 都要带，两种模式的键集才一致，api/前端按同一份契约读。
+    expected = {"s1", "results", "divergence", "rejected", "reject_reason", "safety_flag", "s2",
                 "residual", "followup", "insufficient", "insufficient_reason", "coverage", "manifest"}
     for outcome in (normal, rejected, followup_rejected):
         assert expected <= set(outcome), expected - set(outcome)
