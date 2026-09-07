@@ -15,6 +15,9 @@ data/element_index.json
 eval/epsilon.json
 eval/report.json
 eval/report.md
+eval/mes/items.json
+eval/mes/answer_key.json
+eval/mes/collected.json
 out/
 .venv/
 venv/

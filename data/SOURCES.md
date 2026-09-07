@@ -718,3 +718,34 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     100% 真实验证的检索路径；`mode="hybrid"` 的三路融合（dense+bm25+graph）
     因为仍然无条件算 dense 那一路，还是卡在同一个 huggingface hub 网络限制上
     （见 SOURCES.md 第 19 条），融合逻辑本身用受控假向量在单测里验证过。
+
+23. **V1 · 评测汇总：E1-E13 的具体编号定义这一轮没有拿到 V3 计划文档原文**
+    （跟 X3/K3b 一样的情况），`eval/run_eval.py` 是按现有代码已经产出的、有
+    真实含义的信号重新设计的四类指标——分歧度 vs ε 噪声地板、幻觉率（按有无
+    参考医案分组）、安全否决率+代价、检索模式对比（McNemar）——不是照抄一份
+    这一轮也拿不准是否准确的编号清单。`eval/mcnemar.py` 自实现的精确二项检验
+    和连续性校正卡方近似，用 scipy.stats（这台环境的 .venv 恰好装了，是
+    sentence-transformers 的传递依赖，仅用于开发期离线核对数值，不是项目
+    运行时依赖）逐个用例核对过，浮点精度内完全一致（见该模块文档字符串）。
+
+    真实验证发现并修复了一个刻度错配的 bug：`retrieval_mode_comparison` 最初
+    不分青红皂白地对任意两个检索 mode 的 top-1 分数套用 `MIN_RETRIEVAL_SCORE
+    =0.70` 判"是否够可信"——用真实 bm25/graph 数据一跑，bm25 因为展示分是
+    无界原始分（10-30 常态）而 10/10 全部"达标"，McNemar 给出 p=0.002 看似
+    "bm25 显著更自信"，实际只是刻度不可比，不是真实差异（这正是 K3a 自己
+    的模块文档字符串已经写明的道理："BM25 分数不在同一尺度上，套用同一个
+    阈值没有意义"——这次是我自己在 V1 里忘了这条自己定的规矩）。修复：只有
+    两个 mode 都在 [0,1] 有界的相似度刻度上（dense/graph/hybrid）才用阈值
+    判据，只要有一个是 bm25 就退化成"有没有返回任何结果"这个两种刻度下都
+    成立的更弱判据，并在 `criterion` 字段里如实标注用的是哪一种——不能对
+    不可比的分数硬套一个阈值再假装结果有意义。修复前后都用真实 bm25/graph
+    数据跑过：修复后两者都 10/10 有结果、McNemar 正确给出 p=1.0（无不一致
+    配对），不再是误导性的"显著差异"。
+
+    另用一次真实 claude_cli 调用（FakeRetriever 接 2 条合成医案，1 条主诉）
+    验证了 V1 全链路：`build_report`/`render_markdown` 消费真实 consult()
+    输出无异常（幻觉率 0/2，因为两位医家都忠实引用了真实检索到的 case_id）；
+    `eval/mes/export.py` 的 `build_blind_items` 正确隐去了 cited_case_ids（会
+    暴露 medical case id 前缀=医家身份）和 physician 字段，`winner` 留空待评；
+    `eval/mes/collect.py` 用手填的 winner 换回真实身份、正确统计胜负并算出
+    McNemar p 值。
