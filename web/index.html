@@ -757,16 +757,26 @@ function renderDivergence(divergence) {
   const banner = document.getElementById("divergence-banner");
   if (divergence && divergence.herb_jaccard !== null && divergence.herb_jaccard !== undefined) {
     const j = divergence.herb_jaccard;
+    const eps = divergence.epsilon_online;
     const shared = divergence.shared_herbs || [];
     const tp = divergence.treatment_principle_same ? "治法一致" : "治法不同";
-    let level;
-    if (j <= 0.3) level = "用药高度重合";
-    else if (j <= 0.7) level = "用药部分重合";
-    else level = "用药基本不重合";
+    // 三档判定，按 offline/estimate_epsilon.py 产出的噪声地板分档：
+    //   没测过 ε —— 退回旧的三段式粗判，并如实标注"未测噪声地板"
+    //   jaccard <= ε —— 差异在同一设定重复跑本来就会有的抖动范围内，不算分歧
+    //   ε < jaccard —— 按原来 0.3/0.7 两档粗分程度
+    let level, epsNote;
+    if (eps === null || eps === undefined) {
+      level = j <= 0.3 ? "用药高度重合" : j <= 0.7 ? "用药部分重合" : "用药基本不重合";
+      epsNote = "；对照基准 ε 尚未估算，此数暂无参照";
+    } else if (j <= eps) {
+      level = "用药差异在模型抖动范围内，不构成分歧";
+      epsNote = `；ε=${eps}`;
+    } else {
+      level = j <= 0.5 ? "用药部分重合" : "用药基本不重合";
+      epsNote = `；ε=${eps}（已超出噪声范围）`;
+    }
     const sharedText = shared.length ? `，共用 ${shared.join("、")}` : "";
-    // 项目规则：任何数字都必须带对照。ε 噪声地板（同一主诉重复跑的分歧）要在 AutoDL
-    // 上估算，在此之前这个数只能带着"无基准"的说明展示，不能裸露
-    banner.textContent = `${tp}；${level}（药物 Jaccard 距离 ${j}${sharedText}；对照基准 ε 尚未估算，此数暂无参照）`;
+    banner.textContent = `${tp}；${level}（药物 Jaccard 距离 ${j}${sharedText}${epsNote}）`;
     banner.classList.add("show");
   } else if (divergence && divergence.same === false) {
     banner.textContent = "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";

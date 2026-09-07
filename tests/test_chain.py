@@ -1,4 +1,5 @@
 """core/chain.py 的离线测试：用假 LLM 后端和假检索器，不需要网络。"""
+import json
 from core import chain
 from core.retrieval import Retriever
 from core.schemas import CaseRecord, ElementHit, S1Normalize, S2Elements, S3Syndrome
@@ -759,3 +760,45 @@ def test_batch_runner_counts_normal_and_rejected(capsys):
     assert stats == {"total": 2, "rejected": 1, "insufficient": 0, "divergent": 1,
                      "hallucinated": 1, "durations": stats["durations"]}
     assert "分歧例数：1/1" in capsys.readouterr().out
+
+
+# ---------- 模块 1（E）：divergence.epsilon_online ----------
+
+def test_divergence_epsilon_online_is_none_without_epsilon_json(monkeypatch, tmp_path):
+    monkeypatch.setattr(chain, "EPSILON_PATH", tmp_path / "nope.json")
+    s3_ye = S3Syndrome(syndrome="脾虚", reasoning="x", treatment_principle="健脾",
+                       herbs=["党参"], cited_case_ids=["ye_tianshi-001"])
+    s3_wu = S3Syndrome(syndrome="脾虚", reasoning="x", treatment_principle="健脾",
+                       herbs=["白术"], cited_case_ids=["wu_jutong-001"])
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    div = chain.consult("纳差乏力")["divergence"]
+    assert div["epsilon_online"] is None
+
+
+def test_divergence_epsilon_online_reads_from_epsilon_json(monkeypatch, tmp_path):
+    p = tmp_path / "epsilon.json"
+    p.write_text(json.dumps({"epsilon_online": {"mean": 0.22}}), encoding="utf-8")
+    monkeypatch.setattr(chain, "EPSILON_PATH", p)
+    s3_ye = S3Syndrome(syndrome="脾虚", reasoning="x", treatment_principle="健脾",
+                       herbs=["党参"], cited_case_ids=["ye_tianshi-001"])
+    s3_wu = S3Syndrome(syndrome="脾虚", reasoning="x", treatment_principle="健脾",
+                       herbs=["白术"], cited_case_ids=["wu_jutong-001"])
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    div = chain.consult("纳差乏力")["divergence"]
+    assert div["epsilon_online"] == 0.22
+
+
+def test_divergence_epsilon_online_survives_corrupt_json(monkeypatch, tmp_path):
+    """文件存在但不是合法 JSON（比如估算脚本被中断写了一半）不该让 consult 崩掉。"""
+    p = tmp_path / "epsilon.json"
+    p.write_text("{不是合法 json", encoding="utf-8")
+    monkeypatch.setattr(chain, "EPSILON_PATH", p)
+    s3 = S3Syndrome(syndrome="x", reasoning="x", treatment_principle="x", cited_case_ids=["a"])
+    fake_llm = FakeLLM({"叶天士": s3, "吴鞠通": s3})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    assert chain.consult("纳差乏力")["divergence"]["epsilon_online"] is None

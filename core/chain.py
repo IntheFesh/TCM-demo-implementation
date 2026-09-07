@@ -14,7 +14,9 @@ S1 必须只跑一次：如果对每位医家各跑一次，两次输出的症�
 """
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 from core import herbs as _herbs
 from core.elements import ELEMENTS, LOCATIONS, NATURES
@@ -35,6 +37,22 @@ from core.schemas import (
 
 # MIN_RETRIEVAL_SCORE 挪到 core/retrieval.py 了（ReAct 的 search_cases 工具也要用同一个
 # 阈值，而 tools 不能反向 import chain）。这里 re-export，老调用方不受影响。
+
+# offline/estimate_epsilon.py 的产物。模块级只放路径常量，不在 import 时读文件——
+# 惰性初始化的一贯做法，且这里没有单例可惰性化，每次 consult() 直接读（文件几 KB，
+# 开销可忽略）。文件不存在时 divergence["epsilon_online"] 就是 None，不抛异常：
+# demo 在没跑过 ε 估算时也要能正常用。
+EPSILON_PATH = Path(__file__).resolve().parent.parent / "eval" / "epsilon.json"
+
+
+def _load_epsilon_online() -> float | None:
+    if not EPSILON_PATH.exists():
+        return None
+    try:
+        data = json.loads(EPSILON_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return (data.get("epsilon_online") or {}).get("mean")
 
 
 class SafetyVeto(Exception):
@@ -514,6 +532,10 @@ def consult(
         "herb_jaccard": round(herb_jaccard, 3) if herb_jaccard is not None else None,
         "shared_herbs": shared_herbs,
         "treatment_principle_same": tp_same,
+        # 噪声地板：herb_jaccard 本身没有意义，除非知道"同一设定重复跑，本来就会
+        # 抖多少"。None = 还没跑过 offline/estimate_epsilon.py，前端要如实展示
+        # "未测"，不能假装这个数已经有对照（CLAUDE.md「任何数字都必须带对照」）。
+        "epsilon_online": _load_epsilon_online(),
     }
 
     return {
