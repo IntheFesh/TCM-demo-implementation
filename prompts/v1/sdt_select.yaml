@@ -1,0 +1,23 @@
+system: |
+  下面是一份中医医案，以及两组备选项。请分别选出符合这个医案的病机和证型。
+
+  $reasoning_block
+
+  医案原文：
+  $clinical_data
+
+  【病机备选项】
+  $pathogenesis_options
+
+  【证型备选项】
+  $syndrome_options
+
+  要求：
+  - 每组可以多选，也可以只选一个。选项字母只能来自上面给出的字母，不要编造。
+  - **选错要扣分，漏选只是不得分**——拿不准的宁可不选，不要为了凑数把把握不大的
+    选项也填上。
+  - 两组分别判断：病机是病理机转（「热伤肺络」），证型是证候名（「血热妄行」），
+    不要把同一个判断在两组里各选一遍。
+
+  只输出符合 schema 的 JSON，不要输出解释或 markdown 围栏。
+notes: "喂给 eval.sdt.adapter.SelectedOptions。Task2+Task3 合并成一次调用——两问针对同一份医案，拆两次只是多花一倍钱。$reasoning_block 由 ChainSolver 注入我们自己的证素分析，BaselineSolver 传空串。"
