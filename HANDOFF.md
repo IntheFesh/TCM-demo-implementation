@@ -19,16 +19,19 @@
 
 | 模块 | 离线测试 | 真实冒烟做了什么 | 结论 |
 |---|---|---|---|
-| X2 输出侧安全（十八反十九畏 + 寒热一致性） | 24 条 | 3 次真实开方 + 2 次打回重开 | 0/3 踩禁忌；2/2 重开后避开构造的冲突 |
-| G1 工具层（六件工具 + 信息增益追问候选） | 59 条 | 10 条主诉各算 top-3 候选问题（19 次调用） | 问题质量可用；实测出 30% 重复提问缺口 |
-| G2 ReAct 取证 | 16 条 | 6 轮完整轨迹 + remaining 单变量实验 8 轮 | finish 位置跟着预算走；成本 = MAX_STEPS 次/医家 |
-| A2 粗段切分（三本书） | 15 条 | 纯正则，**这一步不需要 LLM，已经跑完** | 叶 32 / 吴 25 / 张 43 段；张锡纯 43/43 段一段一病人 |
-| SDT 适配器 | 18 条 | 格式验证 0 调用 + 5 条 prompt 质量冒烟（45 次调用） | Test 满分提交得 50.0000/50，格式逐字节正确；Task1 **0 条被改写**，逐字命中 36–38/47 |
+| X2 输出侧安全（十八反十九畏 + 寒热一致性） | 见下 | 3 次真实开方 + 2 次打回重开 | 0/3 踩禁忌；2/2 重开后避开构造的冲突 |
+| G1 工具层（六件工具 + 信息增益追问候选） | 见下 | 10 条主诉各算 top-3 候选问题（19 次调用） | 问题质量可用；实测出 30% 重复提问缺口 |
+| G2 ReAct 取证 | 见下 | 6 轮完整轨迹 + remaining 单变量实验 8 轮 | finish 位置跟着预算走；成本 = MAX_STEPS 次/医家 |
+| A2 粗段切分（三本书） | 见下 | 纯正则，**这一步不需要 LLM，已经跑完** | 叶 32 / 吴 25 / 张 43 段；张锡纯 43/43 段一段一病人 |
+| SDT 适配器 | 见下 | 格式验证 0 调用 + 5 条 prompt 质量冒烟（45 次调用） | Test 满分提交得 50.0000/50，格式逐字节正确；Task1 **0 条被改写**，逐字命中 36–38/47 |
 
 整体视察（`data/SOURCES.md` 第 16 条）之后修了 58 处，其中 5 处是安全相关的真漏洞
 （追问答「有」绕过否决、ReAct 的追问从未问出、安全正则误报/漏报、禁忌别名缺失、
 寒热表条目永远匹配不上）。**修复只有离线测试覆盖，没有真实模型复测**——AutoDL 上
 步骤 4/5 跑通后，X2/G2/G3 那几组冒烟值得重跑一遍确认行为没变。
+
+各模块的「离线测试」不再写死条数（整体视察后从 355 涨到 514，写死的数会立刻过期）——
+跑 `pytest --collect-only -q` 看当前分布，总数见步骤 0 的判据。
 
 `data/graph.json`（123 节点 / 377 边）已经建好并写入权重，**这一步也不需要 LLM**，
 新环境里重跑 `build_graph` + `graph_stats` 即可复现。
@@ -39,9 +42,9 @@
 
 | 模块 | 现状 | AutoDL 上要补的 | 为什么这边补不了 |
 |---|---|---|---|
-| `core/chain.py` 端到端 `consult()` | 20 条离线测试全绿 | 用真实 `cases.json` 跑通 10 条主诉 | 没有 `cases.json`，检索器建不起来 |
-| G3 追问闭环 | 23 条测试 + ScriptedPatient 离线演示 | `SimulatedPatient` 端到端；追问收益要以 ScriptedPatient 为上界做对照 | 同上（`consult` 需要检索器） |
-| K2 医家级权重 λ1 | 12 条测试；λ1 恒为 0 | 挂入真实医案后重跑，确认 λ1 是否仍为 0 | 图里没有 case 节点 |
+| `core/chain.py` 端到端 `consult()` | 离线测试全绿 | 用真实 `cases.json` 跑通 10 条主诉 | 没有 `cases.json`，检索器建不起来 |
+| G3 追问闭环 | 测试 + ScriptedPatient 离线演示 | `SimulatedPatient` 端到端；追问收益要以 ScriptedPatient 为上界做对照 | 同上（`consult` 需要检索器） |
+| K2 医家级权重 λ1 | 有测试；λ1 恒为 0 | 挂入真实医案后重跑，确认 λ1 是否仍为 0 | 图里没有 case 节点 |
 | K2 学派层 λ2 | 代码就绪；`num_schools=1` 时强制为 0 | **注册张锡纯之后** λ2 才第一次有真值 | 张锡纯还没进 `physicians.py`（见步骤 3） |
 | X3 医案三元组 | `query_case_graph` 已就绪，读 `data/case_triples.jsonl` | 抽取脚本 + 产出这个文件 | 抽取要真实 LLM |
 | SDT 全量评测 | 适配器 + 打分包装完成 | Test 50 条 × 两组 Solver | 400 次调用，成本与模型都不对 |
@@ -56,7 +59,7 @@
 
 ```bash
 pip install -r requirements.txt
-pytest -q                      # 判据：444 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
+pytest -q                      # 判据：514 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
 python -c "import openai, os; print(bool(os.environ.get('LLM_API_KEY')))"
 ```
 
@@ -119,7 +122,7 @@ python -m offline.graph_stats
 判据：
 - `graph_stats` 的「当前学派数」变成 2，**λ2 的强制归零警告不再出现**，取而代之
   的是「已有 2 个学派……某个学派下只有一位医家时 λ2 对他不构成独立信号」的提示
-- λ1 分布：预期**仍然接近全 0**（清代医案术语与国标不对齐，见 `SOURCES.md` 第 8 条）。
+- λ1 分布：预期**仍然接近全 0**（清代医案术语与国标不对齐，见 `SOURCES.md` 第 8 条补记与第 10 条）。
   **如果 λ1 真的非 0 了，那是好消息但必须先确认不是 bug**——去看 `count_support`
   数到的是哪些 (症状, 证素) 对，抽查它们在医案里确实成立
 - λ2 现在是第一次有真值。**它仍然不是可信信号**：两个学派、其中一个只有一位医家，
@@ -169,13 +172,14 @@ consult(complaint, ask_fn=SimulatedPatient(profile="<病情，只有它自己知
 判据：文件生成后 `query_case_graph` 的 `available` 变成 `true`；抽查若干条的
 `source_span` 确实能在对应医案原文里找到。
 
-### 步骤 7：SDT 评测（真实 LLM，约 400 + 64 次调用）
+### 步骤 7：SDT 评测（真实 LLM，约 400 + 40 次调用）
 
 ```bash
 export SDT=<TCMEval>/evaluation/TCMEval-SDT
 python -m eval.sdt.run --sdt-dir $SDT --split Test --solver baseline --out out/sdt_base.txt
 python -m eval.sdt.run --sdt-dir $SDT --split Test --solver chain    --out out/sdt_chain.txt
-# 量化安全否决的代价：只重跑被拦的那 8 条，其余 42 条两次输入完全相同
+# 量化安全否决的代价：只重跑被拦的那 8 条（chain 5 次/条 = 40 次），其余 42 条两次输入完全相同
+# 若也想量化 baseline 的安全代价，同样加一条 --solver baseline 的重跑（再 8×3=24 次）
 python -m eval.sdt.run --sdt-dir $SDT --split Test --solver chain --ignore-safety-veto \
     --only-ids <8 个病案 ID> --out out/sdt_chain_nosafety_part.txt
 # 把这 8 行并回 out/sdt_chain.txt 的副本，再打一次分

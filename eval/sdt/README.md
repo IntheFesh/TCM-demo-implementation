@@ -10,7 +10,7 @@
 ```bash
 git clone --depth 1 https://github.com/zhuyan166/TCMEval.git
 export SDT=$PWD/TCMEval/evaluation/TCMEval-SDT
-pip install pandas          # 官方 evaluate.py 顶层 import 了它（虽然没用到）
+# 官方 evaluate.py 顶层 import 了 pandas（虽然脚本里没用到）——已在 requirements.txt 里
 ```
 
 ## 跑

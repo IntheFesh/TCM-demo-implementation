@@ -38,3 +38,27 @@ def test_dose_regex_does_not_eat_herb_names_ending_in_unit_chars():
 def test_two_char_names_are_never_stripped_to_one_char():
     assert normalize_herb("生姜") == "生姜"
     assert normalize_herb("川芎") == "川芎"
+
+
+# ---------- 第二轮复核：产地字不是炮制字 ----------
+
+@pytest.mark.parametrize("a,b", [
+    ("西洋参", "洋参"), ("川牛膝", "怀牛膝"), ("川木香", "木香"),
+    ("北五味子", "南五味子"), ("生首乌", "制首乌"), ("生地黄", "熟地黄"),
+])
+def test_distinct_herbs_never_collapse_into_one_name(a, b):
+    """产地字是药名的一部分，逐字剥会把不同的药归成同一个名字——比不归一更糟。
+    生/制 同理：生首乌解毒通便、制首乌补益，功用相反。"""
+    assert normalize_herb(a) != normalize_herb(b), f"{a} 与 {b} 被归成了同一个名字"
+
+
+def test_chuanlianzi_keeps_its_canonical_name():
+    """川楝子的 canonical 名就带「川」，剥成「楝子」是破坏药名。"""
+    assert normalize_herb("川楝子") == "川楝子"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("何首乌一两二钱", "何首乌"), ("白术三钱三分五厘", "白术"), ("石膏二两半", "石膏"),
+])
+def test_compound_doses_are_fully_stripped(raw, expected):
+    assert normalize_herb(raw) == expected

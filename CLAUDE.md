@@ -48,7 +48,9 @@ offline/   离线脚本：医案抽取、SFT 样本导出
 api/       FastAPI 服务
 web/       前端单页（无构建步骤）
 prompts/v1/ 版本化 prompt 模板（yaml）
-data/      医案原文与 SOURCES.md
+data/      医案粗段（.json）、标准证候定义、生成的图谱与 SOURCES.md
+eval/      需要真实 LLM 的评测（patient_sim、sdt/），不进 pytest
+books/     古籍原文，gitignore，按 README 3.1 下载
 tests/     pytest 用例与测试主诉
 ```
 

@@ -180,13 +180,12 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
         s2 = results[0]["s2"]  # S2 全局共享，各医家拿到的是同一份
     explained_symptoms: set[str] = _explained(s1, s2) if s2 is not None else set()
 
-    # 两个来源：模型明确列进 unexplained_symptoms 的，和没被任何证素引用的。
-    # 取并集——两者不总是一致，宁可多标一个也不要漏掉系统没说清的症状。
-    declared_unexplained = set(getattr(s2, "unexplained_symptoms", None) or [])
+    # 「已解释」的判据只有 core.chain.explained_symptoms 一处（上面），这里不再
+    # 叠一层对 unexplained_symptoms 的处理——叠了就会跟 coverage、残差报的数打架。
     residual_explained = set((residual or {}).get("newly_explained") or [])
 
     for sym in s1.symptoms:
-        if sym in explained_symptoms and sym not in declared_unexplained:
+        if sym in explained_symptoms:
             state = "explained"
         elif sym in residual_explained:
             state = "residual"  # 初轮没解释，残差辨证补上了

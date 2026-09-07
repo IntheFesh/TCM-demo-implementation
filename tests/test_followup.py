@@ -265,3 +265,35 @@ def test_safety_relevance_is_rechecked_even_without_the_flag(monkeypatch):
         "information_gain": 0.5, "source": "graph_ig",
     }])
     assert run_followup(SYMPTOMS, ELEMENTS, lambda q: "有").stopped_by == "safety"
+
+
+# ---------- 第二轮复核：带限定语的肯定 / unknown 回答 ----------
+
+@pytest.mark.parametrize("answer", ["有一点，不多", "有，但不严重", "是的，偶尔有", "有点，不太明显"])
+def test_qualified_affirmatives_are_yes_not_no(answer):
+    """句首肯定、后半句的「不」是程度限定不是否认。归成 no 的话，危重症状会被
+    写进 denied，S3 收到「患者明确否认：便血」照常开方。"""
+    assert parse_answer(answer) == "yes"
+
+
+@pytest.mark.parametrize("answer", ["有一点，不多", "时有时无", "拉过两次", "吐了"])
+def test_dangerous_question_stops_unless_explicitly_denied(monkeypatch, answer):
+    """问的本身是危重症状时，只有明确否认才放行。unknown 也要拦——
+    「时有时无」既不是否认也不构成排除，安全侧该是非对称的。"""
+    monkeypatch.setattr(fu, "question_candidates", lambda *a, **k: [{
+        "question": "有没有便血？", "symptom": "便血", "topic": None,
+        "information_gain": 0.5, "source": "graph_ig", "safety_relevant": True,
+    }])
+    r = run_followup(SYMPTOMS, ELEMENTS, lambda q: answer)
+    assert r.stopped_by == "safety"
+    assert r.asserted == [] and r.denied == []
+
+
+def test_shiwen_fallback_answer_mentioning_danger_is_caught(monkeypatch):
+    """十问歌后备问的是话题（symptom 为 None），只有回答自由文本这一道防线。"""
+    monkeypatch.setattr(fu, "question_candidates", lambda *a, **k: [{
+        "question": "大小便怎么样？", "symptom": None, "topic": "二便",
+        "information_gain": None, "source": "shiwen_fallback",
+    }])
+    r = run_followup(SYMPTOMS, ELEMENTS, lambda q: "解的是黑的，像柏油一样")
+    assert r.stopped_by == "safety"

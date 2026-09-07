@@ -19,11 +19,11 @@ import time
 from core import herbs as _herbs
 from core.elements import ELEMENTS, LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
-from core.followup import AskFn, format_followup_for_s3, run_followup
+from core.followup import AskFn, format_followup_for_s3, parse_answer, run_followup
 from core.physicians import PHYSICIANS
 from core.react import format_trace_for_s3, react_enabled, run_react
 from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
-from core.safety import check_safety
+from core.safety import check_safety, mentions_danger
 from core.safety_output import (
     check_incompatible,
     check_thermal_consistency,
@@ -97,16 +97,24 @@ def _format_elements_summary(s2: S2Elements) -> str:
 
 
 def explained_symptoms(s1: S1Normalize, s2: S2Elements, residual: dict | None = None) -> set[str]:
-    """s1.symptoms 里被 S2（以及残差辨证）的 supporting_symptoms 引用到的那些。
+    """s1.symptoms 里已被解释的那些。**这是全项目唯一的判据**，coverage、残差触发、
+    前端图上的症状 state 三处都调它——CLAUDE.md「同一概念的匹配逻辑只能有一处实现」。
 
-    **只返回 s1.symptoms 的子集。** S2 常把症状名改写（「胃脘胀痛」→「脘腹胀痛」），
-    改写后的名字不在 s1 里，直接拿 supporting_symptoms 的集合当分子，coverage 会超过 1
-    （实测 1.5）。「哪些症状算已解释」此前在 consult、run_residual、api.to_graph 三处
-    各写了一套，这里收成一处——CLAUDE.md「同一概念的匹配逻辑只能有一处实现」。
+    两条规则，缺一处就会出现三个互相矛盾的数（实测过：同一份 s1/s2 下
+    consult.coverage=0.5、residual.coverage_before=0.25、图上 1/4）：
+
+    1. **只返回 s1.symptoms 的子集。** S2 常把症状名改写（「胃脘胀痛」→「脘腹胀痛」），
+       改写后的名字不在 s1 里，拿 supporting_symptoms 当分子会让 coverage 超过 1。
+    2. **模型自己声明未解释的，即使被某个证素引用了也算未解释。** 实测模型经常两边
+       都列（「乏力」同时出现在 supporting_symptoms 和 unexplained_symptoms），
+       以它自己承认的为准更保守。
     """
     referenced = {sym for hit in s2.elements for sym in hit.supporting_symptoms}
-    referenced |= set((residual or {}).get("newly_explained") or [])
-    return {s for s in s1.symptoms if s in referenced}
+    declared_unexplained = set(s2.unexplained_symptoms or [])
+    explained = {s for s in s1.symptoms if s in referenced and s not in declared_unexplained}
+    # 残差补上的那些无条件算已解释：残差本来就是针对未解释症状再跑的一轮
+    explained |= {s for s in s1.symptoms if s in set((residual or {}).get("newly_explained") or [])}
+    return explained
 
 
 def normalize(complaint: str) -> S1Normalize:
@@ -208,6 +216,15 @@ def run_physician(
             answer = ask_fn(trace.pending_question)
             if answer is not None:
                 reject = check_safety([answer])
+                # 跟 G3 追问同一条判据：模型问的本身是危重症状（「有没有便血？」）时，
+                # 只有明确否认才放行。答「有」「是的」「有一点」都要拦——回答原文里
+                # 没有危重词，check_safety 单独看它是放行的。
+                asked = mentions_danger(trace.pending_question)
+                if reject is None and asked and parse_answer(answer) != "no":
+                    reject = (
+                        f"检测到危重症状信号（{asked}），本 demo 不适用于此类情况，"
+                        "请立即就医或拨打急救电话，本次不提供辨证结果。"
+                    )
                 if reject is not None:
                     raise SafetyVeto(reject, llm_calls=trace.llm_calls)
                 trace.pending_answer = answer
@@ -297,11 +314,10 @@ def run_residual(s1: S1Normalize, s2: S2Elements) -> dict | None:
     # 不能只信 unexplained_symptoms 字段——模型经常漏填它，
     # 实测有症状明明没被任何证素引用、该字段却是空的。
     # 取并集：字段声明的 + 实际没被任何 supporting_symptoms 提到的。
-    # 两边都限定在 s1.symptoms 里：模型 declared 的名字也可能是改写过的，不在 s1 里的
-    # 名字算进 unexplained 会让 coverage_before 变成负数。
-    declared = {s for s in (s2.unexplained_symptoms or []) if s in s1.symptoms}
-    actual = set(s1.symptoms) - explained_symptoms(s1, s2)
-    unexplained = sorted(declared | actual, key=s1.symptoms.index)
+    # 未解释 = s1.symptoms 减去 explained_symptoms 的结果。declared 已经在
+    # explained_symptoms 里处理过了（模型声明未解释的不算已解释），这里不再叠一层，
+    # 否则同一份 s1/s2 会得出跟 coverage 不一致的数。
+    unexplained = sorted(set(s1.symptoms) - explained_symptoms(s1, s2), key=s1.symptoms.index)
     total = len(s1.symptoms) or 1
     if len(unexplained) < RESIDUAL_MIN_COUNT:
         return None
@@ -530,30 +546,34 @@ def consult(
     }
 
 
-if __name__ == "__main__":
-    from pathlib import Path
+def run_batch(queries: list[str], consult_fn=None) -> dict:
+    """把 tests/queries.txt 逐条跑一遍并打印结果，返回统计。
 
-    queries_path = Path(__file__).resolve().parent.parent / "tests" / "queries.txt"
-    queries = [
-        q.strip() for q in queries_path.read_text(encoding="utf-8").splitlines() if q.strip()
-    ]
-
-    n_divergent = 0
-    n_hallucinated = 0
-    n_rejected = 0
-    durations = []
+    抽成函数而不是留在 `__main__` 里：`__main__` 块没法被测试覆盖，而这里的
+    分支处理正好出过 bug——原来只处理 rejected，遇到 insufficient（divergence 是
+    None）直接 AttributeError，整批跑挂掉、前面几条的结果一起丢。
+    """
+    fn = consult_fn or consult
+    stats = {"total": len(queries), "rejected": 0, "insufficient": 0,
+             "divergent": 0, "hallucinated": 0, "durations": []}
 
     for i, complaint in enumerate(queries, 1):
         t0 = time.time()
-        outcome = consult(complaint)
+        outcome = fn(complaint)
         elapsed = time.time() - t0
-        durations.append(elapsed)
+        stats["durations"].append(elapsed)
 
         print(f"\n[{i}] 主诉：{complaint}")
 
         if outcome["rejected"]:
-            n_rejected += 1
+            stats["rejected"] += 1
             print(f"  [安全拦截] {outcome['reject_reason']}")
+            print(f"  耗时：{elapsed:.1f}s")
+            continue
+
+        if outcome.get("insufficient"):
+            stats["insufficient"] += 1
+            print(f"  [信息不足] {outcome['insufficient_reason']}")
             print(f"  耗时：{elapsed:.1f}s")
             continue
 
@@ -563,26 +583,40 @@ if __name__ == "__main__":
                 f"  {r['physician_name']}：证型={s3.syndrome}  "
                 f"治法={s3.treatment_principle}  方={s3.formula}  药={'、'.join(s3.herbs)}"
             )
+            if r["no_reference_cases"]:
+                print("    [无参考医案] 检索不到相关医案，本结论没有医案支撑")
             if r["hallucinated"]:
-                n_hallucinated += 1
+                stats["hallucinated"] += 1
                 print(f"    [幻觉] 引用了检索结果之外的医案 id：{r['hallucinated']}")
 
-        div = outcome["divergence"]
+        div = outcome["divergence"] or {}
         hj = div.get("herb_jaccard")
         tp = "治法一致" if div.get("treatment_principle_same") else "治法不同"
         shared = div.get("shared_herbs") or []
         print(
-            f"  分歧：证型{'不同' if div['same'] is False else '相同'}｜{tp}｜"
+            f"  分歧：证型{'不同' if div.get('same') is False else '相同'}｜{tp}｜"
             f"药物Jaccard={hj if hj is not None else 'NA'}"
             f"｜共用药={('、'.join(shared[:6]) or '无')}"
         )
-        if not div["same"]:
-            n_divergent += 1
+        if div.get("same") is False:
+            stats["divergent"] += 1
         print(f"  耗时：{elapsed:.1f}s")
 
+    denom = stats["total"] - stats["rejected"] - stats["insufficient"]
     print("\n=== 统计 ===")
-    print(f"安全拦截例数：{n_rejected}/{len(queries)}")
-    print(f"分歧例数：{n_divergent}/{len(queries) - n_rejected}（分母排除被拦截的例数）")
-    print(f"幻觉例数：{n_hallucinated}/{len(queries) - n_rejected}（分母排除被拦截的例数）")
-    if durations:
-        print(f"平均耗时：{sum(durations) / len(durations):.1f}s")
+    print(f"安全拦截例数：{stats['rejected']}/{stats['total']}")
+    print(f"信息不足例数：{stats['insufficient']}/{stats['total']}")
+    print(f"分歧例数：{stats['divergent']}/{denom}（分母排除被拦截和信息不足的例数）")
+    print(f"幻觉例数：{stats['hallucinated']}/{denom}（分母排除被拦截和信息不足的例数）")
+    if stats["durations"]:
+        print(f"平均耗时：{sum(stats['durations']) / len(stats['durations']):.1f}s")
+    return stats
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+
+    queries_path = Path(__file__).resolve().parent.parent / "tests" / "queries.txt"
+    run_batch([
+        q.strip() for q in queries_path.read_text(encoding="utf-8").splitlines() if q.strip()
+    ])

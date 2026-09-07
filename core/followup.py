@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import Callable
 
-from core.safety import check_safety
+from core.safety import check_safety, mentions_danger
 from core.schemas import FollowupResult, HistoryItem
 from core.tools import is_safety_relevant, question_candidates
 
@@ -35,6 +35,10 @@ MIN_USEFUL_IG = 0.05
 _UNCERTAIN = ("不知道", "不清楚", "说不清", "不确定", "不好说", "记不清", "时有时无")
 _NEGATION = ("没有", "没", "不", "无", "未", "否", "从来")
 _AFFIRM = ("有", "是", "对", "会", "经常", "一直", "偶尔", "确实", "嗯")
+# 带限定语的肯定：「有一点，不多」「有，但不严重」——句首是肯定、后半句的「不」
+# 是程度限定，不是否认。不先认出来的话它们会被归成 no，危重症状写进 denied、
+# S3 收到「患者明确否认：便血」照常开方（实测能端到端复现）。
+_AFFIRM_LEAD = ("有", "是的", "对", "嗯", "确实", "偶尔", "经常", "一直", "会")
 
 # 提问方：给一个问题，返回患者的回答；返回 None 表示对方不打算回答（关掉了对话框、
 # 命令行 Ctrl-C 等）。做成注入的函数是为了让真人、患者模拟器、前端三种来源共用
@@ -55,11 +59,14 @@ def parse_answer(answer: str) -> str:
     为此每轮烧一次调用不划算（G2 实测每次调用约 4–8s）。代价是遇到「一半有一半没有」
     这类回答会归到 unknown——归错成 yes/no 会把一条假证据写进后验，宁可当没问到。
     """
-    a = (answer or "").strip()
+    a = (answer or "").strip().lstrip("，,。.！!　 ")
     if not a:
         return "unknown"
     if any(m in a for m in _UNCERTAIN):
         return "unknown"
+    # 句首是肯定词的一律判 yes，不看后面的「不」——「有一点，不多」是肯定
+    if any(a.startswith(m) for m in _AFFIRM_LEAD):
+        return "yes"
     if any(m in a for m in _NEGATION):
         return "no"
     if any(m in a for m in _AFFIRM):
@@ -108,10 +115,23 @@ def run_followup(
         # safety_relevant 标记全仓库没有任何消费方，实测答「有」就把「便血」写进了
         # asserted、S2/S3 照常开方——正是 CLAUDE.md 那条约定要堵的后门。
         reject = check_safety([answer])
-        if reject is None and verdict == "yes" and top.get("symptom") and (
+        # 问的本身是危重症状时，只有明确否认才放行。yes 固然要拦，**unknown 也要拦**：
+        # 「时有时无」「拉过两次」这类回答既不是否认也不构成排除，按危重处理是安全侧
+        # 该有的非对称——漏拦一次的代价远大于多拦一次。
+        asked_danger = top.get("symptom") and (
             top.get("safety_relevant") or is_safety_relevant(top["symptom"])
-        ):
+        )
+        if reject is None and asked_danger and verdict != "no":
             reject = check_safety([top["symptom"]])
+        # 十问歌后备问的是话题（symptom 为 None），答案里若提到危重内容，check_safety
+        # 已经在上面拦了；这里再用 mentions_danger 兜一层"提到但被当成否定句式"的情况，
+        # 例如「解的是黑的」这种没有明确否定词、check_safety 也认得，但换成
+        # 「不太成形，颜色发黑」时前置否定规则可能误判。
+        if reject is None and verdict != "no" and mentions_danger(answer):
+            reject = check_safety([f"患者自述：{answer}"]) or (
+                f"检测到危重症状信号（{mentions_danger(answer)}），本 demo 不适用于此类情况，"
+                "请立即就医或拨打急救电话，本次不提供辨证结果。"
+            )
         if reject is not None:
             history.append(HistoryItem(
                 question=top["question"], answer=answer,

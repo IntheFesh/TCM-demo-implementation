@@ -12,16 +12,23 @@ S2/S3，不产出任何方药，不是在结果的 note 字段里事后提一句
 from __future__ import annotations
 
 # 覆盖这个 demo 脾胃门范围内、临床上需要立即转诊而不是继续辨证的信号：
-# 消化道出血（呕血/黑便/柏油样便）、意识改变、休克体征、持续剧痛。
+# 消化道出血（呕血/黑便/柏油样便/咖啡渣样呕吐物）、意识改变（昏迷/晕厥/不省人事）、
+# 休克体征、持续剧痛。
 DANGER_KEYWORDS: list[str] = [
     "呕血",
     "吐血",
+    "咯血",
     "便血",
     "血便",
     "黑便",
     "柏油样便",
+    "咖啡渣",
+    "肛门出血",
     "大量出血",
     "昏迷",
+    "晕厥",
+    "不省人事",
+    "叫不醒",
     "神志不清",
     "休克",
     "剧烈腹痛",
@@ -30,61 +37,123 @@ DANGER_KEYWORDS: list[str] = [
 
 # 同一件事的两种写法在拒绝文案里只该出现一次：关键词「吐血」和正则的「呕血」
 # 标签会对同一句话双双命中，dict.fromkeys 去不掉这种"不同字面、同一含义"。
-_LABEL_CANON: dict[str, str] = {"吐血": "呕血", "神志不清": "意识改变", "持续剧痛": "剧烈腹痛"}
+_LABEL_CANON: dict[str, str] = {
+    "吐血": "呕血", "神志不清": "意识改变", "持续剧痛": "剧烈腹痛",
+    "晕厥": "昏迷", "不省人事": "昏迷", "叫不醒": "昏迷", "血便": "便血",
+}
 
 # 口语化表述：患者不会说"吐血"，只会说"吐了血""吐了两次血"。
 # 纯子串匹配对付不了中间插字，用正则允许关键动词与宾语之间有少量字符。
 #
-# 两处实测出来的误报边界，改正则时别改回去：
-#   - 「血」后面跟 压/虚/糖/脂 的是「血压/血虚/血糖/血脂」，前面是「气」的是「气血」，
-#     都不是出血。原来 `(吐|呕|咯|咳).{0,4}血` 把「咳嗽乏力气血不足」整句拦掉了。
-#   - 「便」前面是 小/顺/即/方/随 的是「小便/顺便/即便/方便/随便」，不是大便。
-#     原来 `(便).{0,4}血` 把「小便黄血压偏高」拦成了便血。
-# 黑便那条把 不/未/无/没 排除在间隔之外，因为问诊回答里「大便不黑」极常见；
-# 呕血/便血那两条**刻意不排除**——「吐了不少血」的「不」是数量词，排除会漏掉真出血。
-# 安全层宁可误报不可漏报，所以只堵有把握的误报。
+# 每条正则用命名组 obj 标出「宾语」（血/黑/剧烈/不清……）。否定判断只看紧挨在 obj
+# 前面的那两三个字（见 _object_negated），不看整个间隔——这是两轮实测换来的边界：
+#   - 把 不/未/无/没 整个排除出间隔（上一版的做法）会漏掉「大便不成形发黑」这类
+#     教科书式的柏油便描述（不成形 + 发黑），是真回归；
+#   - 完全不看否定又会把追问的阴性回答「大便不带血」「腹痛不剧烈」「意识不模糊」
+#     整链否决，parse_answer 判 no、check_safety 判拦，同一句话两处答案相反。
+#   - 「吐了不少血」「痛得不行」里的 不少/不行 是数量/程度词，不是否定——
+#     _NEG_QUANTITY 把它们排除在否定之外。
+# 「血」后面跟 压/虚/糖/脂 的是血压/血虚/血糖/血脂，前面是「气」的是气血；
+# 「便」前面是 小/顺/即/方/随 的不是大便。这两条是上一轮实测出来的误报边界。
+_GAP = r"[^。；;！？!?]{0,6}"
 DANGER_PATTERNS: list[tuple[str, str]] = [
-    (r"(吐|呕|咯|咳)[^，。；\s]{0,4}(?<!气)血(?![压虚糖脂])", "呕血"),
-    (r"(?<![小顺即方随])(大?便|拉|排)[^，。；\s不未无没]{0,4}(黑|发黑|柏油)", "黑便"),
-    (r"黑色[^，。；\s]{0,2}(大便|便|粪)", "黑便"),
-    (r"柏油[^，。；\s]{0,3}(便|粪)", "黑便"),
-    (r"(?<![小顺即方随])(便|拉|排)[^，。；\s]{0,4}(?<!气)血(?![压虚糖脂])", "便血"),
-    (r"(腹|肚)[^，。；\s]{0,3}(剧烈|剧痛|绞痛|痛得|痛到|疼得|疼到|痛不欲生)", "剧烈腹痛"),
-    (r"剧烈[^，。；\s]{0,3}(腹痛|肚子疼|肚痛|腹部)", "剧烈腹痛"),
-    (r"(神志|意识)[^，。；\s]{0,4}(不清|模糊|丧失)", "意识改变"),
+    (rf"(吐|呕|咯|咳)(?!血)(?P<gap>{_GAP})(?P<obj>(?<!气)血(?![压虚糖脂]))", "呕血"),
+    (rf"(?<![小顺即方随])(大?便|拉|排|解)(?P<gap>{_GAP})(?P<obj>发黑|黑|柏油)", "黑便"),
+    (r"黑色(?P<gap>[^，。；\s]{0,2})(?P<obj>大便|便|粪|屎)", "黑便"),
+    (r"柏油(?P<gap>[^，。；\s]{0,3})(?P<obj>便|粪|屎)", "黑便"),
+    (rf"(?<![小顺即方随])(便|拉|排|解)(?P<gap>{_GAP})(?P<obj>(?<!气)血(?![压虚糖脂]))", "便血"),
+    (r"大便(?P<gap>[^，。；\s]{0,3})(?P<obj>暗红|鲜红|紫黑)", "便血"),
+    (r"痰(?P<gap>[^，。；\s]{0,2})(?P<obj>血)", "咯血"),
+    (r"(腹|肚|胃|脘)(?P<gap>[^，。；\s]{0,3})"
+     r"(?P<obj>剧烈|剧痛|绞痛|难忍|(?:痛|疼)(?:得|到)(?:不行|不了|受不了|厉害|难受|要命)|(?:痛|疼)(?:得|到)(?![不没未]))", "剧烈腹痛"),
+    (r"剧烈(?P<gap>[^，。；\s]{0,3})(?P<obj>腹痛|肚子疼|肚痛|胃痛|腹部|胃脘)", "剧烈腹痛"),
+    (r"(神志|意识)(?P<gap>[^，。；\s]{0,4})(?P<obj>不清|模糊|丧失)", "意识改变"),
+    (r"(昏|晕)(?P<obj>过去|倒|厥)", "昏迷"),
 ]
 
-# 紧挨在命中位置前面的否定词：「无黑便」「否认呕血」「没有便血」是阴性陈述，
-# 拦掉等于把如实回答"没有"的患者拒之门外。只认**前置**否定，不认命中内部的
-# 「不」（见上面「吐了不少血」的例子）。
-_NEGATION_PREFIXES: tuple[str, ...] = ("无", "否认", "没有", "未见", "不见", "未曾", "从无", "无明显", "无明确")
+# 紧挨在宾语前面的否定词。「不少/不止/不断/不停/不行」是数量/程度词，排除。
+_NEG_BEFORE_OBJ = ("不带", "不出", "不见", "不是", "没有", "未见", "未曾", "没", "无", "未", "不")
+_NEG_QUANTITY = ("不少", "不止", "不断", "不停", "不行", "不了")
+# 宾语前面是这些字时说的不是大便/出血：舌苔黑、面黑、排尿黑
+_NON_STOOL_CONTEXT = ("苔", "舌", "面", "唇", "甲", "尿", "溲")
+# 望诊描述里「色黑」前面若出现这些字，说的是舌苔/面色不是大便
+_NON_STOOL_WORDS = ("舌苔", "苔色", "面色", "唇色", "甲色", "肤色", "舌质", "小便", "溲")
+
+# 紧挨在整个命中前面的否定词：「无黑便」「否认呕血」「没吐过血」「从未便血」是阴性
+# 陈述。只认前置否定，不认命中内部的（那由 _object_negated 按宾语判断）。
+_NEGATION_PREFIXES: tuple[str, ...] = (
+    "无", "否认", "没有", "没", "未见", "不见", "未曾", "从无", "从未", "从没", "不曾",
+    "从不", "无明显", "无明确", "未",
+)
 
 
 def _negated(text: str, start: int) -> bool:
-    before = text[max(0, start - 3):start]
+    before = text[max(0, start - 4):start]
     return any(before.endswith(n) for n in _NEGATION_PREFIXES)
+
+
+def _object_negated(text: str, obj_start: int) -> bool:
+    """宾语（血/黑/剧烈……）紧前面是否定词或非大便语境。"""
+    before = text[max(0, obj_start - 3):obj_start]
+    if any(before.endswith(q) for q in _NEG_QUANTITY):
+        return False
+    if any(before.endswith(n) for n in _NEG_BEFORE_OBJ):
+        return True
+    if any(before.endswith(c) for c in _NON_STOOL_CONTEXT):
+        return True
+    # 「大便正常，面色黑」：obj 前是「色」，要再往前看一格才认得出「面色」
+    return any(w in text[max(0, obj_start - 5):obj_start] for w in _NON_STOOL_WORDS)
+
+
+def _keyword_context_ok(text: str, m) -> bool:
+    """关键词裸子串扫描也要守同样的语境边界：「呕吐血压偏高」里的「吐血」不是吐血。"""
+    kw = m.group(0)
+    nxt = text[m.end():m.end() + 1]
+    if kw.endswith("血") and nxt in ("压", "虚", "糖", "脂"):
+        return False
+    return not _negated(text, m.start())
+
+
+def _scan(text: str, honor_negation: bool) -> list[str]:
+    import re
+
+    hits: list[str] = []
+    for kw in DANGER_KEYWORDS:
+        if any(not honor_negation or _keyword_context_ok(text, m)
+               for m in re.finditer(re.escape(kw), text)):
+            hits.append(_LABEL_CANON.get(kw, kw))
+    for pattern, label in DANGER_PATTERNS:
+        # 不能命中一次就 break：finditer 是非重叠的，被否定跳过的那个最左匹配会把
+        # 后面真正的危重表述一起吞掉（「无便血但大便黑」旧写法整句放行）。
+        # 用 overlapped 扫法——每个位置都起一次匹配。
+        for i in range(len(text)):
+            m = re.compile(pattern).match(text, i)
+            if not m:
+                continue
+            if honor_negation and (_negated(text, m.start()) or _object_negated(text, m.start("obj"))):
+                continue
+            hits.append(label)
+            break
+    return hits
+
+
+def mentions_danger(text: str) -> str | None:
+    """文本里**提到**了危重信号（不管是肯定、否定还是提问）。返回标签或 None。
+
+    给追问用：「有没有便血？」这句问题本身含否定式问法，check_safety 会当成阴性
+    陈述放行；提问方需要知道的是"我问的是不是一个危重症状"，跟"这句话是不是在
+    陈述危重症状"是两个问题。
+    """
+    hits = _scan(text, honor_negation=False)
+    return "、".join(dict.fromkeys(hits)) if hits else None
 
 
 def check_safety(symptoms: list[str]) -> str | None:
     """symptoms 是 S1 标准化后的症状列表（在 S2 之前调用）。命中任一关键词
     就返回可以直接展示给用户的拒绝理由；没有命中则返回 None，放行进入 S2。"""
-    import re
-
-    # 关键词表和正则表可能对同一段文本双重命中（"呕血"既是字面词、
-    # 也匹配 (吐|呕|咯|咳).{0,4}血）。正则的 label 用的是关键词表里的同名词，
-    # 靠 dict.fromkeys 去重即可——不要因为两套机制都命中就报两遍。
     hits: list[str] = []
     for text in symptoms:
-        for kw in DANGER_KEYWORDS:
-            for m in re.finditer(re.escape(kw), text):
-                if not _negated(text, m.start()):
-                    hits.append(_LABEL_CANON.get(kw, kw))
-                    break
-        for pattern, label in DANGER_PATTERNS:
-            for m in re.finditer(pattern, text):
-                if not _negated(text, m.start()):
-                    hits.append(label)
-                    break
+        hits.extend(_scan(text, honor_negation=True))
     if not hits:
         return None
     matched = "、".join(dict.fromkeys(hits))  # 去重且保持命中顺序

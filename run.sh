@@ -45,8 +45,8 @@ if [ -n "$RESPLIT_BOOKS_DIR" ]; then
   echo "共存没问题，extract_cases.py 只看 .json），确认没问题后手动执行："
   echo "  for p in ye_tianshi wu_jutong zhang_xichun; do mkdir -p data/\$p && cp out/\$p/*.json data/\$p/; done"
 else
-  echo "未传 --resplit-data，跳过（data/ 下已有 R1 阶段切好的候选案原文 .txt，"
-  echo "但 extract_cases.py 现在认的是 .json 粗段——数据准备详见 README「数据准备」一节）"
+  echo "未传 --resplit-data，跳过（data/ye_tianshi、data/wu_jutong 里已有随仓库提交的 .json 粗段；"
+  echo "  张锡纯需要先下载第三本书再切，详见 README「快速开始」第 3 步）"
 fi
 
 echo "== 4/5 检查配置与医案抽取（需要 API key）=="

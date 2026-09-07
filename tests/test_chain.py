@@ -696,3 +696,66 @@ def test_react_ask_user_answer_goes_through_safety_and_reaches_s3(monkeypatch):
     assert bad["rejected"] is True and "黑便" in bad["reject_reason"]
     assert bad["results"] == []
     assert fake_llm.s3_systems == [], "被拦截后 S3 一次都不能调"
+
+
+def test_explained_symptoms_is_the_single_source_of_truth(monkeypatch):
+    """同一份 s1/s2 下，coverage、残差的 unexplained、图上的症状 state 必须一致。
+    实测过三处各写一套时得出 0.5 / 0.25 / 1-of-4 三个互相矛盾的数。"""
+    from api.main import to_graph
+
+    s1 = S1Normalize(symptoms=["纳差", "乏力", "口苦", "腹胀"])
+    # 模型把「乏力」同时列进 supporting_symptoms 和 unexplained_symptoms（实测常见）
+    s2 = S2Elements(
+        elements=[ElementHit(element="脾", kind="location",
+                             supporting_symptoms=["纳差", "乏力"], confidence="high")],
+        unexplained_symptoms=["乏力", "口苦", "腹胀"])
+    assert chain.explained_symptoms(s1, s2) == {"纳差"}
+
+    results = [{"physician": "ye_tianshi", "physician_name": "叶天士", "s2": s2,
+                "s3": S3Syndrome(syndrome="x", reasoning="x", treatment_principle="x",
+                                 cited_case_ids=["ye_tianshi-001"]),
+                "refs": [], "hallucinated": []}]
+    states = {n["data"]["id"]: n["data"]["state"]
+              for n in to_graph(s1, results, s2)["nodes"] if n["data"]["layer"] == 0}
+    assert sum(1 for v in states.values() if v == "explained") == 1
+
+
+def test_batch_runner_handles_insufficient_without_crashing(capsys):
+    """批跑器此前只处理 rejected，遇到 insufficient（divergence 为 None）会
+    AttributeError，整批跑挂掉、前面几条的结果一起丢。"""
+    def fake_consult(complaint, **kw):
+        return {
+            "s1": S1Normalize(symptoms=["胸闷"]), "results": [], "divergence": None,
+            "rejected": False, "reject_reason": None, "insufficient": True,
+            "insufficient_reason": "现有症状不足以推断证素", "manifest": {},
+        }
+
+    stats = chain.run_batch(["胸闷气短", "乏力"], consult_fn=fake_consult)
+    assert stats["insufficient"] == 2 and stats["divergent"] == 0
+    out = capsys.readouterr().out
+    assert "[信息不足]" in out and "信息不足例数：2/2" in out
+
+
+def test_batch_runner_counts_normal_and_rejected(capsys):
+    """分母要排除被拦截和信息不足的例数，否则分歧率/幻觉率的分母是错的。"""
+    s3 = S3Syndrome(syndrome="脾虚", reasoning="x", treatment_principle="健脾",
+                    herbs=["党参"], cited_case_ids=["ye_tianshi-001"])
+
+    def fake_consult(complaint, **kw):
+        if "黑便" in complaint:
+            return {"s1": S1Normalize(symptoms=[]), "results": [], "divergence": None,
+                    "rejected": True, "reject_reason": "危重", "manifest": {}}
+        return {
+            "s1": S1Normalize(symptoms=["纳差"]), "rejected": False, "reject_reason": None,
+            "insufficient": False,
+            "results": [{"physician_name": "叶天士", "s3": s3, "hallucinated": ["x-999"],
+                         "no_reference_cases": False}],
+            "divergence": {"same": False, "herb_jaccard": 0.5, "shared_herbs": ["党参"],
+                           "treatment_principle_same": True},
+            "manifest": {},
+        }
+
+    stats = chain.run_batch(["纳差", "解黑便"], consult_fn=fake_consult)
+    assert stats == {"total": 2, "rejected": 1, "insufficient": 0, "divergent": 1,
+                     "hallucinated": 1, "durations": stats["durations"]}
+    assert "分歧例数：1/1" in capsys.readouterr().out
