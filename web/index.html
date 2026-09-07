@@ -185,6 +185,17 @@
     margin: 8px 0;
     font-weight: 600;
   }
+  /* 「参西用药」是医家特征展示，不是警告——刻意用青蓝，跟 .hallucination-warning
+     的红、.safety-thermal 的橙分开，避免读成"这里有问题"。 */
+  .western-drugs {
+    background: #e8f4f8;
+    border: 1px solid #4a8fa8;
+    color: #1f5468;
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 8px 0;
+  }
   .safety-thermal {
     background: #fff4e5;
     border: 1px solid #d18b00;
@@ -825,6 +836,7 @@ function cardHtml(result) {
   const revisedHtml = so.revised
     ? `<div class="safety-revised">已因配伍禁忌自动重开一次方</div>`
     : "";
+  const westernHtml = westernDrugsHtml(s3);
   const noRefHtml = result.no_reference_cases
     ? `<div class="safety-thermal">⚠ 未检索到相关医案（相似度均低于阈值）：本结论没有医案支撑，仅供参考</div>`
     : "";
@@ -842,6 +854,7 @@ function cardHtml(result) {
       <div class="field"><b>治法</b>${escapeHtml(s3.treatment_principle)}</div>
       <div class="field"><b>方剂</b>${escapeHtml(s3.formula || "（未明确）")}</div>
       <div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>
+      ${westernHtml}
       ${incompatibleHtml}
       ${thermalHtml}
       ${revisedHtml}
@@ -862,6 +875,16 @@ function cardHtml(result) {
       </details>
     </div>
   `;
+}
+
+// 「参西用药」栏。张锡纯「衷中参西」会在方里用阿斯匹林这类西药，是他最有辨识度的
+// 特征，单独一栏展示；叶天士/吴鞠通两本书实测一个西药词都没有，他们的 western_drugs
+// 恒为空，此时返回空串——不显示一个空栏。提成顶层纯函数是为了能被测试直接调用
+// （tests/test_web_render.py 用 node 跑的就是这里这份代码，不是另抄一份）。
+function westernDrugsHtml(s3) {
+  const drugs = (s3 && s3.western_drugs) || [];
+  if (!drugs.length) return "";
+  return `<div class="western-drugs"><b>参西用药</b>　${escapeHtml(drugs.join("、"))}</div>`;
 }
 
 function escapeHtml(str) {

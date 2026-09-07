@@ -13,6 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 from core.llm import get_llm, load_prompt, render
+from core.herbs import split_western_drugs
 from core.schemas import CaseRecord, SegmentPatients
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
@@ -106,6 +107,16 @@ def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
         for _v_pos, visit in enumerate(sequence.visits):
             _suffix = _v_pos if _idx_dup else visit.visit_index
             case_id = f"{group_id}-{_suffix}"
+            fields = visit.model_dump()
+            # 西药归位由代码强制，不只靠 prompt：prompt 是约束不是保证，模型照样
+            # 可能把阿斯匹林塞进 herbs。混进去会污染 herb_jaccard，把跨学派分歧
+            # 系统性推高，而那个推高是假的。模型已经放对的部分原样保留，只把
+            # herbs 里混进来的挑出去合并。
+            kept_herbs, moved = split_western_drugs(fields.get("herbs") or [])
+            fields["herbs"] = kept_herbs
+            fields["western_drugs"] = list(
+                dict.fromkeys((fields.get("western_drugs") or []) + moved)
+            )
             record = CaseRecord(
                 case_id=case_id,
                 physician=physician,
@@ -113,7 +124,7 @@ def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
                 raw_excerpt=slice_excerpt(raw, sequence.visits, _v_pos),
                 case_group_id=group_id,
                 prev_case_id=prev_id,
-                **visit.model_dump(),
+                **fields,
             )
             records.append(record)
             prev_id = case_id

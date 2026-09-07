@@ -15,6 +15,11 @@ class CaseStructured(BaseModel):
     treatment_principle: str | None = None
     formula: str | None = None
     herbs: list[str] = Field(default_factory=list)
+    # A2 张锡纯「衷中参西」：方中会出现阿斯匹林、硫酸镁这类西药。跟 herbs 互斥，
+    # 由 core.herbs.split_western_drugs 在抽取边界上强制拆开——混进 herbs 会污染
+    # herb_jaccard，把跨学派分歧系统性推高，而那个推高是假的（两位温病医家不可能
+    # 开阿斯匹林）。叶天士/吴鞠通两本书实测一个西药词都没有，这个字段对他们恒为空。
+    western_drugs: list[str] = Field(default_factory=list)
 
 
 class VisitStructured(CaseStructured):
@@ -273,6 +278,8 @@ class S3Syndrome(BaseModel):
     treatment_principle: str
     formula: str | None = None
     herbs: list[str] = Field(default_factory=list)
+    # 医家开方时也可能用西药（不只是医案原文里有），同 CaseStructured.western_drugs
+    western_drugs: list[str] = Field(default_factory=list)
     # min_length=1 同理：防幻觉的关键约束，不要改成可选。
     cited_case_ids: list[str] = Field(min_length=1)
     note: str | None = None
@@ -292,6 +299,8 @@ class S3SyndromeUnreferenced(BaseModel):
     treatment_principle: str
     formula: str | None = None
     herbs: list[str] = Field(default_factory=list)
+    # 跟 S3Syndrome 一起加：缺了它，检索为空这条路径前端会少一个键
+    western_drugs: list[str] = Field(default_factory=list)
     note: str | None = None
 
     @property

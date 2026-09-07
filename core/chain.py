@@ -78,6 +78,7 @@ RESIDUAL_MAX_ROUNDS = 1
 HERB_ALIASES = _herbs.HERB_ALIASES
 normalize_herb = _herbs.normalize_herb
 strip_dose = _herbs.strip_dose
+split_western_drugs = _herbs.split_western_drugs
 
 
 def _format_case_line(case: CaseRecord) -> str:
@@ -162,6 +163,20 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
         pulse=s1.pulse or "未记",
     )
     return get_llm().generate(system=s2_system, user="", schema=S2Elements)
+
+
+def _split_western_into_s3(s3):
+    """S3 边界上把混进 herbs 的西药挑到 western_drugs。跟 S0 抽取那一侧用的是
+    同一个 core.herbs.split_western_drugs，不各写一套判断。
+
+    prompt 里也写了这条要求，但 prompt 是约束不是保证——模型照样可能把阿斯匹林
+    塞进 herbs，代码这一层必须兜住：混进去会污染 herb_jaccard，把跨学派分歧
+    系统性推高，而那个推高是假的（两位温病医家不可能开阿斯匹林）。
+    """
+    kept, moved = split_western_drugs(s3.herbs or [])
+    s3.herbs = kept
+    s3.western_drugs = list(dict.fromkeys((s3.western_drugs or []) + moved))
+    return s3
 
 
 def run_physician(
@@ -256,7 +271,7 @@ def run_physician(
                 trace.pending_answer = answer
         s3_system = s3_system + format_trace_for_s3(trace)
 
-    s3 = get_llm().generate(system=s3_system, user="", schema=s3_schema)
+    s3 = _split_western_into_s3(get_llm().generate(system=s3_system, user="", schema=s3_schema))
 
     # X2 输出侧安全：十八反十九畏命中就把冲突写进 prompt 重开一次。
     # 只重开一次、不循环——循环会让 llm_calls 变成不可预测的数，
@@ -269,7 +284,9 @@ def run_physician(
             f"{format_conflicts(incompatible)}。请重新拟方避开这些配伍，"
             "其余要求不变。"
         )
-        s3 = get_llm().generate(system=retry_system, user="", schema=s3_schema)
+        s3 = _split_western_into_s3(
+            get_llm().generate(system=retry_system, user="", schema=s3_schema)
+        )
         revised = True
         # 重开之后再查一次：还有冲突就保留结果并如实标出来，不再重开。
         incompatible = check_incompatible(s3.herbs)
@@ -547,6 +564,8 @@ def consult(
     # 哪怕两者治法、方剂一字不差（实测 10 条主诉分歧率 9/9，指标无区分度）。
     # 改用药物集合的 Jaccard 距离作为主指标：用药是医家风格最实在的落点，
     # 而证型命名的差异很大程度上只是措辞。
+    # s3.herbs 在 S3 边界已经被 _split_western_into_s3 清过西药，这里不用再滤一次
+    # ——清洗只在那一处做，下游全都看到干净数据。
     herb_sets = [
         {h for h in (normalize_herb(x) for x in (r["s3"].herbs or [])) if h}
         for r in results
@@ -562,6 +581,28 @@ def consult(
 
     tp_same = len(set(r["s3"].treatment_principle for r in results)) <= 1
 
+    # 西药单独报，不混进 herb_jaccard 这个主指标：只有张锡纯会用西药，把它算进
+    # 药物集合的话，"叶天士没开阿斯匹林"会被当成一条真实的用药分歧计入，
+    # 跨学派分歧被系统性推高——而那个推高只是学派不同带来的记录体例差异，
+    # 不是辨证思路的差异。双方都没有西药时为 None（不是 0）：0 会被读成
+    # "两边西药完全一致"，而实际是"这个维度不适用"。
+    western_sets = [
+        {w for w in (x.strip() for x in (r["s3"].western_drugs or [])) if w}
+        for r in results
+    ]
+    if len(western_sets) >= 2 and any(western_sets):
+        w_inter = set.intersection(*western_sets)
+        w_union = set.union(*western_sets)
+        western_overlap = {
+            "jaccard": round(1.0 - len(w_inter) / len(w_union), 3) if w_union else 0.0,
+            "shared": sorted(w_inter),
+            "by_physician": {
+                r["physician"]: sorted(ws) for r, ws in zip(results, western_sets)
+            },
+        }
+    else:
+        western_overlap = None
+
     divergence = {
         "same": same,
         "method": "exact_string_match",
@@ -569,6 +610,8 @@ def consult(
         "herb_jaccard": round(herb_jaccard, 3) if herb_jaccard is not None else None,
         "shared_herbs": shared_herbs,
         "treatment_principle_same": tp_same,
+        # None = 两位医家都没开西药，这个维度不适用（不是"完全一致"）
+        "western_drug_overlap": western_overlap,
         # 噪声地板：herb_jaccard 本身没有意义，除非知道"同一设定重复跑，本来就会
         # 抖多少"。None = 还没跑过 offline/estimate_epsilon.py，前端要如实展示
         # "未测"，不能假装这个数已经有对照（CLAUDE.md「任何数字都必须带对照」）。
