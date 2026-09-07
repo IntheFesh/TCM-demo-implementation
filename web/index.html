@@ -345,7 +345,10 @@
     font-size: 11px; color: #3b6fd8; cursor: pointer; margin-top: 4px; display: inline-block;
   }
   #cy .cy-clickable { cursor: pointer; }
-  #graph-tooltip {
+  /* .gt-tooltip：模块6的 hover tooltip 视觉样式，改成类而不是 #graph-tooltip 这个
+     具体 id——图谱浏览器（模块7）的画布是另一个 cytoscape 实例、另一个容器，
+     要用同一套视觉但挂在不同的 DOM 节点上，用类选择器两边共用，不重复抄一份。 */
+  .gt-tooltip {
     display: none;
     position: absolute;
     z-index: 20;
@@ -359,9 +362,109 @@
     pointer-events: none;
     box-shadow: 0 4px 14px rgba(0,0,0,0.22);
   }
-  #graph-tooltip.show { display: block; }
-  #graph-tooltip b { color: #fff; }
-  #graph-tooltip .tt-meta { color: #b9bcc4; margin-top: 2px; }
+  .gt-tooltip.show { display: block; }
+  .gt-tooltip b { color: #fff; }
+  .gt-tooltip .tt-meta { color: #b9bcc4; margin-top: 2px; }
+
+  /* ---------- 模块7：图谱浏览器页签 ---------- */
+  #tab-bar {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 10px 24px 0;
+    display: flex;
+    gap: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+    font-size: 14px;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .tab-panel[hidden] { display: none; }
+
+  #gb-lambda1-note {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    color: #7a4a12;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.7;
+    margin-bottom: 12px;
+  }
+  #gb-error-box {
+    display: none;
+    background: #fdecea;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13.5px;
+    margin-bottom: 16px;
+  }
+  #gb-error-box.show { display: block; }
+  #gb-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  #gb-search {
+    flex: 1;
+    min-width: 160px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+  }
+  #gb-search:focus { border-color: var(--accent); }
+  #gb-search-status { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  #gb-physician-select {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 13px;
+    background: var(--panel);
+  }
+  #gb-panel {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px;
+  }
+  #gb-cy {
+    width: 100%;
+    height: 520px;
+    border-radius: 6px;
+    background: #fbfbfd;
+  }
+  #gb-empty-hint {
+    position: absolute;
+    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: var(--muted);
+    font-size: 13px;
+    pointer-events: none;
+  }
+  #gb-empty-hint[hidden] { display: none; }
+  #gb-stats {
+    margin-top: 10px;
+    font-size: 11.5px;
+    color: var(--muted);
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  #gb-cy .gb-search-hit { border-width: 3px !important; }
 </style>
 </head>
 <body>
@@ -371,7 +474,13 @@
   <div class="disclaimer">教学与研究用途，非诊断工具，不能替代执业医师</div>
 </header>
 
+<div id="tab-bar">
+  <button class="tab-btn active" id="tab-btn-consult" data-tab="consult">问诊</button>
+  <button class="tab-btn" id="tab-btn-graph-browser" data-tab="graph-browser">图谱浏览器</button>
+</div>
+
 <main>
+<div id="tab-consult" class="tab-panel">
   <div id="divergence-banner"></div>
   <div id="error-box"></div>
 
@@ -383,7 +492,7 @@
     <div id="cy"></div>
     <div id="residual-note" style="display:none;position:absolute;bottom:26px;left:14px;font-size:12px;color:#C2410C;"></div>
   <div id="graph-note" style="display:none;position:absolute;bottom:8px;left:14px;font-size:12px;color:#9a6b2f;"></div>
-  <div id="graph-tooltip"></div>
+  <div id="graph-tooltip" class="gt-tooltip"></div>
   </div>
 
   <div id="input-panel">
@@ -405,6 +514,26 @@
   <div id="results"></div>
 
   <div id="manifest-footer" style="margin:18px 0 8px;font-size:11px;color:#9a9da5;text-align:center;"></div>
+</div>
+
+<div id="tab-graph-browser" class="tab-panel" hidden>
+  <div id="gb-lambda1-note"></div>
+  <div id="gb-error-box"></div>
+  <div id="gb-toolbar">
+    <input type="text" id="gb-search" placeholder="搜索症状 / 证素 / 证型…" />
+    <button class="ghost-btn" id="gb-search-btn">搜索</button>
+    <span id="gb-search-status"></span>
+    <select id="gb-physician-select"></select>
+    <button class="ghost-btn" id="gb-layer-toggle" hidden>切换到医案层</button>
+    <button class="ghost-btn" id="gb-reset-btn">重置视图</button>
+  </div>
+  <div id="gb-panel">
+    <div id="gb-cy"></div>
+    <div id="gb-tooltip" class="gt-tooltip"></div>
+    <div id="gb-empty-hint">加载中…</div>
+  </div>
+  <div id="gb-stats"></div>
+</div>
 </main>
 <aside id="evidence-panel">
     <div id="evidence-head">
@@ -607,7 +736,31 @@ function buildStylesheet() {
 // 四种节点类型（层 0-3：症状/证素/证型/用药）各一句 + 边一句，加起来是
 // "5 种可 hover 的东西"——不是又多出一种新节点类型，是 4 类节点 + 边。
 
+// data.node_type 存在 = 持久知识图谱（图谱浏览器，模块7）的节点；
+// data.layer 存在 = 单次问诊图（模块6）的节点。两种数据形状不同，但都回答
+// "这个节点是什么"这一句话速览，复用同一个函数、同一套 showTooltip/hideTooltip，
+// 不为图谱浏览器另起一套 tooltip 逻辑。
 function describeNodeTooltip(data) {
+  if (data.node_type) {
+    switch (data.node_type) {
+      case "symptom":
+        return `<b>症状</b>　${escapeHtml(data.label)}`;
+      case "element": {
+        const catLabel = data.category === "location" ? "病位" : data.category === "nature" ? "病性" : (data.category || "");
+        return `<b>证素</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(catLabel)}</div>`;
+      }
+      case "syndrome": {
+        const lines = [`<b>证型</b>　${escapeHtml(data.label)}${data.is_category ? "　（类目）" : ""}`];
+        if (data.definition) lines.push(`<div class="tt-meta">${escapeHtml(data.definition)}</div>`);
+        if (data.tongue_pulse) lines.push(`<div class="tt-meta">${escapeHtml(data.tongue_pulse)}</div>`);
+        return lines.join("");
+      }
+      case "case":
+        return `<b>医案</b>　${escapeHtml(data.label)}`;
+      default:
+        return escapeHtml(data.label || data.id || "");
+    }
+  }
   const physName = data.pname || PHYSICIAN_NAMES[data.phys] || data.phys || "";
   switch (data.layer) {
     case 0: {
@@ -627,7 +780,22 @@ function describeNodeTooltip(data) {
   }
 }
 
-function describeEdgeTooltip(edgeData, sourceLabel, targetLabel) {
+function describeEdgeTooltip(edgeData, sourceLabel, targetLabel, currentPhysician) {
+  if (edgeData.edge_type) {
+    // 持久知识图谱的边：indicates（症状->证素）带 is_cardinal/λ1，
+    // composes（证素->证型）不带 per-physician 权重，两者分开描述。
+    const lines = [`${escapeHtml(sourceLabel || "?")} → ${escapeHtml(targetLabel || "?")}　<span class="tt-meta">(${escapeHtml(edgeData.edge_type)})</span>`];
+    if (edgeData.edge_type === "indicates") {
+      lines.push(`<div class="tt-meta">${edgeData.is_cardinal ? "主症" : "次症"}</div>`);
+      if (currentPhysician && edgeData.lambda1_by_physician) {
+        const l1 = edgeData.lambda1_by_physician[currentPhysician];
+        if (l1 !== undefined) {
+          lines.push(`<div class="tt-meta">λ1（${escapeHtml(PHYSICIAN_NAMES[currentPhysician] || currentPhysician)}）= ${l1.toFixed(2)}</div>`);
+        }
+      }
+    }
+    return lines.join("");
+  }
   const physName = edgeData.pname || PHYSICIAN_NAMES[edgeData.phys] || edgeData.phys || "";
   const lines = [`${escapeHtml(sourceLabel || "?")} → ${escapeHtml(targetLabel || "?")}`];
   if (physName) lines.push(`<div class="tt-meta">${escapeHtml(physName)}</div>`);
@@ -635,9 +803,13 @@ function describeEdgeTooltip(edgeData, sourceLabel, targetLabel) {
   return lines.join("");
 }
 
-function showTooltip(html, clientX, clientY) {
-  const tip = document.getElementById("graph-tooltip");
-  const panel = document.getElementById("graph-panel");
+// panelId/tooltipId 可传：图谱浏览器（模块7）的画布是另一个 cytoscape 实例、
+// 另一个容器，要用同一套定位/显示逻辑但挂在不同的 DOM 节点上，不为它另写
+// 一份 showTooltip/hideTooltip——默认值就是原来 per-consult 图那两个 id，
+// 老调用方不用改。
+function showTooltip(html, clientX, clientY, panelId = "graph-panel", tooltipId = "graph-tooltip") {
+  const tip = document.getElementById(tooltipId);
+  const panel = document.getElementById(panelId);
   const panelRect = panel.getBoundingClientRect();
   tip.innerHTML = html;
   tip.classList.add("show");
@@ -652,8 +824,8 @@ function showTooltip(html, clientX, clientY) {
   tip.style.top = `${Math.max(6, top)}px`;
 }
 
-function hideTooltip() {
-  document.getElementById("graph-tooltip").classList.remove("show");
+function hideTooltip(tooltipId = "graph-tooltip") {
+  document.getElementById(tooltipId).classList.remove("show");
 }
 
 function ensureCanvas() {
@@ -679,7 +851,11 @@ function ensureCanvas() {
   cy.on("mousemove", "node", (evt) => {
     showTooltip(describeNodeTooltip(evt.target.data()), evt.originalEvent.clientX, evt.originalEvent.clientY);
   });
-  cy.on("mouseout", "node", hideTooltip);
+  // 直接把 hideTooltip 当回调传，cytoscape/DOM 会把它们自己的事件对象当第一个
+  // 参数传进来，正好落进 hideTooltip(tooltipId=...) 那个默认参数的位置，把
+  // "graph-tooltip" 这个默认值顶掉——包一层箭头函数、不透传参数，才是真的调用
+  // "无参版本"。
+  cy.on("mouseout", "node", () => hideTooltip());
   cy.on("mouseover", "edge", (evt) => {
     const e = evt.target;
     showTooltip(
@@ -694,7 +870,7 @@ function ensureCanvas() {
       evt.originalEvent.clientX, evt.originalEvent.clientY
     );
   });
-  cy.on("mouseout", "edge", hideTooltip);
+  cy.on("mouseout", "edge", () => hideTooltip());
   // 兜底：鼠标整个离开画布这件事单独用原生 DOM mouseleave 盯一道，不完全
   // 依赖 cytoscape 自己那套"逐帧 hit-test 出有没有悬停元素"的合成事件。
   // 真实验证时发现，鼠标从节点直接"瞬移"到画布外（不经过中间帧）的极端
@@ -702,9 +878,301 @@ function ensureCanvas() {
   // ——真实鼠标移动是连续多帧、不会瞬移，用户手动移开基本不会撞上这条，
   // 但原生 mouseleave 是浏览器对"指针真的离开了这个元素"的保证，不依赖
   // canvas 内部逐帧算出来的悬停状态，加一道更保险。
-  document.getElementById("cy").addEventListener("mouseleave", hideTooltip);
+  document.getElementById("cy").addEventListener("mouseleave", () => hideTooltip());
   return cy;
 }
+
+// ---------- 模块7：图谱浏览器（持久知识图谱，跟上面 per-consult 图是两回事）----------
+//
+// GET /api/graph 一次性把整张图（symptom/element/syndrome，这个 sandbox 里没有
+// case 层）都发过来——123 个节点、377 条边，一次响应装得下，没必要做服务端
+// 分页/按需查询这类复杂度（demo 阶段不过度设计）。"渐进式展开"因此是纯前端的
+// 显示策略：拿到全量数据后先只画证型节点，点开才把它连着的证素/症状加进
+// 画布，不是一次性把 123 个节点全铺开——那样会是一团看不出结构的乱线。
+
+let gbCy = null;
+let gbGraphData = null;         // GET /api/graph 的原始响应，一次性拿全量，之后全部本地过滤/展开
+let gbIndex = null;             // { nodeById, edgesByNode }，拿到数据后建一次，避免每次展开都线性扫全部边
+let gbVisibleIds = new Set();   // 当前画布上已经显示的节点 id
+let gbCurrentPhysician = null;
+let gbShowCaseLayer = false;    // 只有 has_case_layer 为真时这个开关才有意义（按钮本身也只在那时才显示）
+
+function buildGraphBrowserStylesheet() {
+  return [
+    {
+      selector: "node",
+      style: {
+        // is_category 决定形状用函数值而不是 CSS 选择器匹配布尔字段——避免
+        // 对 cytoscape 选择器语法里"布尔真值怎么写"这件事做不必要的猜测，
+        // 函数值直接读 JS 里的布尔值，语义没有歧义。
+        shape: (ele) => (ele.data("is_category") ? "diamond" : "round-rectangle"),
+        label: "data(label)", "text-valign": "center", "text-halign": "center",
+        "font-size": 11, color: "#24262b", "background-color": "#f4f4f6",
+        "border-width": 1, "border-color": "#c7c9d1", padding: "6px",
+        width: "label", height: "label", "text-wrap": "wrap", "text-max-width": "90px",
+      },
+    },
+    { selector: 'node[node_type = "element"]', style: { "background-color": "#efe7fb", "border-color": "#8b6fd9", color: "#4b2e9e" } },
+    { selector: 'node[node_type = "syndrome"]', style: { "background-color": "#e8f4f8", "border-color": "#2f7d95", color: "#1a4652" } },
+    { selector: 'node[node_type = "case"]', style: { "background-color": "#fdf1ea", "border-color": "#C2410C", color: "#7a2c07" } },
+    { selector: "node.gb-search-hit", style: { "border-width": 3 } },
+    {
+      selector: "edge",
+      style: {
+        width: 1.4, "line-color": "#d3d5db", "target-arrow-color": "#d3d5db",
+        "target-arrow-shape": "triangle", "curve-style": "bezier", "arrow-scale": 0.7,
+      },
+    },
+  ];
+}
+
+function ensureGraphBrowserCanvas() {
+  if (gbCy) return gbCy;
+  gbCy = cytoscape({
+    container: document.getElementById("gb-cy"),
+    elements: [],
+    style: buildGraphBrowserStylesheet(),
+    // per-consult 图（cy）用 preset 布局：症状/证素/证型/药物天然分四列，坐标
+    // 是 computeLayout() 算好摆的。这张图没有那种天然分层——点开才逐步长大，
+    // 每次新增节点后都要重新摆位，cose 力导向布局适合这种"节点集合会变"的场景。
+    layout: { name: "preset" },
+    userZoomingEnabled: true,
+    userPanningEnabled: true,
+    boxSelectionEnabled: false,
+  });
+  gbCy.on("tap", "node", (evt) => gbExpandNode(evt.target.id()));
+  gbCy.on("mouseover", "node", (evt) => {
+    showTooltip(describeNodeTooltip(evt.target.data()), evt.originalEvent.clientX, evt.originalEvent.clientY, "gb-panel", "gb-tooltip");
+  });
+  gbCy.on("mousemove", "node", (evt) => {
+    showTooltip(describeNodeTooltip(evt.target.data()), evt.originalEvent.clientX, evt.originalEvent.clientY, "gb-panel", "gb-tooltip");
+  });
+  gbCy.on("mouseout", "node", () => hideTooltip("gb-tooltip"));
+  gbCy.on("mouseover", "edge", (evt) => {
+    const e = evt.target;
+    showTooltip(
+      describeEdgeTooltip(e.data(), e.source().data("label"), e.target().data("label"), gbCurrentPhysician),
+      evt.originalEvent.clientX, evt.originalEvent.clientY, "gb-panel", "gb-tooltip"
+    );
+  });
+  gbCy.on("mousemove", "edge", (evt) => {
+    const e = evt.target;
+    showTooltip(
+      describeEdgeTooltip(e.data(), e.source().data("label"), e.target().data("label"), gbCurrentPhysician),
+      evt.originalEvent.clientX, evt.originalEvent.clientY, "gb-panel", "gb-tooltip"
+    );
+  });
+  gbCy.on("mouseout", "edge", () => hideTooltip("gb-tooltip"));
+  document.getElementById("gb-cy").addEventListener("mouseleave", () => hideTooltip("gb-tooltip"));
+  return gbCy;
+}
+
+function gbBuildIndex() {
+  const nodeById = new Map();
+  for (const n of gbGraphData.graph.nodes) nodeById.set(n.data.id, n);
+  const edgesByNode = new Map();
+  for (const e of gbGraphData.graph.edges) {
+    const { source, target } = e.data;
+    if (!edgesByNode.has(source)) edgesByNode.set(source, []);
+    if (!edgesByNode.has(target)) edgesByNode.set(target, []);
+    edgesByNode.get(source).push(e);
+    edgesByNode.get(target).push(e);
+  }
+  gbIndex = { nodeById, edgesByNode };
+}
+
+function gbApplyPhysicianWeighting() {
+  if (!gbCy) return;
+  gbCy.edges().forEach((ele) => {
+    const l1map = ele.data("lambda1_by_physician");
+    let opacity = 1;
+    if (l1map && gbCurrentPhysician && l1map[gbCurrentPhysician] !== undefined) {
+      // λ1 目前恒为 0（原因如实写在 gb-lambda1-note 里）。opacity 直接等于 λ1
+      // 的话全部边会变成完全透明，图看起来像渲染坏了——用一个下限 + 线性映射，
+      // 数字依然如实反映 λ1（0 时最淡但看得见，1 时最实），不是在掩盖那个 0。
+      opacity = 0.25 + 0.75 * l1map[gbCurrentPhysician];
+    }
+    ele.style("opacity", opacity);
+  });
+}
+
+// 新增节点/边只加不减（不做"点一下收起"）：这一轮的范围是"渐进式展开"，
+// 没有要求可折叠；加一套折叠状态管理会把这个模块的复杂度顶到跟本身价值
+// 不成比例，需要的话留给下一轮。
+function gbAddNodes(nodeIds) {
+  ensureGraphBrowserCanvas();
+  const toAdd = [];
+  for (const id of nodeIds) {
+    if (gbVisibleIds.has(id)) continue;
+    const n = gbIndex.nodeById.get(id);
+    if (!n) continue;
+    // 医案层没打开时不显示 case 节点——has_case_layer 为假时按钮本身都不出现
+    // （见 loadGraphBrowserData），这里再挡一道是防"从别的节点展开时，边的
+    // 另一端恰好是 case 节点"这种间接泄漏。
+    if (n.data.node_type === "case" && !gbShowCaseLayer) continue;
+    toAdd.push({ data: n.data });
+    gbVisibleIds.add(id);
+  }
+  if (toAdd.length) gbCy.add(toAdd);
+
+  // 两端都已经在画布上的边才补上——判据跟 api/main.py::to_graph() 的
+  // add_edge 是同一个道理（两端节点都存在，边才有意义），不是巧合。
+  const edgesToAdd = [];
+  for (const e of gbGraphData.graph.edges) {
+    const { id, source, target } = e.data;
+    if (gbCy.getElementById(id).nonempty()) continue;
+    if (!gbVisibleIds.has(source) || !gbVisibleIds.has(target)) continue;
+    edgesToAdd.push({ data: e.data });
+  }
+  if (edgesToAdd.length) gbCy.add(edgesToAdd);
+
+  if (toAdd.length || edgesToAdd.length) {
+    gbApplyPhysicianWeighting();
+    gbCy.layout({ name: "cose", animate: false, fit: true, padding: 24 }).run();
+  }
+  document.getElementById("gb-empty-hint").hidden = gbVisibleIds.size > 0;
+}
+
+function gbExpandNode(nodeId) {
+  const edges = gbIndex.edgesByNode.get(nodeId) || [];
+  const neighborIds = new Set();
+  for (const e of edges) {
+    const { source, target } = e.data;
+    neighborIds.add(source === nodeId ? target : source);
+  }
+  gbAddNodes([...neighborIds]);
+}
+
+function gbSearch(query) {
+  const status = document.getElementById("gb-search-status");
+  const q = (query || "").trim();
+  if (gbCy) gbCy.nodes().removeClass("gb-search-hit");
+  if (!q) { status.textContent = ""; return; }
+  const matches = gbGraphData.graph.nodes.filter((n) => (n.data.label || "").includes(q));
+  if (!matches.length) {
+    status.textContent = "未找到匹配节点";
+    return;
+  }
+  status.textContent = `找到 ${matches.length} 个匹配节点`;
+  gbAddNodes(matches.map((n) => n.data.id));
+  const matchedIds = new Set(matches.map((n) => n.data.id));
+  const eles = gbCy.nodes().filter((ele) => matchedIds.has(ele.id()));
+  eles.addClass("gb-search-hit");
+  gbCy.animate({ fit: { eles, padding: 40 } }, { duration: 300 });
+}
+
+function gbToggleLayer() {
+  gbShowCaseLayer = !gbShowCaseLayer;
+  document.getElementById("gb-layer-toggle").textContent =
+    gbShowCaseLayer ? "切换到国标层" : "切换到医案层";
+  if (!gbShowCaseLayer) {
+    const caseIds = [...gbVisibleIds].filter((id) => gbIndex.nodeById.get(id)?.data.node_type === "case");
+    for (const id of caseIds) {
+      gbCy.getElementById(id).remove();
+      gbVisibleIds.delete(id);
+    }
+    return;
+  }
+  const toReveal = [];
+  for (const id of gbVisibleIds) {
+    for (const e of gbIndex.edgesByNode.get(id) || []) {
+      const other = e.data.source === id ? e.data.target : e.data.source;
+      if (gbIndex.nodeById.get(other)?.data.node_type === "case") toReveal.push(other);
+    }
+  }
+  gbAddNodes(toReveal);
+}
+
+function gbResetView() {
+  ensureGraphBrowserCanvas();
+  gbCy.elements().remove();
+  gbVisibleIds = new Set();
+  document.getElementById("gb-search").value = "";
+  document.getElementById("gb-search-status").textContent = "";
+  const syndromeIds = gbGraphData.graph.nodes
+    .filter((n) => n.data.node_type === "syndrome")
+    .map((n) => n.data.id);
+  document.getElementById("gb-empty-hint").textContent = "点击节点展开关联的证素/症状，或用上方搜索框定位";
+  gbAddNodes(syndromeIds);
+}
+
+function renderGbLambda1Note(note) {
+  // 原样展示后端 lambda1_note() 算出来的文字，前端不改写、不精简一个字——
+  // 这段话是这个项目的一个真实发现（要么图里压根没挂医案，要么医案证型
+  // 体系跟国标对不上），弱化或省略它比图上有 bug 更严重。
+  document.getElementById("gb-lambda1-note").textContent = note || "";
+}
+
+function renderGbStats(stats) {
+  const el = document.getElementById("gb-stats");
+  if (!stats) { el.textContent = ""; return; }
+  const fmt = (obj) => Object.entries(obj || {}).map(([k, v]) => `${k} ${v}`).join("　");
+  el.textContent = `节点：${fmt(stats.node_type_counts)}　|　边：${fmt(stats.edge_type_counts)}`;
+}
+
+function populateGbPhysicianSelect(physicians) {
+  const sel = document.getElementById("gb-physician-select");
+  sel.innerHTML = "";
+  for (const p of physicians || []) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.name;
+    sel.appendChild(opt);
+  }
+  gbCurrentPhysician = (physicians && physicians[0] && physicians[0].id) || null;
+  if (gbCurrentPhysician) sel.value = gbCurrentPhysician;
+}
+
+async function loadGraphBrowserData() {
+  const hint = document.getElementById("gb-empty-hint");
+  const errBox = document.getElementById("gb-error-box");
+  hint.hidden = false;
+  hint.textContent = "加载中…";
+  errBox.classList.remove("show");
+  try {
+    const resp = await fetch("/api/graph");
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`服务返回错误（HTTP ${resp.status}）：${text}`);
+    }
+    gbGraphData = await resp.json();
+    gbBuildIndex();
+    renderGbLambda1Note(gbGraphData.lambda1_note);
+    renderGbStats(gbGraphData.stats);
+    populateGbPhysicianSelect(gbGraphData.physicians);
+    // 医案层是空的（has_case_layer=false）就不显示这个按钮，不是显示一个
+    // 点了没反应的——这个 sandbox 里 data/graph.json 只有国标层数据，
+    // AutoDL 上跑过 attach_cases 之后 has_case_layer 会是 true，按钮才出现。
+    document.getElementById("gb-layer-toggle").hidden = !gbGraphData.has_case_layer;
+    gbResetView();
+  } catch (err) {
+    hint.hidden = true;
+    errBox.textContent = `图谱加载失败：${err.message || err}`;
+    errBox.classList.add("show");
+  }
+}
+
+function switchTab(tab) {
+  const toConsult = tab === "consult";
+  document.getElementById("tab-btn-consult").classList.toggle("active", toConsult);
+  document.getElementById("tab-btn-graph-browser").classList.toggle("active", !toConsult);
+  document.getElementById("tab-consult").hidden = !toConsult;
+  document.getElementById("tab-graph-browser").hidden = toConsult;
+  if (!toConsult && !gbGraphData) loadGraphBrowserData();
+}
+
+document.getElementById("tab-btn-consult").addEventListener("click", () => switchTab("consult"));
+document.getElementById("tab-btn-graph-browser").addEventListener("click", () => switchTab("graph-browser"));
+document.getElementById("gb-search-btn").addEventListener("click", () => gbSearch(document.getElementById("gb-search").value));
+document.getElementById("gb-search").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") gbSearch(e.target.value);
+});
+document.getElementById("gb-physician-select").addEventListener("change", (e) => {
+  gbCurrentPhysician = e.target.value;
+  gbApplyPhysicianWeighting();
+});
+document.getElementById("gb-layer-toggle").addEventListener("click", gbToggleLayer);
+document.getElementById("gb-reset-btn").addEventListener("click", gbResetView);
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));

@@ -17,6 +17,8 @@ from core.chain import consult
 from core.herbs import strip_dose_and_parens
 from core.physicians import PHYSICIANS
 from core.schemas import S1Normalize
+from core.tools import GRAPH_PATH, get_graph_store
+from offline.graph_stats import compute_stats, lambda1_note
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 
@@ -67,6 +69,78 @@ def api_trajectories(physician: str) -> dict:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     return {"physician": physician, "trajectories": trajectories.get(physician, [])}
+
+
+def _persistent_graph_to_cytoscape(store) -> dict:
+    """把 core.graph.store.NetworkXStore 转成 Cytoscape 的 {nodes, edges} 形状，
+    给图谱浏览器页签用。
+
+    跟 to_graph() 是两个不同的函数、不能合并：那个函数把一次 consult() 的
+    结果拼成"这次辨证走了哪条推理链"，输入是 S1/S2/results；这个函数把
+    持久知识图谱（data/graph.json，K1/K2 建的国标结构层）转成同一种前端
+    图形状，输入是 NetworkXStore。两者只是"目的地格式恰好一样"，源头的
+    数据和语义完全不同，硬合并成一个函数只会让两边的调用方都要小心避开
+    对方的参数。
+
+    边端点字段名要小心：core/graph/store.py 的 save()/load() 已经踩过一次
+    这个坑——每条边自带的 provenance 属性也叫 source（gb_standard/case/…），
+    直接 **data 展开会把 cytoscape 期待的边端点字段 source 覆盖掉。这里改名
+    成 data_source，把 source/target 这两个字段名让给端点。
+    """
+    nodes = []
+    for node_id, data in store.g.nodes(data=True):
+        node_data = {"id": node_id, "label": data.get("name", node_id)}
+        for k, v in data.items():
+            if k != "name":
+                node_data[k] = v
+        nodes.append({"data": node_data})
+
+    edges = []
+    for src, dst, key, data in store.g.edges(keys=True, data=True):
+        edge_data = {"id": f"{src}::{dst}::{key}", "source": src, "target": dst}
+        for k, v in data.items():
+            edge_data["data_source" if k == "source" else k] = v
+        edges.append({"data": edge_data})
+
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/api/graph")
+def api_graph() -> dict:
+    """图谱浏览器页签用的持久知识图谱（data/graph.json 的国标结构层，跟
+    /api/consult 里 to_graph() 产出的单次问诊图是两回事）。
+
+    has_case_layer 如实反映这个 sandbox 的数据现状：这里没有 cases.json，
+    data/graph.json 只挂了国标层，没有 case 节点，所以是 False——前端据此
+    不显示"国标层/医案层"切换按钮，而不是显示一个点了没反应的（AutoDL 上
+    跑过 attach_cases 之后这里会变 True）。
+
+    lambda1_note 直接复用 offline/graph_stats.py 的 lambda1_note()，不在这里
+    重新写一遍或者精简一遍——那段话是这个项目的一个真实发现（λ1 恒为 0，
+    要么是压根没挂医案，要么是挂了医案但证型体系跟国标对不上），只有一处
+    实现，前端原样显示，不弱化也不省略。
+    """
+    store = get_graph_store()
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"未找到 {GRAPH_PATH}。先跑 offline/build_graph.py 建图谱骨架。",
+        )
+
+    stats = compute_stats(store)
+    return {
+        "graph": _persistent_graph_to_cytoscape(store),
+        "has_case_layer": stats["node_type_counts"].get("case", 0) > 0,
+        "lambda1_note": lambda1_note(stats),
+        "physicians": [
+            {"id": pid, "name": info["name"], "color": info["color"]}
+            for pid, info in PHYSICIANS.items()
+        ],
+        "stats": {
+            "node_type_counts": stats["node_type_counts"],
+            "edge_type_counts": stats["edge_type_counts"],
+        },
+    }
 
 
 @app.post("/api/consult")
