@@ -699,3 +699,22 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     jsonl 做子串匹配，从不经过 `NetworkXStore`，两条管道天生独立，给
     graph.json 再建一层没有消费方，是第一版设计者（也就是这一轮的我）凭空
     加的复杂度，撤掉是回到实际需要的规模，不是功能减配。
+
+21. **K3b · 证素索引 + 三路融合：`data/element_index.json` 刻意不依赖 X3 的
+    `case_triples.jsonl`，直接从 `cases.json` 的 `symptoms` 字段建。** 原因见
+    `offline/build_element_index.py` 模块文档字符串：X3 的三元组谓词不限定
+    枚举，要从里面可靠识别"这条是不是症状表现"得再猜一层，`symptoms` 字段
+    本身就是干净列表，没必要绕这一圈——K3b 不依赖 K3b 自己名义上"应该"依赖
+    的东西，是吸取了 X3 第一版返工的教训后主动做的取舍，不是漏掉了该接的线。
+
+    真实验证：`offline/build_element_index.py` 对着这台沙箱里真实存在的
+    `data/graph.json`（K1 建的国标层，123 节点/377 边）和 K3a 那批 15 条合成
+    医案真跑通——15 条里 11 条匹配到至少一个证素、4 条症状表述在图里找不到
+    对应节点（如实报出，不强行凑数）。`core/retrieval_graph.ElementRetriever`
+    和 `HybridRetriever` 的 `mode="graph"` 用这份真实产出的索引真跑：查询
+    证素 {气滞,气虚,脾} 时 top-5 按 Jaccard 相似度正确降序排列（0.6/0.5/0.4/
+    0.333/0.286），跟 `data/element_index.json` 里能手工核对的交并集完全吻合。
+    graph 模式全程不需要 embedding 模型，是继 bm25 之后第二条能在这台沙箱里
+    100% 真实验证的检索路径；`mode="hybrid"` 的三路融合（dense+bm25+graph）
+    因为仍然无条件算 dense 那一路，还是卡在同一个 huggingface hub 网络限制上
+    （见 SOURCES.md 第 19 条），融合逻辑本身用受控假向量在单测里验证过。

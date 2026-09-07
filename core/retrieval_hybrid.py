@@ -1,5 +1,5 @@
-"""K3a：混合检索。在 DenseRetriever 的稠密向量检索之外叠加 BM25 关键词检索，
-用 Reciprocal Rank Fusion（RRF）融合两路排名。
+"""K3a/K3b：混合检索。在 DenseRetriever 的稠密向量检索之外叠加 BM25 关键词
+检索（K3a）和证素路检索（K3b），用 Reciprocal Rank Fusion（RRF）融合排名。
 
 为什么是 RRF 而不是加权求和：稠密分是归一化余弦相似度，落在 [0,1]；BM25 分
 是无界的、还随语料规模变化（idf 项）。两者要加权求和，必须先把 BM25 分数
@@ -21,6 +21,17 @@ jieba 分词必须加载自定义词典（`offline/build_jieba_dict.py` 的产�
 加载词典后才能被当成一个词正确命中。cases.json 生成后（跑
 `offline/extract_cases.py`）词典会并入真实医案里的高频症状表述，覆盖面
 更大，但机制是一样的——不需要 cases.json 才能验证这条设计成立。
+
+**graph 一路（K3b）走的是结构化信号，不是文本信号。** 给定这次问诊 S2 已经
+推断出的证素（`query_elements`），按"这条医案连到多少个同样的证素"打分——
+两条医案文字表述完全不同，只要底层证素一致，这条路能把它们连起来，dense/
+bm25 都做不到。具体打分逻辑在 core/retrieval_graph.py（ElementRetriever），
+这里只管调度。`mode="graph"` 要求调用方显式传 `query_elements`，不传就报错，
+不会静默退化成别的模式——"我请求了 graph 检索，结果却是别的检索"这种静默
+降级比报错更危险，调用方会以为拿到的是证素路的结果。`mode="hybrid"` 则相反：
+传了 `query_elements` 就三路融合，不传就退回 K3a 的两路融合（dense+bm25）
+——不强制调用方在还没算出证素之前就提供它，两路融合本来就是 hybrid 一直
+以来的行为，多一路信号是增益，不提供不算错。
 """
 from __future__ import annotations
 
@@ -29,6 +40,7 @@ import threading
 from pathlib import Path
 
 from core.retrieval import DenseRetriever, CASES_PATH, _case_to_text
+from core.retrieval_graph import ElementRetriever
 from core.schemas import CaseRecord
 
 JIEBA_DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "jieba_dict.txt"
@@ -36,8 +48,7 @@ JIEBA_DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "jieba_dict.
 # RRF 的经验常数，见模块文档字符串。
 RRF_K = 60
 
-ALLOWED_MODES = {"dense", "bm25", "hybrid"}
-# mode="graph" 由 K3b 补充（core/retrieval_graph.py），这里先占位、不实现。
+ALLOWED_MODES = {"dense", "bm25", "graph", "hybrid"}
 
 
 def _rrf_fuse(
@@ -63,6 +74,12 @@ class HybridRetriever(DenseRetriever):
         self._bm25_lock = threading.Lock()
         self._jieba_ready = False
         self._jieba_lock = threading.Lock()
+        self._element_retriever: ElementRetriever | None = None
+        self._element_retriever_lock = threading.Lock()
+        # case_id -> 下标，供 graph 一路把 ElementRetriever 返回的 case_id 换回
+        # 跟 dense/bm25 同一套下标体系去融合。案子数量是几百的量级，不是
+        # "加载模型/大文件"，不需要惰性。
+        self._case_id_to_idx = {c.case_id: i for i, c in enumerate(self._cases)}
 
     def _ensure_jieba(self) -> None:
         if self._jieba_ready:
@@ -125,6 +142,29 @@ class HybridRetriever(DenseRetriever):
         scored.sort(key=lambda x: -x[1])
         return scored
 
+    def _ensure_element_retriever(self) -> ElementRetriever:
+        if self._element_retriever is not None:
+            return self._element_retriever
+        with self._element_retriever_lock:
+            if self._element_retriever is None:
+                self._element_retriever = ElementRetriever()
+            return self._element_retriever
+
+    def _graph_ranking(
+        self, query_elements: list[str], idxs: list[int]
+    ) -> list[tuple[int, float]]:
+        """按证素 Jaccard 相似度降序返回 (下标, 相似度)。相似度就是真实
+        Jaccard 值（[0,1] 有界），跟 dense 的余弦相似度同一个刻度，可以直接
+        当展示分用，不像 BM25 分数那样需要区分"排序用"和"展示用"。不做
+        min_score 过滤——0.70 是拿稠密相似度的实测分布校准出来的阈值
+        （见 core/retrieval.py 的 MIN_RETRIEVAL_SCORE 注释），证素集合通常
+        只有两三个元素，Jaccard 在这种小集合上哪怕只共享一个证素也能到
+        0.3-0.5，套用为稠密分校准的阈值会把 graph 这条信号基本上过滤没。"""
+        retriever = self._ensure_element_retriever()
+        case_ids = [self._cases[i].case_id for i in idxs]
+        by_case_id = retriever.ranking(query_elements, case_ids)
+        return [(self._case_id_to_idx[cid], score) for cid, score in by_case_id]
+
     def search(
         self,
         query: str,
@@ -132,37 +172,49 @@ class HybridRetriever(DenseRetriever):
         k: int = 3,
         min_score: float = 0.0,
         mode: str | None = None,
+        query_elements: list[str] | None = None,
     ) -> list[tuple[CaseRecord, float]]:
         mode = mode or os.environ.get("RETRIEVER_MODE", "hybrid")
         if mode not in ALLOWED_MODES:
             raise ValueError(
                 f"未知的 RETRIEVER_MODE={mode!r}，目前支持 {sorted(ALLOWED_MODES)}"
-                "（mode='graph' 由 K3b 补充，尚未实现）"
+            )
+        if mode == "graph" and not query_elements:
+            # 非静默降级：请求的是证素路检索，没给证素就该报错，不能悄悄退回
+            # 别的模式——调用方会以为自己拿到的是证素路的结果。
+            raise ValueError(
+                "mode='graph' 需要传非空的 query_elements（S2 推断出的证素列表）"
             )
 
         idxs = [i for i, c in enumerate(self._cases) if c.physician == physician]
         if not idxs:
             return []
 
-        # 展示分跟排序用的分是同一路的：dense 模式和 hybrid 模式（hybrid 本来就要
-        # 算稠密相似度去融合）展示真实余弦相似度，前端/prompt 里"相似度"这个词才
-        # 有意义；bm25 模式展示 BM25 原始分——不强行套一个没参与排序的稠密分，
-        # 否则 bm25-only 就必须为了"好看的展示数字"去多算一次稠密编码，白白
-        # 引入了这条路径本不需要的模型依赖（K3a 的设计目标之一就是 bm25 模式
-        # 应该能在没有 embedding 模型的环境里独立跑，见 tests/test_retrieval_hybrid.py）。
+        # 展示分跟排序用的分是同一路的：dense/graph/hybrid（hybrid 本来就要
+        # 算稠密相似度去融合）展示真实余弦相似度或真实 Jaccard 相似度，两者都是
+        # [0,1] 有界、前端/prompt 里"相似度"这个词才有意义；bm25 模式展示 BM25
+        # 原始分——不强行套一个没参与排序的稠密分，否则 bm25-only 就必须为了
+        # "好看的展示数字"去多算一次稠密编码，白白引入了这条路径本不需要的模型
+        # 依赖（K3a 的设计目标之一就是 bm25 模式应该能在没有 embedding 模型的
+        # 环境里独立跑，见 tests/test_retrieval_hybrid.py）。
         if mode == "dense":
             scored = self._dense_ranking(query, idxs, min_score)
         elif mode == "bm25":
             scored = self._bm25_ranking(query, idxs)
-        else:  # hybrid
+        elif mode == "graph":
+            scored = self._graph_ranking(query_elements, idxs)
+        else:  # hybrid：query_elements 有就三路融合，没有就退回两路（向后兼容）
             dense_ranking = self._dense_ranking(query, idxs, min_score)
             bm25_ranking = self._bm25_ranking(query, idxs)
             dense_scores = dict(dense_ranking)
-            fused = _rrf_fuse([[i for i, _ in dense_ranking], [i for i, _ in bm25_ranking]])
+            rankings = [[i for i, _ in dense_ranking], [i for i, _ in bm25_ranking]]
+            if query_elements:
+                rankings.append([i for i, _ in self._graph_ranking(query_elements, idxs)])
+            fused = _rrf_fuse(rankings)
             # 展示分优先用稠密相似度（min_score 过滤剩下的那些才有）；一个案子
-            # 只在 BM25 那一路进了排名、稠密分被 min_score 过滤掉了，就没有真实
-            # 稠密相似度可展示，回退到 0.0——这种案子本来就是"关键词命中但语义
-            # 上不够像"，展示分低是符合直觉的，不是 bug。
+            # 只在 BM25/graph 那一路进了排名、稠密分被 min_score 过滤掉了，就没有
+            # 真实稠密相似度可展示，回退到 0.0——这种案子本来就是"关键词/证素
+            # 命中但语义上不够像"，展示分低是符合直觉的，不是 bug。
             scored = [(i, dense_scores.get(i, 0.0)) for i, _ in fused]
 
         return [(self._cases[i], score) for i, score in scored[:k]]

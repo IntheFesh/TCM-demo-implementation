@@ -322,8 +322,81 @@ def test_search_defaults_to_env_var_when_mode_not_passed(tmp_path, monkeypatch):
 def test_search_unknown_mode_raises_value_error(tmp_path):
     cases_path = _write_cases(tmp_path, [_case("a", "ye_tianshi", ["纳差"])])
     retriever = HybridRetriever(cases_path=cases_path)
-    with pytest.raises(ValueError, match="graph"):
+    with pytest.raises(ValueError, match="vector_db"):
+        retriever.search("q", "ye_tianshi", mode="vector_db")
+
+
+def test_search_graph_mode_without_query_elements_raises_not_silently_degrades(tmp_path):
+    """K3b 的明确设计：mode='graph' 不传 query_elements 必须报错，不能悄悄
+    退回别的模式——调用方会以为自己拿到的是证素路的结果。"""
+    cases_path = _write_cases(tmp_path, [_case("a", "ye_tianshi", ["纳差"])])
+    retriever = HybridRetriever(cases_path=cases_path)
+    with pytest.raises(ValueError, match="query_elements"):
         retriever.search("q", "ye_tianshi", mode="graph")
+    with pytest.raises(ValueError, match="query_elements"):
+        retriever.search("q", "ye_tianshi", mode="graph", query_elements=[])
+
+
+class FakeElementRetriever:
+    """跳过真实 data/element_index.json——直接注入 ranking() 的返回值。"""
+
+    def __init__(self, ranking_by_case_ids: dict):
+        self._ranking_by_case_ids = ranking_by_case_ids
+
+    def ranking(self, query_elements, case_ids):
+        return self._ranking_by_case_ids.get(tuple(sorted(case_ids)), [])
+
+
+def test_search_graph_mode_ranks_by_element_overlap(tmp_path):
+    cases = [
+        _case("no_overlap", "ye_tianshi", ["口苦"]),
+        _case("full_overlap", "ye_tianshi", ["胃脘胀满"]),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+    retriever._element_retriever = FakeElementRetriever({
+        ("full_overlap", "no_overlap"): [("full_overlap", 0.8)],
+    })
+
+    hits = retriever.search("q", "ye_tianshi", k=2, mode="graph", query_elements=["脾", "气滞"])
+    assert [c.case_id for c, _ in hits] == ["full_overlap"]
+    assert hits[0][1] == pytest.approx(0.8)  # 展示分就是真实 Jaccard 相似度
+    assert retriever._model is None  # graph 模式不该碰稠密模型
+
+
+def test_search_hybrid_mode_without_query_elements_stays_two_way(tmp_path):
+    """向后兼容：不传 query_elements 时 hybrid 模式的行为不变（K3a 那一版的
+    两路融合），不强制调用方在算出证素之前就提供它。"""
+    query = "噎膈反胃，食入即吐"
+    retriever = _build_two_case_retriever(
+        tmp_path,
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+        query_vectors={query: [1.0, 0.0]},
+        with_filler=True,
+    )
+    hits = retriever.search(query, "ye_tianshi", k=1, mode="hybrid")
+    assert retriever._element_retriever is None  # 没传 query_elements，不该去碰它
+
+
+def test_search_hybrid_mode_with_query_elements_fuses_three_ways(tmp_path):
+    """传了 query_elements 就该三路融合：一个案子只有 graph 一路支持，
+    dense/bm25 都排不到它，也该能借着 graph 信号进 top-1。"""
+    query = "无关查询文本"
+    cases = [
+        _case("dense_favored", "ye_tianshi", ["其他症状"]),
+        _case("graph_only_favored", "ye_tianshi", ["图谱信号案例"]),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+    _install_fake_dense(
+        retriever, embeddings=[[1.0, 0.0], [0.0, 0.0]], query_vectors={query: [1.0, 0.0]}
+    )
+    retriever._element_retriever = FakeElementRetriever({
+        ("dense_favored", "graph_only_favored"): [("graph_only_favored", 0.9)],
+    })
+
+    hits = retriever.search(query, "ye_tianshi", k=1, mode="hybrid", query_elements=["脾"])
+    assert hits[0][0].case_id == "graph_only_favored"
 
 
 def test_search_empty_physician_returns_empty_without_touching_model(tmp_path):
@@ -333,5 +406,5 @@ def test_search_empty_physician_returns_empty_without_touching_model(tmp_path):
     assert retriever._model is None  # 没有案子可比，不该去碰模型
 
 
-def test_allowed_modes_excludes_graph_for_now():
-    assert ALLOWED_MODES == {"dense", "bm25", "hybrid"}
+def test_allowed_modes_includes_graph():
+    assert ALLOWED_MODES == {"dense", "bm25", "graph", "hybrid"}
