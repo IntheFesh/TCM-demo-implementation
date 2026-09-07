@@ -7,3 +7,8 @@ sentence-transformers>=3.0
 numpy>=1.26
 networkx>=3.2
 pytest>=8.0
+
+# 只有跑 TCMEval-SDT 评测时才需要：官方 evaluate.py 顶层 import 了 pandas，
+# 脚本里并没有实际用到它，但不装就 import 不进来、评测跑不了。这是评测环境的
+# 隐式依赖，不是本项目的依赖——记在这里是为了下次不用再踩一遍。
+pandas

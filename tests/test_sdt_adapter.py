@@ -255,3 +255,20 @@ def test_score_submission_uses_the_official_entry_point(sdt_dir, tmp_path):
     assert r["official_per_record"] == 0.75
     assert r["task_totals"] == {"task1": 2.0, "task2": 2.0, "task3": 2.0, "task4": 2.0}
     assert r["weighted_from_breakdown"] == pytest.approx(2.0)
+
+
+def test_run_only_ids_filters_and_rejects_unknown(sdt_dir, tmp_path, monkeypatch, fake_llm):
+    """量化安全否决的代价时只需要重跑被拦的那几条——其余记录两次输入完全相同，
+    重跑只是白花钱。ID 写错要立刻报错，不能静默跑一个空集合出来。"""
+    from eval.sdt import run as run_mod
+
+    out = tmp_path / "sub.txt"
+    run_mod.main(["--sdt-dir", str(sdt_dir), "--split", "Validation",
+                  "--solver", "baseline", "--out", str(out), "--only-ids", "病例2",
+                  "--ignore-safety-veto"])
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1 and lines[0].startswith("病例2@")
+
+    with pytest.raises(SystemExit, match="不在 Validation 里"):
+        run_mod.main(["--sdt-dir", str(sdt_dir), "--split", "Validation",
+                      "--solver", "baseline", "--out", str(out), "--only-ids", "病例999"])

@@ -26,6 +26,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 条，先看质量")
     ap.add_argument(
+        "--only-ids", default="",
+        help="只跑这些病案 ID（逗号分隔）。量化安全否决的代价时用：被拦下的记录"
+             "才需要用 --ignore-safety-veto 重跑一遍，其余记录两次的输入完全相同，"
+             "重跑只是白花钱。跑完把这几行并回主提交文件即可。",
+    )
+    ap.add_argument(
         "--ignore-safety-veto", action="store_true",
         help="绕过危重症状拦截。默认不绕——被拦的记录产出空答案得 0 分，那是这套"
              "系统真实的行为。用这个开关跑出来的分必须单独标注，不能混进主结果。",
@@ -34,6 +40,12 @@ def main(argv: list[str] | None = None) -> None:
 
     records = load_split(args.sdt_dir, args.split)
     attach_gold(records, read_gold(args.sdt_dir, args.split, strip_bom=True))
+    if args.only_ids:
+        wanted = {x.strip() for x in args.only_ids.split(",") if x.strip()}
+        missing = wanted - {r.record_id for r in records}
+        if missing:
+            raise SystemExit(f"--only-ids 里这些病案 ID 不在 {args.split} 里：{sorted(missing)}")
+        records = [r for r in records if r.record_id in wanted]
     if args.limit:
         records = records[: args.limit]
 
