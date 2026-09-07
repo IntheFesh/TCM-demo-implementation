@@ -57,6 +57,9 @@ def api_consult(req: ConsultRequest) -> dict:
             "results": [],
             "divergence": None,
             "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
+            # 拒绝也要带追问记录：被拦下来的原因可能正是追问问出来的，
+            # 只回一句"检测到危重症状"而不显示是哪一问问出来的，用户无从判断。
+            "followup": _serialize_followup(outcome.get("followup")),
             "manifest": outcome.get("manifest"),
         }
 
@@ -69,6 +72,7 @@ def api_consult(req: ConsultRequest) -> dict:
             "coverage": outcome.get("coverage"),
             "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
             "residual": _serialize_residual(outcome.get("residual")),
+            "followup": _serialize_followup(outcome.get("followup")),
             "results": [],
             "divergence": None,
             "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
@@ -91,9 +95,14 @@ def api_consult(req: ConsultRequest) -> dict:
         "coverage": outcome.get("coverage"),
         "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
         "residual": _serialize_residual(residual),
+        "followup": _serialize_followup(outcome.get("followup")),
         "graph": graph,
         "manifest": outcome.get("manifest"),
     }
+
+
+def _serialize_followup(followup) -> dict | None:
+    return followup.model_dump() if followup is not None else None
 
 
 def _serialize_residual(residual: dict | None) -> dict | None:

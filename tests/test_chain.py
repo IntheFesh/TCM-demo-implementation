@@ -422,3 +422,88 @@ def test_use_react_none_reads_environment(monkeypatch):
     assert chain.consult("纳差乏力")["manifest"]["use_react"] is True
     monkeypatch.setenv("USE_REACT", "0")
     assert chain.consult("纳差乏力")["manifest"]["use_react"] is False
+
+
+# ---------- G3：追问接进 consult ----------
+
+def _followup_setup(monkeypatch, s3=None):
+    s3_ye = s3 or S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                             cited_case_ids=["ye_tianshi-001"])
+    s3_wu = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["wu_jutong-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    monkeypatch.delenv("FAST_MODE", raising=False)
+    return fake_llm
+
+
+def test_consult_without_ask_channel_is_unchanged(monkeypatch):
+    """没有提问渠道就不追问，调用数跟改造前一样。"""
+    fake_llm = _followup_setup(monkeypatch)
+    outcome = chain.consult("纳差乏力")
+    assert outcome["followup"].stopped_by == "no_answer"
+    assert outcome["manifest"]["llm_calls"] == 4
+    assert all("追问结果" not in s for s in fake_llm.s3_systems)
+
+
+def test_followup_costs_one_extra_s2_no_matter_how_many_rounds(monkeypatch):
+    """追问每轮 0 次 LLM 调用（规则解析 + 图上贝叶斯更新），只在问出了新症状之后
+    整体重跑一次 S2。按轮收费的话这个 demo 就没法用了（G2 实测每次调用 4-8s）。
+
+    这里的 S2 一共 3 次：初次、追问后并入新症状那次、以及残差辨证那次
+    （残差是既有行为，跟追问无关——它被触发是因为追问加进来的症状本身
+    没被 FakeLLM 的证素解释）。轮数变多时这个数不许跟着涨。
+    """
+    fake_llm = _followup_setup(monkeypatch)
+    outcome = chain.consult("纳差乏力", ask_fn=lambda q: "有")
+    assert outcome["followup"].rounds >= 2
+    assert fake_llm.calls.count("S2Elements") == 3
+    assert fake_llm.calls.count("S1Normalize") == 1, "S1 仍然全局只跑一次"
+    # 2(S1+S2) + 1(追问后的 S2) + 2(两位医家 S3) + 1(残差)
+    assert outcome["manifest"]["llm_calls"] == 6
+
+
+def test_asserted_symptoms_are_merged_into_the_symptom_list(monkeypatch):
+    _followup_setup(monkeypatch)
+    outcome = chain.consult("纳差乏力", ask_fn=lambda q: "有")
+    for s in outcome["followup"].asserted:
+        assert s in outcome["s1"].symptoms
+
+
+def test_all_denials_do_not_rerun_s2(monkeypatch):
+    """全是否定回答时没有新症状可并，不该白花一次 S2。"""
+    fake_llm = _followup_setup(monkeypatch)
+    outcome = chain.consult("纳差乏力", ask_fn=lambda q: "没有")
+    assert outcome["followup"].denied
+    assert outcome["followup"].asserted == []
+    assert fake_llm.calls.count("S2Elements") == 1
+    assert outcome["manifest"]["llm_calls"] == 4
+
+
+def test_denials_reach_the_s3_prompt(monkeypatch):
+    fake_llm = _followup_setup(monkeypatch)
+    chain.consult("纳差乏力", ask_fn=lambda q: "没有")
+    assert all("患者明确否认" in s for s in fake_llm.s3_systems)
+    assert all("阴性证据" in s for s in fake_llm.s3_systems)
+
+
+def test_dangerous_followup_answer_rejects_and_produces_no_formula(monkeypatch):
+    """追问是安全否决层的后门（CLAUDE.md）。问出危重症状要跟初始主诉命中
+    同一道否决，S3 一次都不能调。"""
+    fake_llm = _followup_setup(monkeypatch)
+    outcome = chain.consult("纳差乏力", ask_fn=lambda q: "有，昨天开始解黑便")
+    assert outcome["rejected"] is True
+    assert "黑便" in outcome["reject_reason"]
+    assert outcome["results"] == []
+    assert fake_llm.calls.count("S3Syndrome") == 0
+
+
+def test_fast_mode_skips_followup_in_consult(monkeypatch):
+    fake_llm = _followup_setup(monkeypatch)
+    monkeypatch.setenv("FAST_MODE", "1")
+    asked = []
+    outcome = chain.consult("纳差乏力", ask_fn=lambda q: asked.append(q) or "有")
+    assert outcome["followup"].stopped_by == "fast_mode"
+    assert asked == []
+    assert fake_llm.calls.count("S2Elements") == 1

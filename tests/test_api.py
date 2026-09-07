@@ -111,3 +111,18 @@ def test_serialize_result_passes_react_trace_through():
     out = _serialize_result({**base, "react_trace": trace})["react_trace"]
     assert out["terminated_by"] == "finish"
     assert out["steps"][0]["action"] == "query_graph"
+
+
+def test_serialize_followup_roundtrip():
+    from api.main import _serialize_followup
+    from core.schemas import FollowupResult, HistoryItem
+
+    assert _serialize_followup(None) is None
+    r = FollowupResult(
+        history=[HistoryItem(question="有没有口苦？", answer="没有",
+                             symptom="口干或口苦", denied=["口干或口苦"])],
+        denied=["口干或口苦"], rounds=1, stopped_by="max_rounds",
+    )
+    out = _serialize_followup(r)
+    assert out["stopped_by"] == "max_rounds"
+    assert out["history"][0]["denied"] == ["口干或口苦"]

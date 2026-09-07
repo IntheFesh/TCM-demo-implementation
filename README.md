@@ -232,6 +232,42 @@ USE_REACT=1 ./run.sh          # 或 uvicorn api.main:app --reload
   调用）、`error`（LLM 调用失败）。**撞 max_steps 不等于正常结束**——它说明
   提示词没让模型知道什么时候算够了，看统计时这两者必须分开。
 
+## 追问（G3，需要提问渠道才会启用）
+
+`consult()` 收一个 `ask_fn`：给一个问题、返回患者的回答。不传就不追问——
+没有提问渠道时静默跳过是对的，不是错误。
+
+```python
+from core.chain import consult
+from eval.patient_sim import ScriptedPatient
+
+consult("胃脘胀痛，嗳气泛酸，纳差", ask_fn=ScriptedPatient(present=["两胁胀满"]))
+```
+
+问什么由 `core/tools.py` 的信息增益决定（见上一节），最多问 `MAX_ASK_ROUNDS=3` 轮。
+四件事值得知道：
+
+- **每轮 0 次 LLM 调用**。答案解析走规则（问的是「有没有 X？」这种封闭问题，
+  答案本质上就是是/否/不确定），后验更新是纯图计算。整个追问只在**问出了新症状
+  之后**整体重跑一次 S2，把新症状并进证素——按轮收费的话这个 demo 就没法用了。
+- **否定回答是证据，不只是去重**。患者说「没有口苦」会把以它为主症的证候压下去，
+  跟他说「有口苦」把它们抬上来是同一件事的两面。这些否认也会写进 S3 的提示词，
+  否则医家模型看不到，照样可能按那条症状开方。
+- **回答先过 `check_safety`**。追问问出「有黑便」跟初始主诉里写了黑便是同一道
+  否决：整轮终止、不产出任何方药。这是 CLAUDE.md 的硬约束——追问是安全否决层
+  的后门，不堵上等于前面那道拦截白做。
+- **`FAST_MODE=1` 跳过整个追问阶段**，演示嫌慢时用。
+
+停止原因记在 `followup.stopped_by`，六种：`max_rounds`（问满）、`converged`
+（再问也问不出信息了）、`no_candidate`（没问题可问）、`safety`（回答触发否决）、
+`fast_mode`、`no_answer`（没有提问渠道 / 对方不答）。**`converged` 和 `max_rounds`
+必须分开看**：前者说明追问设计有效，后者说明轮次上限卡住了它，混成一个就没法调
+`MAX_ASK_ROUNDS`。
+
+患者模拟器在 `eval/patient_sim.py`：`ScriptedPatient`（不调 LLM，按预设症状机械
+作答，是追问效果的**上界**，报告里引用追问收益必须说明用的是哪个患者）和
+`SimulatedPatient`（LLM 扮演，每问 1 次调用，只用于 eval/）。
+
 ## 数据来源与版权
 
 详见 [`data/SOURCES.md`](data/SOURCES.md)。简要结论：

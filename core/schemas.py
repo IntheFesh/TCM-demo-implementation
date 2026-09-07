@@ -172,6 +172,46 @@ class ReActTrace(BaseModel):
     llm_calls: int = 0
 
 
+# ---------- 在线：追问（G3） ----------
+
+
+class HistoryItem(BaseModel):
+    """一轮追问的完整记录。
+
+    四个字段的形状是定死的：`asserted`/`denied` 必须分开存，不能只存 answer
+    原文。实测（见 data/SOURCES.md 第 10 条）患者说了「口不渴」，系统只把它当
+    成一条普通症状收着，下一轮照样问「有没有口干或口苦」——否定回答不进结构化
+    字段，重复提问就堵不掉，而且后验也白丢一半证据。
+    """
+
+    question: str
+    answer: str
+    # 这一问对应的国标症状名。十问歌后备问的是一个话题不是一条症状，此时为 None，
+    # 答案也就无法归到 asserted/denied——这是后备模式的固有代价，不要假装能归。
+    symptom: str | None = None
+    topic: str | None = None
+    asserted: list[str] = Field(default_factory=list)
+    denied: list[str] = Field(default_factory=list)
+    # check_safety 命中时的拒绝理由。非 None 表示这一轮的回答触发了安全否决，
+    # 整个问诊到此为止（CLAUDE.md「追问的回答必须先过 check_safety」）。
+    safety_hit: str | None = None
+
+
+class FollowupResult(BaseModel):
+    history: list[HistoryItem] = Field(default_factory=list)
+    asserted: list[str] = Field(default_factory=list)
+    denied: list[str] = Field(default_factory=list)
+    rounds: int = 0
+    # max_rounds=问满轮次；converged=再问也问不出信息了；no_candidate=没问题可问；
+    # safety=回答触发安全否决；fast_mode=被开关跳过；no_answer=提问方没给回答。
+    # 这六种要分开：converged 和 max_rounds 都是"停了"，但前者说明追问设计有效、
+    # 后者说明轮次上限卡住了它，混成一个就没法调 MAX_ASK_ROUNDS。
+    stopped_by: Literal[
+        "max_rounds", "converged", "no_candidate", "safety", "fast_mode", "no_answer"
+    ]
+    reject_reason: str | None = None
+
+
 class S3Syndrome(BaseModel):
     syndrome: str
     reasoning: str

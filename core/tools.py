@@ -663,11 +663,29 @@ def _symptom_index(store: NetworkXStore, physician: str | None) -> dict[str, dic
     return out
 
 
+def _p_symptom_given_syndrome(weights_by_code: dict[str, float], code: str) -> float:
+    """P(症状=有 | 证候)，钳位后的。常数含义见上面那段注释。"""
+    return min(max(weights_by_code.get(code, P_UNLISTED), P_UNLISTED), P_MAX)
+
+
 def syndrome_posterior(
-    current_elements: list[str], store: NetworkXStore | None = None
+    current_elements: list[str],
+    store: NetworkXStore | None = None,
+    asserted_symptoms: list[str] | None = None,
+    denied_symptoms: list[str] | None = None,
 ) -> dict[str, float]:
-    """P(证候 | 已知证素)。证素为空时退化为均匀先验——那是合理的初始状态
-    （还没问出任何东西），不是错误。"""
+    """P(证候 | 已知证素, 追问答案)。证素为空时退化为均匀先验——那是合理的初始
+    状态（还没问出任何东西），不是错误。
+
+    asserted/denied 是 G3 追问收回来的答案。**否认必须进后验**，不能只用来从
+    候选池里去重：患者说「口不渴」是一条真证据，它把「口干或口苦」列为主症的
+    那几个证候压下去，跟他说「口苦」把它们抬上来是同一件事的两面。只去重不
+    更新，等于把一半的追问收益扔掉。
+
+    用的似然跟信息增益那套完全一致（同一组常数、同样的钳位），所以「问这个问题
+    预期能得到多少 bit」和「答完之后后验变成什么」在数学上是自洽的——两处各写
+    一套的话，IG 排出来的最优问题答完可能并不最优。
+    """
     store = store or get_graph_store()
     if store is None:
         return {}
@@ -675,11 +693,22 @@ def syndrome_posterior(
     if not index:
         return {}
     current = set(current_elements or [])
-    scores = {
-        code: ELEMENT_MATCH_ODDS ** len(current & info["elements"])
-        for code, info in index.items()
-    }
+    symptom_weights = _symptom_index(store, None)
+
+    scores = {}
+    for code, info in index.items():
+        s = float(ELEMENT_MATCH_ODDS ** len(current & info["elements"]))
+        for sym in asserted_symptoms or []:
+            s *= _p_symptom_given_syndrome(symptom_weights.get(sym, {}), code)
+        for sym in denied_symptoms or []:
+            s *= 1.0 - _p_symptom_given_syndrome(symptom_weights.get(sym, {}), code)
+        scores[code] = s
+
     total = sum(scores.values())
+    if total <= 0:
+        # 所有证候的似然都被压到 0（答案互相矛盾时可能出现）。退回均匀分布而不是
+        # 抛异常：追问循环还要继续，NaN 会让它整个哑掉。
+        return {code: 1.0 / len(index) for code in index}
     return {code: s / total for code, s in scores.items()}
 
 
@@ -712,6 +741,8 @@ def question_candidates(
     known_symptoms: list[str] | None = None,
     asked: list[str] | None = None,
     physician: str | None = None,
+    asserted_symptoms: list[str] | None = None,
+    denied_symptoms: list[str] | None = None,
 ) -> list[dict]:
     """按信息增益给出接下来最该问的 k 个问题，算不出来时退到十问歌固定顺序。
 
@@ -730,6 +761,10 @@ def question_candidates(
 
     `known_symptoms` 传患者已经陈述过的症状（会从候选池里去掉），`asked` 传已经
     问过的（症状名或十问歌 topic 都认）。不传的话会反复问同一个问题。
+
+    `asserted_symptoms` / `denied_symptoms` 是追问已经问出来的肯定/否定回答：
+    两者都进后验（见 syndrome_posterior），也都从候选池里去掉——问过的问题不该
+    再问第二遍，无论答案是有还是没有。
     """
     store = store or get_graph_store()
     asked_set = set(asked or [])
@@ -737,7 +772,10 @@ def question_candidates(
     if store is None:
         return _shiwen_fallback(k, asked_set, "图谱不可用（data/graph.json 不存在）")
 
-    posterior = syndrome_posterior(current_elements, store)
+    posterior = syndrome_posterior(
+        current_elements, store,
+        asserted_symptoms=asserted_symptoms, denied_symptoms=denied_symptoms,
+    )
     symptom_weights = _symptom_index(store, physician)
     if not posterior or not symptom_weights:
         return _shiwen_fallback(k, asked_set, "图里没有可用的证候假设空间或 indicates 边")
@@ -746,9 +784,12 @@ def question_candidates(
     # 同一个模块里两套"这条症状算不算已经知道了"的判断迟早会分叉。
     # 它只做字面匹配，患者换个说法（「大便溏薄」vs 标准里的「大便稀溏」）就漏，
     # 这个缺口的根因是缺一层术语映射，见 data/SOURCES.md 第 7 节第 10 条。
+    # 答过的（不管答有还是答没有）等同于已知，不再问第二遍
+    all_known = list(known_symptoms or []) + list(asserted_symptoms or []) \
+        + list(denied_symptoms or [])
     known_ids = {
         sym_id
-        for ks in (known_symptoms or [])
+        for ks in all_known
         for sym_id in _match_graph_symptoms(store, ks)
     }
     known_names = {(store.get_node(i) or {}).get("name") for i in known_ids}

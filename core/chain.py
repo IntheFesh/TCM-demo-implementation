@@ -19,6 +19,7 @@ import time
 from core import herbs as _herbs
 from core.elements import ELEMENTS, LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
+from core.followup import AskFn, format_followup_for_s3, run_followup
 from core.physicians import PHYSICIANS
 from core.react import format_trace_for_s3, react_enabled, run_react
 from core.retrieval import get_retriever
@@ -28,7 +29,7 @@ from core.safety_output import (
     check_thermal_consistency,
     format_conflicts,
 )
-from core.schemas import CaseRecord, S1Normalize, S2Elements, S3Syndrome
+from core.schemas import CaseRecord, FollowupResult, S1Normalize, S2Elements, S3Syndrome
 
 # 检索相似度下限。实测正常匹配在 0.85-0.90，低于 0.70 基本是"库里没有相关案子"，
 # 此时给空列表比塞三条不相关的更诚实——S3 prompt 里已有"参考医案差异较大时
@@ -119,6 +120,7 @@ def run_physician(
     physician: str,
     physician_name: str,
     use_react: bool = False,
+    followup: FollowupResult | None = None,
 ) -> dict:
     symptoms_text = "；".join(s1.symptoms)
 
@@ -159,6 +161,11 @@ def run_physician(
     # G2：开了 ReAct 就先跑一轮取证，把查到的东西追加到 S3 prompt 后面。
     # 只追加、不改 s3_syndrome.yaml——不开 ReAct 时 prompt 要跟改造前逐字节一致，
     # 否则 use_react 的 A/B 里混进了 prompt 变化这个额外变量。
+    # 追问结果接在 S3 提示词后面。否认的那部分尤其重要——肯定的症状会并进症状表
+    # 传下去，否认的不会，S3 看不到就照样可能按那条症状去开方。
+    if followup is not None:
+        s3_system = s3_system + format_followup_for_s3(followup)
+
     trace = None
     if use_react:
         trace = run_react(
@@ -278,9 +285,17 @@ def run_residual(s1: S1Normalize, s2: S2Elements) -> dict | None:
     }
 
 
-def consult(complaint: str, use_react: bool | None = None) -> dict:
+def consult(
+    complaint: str,
+    use_react: bool | None = None,
+    ask_fn: AskFn | None = None,
+) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
-    测试和 A/B 脚本靠它固定条件，不受环境影响。"""
+    测试和 A/B 脚本靠它固定条件，不受环境影响。
+
+    ask_fn 是追问的提问渠道（真人命令行、患者模拟器、前端各传各的）。不传就
+    不追问——没有提问渠道时静默跳过是对的，不是错误。
+    """
     _t0 = time.time()
     if use_react is None:
         use_react = react_enabled()
@@ -302,6 +317,38 @@ def consult(complaint: str, use_react: bool | None = None) -> dict:
         }
 
     s2 = infer_elements(s1)
+
+    # G3 追问：每轮 0 次 LLM 调用（规则解析 + 图上贝叶斯更新），只在问出了新症状
+    # 之后重跑一次 S2 把新症状并进证素。
+    followup = run_followup(
+        s1.symptoms, [h.element for h in s2.elements], ask_fn
+    )
+    extra_calls = 0
+    if followup.stopped_by == "safety":
+        # 追问问出危重症状 = 跟初始主诉命中同一道否决，同样不产出任何方药。
+        # CLAUDE.md：追问是安全否决层的后门，这里堵上。
+        return {
+            "s1": s1,
+            "results": [],
+            "divergence": None,
+            "rejected": True,
+            "reject_reason": followup.reject_reason,
+            "s2": s2,
+            "followup": followup,
+            "manifest": _build_manifest(
+                int((time.time() - _t0) * 1000), 2, use_react
+            ),
+        }
+    if followup.asserted:
+        # 追问确认的是国标症状名（来自图谱节点），本身已经是标准表述，不需要再过
+        # S1——这不违反"S1 全局只跑一次"，S1 一次也没有多跑。
+        s1 = S1Normalize(
+            symptoms=s1.symptoms + followup.asserted,
+            tongue=s1.tongue, pulse=s1.pulse, unmapped=s1.unmapped,
+        )
+        s2 = infer_elements(s1)
+        extra_calls += 1
+
     residual = run_residual(s1, s2)
 
     # 证素层为空 = 结构化推理没有落点。此时若继续跑 S3，模型会绕开证素
@@ -322,6 +369,7 @@ def consult(complaint: str, use_react: bool | None = None) -> dict:
             "reject_reason": None,
             "s2": s2,
             "residual": residual,
+            "followup": followup,
             "insufficient": True,
             "insufficient_reason": (
                 "现有症状不足以推断证素，无法进行有依据的辨证。"
@@ -330,11 +378,13 @@ def consult(complaint: str, use_react: bool | None = None) -> dict:
             ),
             "coverage": round(coverage, 3),
             "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000), 2 + (1 if residual else 0), use_react
+                int((time.time() - _t0) * 1000),
+                2 + extra_calls + (1 if residual else 0), use_react
             ),
         }
     results = [
-        run_physician(s1, s2, physician, info["name"], use_react=use_react)
+        run_physician(s1, s2, physician, info["name"], use_react=use_react,
+                      followup=followup)
         for physician, info in PHYSICIANS.items()
     ]
 
@@ -378,6 +428,7 @@ def consult(complaint: str, use_react: bool | None = None) -> dict:
         "reject_reason": None,
         "s2": s2,
         "residual": residual,
+        "followup": followup,
         "insufficient": False,
         "insufficient_reason": None,
         "coverage": round(coverage, 3),
@@ -387,6 +438,7 @@ def consult(complaint: str, use_react: bool | None = None) -> dict:
         "manifest": _build_manifest(
             int((time.time() - _t0) * 1000),
             2
+            + extra_calls
             + len(results)
             + (1 if residual else 0)
             + sum(1 for r in results if r["safety_output"]["revised"])
