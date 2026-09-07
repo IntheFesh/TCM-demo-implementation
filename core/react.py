@@ -20,11 +20,17 @@ from __future__ import annotations
 import json
 import os
 
+from core.followup import fast_mode_enabled
 from core.llm import LLMError, get_llm, load_prompt, render
 from core.schemas import ReActStep, ReActStepRecord, ReActTrace
 from core.tools import TOOLS, run_tool, tools_manifest
 
 MAX_STEPS = 5
+# FAST_MODE 下的步数上限。2 步是有意的下限而不是 1：ReAct 至少要能"查一次 +
+# 收尾"，压到 1 步就只剩一次工具调用、连收尾的机会都没有，轨迹会必然以
+# max_steps 结束，看起来像模型不会收尾，实际是被上限卡死的——那正是
+# SOURCES.md 第 11/12 条要求把这两种情况分开看的原因。
+FAST_MODE_MAX_STEPS = 2
 # observation 塞回 prompt 时的截断长度。不截断的话 search_cases 一次返回三条
 # 完整医案，几步之后 history 会把 prompt 撑到几千字，后面的步反而看不清重点。
 MAX_OBSERVATION_CHARS = 1200
@@ -82,10 +88,17 @@ def run_react(
     name: str,
     symptoms: str,
     elements_summary: str,
-    max_steps: int = MAX_STEPS,
+    max_steps: int | None = None,
 ) -> ReActTrace:
     """跑一轮 ReAct，返回完整轨迹。不抛异常：LLM 调用失败也记进轨迹返回，
-    让上层决定要不要继续——一次工具层的意外不该让整条问诊挂掉。"""
+    让上层决定要不要继续——一次工具层的意外不该让整条问诊挂掉。
+
+    max_steps=None 时按 FAST_MODE 决定（开着降到 FAST_MODE_MAX_STEPS，否则
+    MAX_STEPS），显式传数字优先。形状跟 use_react=None / eval_mode=None 一致。
+    判断放在这里而不是 chain.py 的调用点：只在调用方生效的开关是半吊子，
+    换一个调用方进来就漏了。"""
+    if max_steps is None:
+        max_steps = FAST_MODE_MAX_STEPS if fast_mode_enabled() else MAX_STEPS
     prompt = load_prompt("s3_react")
     records: list[ReActStepRecord] = []
     seen: dict[str, int] = {}

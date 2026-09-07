@@ -47,8 +47,19 @@ AskFn = Callable[[str], str | None]
 
 
 def fast_mode_enabled() -> bool:
-    """演示时嫌慢就开，跳过整个追问阶段。默认关——追问是这一轮的功能主体，
-    默认跳过等于默认不用。"""
+    """演示现场网络慢或临时预算紧张时的兜底开关。默认关。
+
+    **全项目唯一的 FAST_MODE 判定实现**，三处代码路径都调它、不各写一套：
+      1. 本模块的追问循环：max_rounds 降到 0（一个问题都不问）
+      2. core/react.py 的 run_react：步数上限降到 FAST_MODE_MAX_STEPS
+      3. core/chain.py 的 run_residual：残差辨证整体关闭
+    三处必须同时生效——只关一半的开关是陷阱：用户以为省了预算，实际还在花。
+
+    判定实现留在这个模块是历史原因（FAST_MODE 最早只管追问）。没有挪到中立
+    模块：本项目三个开关的约定就是"住在它主要治理的模块里"
+    （USE_REACT 在 core/react.py，EVAL_MODE 在 core/safety.py），为一个函数
+    新建一个 config 模块反而会让这三个开关的摆放变得不一致。
+    """
     return os.environ.get("FAST_MODE", "0").lower() in ("1", "true", "yes")
 
 

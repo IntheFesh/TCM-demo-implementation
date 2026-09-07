@@ -21,7 +21,9 @@ from pathlib import Path
 from core import herbs as _herbs
 from core.elements import ELEMENTS, LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
-from core.followup import AskFn, format_followup_for_s3, parse_answer, run_followup
+from core.followup import (
+    AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
+)
 from core.physicians import PHYSICIANS
 from core.react import format_trace_for_s3, react_enabled, run_react
 from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
@@ -356,6 +358,13 @@ def run_residual(s1: S1Normalize, s2: S2Elements) -> dict | None:
     这是"系统知道自己哪里没说清楚"的落点——不做的话 unexplained_symptoms
     只是个统计数字，界面上看不出系统承认了什么。
     """
+    # FAST_MODE：残差辨证整体关闭。它是三处降级里最贵的一处——每触发一次就是
+    # 一次完整的 S2 调用，而它本来就是"锦上添花"（把没解释的症状再推一轮），
+    # 不是产出方药的必经步骤。判断放在这里而不是 consult 的调用点：只在调用方
+    # 生效的开关是半吊子。
+    if fast_mode_enabled():
+        return None
+
     # 不能只信 unexplained_symptoms 字段——模型经常漏填它，
     # 实测有症状明明没被任何证素引用、该字段却是空的。
     # 取并集：字段声明的 + 实际没被任何 supporting_symptoms 提到的。
