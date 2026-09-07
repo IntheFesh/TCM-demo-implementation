@@ -345,6 +345,23 @@
     font-size: 11px; color: #3b6fd8; cursor: pointer; margin-top: 4px; display: inline-block;
   }
   #cy .cy-clickable { cursor: pointer; }
+  #graph-tooltip {
+    display: none;
+    position: absolute;
+    z-index: 20;
+    max-width: 260px;
+    padding: 8px 10px;
+    background: #24262b;
+    color: #f2f2f4;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.6;
+    pointer-events: none;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.22);
+  }
+  #graph-tooltip.show { display: block; }
+  #graph-tooltip b { color: #fff; }
+  #graph-tooltip .tt-meta { color: #b9bcc4; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -366,6 +383,7 @@
     <div id="cy"></div>
     <div id="residual-note" style="display:none;position:absolute;bottom:26px;left:14px;font-size:12px;color:#C2410C;"></div>
   <div id="graph-note" style="display:none;position:absolute;bottom:8px;left:14px;font-size:12px;color:#9a6b2f;"></div>
+  <div id="graph-tooltip"></div>
   </div>
 
   <div id="input-panel">
@@ -401,6 +419,10 @@
 // 配色由 /api/consult 响应里的 result.color 提供（源头是 core/physicians.py）。
 // 这里只保留图渲染用的运行时缓存，每次响应回来时填充。
 let PHYSICIAN_COLORS = {};
+// hover tooltip 用：herb 节点的 data 里只带 phys（id），不带 pname（syn 节点带了，
+// herb 没有——to_graph() 没为 herb 节点重复存一份，这里在前端补一份映射，不是
+// 因为后端漏了字段，是没必要为一个纯展示用途改后端契约（模块6"不改后端"）。
+let PHYSICIAN_NAMES = {};
 const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640 };
 const Y_MIN = 60, Y_MAX = 460;
 
@@ -572,6 +594,68 @@ function buildStylesheet() {
   return style;
 }
 
+// ---------- hover tooltip ----------
+//
+// 跟点击打开的侧栏（openEvidence/EVIDENCE）是两件事：侧栏给的是完整证据链
+// （推理过程、引用医案、取证轨迹……），要点开才看；hover 给的是"这个节点/
+// 这条边是什么"的一句话速览，划过去就有，不用点。数据不查 EVIDENCE——
+// EVIDENCE 是按"这条结论的完整依据"组织的，字段比这里需要的重得多，
+// hover 直接读 cytoscape 节点/边自身的 data() 就够，两者故意不复用同一份
+// 组装逻辑，因为回答的不是同一个问题（同一条例外，CLAUDE.md 对
+// core/safety.py 危重词表不并进 SYNONYMS 是同一个理由）。
+//
+// 四种节点类型（层 0-3：症状/证素/证型/用药）各一句 + 边一句，加起来是
+// "5 种可 hover 的东西"——不是又多出一种新节点类型，是 4 类节点 + 边。
+
+function describeNodeTooltip(data) {
+  const physName = data.pname || PHYSICIAN_NAMES[data.phys] || data.phys || "";
+  switch (data.layer) {
+    case 0: {
+      const stateLabel = { explained: "已解释", residual: "残差辨证补充解释", unexplained: "未解释" }[data.state] || data.state || "";
+      return `<b>症状</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(stateLabel)}</div>`;
+    }
+    case 1: {
+      const kindLabel = data.kind === "location" ? "病位" : data.kind === "nature" ? "病性" : (data.kind || "");
+      return `<b>证素</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(kindLabel)}${data.residual ? "　（残差辨证补充）" : ""}</div>`;
+    }
+    case 2:
+      return `<b>证型</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(physName)}</div>`;
+    case 3:
+      return `<b>用药</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(physName)}</div>`;
+    default:
+      return escapeHtml(data.label || data.id || "");
+  }
+}
+
+function describeEdgeTooltip(edgeData, sourceLabel, targetLabel) {
+  const physName = edgeData.pname || PHYSICIAN_NAMES[edgeData.phys] || edgeData.phys || "";
+  const lines = [`${escapeHtml(sourceLabel || "?")} → ${escapeHtml(targetLabel || "?")}`];
+  if (physName) lines.push(`<div class="tt-meta">${escapeHtml(physName)}</div>`);
+  if (edgeData.residual) lines.push('<div class="tt-meta">残差辨证补充的连线</div>');
+  return lines.join("");
+}
+
+function showTooltip(html, clientX, clientY) {
+  const tip = document.getElementById("graph-tooltip");
+  const panel = document.getElementById("graph-panel");
+  const panelRect = panel.getBoundingClientRect();
+  tip.innerHTML = html;
+  tip.classList.add("show");
+  // 先显示、量出真实尺寸，再据此把 tooltip 夹在画布范围内——鼠标贴着
+  // 右/下边缘时不这么做的话，tooltip 会被裁出可视区域，看不全。
+  const tipRect = tip.getBoundingClientRect();
+  let left = clientX - panelRect.left + 14;
+  let top = clientY - panelRect.top + 14;
+  left = Math.min(left, panel.clientWidth - tipRect.width - 6);
+  top = Math.min(top, panel.clientHeight - tipRect.height - 6);
+  tip.style.left = `${Math.max(6, left)}px`;
+  tip.style.top = `${Math.max(6, top)}px`;
+}
+
+function hideTooltip() {
+  document.getElementById("graph-tooltip").classList.remove("show");
+}
+
 function ensureCanvas() {
   // 画布只建一次。生长动画需要 cy.add() 往已有画布上分批追加元素，
   // 每次 destroy 重建就没有"增量"可言了。
@@ -589,6 +673,36 @@ function ensureCanvas() {
   cy.on("tap", (evt) => {
     if (evt.target === cy) closeEvidence();
   });
+  cy.on("mouseover", "node", (evt) => {
+    showTooltip(describeNodeTooltip(evt.target.data()), evt.originalEvent.clientX, evt.originalEvent.clientY);
+  });
+  cy.on("mousemove", "node", (evt) => {
+    showTooltip(describeNodeTooltip(evt.target.data()), evt.originalEvent.clientX, evt.originalEvent.clientY);
+  });
+  cy.on("mouseout", "node", hideTooltip);
+  cy.on("mouseover", "edge", (evt) => {
+    const e = evt.target;
+    showTooltip(
+      describeEdgeTooltip(e.data(), e.source().data("label"), e.target().data("label")),
+      evt.originalEvent.clientX, evt.originalEvent.clientY
+    );
+  });
+  cy.on("mousemove", "edge", (evt) => {
+    const e = evt.target;
+    showTooltip(
+      describeEdgeTooltip(e.data(), e.source().data("label"), e.target().data("label")),
+      evt.originalEvent.clientX, evt.originalEvent.clientY
+    );
+  });
+  cy.on("mouseout", "edge", hideTooltip);
+  // 兜底：鼠标整个离开画布这件事单独用原生 DOM mouseleave 盯一道，不完全
+  // 依赖 cytoscape 自己那套"逐帧 hit-test 出有没有悬停元素"的合成事件。
+  // 真实验证时发现，鼠标从节点直接"瞬移"到画布外（不经过中间帧）的极端
+  // 情况下，cytoscape 的 node mouseout 有几率没触发，tooltip 会卡住不消失
+  // ——真实鼠标移动是连续多帧、不会瞬移，用户手动移开基本不会撞上这条，
+  // 但原生 mouseleave 是浏览器对"指针真的离开了这个元素"的保证，不依赖
+  // canvas 内部逐帧算出来的悬停状态，加一道更保险。
+  document.getElementById("cy").addEventListener("mouseleave", hideTooltip);
   return cy;
 }
 
@@ -962,6 +1076,7 @@ function resetSecondaryPanels() {
   lastGraph = null;
   EVIDENCE = {};
   closeEvidence();
+  hideTooltip();
   for (const id of ["residual-note", "graph-note", "followup-note"]) {
     const el = document.getElementById(id);
     if (el) { el.textContent = ""; el.style.display = "none"; }
@@ -1028,8 +1143,10 @@ function renderConsultResult(data) {
     return;
   }
   PHYSICIAN_COLORS = {};
+  PHYSICIAN_NAMES = {};
   for (const r of data.results) {
     if (r.color) PHYSICIAN_COLORS[r.physician] = r.color;
+    PHYSICIAN_NAMES[r.physician] = r.physician_name;
   }
   const m = data.manifest;
   document.getElementById("manifest-footer").textContent = m
