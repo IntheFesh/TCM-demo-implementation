@@ -25,7 +25,7 @@ from core.followup import (
     AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
 )
 from core.physicians import PHYSICIANS
-from core.react import format_trace_for_s3, react_enabled, run_react
+from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
 from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
 from core.safety import check_safety, mentions_danger, safety_bypassed
 from core.safety_output import (
@@ -190,6 +190,7 @@ def run_physician(
     followup: FollowupResult | None = None,
     ask_fn: AskFn | None = None,
     bypass_safety: bool = False,
+    on_step: StepFn | None = None,
 ) -> dict:
     """bypass_safety 由 consult() 一次算好后传进来，不在这里各自读一次环境变量
     ——同一个请求的几个中止点必须用同一个判断，不能一半拦一半不拦。"""
@@ -249,6 +250,7 @@ def run_physician(
             name=physician_name,
             symptoms=symptoms_text,
             elements_summary=_format_elements_summary(s2),
+            on_step=on_step,
         )
         # ReAct 用 ask_user 收尾 = 它要追问患者。有提问渠道就真的问，回答先过
         # check_safety 再交给 S3；没有渠道时问题只记录，S3 拿不到答案。
@@ -273,6 +275,10 @@ def run_physician(
                 trace.pending_answer = answer
         s3_system = s3_system + format_trace_for_s3(trace)
 
+    if on_step is not None:
+        # 没开 ReAct 时这是这位医家唯一一次要等的 LLM 调用；开了 ReAct 也要报——
+        # 取证结束不代表马上有结果，S3 本身也要等一次真实调用。
+        on_step("s3_start", {"physician": physician, "physician_name": physician_name})
     s3 = _split_western_into_s3(get_llm().generate(system=s3_system, user="", schema=s3_schema))
 
     # X2 输出侧安全：十八反十九畏命中就把冲突写进 prompt 重开一次。
@@ -409,6 +415,7 @@ def consult(
     use_react: bool | None = None,
     ask_fn: AskFn | None = None,
     eval_mode: bool | None = None,
+    on_step: StepFn | None = None,
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
@@ -420,8 +427,22 @@ def consult(
     打开之后，**安全检查照跑、命中原因照记进返回值的 safety_flag，但不再中止
     链路**——评测要量化"安全否决花了多少分"，就得让被拦的那些主诉也走完一遍
     拿到分数，否则那个代价算不出来。默认关，demo 的拦截红线不受影响。
+
+    on_step 是 SSE 分步进度用的回调，(事件名, 数据字典) -> None。不传（CLI、
+    eval/、批跑现状）就完全不影响这个函数原来的行为——每一处 emit 之前都判了
+    `if on_step is not None`。传了之后在 S1/S2/追问/残差/每位医家开始与结束
+    这几个自然边界各上报一次；医家内部更细的 ReAct 单步进度由 run_physician
+    透传给 run_react（同一个回调对象，不是另起一套）。**不在这里处理"追问 /
+    ReAct 追问需要用户回答"这件事**——那仍然是 ask_fn 的职责：SSE 端点想在
+    追问时推 need_input 事件、暂停等回答，只需要传一个自己包了一层的 ask_fn，
+    不需要 consult() 或 core/followup.py 知道"上面接的是不是 SSE"。
     """
     _t0 = time.time()
+
+    def emit(name: str, **data) -> None:
+        if on_step is not None:
+            on_step(name, data)
+
     if use_react is None:
         use_react = react_enabled()
     # 一次 consult 里只判一次，之后一路用这个布尔值：中途有人改环境变量时，
@@ -431,6 +452,7 @@ def consult(
     # 链路继续往下走，但这个字段仍然如实记着"本来会被拦"，两种模式同一套语义。
     safety_flag: str | None = None
     s1 = normalize(complaint)
+    emit("s1_done", symptoms=s1.symptoms, tongue=s1.tongue, pulse=s1.pulse, unmapped=s1.unmapped)
 
     # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
     # 不产出任何方药。不要把这道检查挪到 run_physician 内部或结果的 note 字段。
@@ -453,12 +475,20 @@ def consult(
         }
 
     s2 = infer_elements(s1)
+    emit("s2_done", elements=[
+        {"element": h.element, "kind": h.kind, "confidence": h.confidence} for h in s2.elements
+    ], unexplained_symptoms=s2.unexplained_symptoms)
 
     # G3 追问：每轮 0 次 LLM 调用（规则解析 + 图上贝叶斯更新），只在问出了新症状
     # 之后重跑一次 S2 把新症状并进证素。
+    # 追问过程中每一问/每一答的进度不在这里上报——那是 ask_fn 的职责（SSE 端点
+    # 想要 need_input 事件，自己包一层传进来的 ask_fn，不需要 run_followup 或
+    # 这里知道调用方是不是 SSE）。这里只上报"追问这一整段结束了"。
     followup = run_followup(
         s1.symptoms, [h.element for h in s2.elements], ask_fn
     )
+    emit("followup_done", stopped_by=followup.stopped_by, rounds=followup.rounds,
+         asserted=followup.asserted, denied=followup.denied)
     extra_calls = 0
     if followup.stopped_by == "safety":
         # 追问问出危重症状 = 跟初始主诉命中同一道否决，同样不产出任何方药。
@@ -501,8 +531,15 @@ def consult(
         )
         s2 = infer_elements(s1)
         extra_calls += 1
+        emit("s2_done", elements=[
+            {"element": h.element, "kind": h.kind, "confidence": h.confidence} for h in s2.elements
+        ], unexplained_symptoms=s2.unexplained_symptoms, after_followup=True)
 
     residual = run_residual(s1, s2)
+    if residual:
+        emit("residual_done", newly_explained=residual["newly_explained"],
+             still_unexplained=residual["still_unexplained"],
+             coverage_before=residual["coverage_before"], coverage_after=residual["coverage_after"])
 
     # 证素层为空 = 结构化推理没有落点。此时若继续跑 S3，模型会绕开证素
     # 直接"看主诉猜证型"（实测「胸闷气短」这类信息量过低的主诉，S2 返回空证素，
@@ -537,10 +574,14 @@ def consult(
     results = []
     try:
         for physician, info in PHYSICIANS.items():
-            results.append(run_physician(
+            emit("physician_start", physician=physician, physician_name=info["name"])
+            r = run_physician(
                 s1, s2, physician, info["name"], use_react=use_react,
-                followup=followup, ask_fn=ask_fn, bypass_safety=bypass,
-            ))
+                followup=followup, ask_fn=ask_fn, bypass_safety=bypass, on_step=on_step,
+            )
+            results.append(r)
+            emit("physician_done", physician=physician, physician_name=info["name"],
+                 syndrome=r["s3"].syndrome, herbs=r["s3"].herbs)
     except SafetyVeto as veto:
         # ReAct 追问问出了危重症状：跟初始主诉命中同一道否决，已经跑完的医家结果
         # 也不返回——被拦截的请求不产出任何方药。

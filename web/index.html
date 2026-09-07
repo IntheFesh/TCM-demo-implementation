@@ -124,6 +124,55 @@
     background: #a9b6ec;
     cursor: not-allowed;
   }
+  #progress-log {
+    display: none;
+    margin-top: 10px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--muted);
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    white-space: pre-wrap;
+    max-height: 130px;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  #progress-log.show { display: block; }
+  #need-input-box {
+    display: none;
+    margin-top: 10px;
+    padding: 10px 12px;
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 8px;
+  }
+  #need-input-box.show { display: block; }
+  #need-input-question {
+    font-size: 13.5px;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+  #need-input-answer {
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 13.5px;
+    outline: none;
+  }
+  #need-input-answer:focus { border-color: var(--accent); }
+  #need-input-submit {
+    background: var(--warn-border);
+    color: #fff;
+    border: none;
+    padding: 8px 16px;
+    font-size: 13.5px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
   #error-box {
     display: none;
     background: #fdecea;
@@ -324,6 +373,14 @@
     <div class="input-row">
       <span id="status-text"></span>
       <button id="submit-btn">辨证</button>
+    </div>
+    <div id="progress-log"></div>
+    <div id="need-input-box">
+      <div id="need-input-question"></div>
+      <div class="input-row" style="justify-content: flex-start;">
+        <input type="text" id="need-input-answer" placeholder="请输入回答，例如：有 / 没有" />
+        <button id="need-input-submit">回答</button>
+      </div>
     </div>
   </div>
 
@@ -948,6 +1005,181 @@ function clearError() {
   box.textContent = "";
 }
 
+// data 的形状是 api/main.py::_consult_response() 的返回值——不管是走
+// /api/consult 的普通响应体，还是走 /api/consult/stream 的 done 事件，
+// 两条路径共用同一个后端函数拼出这份 JSON，这里也只用一份渲染逻辑接。
+function renderConsultResult(data) {
+  resetSecondaryPanels();
+  if (data.rejected) {
+    showError(`⚠ ${data.reject_reason}`);
+    renderDivergence(null);
+    renderResults([]);
+    renderFollowup(data.followup);
+    renderGraph(data.graph);
+    return;
+  }
+  if (data.insufficient) {
+    // 信息不足不是错误：系统承认没法有依据地辨证，要把补充信息的提示原样给用户
+    showError(`ℹ ${data.insufficient_reason || "现有症状不足以推断证素，请补充更多信息。"}`);
+    renderDivergence(null);
+    renderResults([]);
+    renderFollowup(data.followup);
+    renderGraph(data.graph);
+    return;
+  }
+  PHYSICIAN_COLORS = {};
+  for (const r of data.results) {
+    if (r.color) PHYSICIAN_COLORS[r.physician] = r.color;
+  }
+  const m = data.manifest;
+  document.getElementById("manifest-footer").textContent = m
+    ? `${m.model}　prompt ${m.prompt_version}　语料 ${m.cases_sha256 || "?"}　${m.llm_calls} 次调用　${(m.elapsed_ms / 1000).toFixed(1)}s`
+    : "";
+  buildEvidenceIndex(data);
+  const res = data.residual;
+  const rnote = document.getElementById("residual-note");
+  if (rnote) {
+    if (res && res.triggered) {
+      const before = Math.round(res.coverage_before * 100);
+      const after = Math.round(res.coverage_after * 100);
+      const gained = (res.newly_explained || []).join("、");
+      rnote.innerHTML = `残差辨证：初轮解释率 ${before}% → ${after}%` +
+        (gained ? `，补充解释「${escapeHtml(gained)}」` : "") +
+        (res.still_unexplained && res.still_unexplained.length
+          ? `；仍未解释「${escapeHtml(res.still_unexplained.join("、"))}」` : "");
+      rnote.style.display = "block";
+    } else {
+      rnote.style.display = "none";
+    }
+  }
+  lastGraph = data.graph;
+  const dropped = data.graph.dropped_edges || 0;
+  const note = document.getElementById("graph-note");
+  if (dropped > 0) {
+    note.textContent = `有 ${dropped} 条推理连线因症状表述不一致未能显示`;
+    note.style.display = "block";
+  } else {
+    note.style.display = "none";
+  }
+  renderDivergence(data.divergence);
+  renderResults(data.results);
+  renderFollowup(data.followup);
+  renderGraph(data.graph);
+}
+
+// ---------- SSE 分步进度 ----------
+
+function appendProgress(line) {
+  const log = document.getElementById("progress-log");
+  log.classList.add("show");
+  log.textContent += (log.textContent ? "\n" : "") + line;
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearProgress() {
+  const log = document.getElementById("progress-log");
+  log.textContent = "";
+  log.classList.remove("show");
+}
+
+let currentStreamId = null;
+
+function showNeedInput(question) {
+  document.getElementById("need-input-question").textContent = `❓ ${question}`;
+  const input = document.getElementById("need-input-answer");
+  input.value = "";
+  document.getElementById("need-input-box").classList.add("show");
+  input.focus();
+}
+
+function hideNeedInput() {
+  document.getElementById("need-input-box").classList.remove("show");
+}
+
+async function submitNeedInputAnswer() {
+  const input = document.getElementById("need-input-answer");
+  const answer = input.value.trim();
+  // 没有 currentStreamId 说明流已经结束（比如用户手滑点了两下）——这时候
+  // 提交答案没有地方能接住，后端会回 404，不如干脆不发这个请求。
+  if (!answer || !currentStreamId) return;
+  hideNeedInput();
+  try {
+    const resp = await fetch(`/api/consult/stream/${currentStreamId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`回答提交失败（HTTP ${resp.status}）：${text}`);
+    }
+    // 不在这里手动往 progress-log 加"已回答"——服务端会在真正收到、真正
+    // 让 consult() 里的 ask_fn 返回之后回发一条 followup_answered 事件，
+    // 那条才是唯一真相；这里手动加一条的话，等那条事件到达时就会重复一遍。
+  } catch (err) {
+    showError(`回答提交失败：${err.message || err}`);
+  }
+}
+
+// 把一条 SSE 进度事件翻成人看得懂的一行日志。事件名和数据形状是
+// core/chain.py::consult() 的 on_step 回调定义的契约——那边新增一种事件，
+// 这里要跟着加一个 case，不加也不会报错，只是进度条上少一行，不算严重故障，
+// 所以没有钉一条"事件名必须穷举"的断言，交给人工核对事件名对不对得上。
+function describeProgressEvent(name, data) {
+  switch (name) {
+    case "s1_done":
+      return `① 症状标准化：${(data.symptoms || []).join("、")}`;
+    case "s2_done":
+      return `② 证素推断${data.after_followup ? "（追问后重跑）" : ""}：` +
+        ((data.elements || []).map((e) => e.element).join("、") || "（未推出证素）");
+    case "followup_done":
+      if (data.stopped_by === "no_answer") return "③ 追问：无提问渠道，跳过";
+      if (data.stopped_by === "fast_mode") return "③ 追问：FAST_MODE 已跳过";
+      return `③ 追问结束（${data.rounds} 轮，${data.stopped_by}）`;
+    case "residual_done":
+      return `④ 残差辨证：补充解释「${(data.newly_explained || []).join("、") || "无"}」`;
+    case "physician_start":
+      return `▶ ${data.physician_name} 开始辨证…`;
+    case "react_step":
+      return `　${data.physician_name} 取证第 ${data.step} 步：${data.action}`;
+    case "s3_start":
+      return `　${data.physician_name} 正在拟定证型与方药…`;
+    case "physician_done":
+      return `✓ ${data.physician_name} 完成：${data.syndrome}`;
+    case "followup_answered":
+      return `　已回答「${data.question}」：${data.answer}`;
+    default:
+      return null; // stream_id / need_input / done / error 各自单独处理，不进日志
+  }
+}
+
+// 手写 SSE 帧解析而不是用浏览器原生 EventSource：EventSource 只能发 GET，
+// 这里要在打开流的同一个请求里带上 complaint（POST body），只能自己用
+// fetch + ReadableStream 读。SSE 帧格式是"若干 field: value 行 + 一个空行"，
+// 这里只用到 event/data 两个字段。
+async function readSSE(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let eventName = "message";
+      const dataLines = [];
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) eventName = line.slice(7);
+        else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+      }
+      if (dataLines.length) onEvent(eventName, JSON.parse(dataLines.join("\n")));
+    }
+  }
+}
+
 async function submitConsult() {
   const complaint = document.getElementById("complaint").value.trim();
   if (!complaint) {
@@ -959,11 +1191,14 @@ async function submitConsult() {
   const status = document.getElementById("status-text");
   btn.disabled = true;
   btn.textContent = "推理中…";
-  status.textContent = "预计需要 15–25 秒，请耐心等待";
+  status.textContent = "";
   clearError();
+  clearProgress();
+  hideNeedInput();
+  currentStreamId = null;
 
   try {
-    const resp = await fetch("/api/consult", {
+    const resp = await fetch("/api/consult/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ complaint }),
@@ -972,63 +1207,29 @@ async function submitConsult() {
       const text = await resp.text();
       throw new Error(`服务返回错误（HTTP ${resp.status}）：${text}`);
     }
-    const data = await resp.json();
-    resetSecondaryPanels();
-    if (data.rejected) {
-      showError(`⚠ ${data.reject_reason}`);
-      renderDivergence(null);
-      renderResults([]);
-      renderFollowup(data.followup);
-      renderGraph(data.graph);
-      return;
-    }
-    if (data.insufficient) {
-      // 信息不足不是错误：系统承认没法有依据地辨证，要把补充信息的提示原样给用户
-      showError(`ℹ ${data.insufficient_reason || "现有症状不足以推断证素，请补充更多信息。"}`);
-      renderDivergence(null);
-      renderResults([]);
-      renderFollowup(data.followup);
-      renderGraph(data.graph);
-      return;
-    }
-    PHYSICIAN_COLORS = {};
-    for (const r of data.results) {
-      if (r.color) PHYSICIAN_COLORS[r.physician] = r.color;
-    }
-    const m = data.manifest;
-    document.getElementById("manifest-footer").textContent = m
-      ? `${m.model}　prompt ${m.prompt_version}　语料 ${m.cases_sha256 || "?"}　${m.llm_calls} 次调用　${(m.elapsed_ms / 1000).toFixed(1)}s`
-      : "";
-    buildEvidenceIndex(data);
-    const res = data.residual;
-    const rnote = document.getElementById("residual-note");
-    if (rnote) {
-      if (res && res.triggered) {
-        const before = Math.round(res.coverage_before * 100);
-        const after = Math.round(res.coverage_after * 100);
-        const gained = (res.newly_explained || []).join("、");
-        rnote.innerHTML = `残差辨证：初轮解释率 ${before}% → ${after}%` +
-          (gained ? `，补充解释「${escapeHtml(gained)}」` : "") +
-          (res.still_unexplained && res.still_unexplained.length
-            ? `；仍未解释「${escapeHtml(res.still_unexplained.join("、"))}」` : "");
-        rnote.style.display = "block";
+
+    let doneData = null;
+    let errorDetail = null;
+    await readSSE(resp, (name, data) => {
+      if (name === "stream_id") {
+        currentStreamId = data.stream_id;
+      } else if (name === "need_input") {
+        showNeedInput(data.question);
+      } else if (name === "error") {
+        errorDetail = data.detail;
+      } else if (name === "done") {
+        doneData = data;
       } else {
-        rnote.style.display = "none";
+        const line = describeProgressEvent(name, data);
+        if (line) appendProgress(line);
+        if (name === "followup_answered") hideNeedInput();
       }
-    }
-    lastGraph = data.graph;
-    const dropped = data.graph.dropped_edges || 0;
-    const note = document.getElementById("graph-note");
-    if (dropped > 0) {
-      note.textContent = `有 ${dropped} 条推理连线因症状表述不一致未能显示`;
-      note.style.display = "block";
-    } else {
-      note.style.display = "none";
-    }
-    renderDivergence(data.divergence);
-    renderResults(data.results);
-    renderFollowup(data.followup);
-    renderGraph(data.graph);
+    });
+
+    hideNeedInput();
+    if (errorDetail) throw new Error(errorDetail);
+    if (!doneData) throw new Error("事件流意外中断，没有收到最终结果");
+    renderConsultResult(doneData);
   } catch (err) {
     console.error("consult failed:", err);
     showError(`请求失败：${err.message || err}\n${(err.stack || "").split("\n").slice(0, 3).join("\n")}`);
@@ -1036,10 +1237,15 @@ async function submitConsult() {
     btn.disabled = false;
     btn.textContent = "辨证";
     status.textContent = "";
+    currentStreamId = null;
   }
 }
 
 document.getElementById("submit-btn").addEventListener("click", submitConsult);
+document.getElementById("need-input-submit").addEventListener("click", submitNeedInputAnswer);
+document.getElementById("need-input-answer").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") submitNeedInputAnswer();
+});
 document.getElementById("skip-btn").addEventListener("click", skipAnimation);
 document.getElementById("replay-btn").addEventListener("click", replayGraph);
 // 保险起见运行时把面板挂到 body 末尾：只要祖先里有任何 transform/filter，

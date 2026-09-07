@@ -1,10 +1,15 @@
 """FastAPI 服务：/api/consult 跑推理链并把结果拼成前端可渲染的图数据。"""
 from __future__ import annotations
 
+import json
+import queue
+import secrets
+import threading
 from pathlib import Path
+from typing import Iterator
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -66,7 +71,19 @@ def api_trajectories(physician: str) -> dict:
 
 @app.post("/api/consult")
 def api_consult(req: ConsultRequest) -> dict:
-    outcome = consult(req.complaint)
+    return _consult_response(consult(req.complaint))
+
+
+def _consult_response(outcome: dict) -> dict:
+    """把 consult() 的原始返回值拼成前端要的 JSON 形状。
+
+    **全项目"consult() 结果怎么序列化给前端"这件事唯一的实现**：/api/consult
+    和 /api/consult/stream 的终值事件都调这一个函数，不是各写一份——两条路径
+    对同一份 outcome 必须产出完全相同的 JSON，否则流式端点收到的 done 事件
+    和非流式端点的响应体就成了两份分叉的契约，前端的渲染函数没法共用
+    （CLAUDE.md 第二次撞墙那条：字面上看着像"抄一份改改"，实际是同一个判断
+    在两处实现，改一边会看不出会不会连带影响另一边）。
+    """
     s1: S1Normalize = outcome["s1"]
 
     if outcome["rejected"]:
@@ -125,6 +142,104 @@ def api_consult(req: ConsultRequest) -> dict:
         "graph": graph,
         "manifest": outcome.get("manifest"),
     }
+
+
+# ---------- SSE 分步进度 ----------
+#
+# 跟 /api/consult 是并行的两条路径，不是替代关系——旧接口原样保留，/api/consult
+# 从不传 ask_fn/on_step，行为跟改造前逐字节一致，eval/、老测试都还在用它。
+# 这条新路径解决两件旧接口做不到的事：(1) 两位医家 + ReAct 加起来能到七八十秒，
+# 期间前端只能干等；(2) 旧接口从不传 ask_fn，追问 / ReAct 的 ask_user 问出的
+# 问题从来没人真的回答过。
+#
+# 实现思路：consult() 本来就是同步阻塞函数，不改成异步生成器（改了要动它的全部
+# 调用方，CLI/eval/老测试全部要跟着换）。而是让它在后台线程里跑，用两个线程安全
+# 的 queue.Queue 搬运数据：
+#   events_q：consult() 的 on_step 回调往里塞进度事件，下面的生成器读出来转成
+#             SSE 帧发给客户端。
+#   answer_q：追问 / ReAct 问出问题时，下面包的 ask_fn 先往 events_q 塞一条
+#             need_input 事件，再阻塞在 answer_q.get() 上——真正暂停的是这根
+#             后台线程，HTTP 连接本身一直开着，只是暂时没有新事件可读。客户端
+#             从 /api/consult/stream/{stream_id}/answer 这个独立端点把答案
+#             塞进同一个 answer_q，后台线程就解除阻塞、继续往下跑。
+# 一个 stream 同一时刻最多有一个悬而未决的问题（追问和 ReAct 的 ask_user 都在
+# consult() 内部顺序执行，不会同时问两件事），所以一个 stream 只用一个答案队列，
+# 不必给每个问题各开一个。
+
+ANSWER_TIMEOUT_SECONDS = 300  # 没人回答时的兜底：不能让后台线程无限期挂着
+_answer_queues: dict[str, queue.Queue] = {}
+_answer_queues_lock = threading.Lock()
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/consult/stream")
+def api_consult_stream(req: ConsultRequest) -> StreamingResponse:
+    stream_id = secrets.token_urlsafe(12)
+    events_q: queue.Queue = queue.Queue()
+    answer_q: queue.Queue = queue.Queue()
+    with _answer_queues_lock:
+        _answer_queues[stream_id] = answer_q
+
+    def stream_ask_fn(question: str) -> str | None:
+        events_q.put(("need_input", {"question": question}))
+        try:
+            answer = answer_q.get(timeout=ANSWER_TIMEOUT_SECONDS)
+        except queue.Empty:
+            # AskFn 的既有契约（core/followup.py）：返回 None = 提问方不打算
+            # 回答。这里的"不打算"是等到超时，不是真的有人主动关掉了对话框，
+            # 但对下游（run_followup / run_physician）来说是同一件事——这个
+            # 问题问不出答案了，不需要为"超时"另开一条分支。
+            return None
+        events_q.put(("followup_answered", {"question": question, "answer": answer}))
+        return answer
+
+    def worker() -> None:
+        try:
+            outcome = consult(
+                req.complaint,
+                ask_fn=stream_ask_fn,
+                on_step=lambda name, data: events_q.put((name, data)),
+            )
+            events_q.put(("done", _consult_response(outcome)))
+        except Exception as e:  # noqa: BLE001 - 后台线程的异常不会自己冒泡到 HTTP
+            # 响应里，必须在这兜住转成一个 error 事件；不然客户端只会看到连接
+            # 挂在那不动，什么错误信息都拿不到。
+            events_q.put(("error", {"detail": str(e)}))
+        finally:
+            events_q.put((None, None))  # 哨兵：告诉下面的生成器可以收工了
+            with _answer_queues_lock:
+                _answer_queues.pop(stream_id, None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def gen() -> Iterator[str]:
+        yield _sse("stream_id", {"stream_id": stream_id})
+        while True:
+            name, data = events_q.get()
+            if name is None:
+                return
+            yield _sse(name, data)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+class ConsultStreamAnswer(BaseModel):
+    answer: str
+
+
+@app.post("/api/consult/stream/{stream_id}/answer")
+def api_consult_stream_answer(stream_id: str, req: ConsultStreamAnswer) -> dict:
+    with _answer_queues_lock:
+        q = _answer_queues.get(stream_id)
+    if q is None:
+        # 两种情况都会落到这——stream_id 写错，或者这个 stream 已经跑完/当前
+        # 没有待回答的问题。404 而不是静默忽略：前端要知道这次回答没地方接。
+        raise HTTPException(status_code=404, detail="stream 不存在，或当前没有待回答的问题")
+    q.put(req.answer)
+    return {"ok": True}
 
 
 def _serialize_followup(followup) -> dict | None:

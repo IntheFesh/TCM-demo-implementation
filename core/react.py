@@ -19,11 +19,18 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Callable
 
 from core.followup import fast_mode_enabled
 from core.llm import LLMError, get_llm, load_prompt, render
 from core.schemas import ReActStep, ReActStepRecord, ReActTrace
 from core.tools import TOOLS, run_tool, tools_manifest
+
+# 分步进度回调：(事件名, 数据字典) -> None。定义在这里（而不是 core/chain.py）
+# 是因为依赖方向是单向的——chain.py import react.py，反过来会成环。跟 AskFn
+# 定义在 core/followup.py、chain.py 再导入是同一个先例：谁最先需要这个类型，
+# 类型就定义在谁那，上游模块导入下游的，不新建一个中立类型模块。
+StepFn = Callable[[str, dict], None]
 
 MAX_STEPS = 5
 # FAST_MODE 下的步数上限。2 步是有意的下限而不是 1：ReAct 至少要能"查一次 +
@@ -89,6 +96,7 @@ def run_react(
     symptoms: str,
     elements_summary: str,
     max_steps: int | None = None,
+    on_step: StepFn | None = None,
 ) -> ReActTrace:
     """跑一轮 ReAct，返回完整轨迹。不抛异常：LLM 调用失败也记进轨迹返回，
     让上层决定要不要继续——一次工具层的意外不该让整条问诊挂掉。
@@ -96,7 +104,13 @@ def run_react(
     max_steps=None 时按 FAST_MODE 决定（开着降到 FAST_MODE_MAX_STEPS，否则
     MAX_STEPS），显式传数字优先。形状跟 use_react=None / eval_mode=None 一致。
     判断放在这里而不是 chain.py 的调用点：只在调用方生效的开关是半吊子，
-    换一个调用方进来就漏了。"""
+    换一个调用方进来就漏了。
+
+    on_step 不传时（CLI、离线批跑、eval/ 全都不传）整个循环跟改造前逐字节一致
+    ——没有 SSE 场景时不该为进度上报多花一次判断之外的开销。传了就在每一步
+    落地（含"重复调用""工具名不存在"这类中途 continue 的步骤，不止 finish/
+    ask_user/max_steps 这几种终止路径）之后调一次，事件数恒等于 trace.steps
+    的条数——这是它的不变量，别在某个 continue 分支漏调。"""
     if max_steps is None:
         max_steps = FAST_MODE_MAX_STEPS if fast_mode_enabled() else MAX_STEPS
     prompt = load_prompt("s3_react")
@@ -105,6 +119,15 @@ def run_react(
     consecutive_dupes = 0
     llm_calls = 0
     retrieved: list[str] = []
+
+    def emit_step() -> None:
+        if on_step is None:
+            return
+        r = records[-1]
+        on_step("react_step", {
+            "physician_name": name, "step": r.step, "action": r.action,
+            "thought": (r.thought or "")[:80], "note": r.note,
+        })
 
     for step in range(1, max_steps + 1):
         system = render(
@@ -124,6 +147,7 @@ def run_react(
                 step=step, thought="（本步 LLM 调用失败）", action="(none)",
                 observation="", note=f"LLM 调用失败：{e}",
             ))
+            emit_step()
             llm_calls += 1
             return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="error", llm_calls=llm_calls)
 
@@ -134,6 +158,7 @@ def run_react(
                 step=step, thought=out.thought, action=FINISH_ACTION,
                 observation="（模型判断证据已足够，结束取证）",
             ))
+            emit_step()
             return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="finish", llm_calls=llm_calls)
 
         if action == ASK_ACTION:
@@ -146,11 +171,13 @@ def run_react(
                     action_input=out.action_input, observation=_observation_text(result),
                     note="参数不合法",
                 ))
+                emit_step()
                 continue
             records.append(ReActStepRecord(
                 step=step, thought=out.thought, action=ASK_ACTION,
                 action_input=out.action_input, observation=_observation_text(result),
             ))
+            emit_step()
             return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="ask_user",
                 pending_question=result.get("question"), llm_calls=llm_calls,
             )
@@ -166,6 +193,7 @@ def run_react(
                 }),
                 note="工具名不存在",
             ))
+            emit_step()
             continue
 
         key = _call_key(action, out.action_input)
@@ -178,6 +206,7 @@ def run_react(
                 observation=f"（与第 {seen[key]} 步完全相同的调用，结果不会变，未重复执行）",
                 note="重复调用",
             ))
+            emit_step()
             if consecutive_dupes >= 2:
                 # 连着两次原地打转就停：再问下去只会烧调用次数。
                 return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="no_progress", llm_calls=llm_calls
@@ -194,6 +223,7 @@ def run_react(
             action_input=out.action_input, observation=_observation_text(result),
             note="参数不合法" if "error" in result else None,
         ))
+        emit_step()
 
     return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="max_steps", llm_calls=llm_calls)
 

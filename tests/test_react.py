@@ -281,3 +281,64 @@ def test_pending_answer_is_shown_to_s3():
                        terminated_by="ask_user", pending_question="有没有口苦？", pending_answer="没有")
     text = format_trace_for_s3(trace)
     assert "有没有口苦？" in text and "患者答：没有" in text
+
+
+# ---------- on_step：SSE 分步进度用的回调 ----------
+
+
+def test_on_step_not_called_when_absent(scripted):
+    """不传 on_step（CLI、eval/、离线批跑的现状）时循环不该因为多了这个参数
+    而改变行为——这条只是确认默认值不引入任何副作用，行为已经被上面十几条
+    老测试钉死了，这里不重复断言 trace 内容。"""
+    scripted([ReActStep(thought="够了", action="finish")])
+    _run()  # 不传 on_step，不抛异常即通过
+
+
+def test_on_step_fires_once_per_recorded_step_including_continue_paths(scripted):
+    """事件数必须恒等于 trace.steps 的条数——包括"工具名写错""参数不合法"
+    这类中途 continue、不终止循环的步骤。只测终止路径会漏掉这两条，
+    而这正是 SSE 场景下"进度条只走了一半"这类 bug 藏身的地方。"""
+    events = []
+    scripted([
+        ReActStep(thought="查错了名字", action="query_knowledge_graph",  # 工具名不存在 -> continue
+                  action_input={"node": "纳呆"}),
+        ReActStep(thought="漏了必填参数", action="lookup_standard", action_input={}),  # 参数不合法 -> continue
+        ReActStep(thought="够了，这句会被截断到八十字以内用于进度展示" * 3, action="finish"),
+    ])
+    trace = run_react(
+        name="叶天士", symptoms="纳差", elements_summary="脾",
+        on_step=lambda name, data: events.append((name, data)),
+    )
+    assert len(events) == len(trace.steps) == 3
+    assert [e[0] for e in events] == ["react_step"] * 3
+    assert [e[1]["step"] for e in events] == [1, 2, 3]
+    assert events[0][1]["note"] == "工具名不存在"
+    assert events[1][1]["note"] == "参数不合法"
+    assert events[2][1]["action"] == "finish"
+    # thought 截断到 80 字，不把完整推理过程都塞进每一条 SSE 消息
+    assert len(events[2][1]["thought"]) <= 80
+    assert events[0][1]["physician_name"] == "叶天士"
+
+
+def test_on_step_fires_on_llm_error_and_no_progress_too(monkeypatch):
+    """error 和 no_progress 这两种终止路径也不能漏——它们各自只有一条
+    独立的 return 语句，跟其余五条路径不共用同一段收尾代码。"""
+    from core import react as react_mod
+
+    events = []
+    monkeypatch.setattr(react_mod, "get_llm", lambda: ScriptedLLM([LLMError("挂了")]))
+    trace = run_react(name="叶天士", symptoms="纳差", elements_summary="脾",
+                      on_step=lambda name, data: events.append((name, data)))
+    assert trace.terminated_by == "error"
+    assert len(events) == 1
+
+    events.clear()
+    monkeypatch.setattr(react_mod, "get_llm", lambda: ScriptedLLM([
+        ReActStep(thought="查", action="query_graph", action_input={"node": "纳呆"}),
+        ReActStep(thought="再查一遍", action="query_graph", action_input={"node": "纳呆"}),
+        ReActStep(thought="还查", action="query_graph", action_input={"node": "纳呆"}),
+    ]))
+    trace = run_react(name="叶天士", symptoms="纳差", elements_summary="脾",
+                      on_step=lambda name, data: events.append((name, data)))
+    assert trace.terminated_by == "no_progress"
+    assert len(events) == len(trace.steps) == 3
