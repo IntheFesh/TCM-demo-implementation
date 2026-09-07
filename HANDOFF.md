@@ -46,7 +46,12 @@
 | G3 追问闭环 | 测试 + ScriptedPatient 离线演示 | `SimulatedPatient` 端到端；追问收益要以 ScriptedPatient 为上界做对照 | 同上（`consult` 需要检索器） |
 | K2 医家级权重 λ1 | 有测试；λ1 恒为 0 | 挂入真实医案后重跑，确认 λ1 是否仍为 0 | 图里没有 case 节点 |
 | K2 学派层 λ2 | 代码就绪；`num_schools=1` 时强制为 0 | **注册张锡纯之后** λ2 才第一次有真值 | 张锡纯还没进 `physicians.py`（见步骤 3） |
-| X3 医案三元组 | `query_case_graph` 已就绪，读 `data/case_triples.jsonl` | 抽取脚本 + 产出这个文件 | 抽取要真实 LLM |
+| X3 医案三元组 | **已实现**（`offline/extract_case_triples.py`），1 条医案真实抽取验证过（9/9 三元组通过 source_span 核验），见 SOURCES.md 第 20 条 | 对全量 `cases.json` 真实跑一遍，产出完整的 `data/case_triples.jsonl` | 这边只有 1 条合成医案能验证代码路径，没有真实全量 `cases.json` |
+| K3a 混合检索（BM25+RRF） | **已实现**，bm25 一路 100% 真实验证过（不需要模型），dense/hybrid 代码路径用受控假向量验证过 | 挂真实 `cases.json` 后重跑 dense/hybrid，产出真实语义相似度数字 | 这台环境连不上 huggingface hub，下载不了 embedding 模型（见 SOURCES.md 第 19 条，跟连不上 DeepSeek 是同一类限制） |
+| K3b 证素路检索 + 三路融合 | **已实现**，graph 一路 100% 真实验证过（`offline/build_element_index.py` 对着真实 `data/graph.json` 真跑），hybrid 三路融合代码路径验证过 | 挂真实 `cases.json` 后跑三路融合的真实对比表格 | 同上，dense 那一路的网络限制 |
+| E ε 噪声地板 | **已实现**（`offline/estimate_epsilon.py`），claude_cli 真实跑过 1 条主诉（epsilon_online/epsilon_s2） | 对 10 条测试主诉 × 3 次重复跑满，产出可信的分档阈值 | 这边只跑了 n=1，不能下结论，见 SOURCES.md 第 18 条 |
+| V1 评测汇总 | **已实现**（`eval/run_eval.py` + `eval/mcnemar.py` + `eval/mes/`），1 次真实 claude_cli 调用验证过全链路，见 SOURCES.md 第 23 条 | 对全量测试主诉真实跑一遍，产出正式的 `eval/report.md`；如果拿到了 V3 计划文档原文的 E1-E13 定义，按原文核对这一版自定义指标是否对得上 | 这边的"E1-E13"是按现有代码信号重新设计的，不是照抄原始编号（这一轮没拿到原文） |
+| 附属 quota.py/transition.py | **已实现**，6 条合成医案真实跑通全链路，见 SOURCES.md 第 24 条 | 对真实 `cases.json` 跑 `quota.py` 看是否达标；样本量达标后 `transition.py` 摆出的轨迹才有实际参考价值 | 同上，没有真实全量 `cases.json` |
 | SDT 全量评测 | 适配器 + 打分包装完成 | Test 50 条 × 两组 Solver | 400 次调用，成本与模型都不对 |
 
 ---
@@ -165,12 +170,20 @@ consult(complaint, ask_fn=SimulatedPatient(profile="<病情，只有它自己知
 
 ### 步骤 6：X3 三元组抽取
 
-产出 `data/case_triples.jsonl`，一行一条 `{case_id, physician, s, p, o, source_span}`。
-`source_span` 是这条三元组在医案原文里的出处，**不能省**——省了它，工具查出来的东西
-跟凭空生成的没区别，防幻觉链条在工具这一层就断了。
+```bash
+python -m offline.extract_case_triples --dry-run   # 先看预估调用数
+python -m offline.extract_case_triples              # 真的跑，产出 data/case_triples.jsonl
+```
+
+一行一条 `{case_id, physician, s, p, o, source_span}`。`source_span` 是这条三元组在
+医案原文里的出处，**不能省**——省了它，工具查出来的东西跟凭空生成的没区别，
+防幻觉链条在工具这一层就断了；这一步已经在代码里做了逐字核验（`item.source_span
+not in text` 就整条丢弃），不是只靠人工抽查。
 
 判据：文件生成后 `query_case_graph` 的 `available` 变成 `true`；抽查若干条的
-`source_span` 确实能在对应医案原文里找到。
+`source_span` 确实能在对应医案原文里找到。**这一步的代码和逐字核验机制已经在
+沙箱里用 1 条医案真实验证过**（9/9 三元组通过核验，见 `data/SOURCES.md` 第 20 条）
+——AutoDL 上要做的是对全量 `cases.json` 重跑一遍，不是从头验证机制本身。
 
 ### 步骤 7：SDT 评测（真实 LLM，约 400 + 40 次调用）
 
@@ -209,11 +222,35 @@ score_submission(SDT, "Test", "out/sdt_chain.txt")
   ⚠️ 官方计分对 Task1 的多摘没有惩罚（惩罚代码被注释掉了）——**不要**因此
   去教模型在 Task1 上多摘，那是钻评分脚本的漏洞，不是提升系统
 
-### 步骤 8：X1 打分 / ε 噪声地板 / K3a·K3b / V1 全量评测
+### 步骤 8：ε 噪声地板 / K3a·K3b / V1 全量评测
 
-**这几项的 spec 在 V3 计划文档里，不在代码库里，我这边没有。** 不替你补，
-免得写出一份看起来完整、实际跟计划对不上的步骤。开跑前把它们的定义（指标怎么算、
-对照组是什么、判据是什么）落到本文件里再动手。
+**这几项的代码和沙箱级真实验证已经在后续一轮补完**（本文件最初写这一节时还没有，
+下面是补完后的现状）：
+
+```bash
+python -m offline.build_jieba_dict                          # K3a：BM25 分词词典，0 调用
+python -m offline.estimate_epsilon --n-repeats 3             # E：噪声地板，真实 LLM
+python -m offline.build_element_index                        # K3b：证素索引，0 调用（需要 cases.json + data/graph.json）
+python -m eval.run_eval --queries-path tests/queries.txt     # V1：评测汇总，真实 LLM
+```
+
+**这一轮遇到的具体坑，AutoDL 上重跑前先读**（都记在 `data/SOURCES.md`，
+条目号见下）：
+- K3a/K3b 的 dense/hybrid 检索模式需要下载 `BAAI/bge-small-zh-v1.5`，这台
+  沙箱连 huggingface hub 都被网络限制挡了（跟连不上 DeepSeek 是同一类问题）
+  ——bm25/graph 两个模式不需要模型，已经 100% 真实验证过（第 19、21 条）
+- V1 的 `retrieval_mode_comparison` 最初对 bm25（无界分数）和有界模式套用
+  同一个阈值判"是否可信"，产出过一次误导性的"显著差异"结论，已修复（第 23 条）
+  ——如果以后新增别的检索模式，注意它的展示分是不是跟已有的 dense/graph
+  在同一个 [0,1] 刻度上，不是就要单独处理，不能想当然套用同一个阈值
+- V1 报的"E1-E13"是按现有代码信号重新设计的一套指标，**不是 V3 计划文档的
+  原始编号**（那份原文这一轮也没拿到）——如果后续拿到了原文，要按原文核对
+  `eval/run_eval.py` 里这四类指标（分歧度/幻觉率/否决代价/检索模式对比）
+  跟原始定义对不对得上，对不上就按原文改，不要不核对就直接拿去当 E1-E13 报
+
+判据：`eval/report.json`/`eval/report.md` 生成，四类指标都带着各自的对照
+基准（不是裸数字）；McNemar p 值跟 `eval/mcnemar.py` 用 scipy 核对过的公式
+一致（浮点精度内）。
 
 ---
 

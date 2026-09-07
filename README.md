@@ -16,7 +16,13 @@
 - 检索并展示每条结论所依据的真实医案（id + 相似度），可展开核查
 - 检测并标红"幻觉引用"——模型引用了检索结果之外的医案 id
 - 用 Cytoscape 图直观展示"症状 → 证素 → 证型 → 药物"四层推理链
-- 以两位医家用药集合的 Jaccard 距离 + 治法是否一致为主指标标出分歧（证型名逐字比对只作附注，实测无区分度）
+- 以两位医家用药集合的 Jaccard 距离 + 治法是否一致为主指标标出分歧（证型名逐字比对只作附注，实测无区分度），
+  并对照噪声地板 ε（`offline/estimate_epsilon.py`）判断这个分歧是不是真实的、不是重复采样的抖动
+- 检索支持三种独立信号（语义相似度 dense / 关键词 bm25 / 证素结构 graph）互相融合，
+  见「检索：三路融合」一节
+- 同一病人的复诊序列可以按证素状态摆成轨迹（`core/transition.py`），不做转移概率预测（样本量不够）
+- 用 McNemar 检验判断两种配置（比如两种检索模式）之间的差异是不是统计显著，不是靠肉眼比大小
+  （`eval/run_eval.py` + `eval/mcnemar.py`）
 
 **不能做（明确边界）：**
 - **不是诊断工具**，不能替代执业医师，不出具任何可执行的临床处方
@@ -35,6 +41,15 @@
   它只说明"两位用药有多不重合"，不说明"这个不重合是否显著"
 - 两位医家分处清初（叶天士）与清中（吴鞠通），时代是混杂因素，观测到的
   差异中含时代成分，不能直接等同于个人风格差异
+- **这台开发/沙箱环境本身连不上 huggingface hub**（跟连不上 DeepSeek API 是
+  同一类网络限制），`dense`/`hybrid` 检索模式需要的 embedding 模型下载不了，
+  这两个模式的真实语义相似度数字这台环境产不出来，代码路径靠受控假向量
+  验证过；`bm25`/`graph` 两个模式不需要网络，已经在这台环境里 100% 真实
+  验证过（见 `data/SOURCES.md` 第 19、21 条）
+- V1 评测的具体指标（分歧度 vs ε、幻觉率、安全否决代价、检索模式对比）是
+  按现有代码已经产出的信号重新设计的一套，不是某个外部规范文档里的原始
+  编号——如果你手上有那份原始定义，以它为准核对调整（`data/SOURCES.md`
+  第 23 条）
 
 ## 快速开始
 
@@ -172,11 +187,15 @@ PORT=8080 ./run.sh                     # 换端口
 ```
 core/           数据模型（pydantic）、LLM 抽象层、证素表、检索、推理链、安全否决——全项目地基
   graph/        知识图谱存储层（K1/K2，见下方"知识图谱权重"一节）
-offline/        离线脚本：医案切分/抽取、SFT 样本导出、图谱构建
-api/            FastAPI 服务（/api/consult、/health、静态文件）
+  retrieval.py / retrieval_hybrid.py / retrieval_graph.py   稠密/BM25/证素三路检索（见下方"检索：三路融合"一节）
+  transition.py 证素轨迹（trajectory-only，见下方"证素轨迹"一节）
+offline/        离线脚本：医案切分/抽取、SFT 样本导出、图谱构建、三元组抽取、证素索引、配额审计
+api/            FastAPI 服务（/api/consult、/api/trajectories/{physician}、/health、静态文件）
 web/            前端单页 index.html，无构建步骤，Cytoscape.js 走 CDN
 prompts/v1/     版本化 prompt 模板（yaml，$var 占位符）
 data/           医案原文（data/ye_tianshi/、data/wu_jutong/）、证候标准数据、SOURCES.md 版权说明
+eval/           需要真实 LLM 的评测：patient_sim、sdt/（外部 TCMEval-SDT 适配器）、
+                run_eval.py + mcnemar.py（V1 评测汇总）、mes/（盲评导出/收集），不进 pytest 自动跑
 tests/          pytest 用例（全部不需要网络）+ tests/queries.txt 测试主诉
 CLAUDE.md       项目架构与代码约定，改代码前建议先读
 run.sh          一键运行脚本
@@ -191,6 +210,11 @@ run.sh          一键运行脚本
 | `offline/export_sft.py` | 从 `cases.json` 派生 alpaca 格式的 SFT 训练样本 `sft.jsonl`（`python -m offline.export_sft`）。现在数据量不够训练，这一步只是把管道建好，并在代码层面强制过滤掉 `copyright_status == "copyrighted"` 的记录 |
 | `offline/build_graph.py` | 从 `data/standard/syndromes.jsonl` 建知识图谱骨架（symptom/element/syndrome 三类节点，`python -m offline.build_graph`），并打印语料库门类覆盖检查 |
 | `offline/graph_stats.py` | 给图里的 indicates 边算并写回医家级四层收缩权重，打印节点/边分布、λ1 分布等统计（`python -m offline.graph_stats`）——**λ 相关的数字务必看下面"知识图谱权重"一节的 λ2 说明再解读** |
+| `offline/build_jieba_dict.py` | K3a：生成 BM25 检索用的中医术语自定义词典 `data/jieba_dict.txt` |
+| `offline/estimate_epsilon.py` | E：估计噪声地板 ε（`epsilon_online`/`epsilon_s2`/`epsilon_extract`），写 `eval/epsilon.json`，供前端"分歧度"和 V1 的显著性判断做对照基准 |
+| `offline/extract_case_triples.py` | X3：从每一诊原文用真实 LLM 抽取三元组（`{case_id,physician,s,p,o,source_span}`），写 `data/case_triples.jsonl`，`core/tools.py` 的 `query_case_graph` 工具消费这份数据 |
+| `offline/build_element_index.py` | K3b：从 `cases.json` 的症状字段建证素索引 `data/element_index.json`，供检索的 `mode="graph"` 和 `core/transition.py` 用 |
+| `offline/quota.py` | 附属：审计 `cases.json` 是否达到 `data/SOURCES.md` 里写明的样本量门槛（总案例 60、带复诊序列 50） |
 
 ## 知识图谱权重（进阶功能，非 consult 主流程必需）
 
@@ -292,6 +316,83 @@ consult("胃脘胀痛，嗳气泛酸，纳差", ask_fn=ScriptedPatient(present=[
 作答，是追问效果的**上界**，报告里引用追问收益必须说明用的是哪个患者）和
 `SimulatedPatient`（LLM 扮演，每问 1 次调用，只用于 eval/）。
 
+## 检索：三路融合（K3a/K3b，进阶功能）
+
+`core/retrieval.py` 的 `get_retriever()` 返回的是 `core/retrieval_hybrid.py`
+的 `HybridRetriever`——`DenseRetriever`（稠密向量检索）的超集，另外叠加了
+BM25 关键词检索（K3a）和证素路检索（K3b），用 Reciprocal Rank Fusion 融合。
+`RETRIEVER_MODE` 环境变量或 `search(mode=...)` 参数选路，四种取值：
+
+| mode | 依赖 | 说明 |
+|---|---|---|
+| `dense` | embedding 模型 | 语义相似度，原有行为不变 |
+| `bm25` | `data/jieba_dict.txt`（可选，缺失时退化到 jieba 默认词典） | 关键词重合，不需要 embedding 模型 |
+| `graph` | `data/element_index.json` + `query_elements` 参数 | 证素 Jaccard 相似度；不传 `query_elements` 直接报错，不静默退化成别的模式 |
+| `hybrid`（默认） | 上面几路都可选 | 传了 `query_elements` 就三路融合，没传就退回 dense+bm25 两路，向后兼容 |
+
+`min_score`（默认阈值 `MIN_RETRIEVAL_SCORE=0.70`）只作用于 dense 那一路——
+bm25 的展示分是无界原始分，graph 的展示分是证素集合通常只有两三个元素时的
+Jaccard 相似度，套用为稠密余弦相似度校准的阈值没有意义，也因此 `bm25`/
+`graph`/`hybrid` 模式下离题主诉不会被过滤成空列表（这一条实测记在
+`data/SOURCES.md` 第 19 条）。跑法：
+
+```bash
+python -m offline.build_jieba_dict          # K3a：BM25 分词词典
+python -m offline.extract_case_triples      # X3：真实 LLM 抽取医案三元组（需要 cases.json）
+python -m offline.build_element_index       # K3b：证素索引（需要 cases.json + data/graph.json）
+RETRIEVER_MODE=hybrid ./run.sh              # 或 dense/bm25/graph
+```
+
+## 证素轨迹（附属，进阶功能）
+
+`core/transition.py` 把同一病人（`case_group_id`）的复诊序列按 `visit_index`
+排序，配上每一诊的证素状态（来自 K3b 的 `data/element_index.json`）。
+**只做轨迹展示，不拟合转移概率模型**——demo 阶段样本量连
+`offline/quota.py` 的门槛（带复诊序列 ≥50 例/医家）都够不上，此时拟合
+转移核只会制造一个看着像结论、实际是噪声的数字。
+
+```bash
+GET /api/trajectories/{physician}   # 例如 /api/trajectories/ye_tianshi
+```
+
+未知医家返回 404；`cases.json`/`data/element_index.json` 还没生成返回 503
+（不是 500——demo 环境没有真实数据是正常状态，不是系统故障）。
+
+## 评测汇总（V1，需要真实 LLM，不进 pytest）
+
+`eval/run_eval.py` 把 divergence（分歧度 vs ε 噪声地板）、幻觉率（按有无
+参考医案分组）、安全否决率+代价、检索模式对比（自实现 McNemar 检验，见
+`eval/mcnemar.py`）汇总成 `eval/report.json` / `eval/report.md`：
+
+```bash
+python -m eval.run_eval --queries-path tests/queries.txt
+```
+
+`eval/mes/`（盲评导出/收集）用于人工判断"这条辨证像不像话"这类自动指标
+测不了的问题：`export.py` 把两位医家对同一条主诉的结果匿名成 A/B（隐去
+`cited_case_ids` 以防暴露医家身份）导出评分表，人工填完 `winner` 之后
+`collect.py` 换回身份、统计胜负、算 McNemar 显著性。
+
+```bash
+python -m eval.mes.export           # 导出 eval/mes/items.json + answer_key.json
+# ……人工在 items.json 里给每条填 winner: "A"/"B"/"tie"……
+python -m eval.mes.collect          # 统计胜负，写 eval/mes/collected.json
+```
+
+## 外部评测：TCMEval-SDT
+
+`eval/sdt/` 是接入官方 [TCMEval-SDT](https://github.com) 评测集的适配器
+（`adapter.py` 把 `core.chain` 的输出转成 SDT 要求的三段式格式，`score.py`
+包一层官方计分脚本，`run.py` 是跑一整个 split 的入口），详见
+[`eval/sdt/README.md`](eval/sdt/README.md)。跟 `eval/run_eval.py`（V1，
+本项目自定义指标）是两套独立的评测：SDT 用外部数据集和外部计分标准，
+V1 用本项目自己产出的信号（分歧度、幻觉率等）。
+
+```bash
+export SDT=<TCMEval-SDT 数据集路径>
+python -m eval.sdt.run --sdt-dir $SDT --split Test --solver chain --out out/sdt_chain.txt
+```
+
 ## 数据来源与版权
 
 详见 [`data/SOURCES.md`](data/SOURCES.md)。简要结论：
@@ -325,6 +426,13 @@ API key 的环境里直接跑，覆盖：
   `CaseRecord`、`case_id` 格式、`prev_case_id` 链式关系、`case_group_id` 一致性、
   交叉校验不一致时正确写进 `extract_warnings.json` 而不是被静默丢弃
 - `core/graph/`：图存储的增删查改、四层收缩权重的数学边界（λ 恒和为 1）
+- `core/retrieval_hybrid.py` / `core/retrieval_graph.py`：RRF 融合公式、jieba 自定义
+  词典生效、`min_score` 只作用于 dense 一路、`mode="graph"` 不传 `query_elements`
+  报错不静默降级、`mode="hybrid"` 有/无证素两种融合路径
+- `eval/mcnemar.py`：自实现的精确二项检验和连续性校正卡方近似，数值跟 scipy.stats
+  逐用例核对过（scipy 只是开发期核对工具，不是项目运行时依赖）
+- `eval/run_eval.py` / `eval/mes/`：分歧度/幻觉率/否决代价/检索模式对比四类指标、
+  盲评导出隐去医家身份、盲评收集正确统计胜负
 
 以下需要真实 API key 和网络，属于人工验收范畴，不在 `pytest` 里自动跑：
 「快速开始」第 3.4 步实际抽取质量（诊次切得准不准）、`core/chain.py` 的
