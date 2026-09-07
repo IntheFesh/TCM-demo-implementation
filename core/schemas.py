@@ -59,6 +59,31 @@ class CaseRecord(VisitStructured):
     raw_excerpt: str | None = None
 
 
+# ---------- X3：医案三元组（确定性转换产物，不是 LLM 输出） ----------
+
+
+class CaseTriple(BaseModel):
+    """offline/extract_case_triples.py 从已结构化的 CaseRecord 字段（syndrome/
+    treatment_principle/formula/herbs）拼出的关系事实，写入 data/case_triples.jsonl，
+    喂给 offline/build_graph.py 的第二层图谱构建（治法/方剂/药物/医家节点）。
+
+    不是新的 LLM 抽取——这些字段在 S0（offline/extract_cases.py）已经从原文抽取过
+    一次，这里只是把已经结构化的字段串成图边，见 extract_case_triples.py 模块
+    文档字符串。source_span 仍然要求非空：防幻觉约束不因为"不是 LLM 输出"就放松，
+    这里的"幻觉"风险是拼接逻辑写错导致三元组指向错误的原文，空 source_span
+    同样说明这条边编不出可核验的出处。
+    """
+
+    case_id: str
+    physician: str
+    subject: str
+    subject_type: str
+    predicate: str
+    object: str
+    object_type: str
+    source_span: str = Field(min_length=1)
+
+
 # ---------- 知识图谱：证候定义（人工核对录入，不是 LLM 输出） ----------
 
 

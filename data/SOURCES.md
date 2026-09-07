@@ -669,3 +669,23 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     相似度）用受控的假向量在单测里验证过 21 条，覆盖了融合公式、展示分来源、
     min_score 只作用于稠密路、mode 调度、env var 默认值等；真实语义向量参与
     的三路对比表格留到 AutoDL。
+
+20. **X3 · 医案三元组抽取：不是新的 LLM 调用，纯本地确定性转换，因此在这台
+    沙箱里 100% 真实跑通（不受 huggingface hub / DeepSeek 网络限制影响）。**
+    用 4 条合成医案（叶天士 2 条复诊序列共享同一句治法/方剂原文、吴鞠通 1 条
+    证型有但无方剂、1 条连证型都没有）真跑了 `offline/extract_case_triples.py`
+    → `offline/build_graph.py` 全链路：17 条三元组正确按 predicate 分布
+    {practiced_by:4, evidences:3, treated_by:3, realized_by:2, contains:5}，
+    链条缺哪一环从哪一环断开（吴鞠通那条"无方剂"的医案止步于 treated_by，
+    "无证型"的止步于 practiced_by，都没有编造缺失的中间节点）；两条叶天士
+    医案共享的 `therapy::疏肝和胃`/`formula::柴胡疏肝散` 节点被正确聚合成
+    一个节点、各自的 `contains` 边（其中"柴胡"两条医案都开了，形成同一对
+    (formula, herb) 节点）都完整保留、互不覆盖——这正是 `attach_case_triples`
+    里 `edge_key` 必须带 case_id 的那条设计要防的事，K1 阶段 indicates 边
+    已经因为漏加这个 key 丢过 29 条事实（见本文件更早的条目），这次在写
+    X3 时提前把同一个坑复现成单测（`tests/test_build_graph_triples.py` 的
+    `test_two_cases_sharing_same_triple_both_survive_not_overwritten` 和
+    `test_two_cases_sharing_same_formula_herb_pair_both_survive`）而不是等
+    真跑出问题才发现。案例证候节点用 `syndrome::case::{原文文本}` 命名空间，
+    刻意不尝试对齐 `offline/build_graph.py` 里国标证候的 `syndrome::{code}`
+    ——那是 `attach_cases()` 已经在做的匹配工作，这里再写一遍是重复实现。
