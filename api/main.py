@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.chain import consult
+from core.herbs import strip_dose_and_parens
 from core.physicians import PHYSICIANS
 from core.schemas import S1Normalize
 
@@ -251,8 +252,16 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
 
         # layer 3 药物：每位医家最多取 6 味
         for herb in r["s3"].herbs[:MAX_HERBS_PER_PHYSICIAN]:
+            # id 必须保留原始写法（含剂量）：前端侧栏 buildEvidenceIndex() 用同一个
+            # 拼法（herb::{physician}::{原始 herb}）反查证据，id 一变两边就对不上了。
+            # label 单独剥掉剂量——"党参三钱""黄芪一两二钱"这种全串塞进节点，
+            # text-max-width:90px 一折就是三四行，图挤得看不清药名本身。
+            # 剥剂量只用 strip_dose_and_parens，不用 normalize_herb：后者还会查
+            # 别名表、剥炮制前缀，会把模型实际写的"广皮"显示成"陈皮"，
+            # label 要的是"同一个名字去掉剂量"，不是"归一到另一个名字"。
             herb_id = f"herb::{physician}::{herb}"
-            add_node(herb_id, label=herb, layer=3, phys=physician)
+            label = strip_dose_and_parens(herb) or herb  # 剥空了（纯剂量字符串之类的脏数据）就退回原文，节点不能没有 label
+            add_node(herb_id, label=label, layer=3, phys=physician)
             add_edge(syn_id, herb_id, phys=physician)
 
     return {"nodes": nodes, "edges": edges, "dropped_edges": len(dropped)}
