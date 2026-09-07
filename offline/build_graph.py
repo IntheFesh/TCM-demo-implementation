@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 
 from core.graph.store import NetworkXStore
-from core.schemas import CaseTriple, SyndromeDefinition
+from core.schemas import SyndromeDefinition
 
 STANDARD_PATH = Path(__file__).resolve().parent.parent / "data" / "standard" / "syndromes.jsonl"
 GRAPH_OUT_PATH = Path(__file__).resolve().parent.parent / "data" / "graph.json"
@@ -242,52 +242,6 @@ def attach_cases(store: NetworkXStore, cases_path: Path) -> dict:
     return stats
 
 
-def attach_case_triples(store: NetworkXStore, triples_path: Path) -> dict:
-    """X3 第二层：把 offline/extract_case_triples.py 产出的
-    data/case_triples.jsonl 挂进图，补上 therapy/formula/herb/physician 节点
-    和 treated_by/realized_by/contains/practiced_by/evidences 边。
-
-    **同一个 (subject, predicate, object) 会被很多条不同的医案各说一次**——
-    好几条医案完全可能共享同一句治法原文（"健脾和胃"这四个字不是哪条医案独有
-    的）。therapy/formula/herb 这三类节点就是刻意设计成跨医案共享的（K2 以后
-    按医案统计权重要用到这份聚合），但这意味着 `syndrome::case::X -treated_by->
-    therapy::Y` 这样的边，不同医案会反复写同一对 (src, dst)。NetworkXStore.add_edge
-    默认用 edge_type 当 multi-edge key，同一对节点间重复调用是"覆盖"不是"新增"
-    ——K1 阶段 indicates 边已经踩过这个坑（同一 (症状,证素) 被多条证候定义各写
-    一次，不加 code 前缀会静默覆盖丢证据，见 build_graph() 里 indicates 边的
-    edge_key 注释），这里是同一个坑的第二次出现：**必须把 case_id 编进 edge_key**，
-    否则后一条医案的 source_span 会静默覆盖前一条，图上"这条治法证据来自几条
-    医案"这件事就没法数了。
-
-    case 节点 src 本身已经是 case_id 唯一的（case::{case_id}），所以
-    evidences/practiced_by 这两类边的 (src, dst) 天然不会跟别的医案撞——
-    一条医案最多产出一条 evidences、一条 practiced_by——不需要额外的 edge_key。
-    """
-    stats = {"triples": 0, "by_predicate": {}}
-    with triples_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            t = CaseTriple.model_validate_json(line)
-            store.add_node(t.subject, node_type=t.subject_type)
-            store.add_node(t.object, node_type=t.object_type)
-
-            needs_case_scoped_key = t.predicate in ("treated_by", "realized_by", "contains")
-            store.add_edge(
-                t.subject, t.object,
-                edge_key=f"{t.predicate}::{t.case_id}" if needs_case_scoped_key else None,
-                edge_type=t.predicate,
-                source="case",
-                case_id=t.case_id,
-                physician=t.physician,
-                source_span=t.source_span,
-            )
-            stats["triples"] += 1
-            stats["by_predicate"][t.predicate] = stats["by_predicate"].get(t.predicate, 0) + 1
-    return stats
-
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="从 syndromes.jsonl 建知识图谱骨架")
     parser.add_argument(
@@ -301,12 +255,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--cases-path", type=Path, default=Path("cases.json"),
         help="医案 cases.json 路径；存在则挂入 case 节点，传 --cases-path /dev/null 可跳过",
-    )
-    parser.add_argument(
-        "--triples-path", type=Path,
-        default=Path(__file__).resolve().parent.parent / "data" / "case_triples.jsonl",
-        help="X3 产出的医案三元组路径（offline/extract_case_triples.py 生成）；"
-             "存在则挂入 therapy/formula/herb/physician 节点，不存在则跳过",
     )
     args = parser.parse_args(argv)
 
@@ -328,12 +276,9 @@ def main(argv: list[str] | None = None) -> None:
     else:
         print(f"未挂入医案（{args.cases_path} 不存在或为空），图中无 case 节点，λ1 将全为 0")
 
-    if args.triples_path and args.triples_path.is_file() and args.triples_path.stat().st_size > 0:
-        tstats = attach_case_triples(store, args.triples_path)
-        print(f"挂入医案三元组（X3）：{tstats['triples']} 条，按 predicate 分布：{tstats['by_predicate']}")
-    else:
-        print(f"未挂入医案三元组（{args.triples_path} 不存在或为空），"
-              "先跑 offline/extract_case_triples.py 生成它，图中不会有 therapy/formula/herb/physician 节点")
+    # X3 的 data/case_triples.jsonl 不挂进这张图：它的消费方是 core/tools.py 的
+    # query_case_graph()，直接读 jsonl 做子串匹配，不经过 NetworkXStore——见
+    # offline/extract_case_triples.py 模块文档字符串。两条管道各自独立。
 
     store.save(args.out)
 

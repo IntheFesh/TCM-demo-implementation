@@ -670,22 +670,32 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     min_score 只作用于稠密路、mode 调度、env var 默认值等；真实语义向量参与
     的三路对比表格留到 AutoDL。
 
-20. **X3 · 医案三元组抽取：不是新的 LLM 调用，纯本地确定性转换，因此在这台
-    沙箱里 100% 真实跑通（不受 huggingface hub / DeepSeek 网络限制影响）。**
-    用 4 条合成医案（叶天士 2 条复诊序列共享同一句治法/方剂原文、吴鞠通 1 条
-    证型有但无方剂、1 条连证型都没有）真跑了 `offline/extract_case_triples.py`
-    → `offline/build_graph.py` 全链路：17 条三元组正确按 predicate 分布
-    {practiced_by:4, evidences:3, treated_by:3, realized_by:2, contains:5}，
-    链条缺哪一环从哪一环断开（吴鞠通那条"无方剂"的医案止步于 treated_by，
-    "无证型"的止步于 practiced_by，都没有编造缺失的中间节点）；两条叶天士
-    医案共享的 `therapy::疏肝和胃`/`formula::柴胡疏肝散` 节点被正确聚合成
-    一个节点、各自的 `contains` 边（其中"柴胡"两条医案都开了，形成同一对
-    (formula, herb) 节点）都完整保留、互不覆盖——这正是 `attach_case_triples`
-    里 `edge_key` 必须带 case_id 的那条设计要防的事，K1 阶段 indicates 边
-    已经因为漏加这个 key 丢过 29 条事实（见本文件更早的条目），这次在写
-    X3 时提前把同一个坑复现成单测（`tests/test_build_graph_triples.py` 的
-    `test_two_cases_sharing_same_triple_both_survive_not_overwritten` 和
-    `test_two_cases_sharing_same_formula_herb_pair_both_survive`）而不是等
-    真跑出问题才发现。案例证候节点用 `syndrome::case::{原文文本}` 命名空间，
-    刻意不尝试对齐 `offline/build_graph.py` 里国标证候的 `syndrome::{code}`
-    ——那是 `attach_cases()` 已经在做的匹配工作，这里再写一遍是重复实现。
+20. **X3 · 医案三元组抽取：第一版设计跟已有代码的契约对不上，写完才发现，
+    返工重写。** 第一次实现把这步想成"纯本地确定性转换"（复用 CaseRecord 已经
+    抽好的 syndrome/治法/方剂/药物字段拼图边），跑完全套代码、测试、真实验证
+    才去检查 `core/tools.py`——结果发现 `query_case_graph()`（连同它的测试
+    `tests/test_tools.py` 和 `HANDOFF.md` 步骤六）早就钉死了 X3 的产出格式：
+    每行 `{case_id, physician, s, p, o, source_span}`，s/p/o 是从医案**原文**
+    逐句抽出的细粒度关系（"患者 表现为 脘痛"这种），source_span 要求逐字
+    可在原文里核验——跟第一版"证候->治法->方剂->药物"这条粗粒度链、且
+    source_span 整段共享的设计完全对不上。这正是 CLAUDE.md 那条"同一堵墙撞
+    第三次"警告想防的事：每个模块单独看都自洽，接进已有系统才看出矛盾。
+    第一版的 `core/schemas.CaseTriple`、`offline/build_graph.attach_case_triples()`
+    连同它的测试全部撤掉重写，没有反过来去改 `query_case_graph`——它是先写好
+    且已被测试和文档钉死的契约，理应是被迁就的一方。
+
+    重写后：新增 `prompts/v1/s5_extract_triples.yaml`，`offline/extract_case_triples.py`
+    对每一诊的 `raw_excerpt` 真实调用一次 LLM，抽取端定的 `s/p/o/source_span`
+    在写文件前逐字核验（`item.source_span not in text` 就整条丢弃，丢了多少条
+    在统计里如实报出，不静默吞）——这一步 pydantic schema 校验不了，只能在
+    代码里做。真实调用（claude_cli，非 DeepSeek，数字不可比）：1 条医案
+    （"脘痛不食，脉弦。此肝木犯胃，宜苦辛通降，与川连、吴萸、白芍、半夏。"）
+    抽出 9 条三元组，9/9 通过 source_span 核验（0 条被拒），跟 `query_case_graph`
+    真实对接：查 `symptom="脘痛"` 命中 2 条，`available` 从 false 变 true——
+    HANDOFF.md 步骤六的验收判据（"文件生成后 available 变 true；抽查
+    source_span 确实能在原文里找到"）两条都满足。
+
+    `offline/build_graph.py` 不再挂 X3 的产出：`query_case_graph` 直接读
+    jsonl 做子串匹配，从不经过 `NetworkXStore`，两条管道天生独立，给
+    graph.json 再建一层没有消费方，是第一版设计者（也就是这一轮的我）凭空
+    加的复杂度，撤掉是回到实际需要的规模，不是功能减配。
