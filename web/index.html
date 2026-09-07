@@ -124,6 +124,16 @@
     background: #a9b6ec;
     cursor: not-allowed;
   }
+  #retriever-mode-label { font-size: 12.5px; color: var(--muted); }
+  #retriever-mode {
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 12.5px;
+    background: var(--panel);
+    color: var(--text);
+  }
   #progress-log {
     display: none;
     margin-top: 10px;
@@ -499,6 +509,14 @@
     <textarea id="complaint" placeholder="请输入患者主诉，例如：胃脘胀痛，食后加重，嗳气泛酸，舌淡红苔薄白，脉弦。"></textarea>
     <div class="input-row">
       <span id="status-text"></span>
+      <label id="retriever-mode-label" for="retriever-mode">检索模式</label>
+      <select id="retriever-mode">
+        <option value="">默认</option>
+        <option value="hybrid">hybrid（稠密+BM25 融合）</option>
+        <option value="dense">dense（稠密向量）</option>
+        <option value="bm25">bm25（关键词）</option>
+        <option value="graph">graph（证素索引）</option>
+      </select>
       <button id="submit-btn">辨证</button>
     </div>
     <div id="progress-log"></div>
@@ -1591,10 +1609,31 @@ function clearError() {
 // data 的形状是 api/main.py::_consult_response() 的返回值——不管是走
 // /api/consult 的普通响应体，还是走 /api/consult/stream 的 done 事件，
 // 两条路径共用同一个后端函数拼出这份 JSON，这里也只用一份渲染逻辑接。
+// 检索模式跟着请求走：空值表示"用服务端默认"，这时候整个字段都不带，
+// 而不是传一个空字符串（空字符串不在 ALLOWED_MODES 里，会被当成非法模式名）。
+function buildConsultRequestBody(complaint) {
+  const body = { complaint };
+  const sel = document.getElementById("retriever-mode");
+  const mode = sel ? sel.value : "";
+  if (mode) body.retriever_mode = mode;
+  return body;
+}
+
 function renderConsultResult(data) {
   resetSecondaryPanels();
   if (data.rejected) {
     showError(`⚠ ${data.reject_reason}`);
+    renderDivergence(null);
+    renderResults([]);
+    renderFollowup(data.followup);
+    renderGraph(data.graph);
+    return;
+  }
+  if (data.retrieval_error) {
+    // 选的检索模式这台机器上跑不起来。这是服务端能力问题，不是"你给的信息不够"，
+    // 所以跟 insufficient 分开显示；后端也没有偷偷换个模式跑完再假装成功，
+    // 这里如实把原因显示出来（graph 模式的静默降级会让 E8 消融失去意义）。
+    showError(`⚠ ${data.retrieval_error}`);
     renderDivergence(null);
     renderResults([]);
     renderFollowup(data.followup);
@@ -1786,7 +1825,10 @@ async function submitConsult() {
     const resp = await fetch("/api/consult/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ complaint }),
+      // 检索模式跟着这一次请求走，不去调什么"服务端设置"接口——服务端的
+      // RETRIEVER_MODE 是进程级的，改它会影响同时在跑的别人的请求。
+      // 空字符串 = 用默认，这时候不带这个字段（不是传 ""，那是个非法模式名）。
+      body: JSON.stringify(buildConsultRequestBody(complaint)),
     });
     if (!resp.ok) {
       const text = await resp.text();

@@ -27,6 +27,7 @@ from core.followup import (
 from core.physicians import PHYSICIANS
 from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
 from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
+from core.retrieval_hybrid import ALLOWED_MODES
 from core.safety import check_safety, mentions_danger, safety_bypassed
 from core.safety_output import (
     check_incompatible,
@@ -66,6 +67,24 @@ class SafetyVeto(Exception):
         super().__init__(reason)
         self.reason = reason
         self.llm_calls = llm_calls
+
+
+class RetrievalUnavailable(Exception):
+    """请求的检索模式这台机器上跑不起来（graph 模式缺 data/element_index.json、
+    或者缺 query_elements）。形状照抄 SafetyVeto：发生点在 run_physician 深处，
+    处理点只能在 consult 这一层。
+
+    **检索层照旧大声报错，这里只负责把它翻译成用户看得懂的话，不做静默降级。**
+    K3b 的 graph 模式明确设计成"拿不到证素就报错"而不是悄悄退回 hybrid——
+    退回去的话调用方以为自己拿到的是证素路的结果，E8 消融比的就不再是
+    "graph vs 别的"，那组数字直接失去意义。所以这个异常存在的意义是"把 500
+    变成一句人话"，不是"把错误吞掉继续跑"。
+    """
+
+    def __init__(self, mode: str, detail: str):
+        super().__init__(detail)
+        self.mode = mode
+        self.detail = detail
 
 # 残差辨证触发阈值：未解释症状 >=2 条 且 占比 >=30% 时，用这些症状再跑一轮，
 # 看能不能构成兼夹证。S2 共享之后未解释症状是全局唯一一份，所以残差也只跑一次，
@@ -181,6 +200,40 @@ def _split_western_into_s3(s3):
     return s3
 
 
+def _search_cases(
+    query: str, physician: str, s2: S2Elements, retriever_mode: str | None
+) -> list[tuple[CaseRecord, float]]:
+    """检索该医家的 top-3 医案。全项目唯一一处把 retriever_mode 翻译成
+    search() 关键字参数的地方。
+
+    两条判断都在这里，不散到调用点：
+
+    1. **不传 mode 时一个额外关键字都不加。** 保持默认路径跟改造前逐字节一致，
+       也保证第三方 Retriever 实现（测试里的 FakeRetriever、将来别的后端）不必
+       为了这个开关改签名——search() 的抽象基类签名里本来就没有 mode。
+    2. **只有 mode="graph" 才传 query_elements。** graph 是唯一必须要证素的模式；
+       给 hybrid 也传的话，默认的两路融合会变成三路，那是在没人要求的情况下
+       改掉了默认检索行为，也就改掉了 E8 消融的对照基线。三路融合（K3b）目前
+       从 consult 走不到，这一轮不顺手打开它，要开该是单独一轮、带对照数字地开。
+    """
+    kwargs: dict = {}
+    if retriever_mode is not None:
+        kwargs["mode"] = retriever_mode
+    if retriever_mode == "graph":
+        kwargs["query_elements"] = [h.element for h in s2.elements]
+
+    try:
+        return get_retriever().search(
+            query, physician, k=3, min_score=MIN_RETRIEVAL_SCORE, **kwargs
+        )
+    except (ValueError, FileNotFoundError) as e:
+        # 只翻译、不吞：检索层照旧大声报错（K3b 的 graph 模式故意不静默降级），
+        # 这里把它裹成 RetrievalUnavailable 交给 consult 转成一句人话，避免
+        # 500 裸奔到前端。范围收得很窄——只包住这一次 search() 调用，
+        # 别处抛的 ValueError（比如 pydantic 校验）不会被误当成检索问题。
+        raise RetrievalUnavailable(retriever_mode or "hybrid", str(e)) from e
+
+
 def run_physician(
     s1: S1Normalize,
     s2: S2Elements,
@@ -191,9 +244,16 @@ def run_physician(
     ask_fn: AskFn | None = None,
     bypass_safety: bool = False,
     on_step: StepFn | None = None,
+    retriever_mode: str | None = None,
 ) -> dict:
     """bypass_safety 由 consult() 一次算好后传进来，不在这里各自读一次环境变量
-    ——同一个请求的几个中止点必须用同一个判断，不能一半拦一半不拦。"""
+    ——同一个请求的几个中止点必须用同一个判断，不能一半拦一半不拦。
+
+    retriever_mode 同理由 consult() 逐请求传进来，**不读也不写任何全局状态**：
+    RETRIEVER_MODE 那个环境变量是进程级的，两个并发请求各选一种模式会互相
+    污染（跟 safety_bypassed() 拒绝"接到环境变量"是同一条理由）。不传就完全
+    走改造前的老路——连 mode 关键字都不传给 search()，行为逐字节一致。
+    """
     symptoms_text = "；".join(s1.symptoms)
     # ReAct 追问命中危重症状时，demo 模式抛 SafetyVeto 中止；EVAL_MODE 下不中止，
     # 把本该拦截的原因经由返回值带回 consult()（异常没抛，只能走返回值这条路）。
@@ -201,7 +261,7 @@ def run_physician(
 
     # 检索该医家 top-3 医案
     query = f"{symptoms_text}。舌{s1.tongue or '未记'}，脉{s1.pulse or '未记'}"
-    hits = get_retriever().search(query, physician, k=3, min_score=MIN_RETRIEVAL_SCORE)
+    hits = _search_cases(query, physician, s2, retriever_mode)
     # 一条相关医案都没有时换用不含 cited_case_ids 的 schema（见 S3SyndromeUnreferenced
     # 的文档字符串）。不是放松 min_length=1，是这个场景下根本没有可引用的东西。
     s3_schema = S3Syndrome if hits else S3SyndromeUnreferenced
@@ -416,6 +476,7 @@ def consult(
     ask_fn: AskFn | None = None,
     eval_mode: bool | None = None,
     on_step: StepFn | None = None,
+    retriever_mode: str | None = None,
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
@@ -436,12 +497,30 @@ def consult(
     ReAct 追问需要用户回答"这件事**——那仍然是 ask_fn 的职责：SSE 端点想在
     追问时推 need_input 事件、暂停等回答，只需要传一个自己包了一层的 ask_fn，
     不需要 consult() 或 core/followup.py 知道"上面接的是不是 SSE"。
+
+    retriever_mode 是**逐请求**的检索模式（dense/bm25/graph/hybrid），不传就走
+    检索层自己的默认。**这里刻意不去设 RETRIEVER_MODE 环境变量**：那个变量是
+    进程级的，一个请求设了它，同一进程里并发的另一个请求就跟着变了——跟
+    safety_bypassed() 当初拒绝"把开关接到环境变量上"是同一条理由。这个参数
+    从头到尾只在调用栈里传，任何时候都不写进程状态。
+
+    模式不认识时**立刻抛 ValueError**，不往下跑：不然要等到第一位医家开始检索
+    才失败，S1/S2 两次 LLM 调用已经白花了。跑得起来但这台机器上没有对应数据
+    （graph 模式缺 element_index.json）是另一回事，那走 RetrievalUnavailable，
+    返回值里带一句人话的 retrieval_error，不是异常也不是 500。
     """
     _t0 = time.time()
 
     def emit(name: str, **data) -> None:
         if on_step is not None:
             on_step(name, data)
+
+    if retriever_mode is not None and retriever_mode not in ALLOWED_MODES:
+        # 模式名的合法集合只有 core/retrieval_hybrid.py 那一份，这里 import 常量
+        # 复用，不另抄一份字符串列表——抄一份的话加新模式时必然漏改一处。
+        raise ValueError(
+            f"未知的 retriever_mode={retriever_mode!r}，目前支持 {sorted(ALLOWED_MODES)}"
+        )
 
     if use_react is None:
         use_react = react_enabled()
@@ -468,7 +547,7 @@ def consult(
             "divergence": None,
             "rejected": True,
             "reject_reason": reject_reason,
-            "safety_flag": safety_flag,
+            "safety_flag": safety_flag, "retrieval_error": None,
             "s2": None, "residual": None, "followup": None,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react),
@@ -501,7 +580,7 @@ def consult(
             "divergence": None,
             "rejected": True,
             "reject_reason": followup.reject_reason,
-            "safety_flag": safety_flag,
+            "safety_flag": safety_flag, "retrieval_error": None,
             "s2": s2,
             "followup": followup,
             "residual": None, "insufficient": False, "insufficient_reason": None, "coverage": None,
@@ -518,7 +597,7 @@ def consult(
             return {
                 "s1": s1, "results": [], "divergence": None,
                 "rejected": True, "reject_reason": reject,
-                "safety_flag": safety_flag,
+                "safety_flag": safety_flag, "retrieval_error": None,
                 "s2": s2, "followup": followup, "residual": None,
                 "insufficient": False, "insufficient_reason": None, "coverage": None,
                 "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react),
@@ -565,7 +644,7 @@ def consult(
                 "饮食与二便情况、寒热喜恶、舌象与脉象。"
             ),
             "coverage": round(coverage, 3),
-            "safety_flag": safety_flag,
+            "safety_flag": safety_flag, "retrieval_error": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
                 2 + extra_calls + (1 if residual else 0), use_react
@@ -578,6 +657,7 @@ def consult(
             r = run_physician(
                 s1, s2, physician, info["name"], use_react=use_react,
                 followup=followup, ask_fn=ask_fn, bypass_safety=bypass, on_step=on_step,
+                retriever_mode=retriever_mode,
             )
             results.append(r)
             emit("physician_done", physician=physician, physician_name=info["name"],
@@ -594,10 +674,32 @@ def consult(
         return {
             "s1": s1, "results": [], "divergence": None,
             "rejected": True, "reject_reason": veto.reason,
-            "safety_flag": safety_flag or veto.reason,
+            "safety_flag": safety_flag or veto.reason, "retrieval_error": None,
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react),
+        }
+    except RetrievalUnavailable as e:
+        # 选的检索模式这台机器上没有对应数据（graph 缺 element_index.json 之类）。
+        # 已经跑完的医家结果也不返回：一半医家用了这个模式、另一半没有的话，
+        # 那份对照本身就是错的，不如干净地什么都不给、把原因说清楚。
+        # **不在这里静默降级回 hybrid**——那样用户以为自己看到的是 graph 模式的
+        # 结果，E8 消融的数字也就没有意义了（这一条是这个模块的硬约束）。
+        return {
+            "s1": s1, "results": [], "divergence": None,
+            "rejected": False, "reject_reason": None,
+            "safety_flag": safety_flag,
+            "retrieval_error": (
+                f"检索模式「{e.mode}」在这台机器上不可用：{e.detail} "
+                "换用默认模式可以正常辨证；本次没有降级到别的模式跑，"
+                "是为了不让你以为看到的是这个模式的结果。"
+            ),
+            "s2": s2, "followup": followup, "residual": residual,
+            "insufficient": False, "insufficient_reason": None, "coverage": None,
+            "manifest": _build_manifest(
+                int((time.time() - _t0) * 1000),
+                2 + extra_calls + (1 if residual else 0), use_react,
+            ),
         }
 
     syndromes = {r["physician"]: r["s3"].syndrome for r in results}
@@ -674,7 +776,7 @@ def consult(
         "divergence": divergence,
         "rejected": False,
         "reject_reason": None,
-        "safety_flag": safety_flag,
+        "safety_flag": safety_flag, "retrieval_error": None,
         "s2": s2,
         "residual": residual,
         "followup": followup,

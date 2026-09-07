@@ -71,15 +71,21 @@ def live_server():
     thread.start()
 
     base_url = f"http://127.0.0.1:{port}"
-    deadline = time.time() + 5
+    # 等待预算给到 60 秒，不是因为起 uvicorn 慢（本机回环通常 0.2 秒内就绪，
+    # 循环一就绪就退出，不会真等满），而是因为 app 的 startup 钩子会跑真实的
+    # 检索器预热：这台沙箱没有 cases.json，预热几毫秒就跳过了；**有 cases.json
+    # 的机器（AutoDL）会在这里真的加载 embedding 模型**，5 秒根本不够，
+    # 这条测试会在那边莫名其妙地红。发现过程记在模块8：临时造了个合成
+    # cases.json 做验证，这条测试立刻就红了，才看出预算是按空环境定的。
+    deadline = time.time() + 60
     while time.time() < deadline:
         try:
-            httpx.get(f"{base_url}/health", timeout=0.5)
+            httpx.get(f"{base_url}/health", timeout=1.0)
             break
         except httpx.TransportError:
             time.sleep(0.05)
     else:
-        raise RuntimeError("uvicorn 没能在 5 秒内起来")
+        raise RuntimeError("uvicorn 没能在 60 秒内起来")
 
     yield base_url
 

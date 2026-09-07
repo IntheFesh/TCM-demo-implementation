@@ -64,7 +64,7 @@ def test_root_redirects_to_app():
 
 
 def test_consult_endpoint_returns_graph_with_valid_edges(monkeypatch):
-    monkeypatch.setattr(api_main, "consult", lambda complaint: _fake_outcome())
+    monkeypatch.setattr(api_main, "consult", lambda complaint, **kw: _fake_outcome())
     client = TestClient(api_main.app)
     resp = client.post("/api/consult", json={"complaint": "纳差乏力"})
     assert resp.status_code == 200
@@ -78,7 +78,7 @@ def test_consult_endpoint_returns_graph_with_valid_edges(monkeypatch):
 
 
 def test_consult_endpoint_returns_rejection_without_calling_to_graph(monkeypatch):
-    monkeypatch.setattr(api_main, "consult", lambda complaint: _fake_rejected_outcome())
+    monkeypatch.setattr(api_main, "consult", lambda complaint, **kw: _fake_rejected_outcome())
     client = TestClient(api_main.app)
     resp = client.post("/api/consult", json={"complaint": "近日解黑色柏油样便"})
     assert resp.status_code == 200
@@ -242,3 +242,77 @@ def test_api_trajectories_physician_with_no_trajectories_returns_empty_list(monk
     resp = TestClient(api_main.app).get("/api/trajectories/ye_tianshi")
     assert resp.status_code == 200
     assert resp.json()["trajectories"] == []
+
+
+# ---------- 模块8：逐请求检索模式 ----------
+
+
+def test_consult_endpoint_threads_retriever_mode_through(monkeypatch):
+    """请求体里的 retriever_mode 要原样传给 consult()——不是存到什么服务端
+    设置里，也不是设环境变量。"""
+    seen = {}
+
+    def fake_consult(complaint, **kwargs):
+        seen.update(kwargs)
+        return _fake_outcome()
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+    resp = client.post("/api/consult", json={"complaint": "纳差乏力", "retriever_mode": "bm25"})
+    assert resp.status_code == 200
+    assert seen["retriever_mode"] == "bm25"
+
+
+def test_consult_endpoint_defaults_retriever_mode_to_none(monkeypatch):
+    seen = {}
+
+    def fake_consult(complaint, **kwargs):
+        seen.update(kwargs)
+        return _fake_outcome()
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+    client.post("/api/consult", json={"complaint": "纳差乏力"})
+    assert seen["retriever_mode"] is None
+
+
+def test_unknown_retriever_mode_is_400_not_500(monkeypatch):
+    """模式名写错是请求的问题，要回 400 并带上人能看懂的原因，不是 500。"""
+    def fake_consult(complaint, **kwargs):
+        raise ValueError("未知的 retriever_mode='xxx'，目前支持 ['bm25', 'dense', 'graph', 'hybrid']")
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+    resp = client.post("/api/consult", json={"complaint": "纳差乏力", "retriever_mode": "xxx"})
+    assert resp.status_code == 400
+    assert "未知的 retriever_mode" in resp.json()["detail"]
+
+
+def test_retrieval_error_reaches_the_frontend_as_a_field_not_a_500(monkeypatch):
+    """检索模式不可用时是 200 + retrieval_error 字段，不是 500 裸奔——
+    前端能把这句话显示出来，而不是看到一个"服务器内部错误"。"""
+    def fake_consult(complaint, **kwargs):
+        outcome = _fake_outcome()
+        outcome["results"] = []
+        outcome["divergence"] = None
+        outcome["retrieval_error"] = "检索模式「graph」在这台机器上不可用：未找到 element_index.json"
+        return outcome
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+    resp = client.post("/api/consult", json={"complaint": "纳差乏力", "retriever_mode": "graph"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "graph" in body["retrieval_error"]
+    assert body["results"] == []
+    assert body["rejected"] is False
+    assert body["insufficient"] is False
+
+
+def test_retrieval_error_key_present_on_normal_path_too(monkeypatch):
+    """键集一致：正常返回也要带 retrieval_error（None），前端按同一份契约读。"""
+    monkeypatch.setattr(api_main, "consult", lambda complaint, **kw: _fake_outcome())
+    client = TestClient(api_main.app)
+    body = client.post("/api/consult", json={"complaint": "纳差乏力"}).json()
+    assert "retrieval_error" in body
+    assert body["retrieval_error"] is None

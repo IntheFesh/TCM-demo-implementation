@@ -39,6 +39,13 @@ def _warmup() -> None:
 
 class ConsultRequest(BaseModel):
     complaint: str
+    # 逐请求的检索模式。**刻意不做成服务端的全局设置**：RETRIEVER_MODE 那个
+    # 环境变量是进程级的，一个请求设了它，同一进程里并发的另一个请求就跟着变了。
+    # 这个字段一路作为函数参数传到检索层，任何时候都不写进程状态。
+    # 合法值不在这里用 Literal 卡：校验只在 core.chain.consult() 一处
+    # （对着 ALLOWED_MODES），这里卡一遍等于把同一个判断实现两遍，
+    # 加新模式时必然漏改一处。
+    retriever_mode: str | None = None
 
 
 @app.get("/health")
@@ -145,7 +152,14 @@ def api_graph() -> dict:
 
 @app.post("/api/consult")
 def api_consult(req: ConsultRequest) -> dict:
-    return _consult_response(consult(req.complaint))
+    try:
+        outcome = consult(req.complaint, retriever_mode=req.retriever_mode)
+    except ValueError as e:
+        # 模式名不认识 = 请求写错了，是 400 不是 500。只有这一种 ValueError 能
+        # 从 consult() 冒到这里（consult 开头就校验了 retriever_mode，其余路径
+        # 的检索问题都被包成 RetrievalUnavailable 走返回值，不抛异常）。
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return _consult_response(outcome)
 
 
 def _consult_response(outcome: dict) -> dict:
@@ -167,6 +181,7 @@ def _consult_response(outcome: dict) -> dict:
             "rejected": True,
             "reject_reason": outcome["reject_reason"],
             "safety_flag": outcome.get("safety_flag"),
+            "retrieval_error": outcome.get("retrieval_error"),
             "results": [],
             "divergence": None,
             "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
@@ -176,11 +191,34 @@ def _consult_response(outcome: dict) -> dict:
             "manifest": outcome.get("manifest"),
         }
 
+    if outcome.get("retrieval_error"):
+        # 选的检索模式这台机器上没有对应数据。单独一个分支而不是混进
+        # insufficient：那个字段的意思是"你给的信息不够辨证"，这里是
+        # "服务端这条检索路跑不起来"，混成一个会把服务端的问题说成用户的问题。
+        return {
+            "s1": s1.model_dump(),
+            "rejected": False,
+            "reject_reason": None,
+            "safety_flag": outcome.get("safety_flag"),
+            "retrieval_error": outcome["retrieval_error"],
+            "insufficient": False,
+            "insufficient_reason": None,
+            "coverage": outcome.get("coverage"),
+            "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
+            "residual": _serialize_residual(outcome.get("residual")),
+            "followup": _serialize_followup(outcome.get("followup")),
+            "results": [],
+            "divergence": None,
+            "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
+            "manifest": outcome.get("manifest"),
+        }
+
     if outcome.get("insufficient"):
         return {
             "s1": outcome["s1"].model_dump(),
             "rejected": False,
             "safety_flag": outcome.get("safety_flag"),
+            "retrieval_error": outcome.get("retrieval_error"),
             "insufficient": True,
             "insufficient_reason": outcome["insufficient_reason"],
             "coverage": outcome.get("coverage"),
@@ -205,6 +243,7 @@ def _consult_response(outcome: dict) -> dict:
         # EVAL_MODE 下非空 = 这条主诉本该被安全层拦下，但评测模式让它跑完了。
         # demo 模式下这个分支的它恒为 None（命中就走上面 rejected 分支了）。
         "safety_flag": outcome.get("safety_flag"),
+        "retrieval_error": outcome.get("retrieval_error"),
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
         "insufficient": False,
@@ -251,6 +290,12 @@ def _sse(event: str, data: dict) -> str:
 
 @app.post("/api/consult/stream")
 def api_consult_stream(req: ConsultRequest) -> StreamingResponse:
+    """retriever_mode 跟 /api/consult 一样逐请求传下去。模式名不认识时这条
+    路径不回 400 而是发一个 error 事件——不是漏了，是刻意：模式合法性只在
+    core.chain.consult() 一处校验（对着 ALLOWED_MODES），在这里再判一次等于
+    把同一个判断连同错误文案实现两遍。worker 里 consult() 抛的 ValueError 会
+    被兜成 error 事件，消息跟 400 那条完全一样，前端的 error 分支照样能显示。
+    """
     stream_id = secrets.token_urlsafe(12)
     events_q: queue.Queue = queue.Queue()
     answer_q: queue.Queue = queue.Queue()
@@ -276,6 +321,7 @@ def api_consult_stream(req: ConsultRequest) -> StreamingResponse:
                 req.complaint,
                 ask_fn=stream_ask_fn,
                 on_step=lambda name, data: events_q.put((name, data)),
+                retriever_mode=req.retriever_mode,
             )
             events_q.put(("done", _consult_response(outcome)))
         except Exception as e:  # noqa: BLE001 - 后台线程的异常不会自己冒泡到 HTTP

@@ -64,7 +64,7 @@
 
 ```bash
 pip install -r requirements.txt
-pytest -q                      # 判据：514 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
+pytest -q                      # 判据：802 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
 python -c "import openai, os; print(bool(os.environ.get('LLM_API_KEY')))"
 ```
 

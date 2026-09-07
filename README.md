@@ -89,7 +89,12 @@ cp .env.example .env
 | `LLM_MAX_TOKENS` | 单次输出上限，默认 8192（DeepSeek 默认 4096，S0 抽多病人粗段会被截断） |
 | `CLAUDE_CLI_MODEL` / `CLAUDE_CLI_TIMEOUT` | `claude_cli` 模式下的模型名与超时，默认 `claude-sonnet-5` / 180 |
 | `USE_REACT` | `1` 打开 ReAct 取证（默认关，见「ReAct 取证模式」一节） |
-| `FAST_MODE` | `1` 跳过整个追问阶段（默认关，见「追问」一节） |
+| `FAST_MODE` | `1` 同时降级三处：追问 0 轮、ReAct 步数上限降到 2、残差辨证整体关闭（默认关，见「追问」一节）。实测一次完整问诊 14 次调用 → 8 次 |
+| `EVAL_MODE` | `1` **只**让安全否决不中止链路（检查照跑、命中原因照记进 `safety_flag`），给评测量化"安全否决花了多少分"用。默认关，demo 的拦截红线不受影响；不要在对外演示的机器上打开 |
+
+> **检索模式不是环境变量。** `RETRIEVER_MODE` 仍然存在（离线脚本/单机评测用），
+> 但 HTTP 请求要切模式请用请求体里的 `retriever_mode` 字段——环境变量是进程级的，
+> 两个并发请求各选一种模式会互相污染。详见「检索：三路融合」一节。
 
 ### 第 3 步：生成 `cases.json`（医案结构化数据）
 
@@ -190,8 +195,8 @@ core/           数据模型（pydantic）、LLM 抽象层、证素表、检索�
   retrieval.py / retrieval_hybrid.py / retrieval_graph.py   稠密/BM25/证素三路检索（见下方"检索：三路融合"一节）
   transition.py 证素轨迹（trajectory-only，见下方"证素轨迹"一节）
 offline/        离线脚本：医案切分/抽取、SFT 样本导出、图谱构建、三元组抽取、证素索引、配额审计
-api/            FastAPI 服务（/api/consult、/api/trajectories/{physician}、/health、静态文件）
-web/            前端单页 index.html，无构建步骤，Cytoscape.js 走 CDN
+api/            FastAPI 服务（见下方「HTTP 接口」一节）
+web/            前端单页 index.html，无构建步骤，Cytoscape.js 走 CDN；两个页签：问诊 / 图谱浏览器
 prompts/v1/     版本化 prompt 模板（yaml，$var 占位符）
 data/           医案原文（data/ye_tianshi/、data/wu_jutong/）、证候标准数据、SOURCES.md 版权说明
 eval/           需要真实 LLM 的评测：patient_sim、sdt/（外部 TCMEval-SDT 适配器）、
@@ -200,6 +205,64 @@ tests/          pytest 用例（全部不需要网络）+ tests/queries.txt 测�
 CLAUDE.md       项目架构与代码约定，改代码前建议先读
 run.sh          一键运行脚本
 ```
+
+## HTTP 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/consult` | 跑完整条推理链，一次性返回结果 + 图数据。请求体 `{complaint, retriever_mode?}` |
+| `POST` | `/api/consult/stream` | 同一条链路的 **SSE 分步进度版**。请求体一样，响应是 `text/event-stream` |
+| `POST` | `/api/consult/stream/{stream_id}/answer` | 回答流里 `need_input` 事件问出的追问，请求体 `{answer}` |
+| `GET` | `/api/graph` | 持久知识图谱（`data/graph.json` 的国标结构层），图谱浏览器页签用 |
+| `GET` | `/api/trajectories/{physician}` | 某位医家名下带复诊序列的病人证素轨迹 |
+| `GET` | `/health` | 存活探针 |
+
+**两条 consult 路径共用同一个序列化函数**（`api/main.py::_consult_response`），
+所以流式端点 `done` 事件的 data 跟非流式端点的响应体逐字段相同，前端一份渲染
+逻辑接两条路。
+
+### SSE 事件与追问
+
+`/api/consult/stream` 先发一条 `stream_id` 事件，然后按推理链的自然边界依次发
+`s1_done` / `s2_done` / `followup_done` / `residual_done` / `physician_start` /
+`react_step` / `s3_start` / `physician_done`，最后一条是 `done`（载荷即完整结果）
+或 `error`。
+
+追问走 `need_input` 事件：**流会真的停在那里等**（服务端那根线程阻塞在答案队列上，
+HTTP 连接一直开着），客户端拿 `stream_id` POST 到 `/answer` 端点，线程解除阻塞、
+流继续往下走。没人回答时按 `ANSWER_TIMEOUT_SECONDS`（默认 300 秒）超时，
+按"提问方不打算回答"处理，不是报错。这是旧接口做不到的事——`/api/consult`
+从不传提问渠道，追问问出的问题从来没人接。
+
+```bash
+# 看真实事件流
+curl -N -X POST http://127.0.0.1:8000/api/consult/stream \
+  -H "Content-Type: application/json" \
+  -d '{"complaint": "胃脘胀痛，食后加重，嗳气泛酸"}'
+```
+
+## 前端页面
+
+无构建步骤，一个 `web/index.html`，两个页签：
+
+**问诊页**——输入主诉、选检索模式、点「辨证」。走的是 SSE 端点，所以推理期间
+能看见分步进度（症状标准化 → 证素推断 → 追问 → 每位医家取证/开方），不再是
+一句静态的"请耐心等待"；系统要追问时页面上直接弹输入框，答完流继续往下走。
+结果出来后是四层生长图（症状→证素→证型→用药）+ 两位医家的结论对照 + 分歧度。
+
+**图谱浏览器页**——浏览持久知识图谱（`data/graph.json` 的国标结构层）。初始只
+铺 17 个证型节点，点开才逐步展开它连着的证素/症状（123 个节点一次性铺开是一团
+乱线）；支持按名字搜索、按医家切换 λ1 权重（边的透明度按 λ1 编码）。
+类目证候用菱形节点区分。**页面顶部那段 λ1 说明不是装饰**：它是
+`offline/graph_stats.py::lambda1_note()` 按当前这张图的实际内容算出来的，
+两种成因（图里根本没挂医案 / 挂了但医案证型跟国标术语对不上）说的是不同的话，
+前端原样显示、不改写。医案层为空时「国标层/医案层」切换按钮直接不显示，
+而不是显示一个点了没反应的。
+
+两张图的节点和边都能 hover 出速览（症状的解释状态、证素的病位/病性、证型的
+定义与舌脉、用药所属医家、边的主症/次症与 λ1）。图上药名只显示药名本身，
+剂量不进节点标签（"党参三钱"显示成"党参"），但节点 id 保留原始写法——
+侧栏证据链靠它反查。
 
 ## 离线脚本一览
 
@@ -343,6 +406,31 @@ python -m offline.build_element_index       # K3b：证素索引（需要 cases.
 RETRIEVER_MODE=hybrid ./run.sh              # 或 dense/bm25/graph
 ```
 
+### 在线切模式：逐请求，不是环境变量
+
+网页上的「检索模式」下拉框、以及 `POST /api/consult`（含 `/stream`）请求体里的
+`retriever_mode` 字段，都是**逐请求**生效的：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/consult \
+  -H "Content-Type: application/json" \
+  -d '{"complaint": "胃脘胀痛，嗳气泛酸", "retriever_mode": "bm25"}'
+```
+
+**服务端不会因此去设 `RETRIEVER_MODE`。** 那个变量是进程级的，一个请求设了它，
+同一进程里并发的另一个请求就跟着变了——这跟 `EVAL_MODE` 那个开关当初被做成
+"显式参数优先、环境变量只作兜底"是同一条理由。`retriever_mode` 一路作为函数
+参数传到检索层，任何时候都不写进程状态（`tests/test_retriever_mode.py` 里有一条
+双线程并发测试专门钉这件事）。
+
+两种失败分得很清楚：
+
+- **模式名不认识** → 立刻 `400`，一次 LLM 调用都不花（校验发生在 S1 之前）。
+- **模式认识、但这台机器上跑不起来**（`graph` 缺 `data/element_index.json`）
+  → `200` + 响应体里的 `retrieval_error` 一句人话，**不静默降级到别的模式**。
+  降级的话调用方会以为自己看到的是证素路的结果，E8 消融那组数字也就失去意义了。
+  检索层照旧大声报错，只是不再让 500 裸奔到前端。
+
 ## 证素轨迹（附属，进阶功能）
 
 `core/transition.py` 把同一病人（`case_group_id`）的复诊序列按 `visit_index`
@@ -357,6 +445,29 @@ GET /api/trajectories/{physician}   # 例如 /api/trajectories/ye_tianshi
 
 未知医家返回 404；`cases.json`/`data/element_index.json` 还没生成返回 503
 （不是 500——demo 环境没有真实数据是正常状态，不是系统故障）。
+
+## 分歧度里的西药：单列，不混进 `herb_jaccard`
+
+`CaseRecord` / `S3Syndrome` 都有 `western_drugs` 字段，跟 `herbs` 互斥。
+张锡纯「衷中参西」的方子里会出现阿斯匹林、百布圣、金鸡纳霜这类西药，
+混进 `herbs` 会把跨学派分歧系统性推高——而那个推高是假的，"叶天士没开
+阿斯匹林"是学派记录体例的差异，不是辨证思路的差异。所以：
+
+- `herb_jaccard`（分歧度主指标）只算中药；
+- 西药单独报在 `divergence.western_drug_overlap`，两边都没开西药时是 `None`
+  而不是 `0`——`0` 会被读成"两边西药完全一致"，实际是"这个维度不适用"；
+- 拆分只有一处实现（`core.herbs.split_western_drugs`），S0 抽取和 S3 开方
+  两个边界都调它。prompt 里也写了同样的要求，但 prompt 是约束不是保证，
+  代码这层必须兜住。
+
+词表是从 `books/584-医学衷中参西录.txt`（GB18030）真实文本里挖出来的，
+实测推翻了两个想当然的写法（阿斯匹林 136 次 / 阿司匹林 0 次；百布圣 19 次 /
+白布圣 0 次）。刻意不收单独的"盐酸/硫酸/碘"：原书 8 次"盐酸"里有 5 次是
+「鸡内金……含有稀盐酸」这种成分描述，收进去会把真中药误判成西药，
+而误判的代价（一味中药被剔出主指标）比漏判更糟。
+
+> 张锡纯本人还没注册进 `core/physicians.py`（见 HANDOFF 步骤 3），
+> 所以现在真实链路上这个字段恒为空，上面这套是为他进来那天准备的。
 
 ## 评测汇总（V1，需要真实 LLM，不进 pytest）
 

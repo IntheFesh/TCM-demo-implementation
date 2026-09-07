@@ -172,3 +172,42 @@ def test_read_sse_handles_multibyte_utf8_split_across_chunk_boundary():
     """
     out = json.loads(_run_node(js))
     assert out == [["physician_start", {"physician_name": "叶天士"}]]
+
+
+# ---------- 模块8：检索模式跟着请求走 ----------
+
+
+def _build_body(mode_value: str) -> dict:
+    """真实跑 index.html 里的 buildConsultRequestBody()，用一个只回答
+    #retriever-mode 的 document 桩喂给它。"""
+    js = f"""
+    globalThis.document = {{
+      getElementById: (id) => (id === "retriever-mode" ? {{ value: {json.dumps(mode_value)} }} : null),
+    }};
+    process.stdout.write(JSON.stringify(buildConsultRequestBody("纳差乏力")));
+    """
+    return json.loads(_run_node(js))
+
+
+def test_request_body_omits_retriever_mode_when_default_selected():
+    """选"默认"时整个字段都不带——不是传空字符串。空字符串不在
+    ALLOWED_MODES 里，传过去会被判成非法模式名直接 400。"""
+    body = _build_body("")
+    assert body == {"complaint": "纳差乏力"}
+    assert "retriever_mode" not in body
+
+
+def test_request_body_carries_the_selected_mode():
+    for mode in ["hybrid", "dense", "bm25", "graph"]:
+        body = _build_body(mode)
+        assert body["retriever_mode"] == mode
+        assert body["complaint"] == "纳差乏力"
+
+
+def test_request_body_survives_a_page_without_the_selector():
+    """选择框不存在时（比如将来某个精简页面）不该抛异常，退回默认行为。"""
+    js = """
+    globalThis.document = { getElementById: () => null };
+    process.stdout.write(JSON.stringify(buildConsultRequestBody("纳差")));
+    """
+    assert json.loads(_run_node(js)) == {"complaint": "纳差"}
