@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -41,6 +41,26 @@ def health() -> dict:
 @app.get("/")
 def root() -> RedirectResponse:
     return RedirectResponse(url="/app/index.html")
+
+
+@app.get("/api/trajectories/{physician}")
+def api_trajectories(physician: str) -> dict:
+    """附属功能：某位医家名下、带复诊序列的病人证素轨迹（core/transition.py，
+    trajectory-only，不含转移概率）。cases.json / data/element_index.json
+    缺失是这台 demo 环境的正常状态（数据要在有真实 LLM 的机器上生成），
+    不是服务器错误——用 503 而不是 500，前端可以据此显示"这项功能待数据
+    就绪"而不是当成系统故障。"""
+    if physician not in PHYSICIANS:
+        raise HTTPException(status_code=404, detail=f"未知医家：{physician}")
+
+    from core.transition import load_trajectories
+
+    try:
+        trajectories = load_trajectories()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {"physician": physician, "trajectories": trajectories.get(physician, [])}
 
 
 @app.post("/api/consult")

@@ -198,3 +198,47 @@ def test_api_consult_insufficient_path(monkeypatch):
     assert resp.status_code == 200
     assert body["insufficient"] is True and body["insufficient_reason"] == "请补充更多信息"
     assert body["results"] == [] and body["followup"] is None
+
+
+# ---------- /api/trajectories/{physician} ----------
+
+
+def test_api_trajectories_unknown_physician_404():
+    resp = TestClient(api_main.app).get("/api/trajectories/nobody")
+    assert resp.status_code == 404
+
+
+def test_api_trajectories_missing_data_returns_503(monkeypatch):
+    import core.transition as transition_mod
+
+    def boom(*a, **k):
+        raise FileNotFoundError("未找到 cases.json")
+
+    monkeypatch.setattr(transition_mod, "load_trajectories", boom)
+    resp = TestClient(api_main.app).get("/api/trajectories/ye_tianshi")
+    assert resp.status_code == 503
+
+
+def test_api_trajectories_returns_only_requested_physician(monkeypatch):
+    import core.transition as transition_mod
+
+    fake = {
+        "ye_tianshi": [{"case_group_id": "g1", "n_visits": 2, "visits": []}],
+        "wu_jutong": [{"case_group_id": "g2", "n_visits": 3, "visits": []}],
+    }
+    monkeypatch.setattr(transition_mod, "load_trajectories", lambda: fake)
+    resp = TestClient(api_main.app).get("/api/trajectories/ye_tianshi")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["physician"] == "ye_tianshi"
+    assert len(body["trajectories"]) == 1
+    assert body["trajectories"][0]["case_group_id"] == "g1"
+
+
+def test_api_trajectories_physician_with_no_trajectories_returns_empty_list(monkeypatch):
+    import core.transition as transition_mod
+
+    monkeypatch.setattr(transition_mod, "load_trajectories", lambda: {})
+    resp = TestClient(api_main.app).get("/api/trajectories/ye_tianshi")
+    assert resp.status_code == 200
+    assert resp.json()["trajectories"] == []
