@@ -6,6 +6,15 @@ extract_warnings.json
 *.jsonl
 !data/standard/*.jsonl
 data/graph.json
+# K3a 生成物：offline/build_jieba_dict.py 的产物，随 cases.json 变化，不入版本控制
+data/jieba_dict.txt
+# K3b/X3 生成物
+data/case_triples.jsonl
+data/element_index.json
+# V1 生成物
+eval/epsilon.json
+eval/report.json
+eval/report.md
 out/
 .venv/
 venv/

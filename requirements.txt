@@ -6,6 +6,8 @@ uvicorn[standard]>=0.29
 sentence-transformers>=3.0
 numpy>=1.26
 networkx>=3.2
+rank-bm25>=0.2
+jieba>=0.42
 pytest>=8.0
 
 # 只有跑 TCMEval-SDT 评测时才需要：官方 evaluate.py 顶层 import 了 pandas，

@@ -119,10 +119,18 @@ _retriever_singleton: Retriever | None = None
 
 
 def get_retriever() -> Retriever:
-    """惰性单例。"""
+    """惰性单例。返回 HybridRetriever（DenseRetriever 的超集，见
+    core/retrieval_hybrid.py）——这样 RETRIEVER_MODE 环境变量能在每次
+    search() 调用时动态生效，不需要按 mode 分别建单例（V1 的 E8 消融
+    只改环境变量重跑，不重启进程）。放在这里而不是模块顶层 import，
+    是为了避免 core.retrieval 反向依赖 core.retrieval_hybrid 造成循环
+    import（retrieval_hybrid 依赖 retrieval，不能反过来在模块顶层互相依赖）。
+    """
     global _retriever_singleton
     if _retriever_singleton is None:
-        _retriever_singleton = DenseRetriever()
+        from core.retrieval_hybrid import HybridRetriever
+
+        _retriever_singleton = HybridRetriever()
     return _retriever_singleton
 
 
