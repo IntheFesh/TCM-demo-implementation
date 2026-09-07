@@ -224,7 +224,9 @@ USE_REACT=1 ./run.sh          # 或 uvicorn api.main:app --reload
   里没有一轮提前收尾（预算 5 步就在第 5 步 finish，预算 3 步就撞 max_steps）。
   两位医家开 ReAct，S3 阶段从 2 次调用变成 12 次。`manifest.llm_calls` 会如实
   计入，`manifest.use_react` 记这次开没开——拿调用数算成本时看这两个字段，
-  别按"上限"估。详见 `data/SOURCES.md` 第 11 条。
+  别按"上限"估。试过去掉提示词里的剩余步数计数来让它早点收尾，n=8 的对照
+  实验证明那样只会更糟（步数 5.00→4.75 几乎没降，finish 率却从 5/5 掉到 4/8）。
+  详见 `data/SOURCES.md` 第 11、12 条。
 - 结束原因分五种记在 `react_trace.terminated_by`：`finish`（模型自己判断够了）、
   `ask_user`（它要追问）、`max_steps`（撞上限）、`no_progress`（连续重复同一个
   调用）、`error`（LLM 调用失败）。**撞 max_steps 不等于正常结束**——它说明
