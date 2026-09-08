@@ -235,8 +235,13 @@ def test_consult_rejects_before_s2_on_danger_symptoms(monkeypatch):
 # ---------- X2 输出侧安全：Generate-Verify-Revise 闭环 ----------
 
 class ViolatingThenCleanLLM(FakeLLM):
-    """第一次 S3 开出含配伍禁忌的方，收到带【配伍禁忌】的重开提示后改开干净方。
-    用来验证重开真的被触发，而不是只把违规标出来就算完。"""
+    """第一次 S3 开出含配伍禁忌的方，收到带【安全问题】的重开提示后改开干净方。
+    用来验证重开真的被触发，而不是只把违规标出来就算完。
+
+    契约变更（M2）：重开提示的标记从【配伍禁忌】改成【安全问题】——M2 把重开
+    触发条件从"只看十八反十九畏"扩成"十八反十九畏或剂量超限"两种拦截级问题，
+    提示语要能同时描述这两种，不能再用只指代配伍禁忌的旧标记。
+    """
 
     def __init__(self, s3_by_physician, clean_by_physician):
         super().__init__(s3_by_physician)
@@ -244,7 +249,7 @@ class ViolatingThenCleanLLM(FakeLLM):
         self.retry_prompts: list[str] = []
 
     def generate(self, system, user, schema, temperature=0.0, **kwargs):
-        if schema is S3Syndrome and "【配伍禁忌】" in system:
+        if schema is S3Syndrome and "【安全问题】" in system:
             self.calls.append(schema.__name__)
             self.retry_prompts.append(system)
             for name, s3 in self.clean_by_physician.items():

@@ -293,6 +293,59 @@ class HerbItem(BaseModel):
     dose_evidence: list[str] = Field(default_factory=list)
 
 
+class DoseViolation(BaseModel):
+    """一味药剂量超过 core.safety_output.DOSE_LIMITS 里的常用上限。
+
+    这不是 LLM 输出 schema——`core.safety_output.check_dose_limits()` 用确定性
+    规则算出来的结果，M2 把它做成 pydantic 模型（而不是像 check_incompatible
+    继续返回裸 tuple）是因为它要装进 FormulaSafety，被 FormulaCandidate.safety
+    这个真实字段携带，FormulaSafety 又是这个模块里的类型——三者必须在同一处
+    定义才不会出现循环依赖（见 FormulaSafety 的文档字符串）。
+    """
+
+    herb: str
+    dose: float
+    unit: str
+    limit_g: float
+    reason: str
+
+
+class FormulaSafety(BaseModel):
+    """一个候选方的 X2 输出侧安全汇总：十八反十九畏、寒热方向、剂量上限、
+    必要煎法、毒性标记。字段本身在这里定义，但**产出这个对象的逻辑一律在
+    core/safety_output.py**（check_incompatible/check_thermal_consistency/
+    check_dose_limits/check_required_decoction/check_toxic_herbs 五个函数 +
+    assess_formula_safety 这一个组装点）——这条边界很重要：
+
+    这个类本该跟着 check_dose_limits 等函数放在 core/safety_output.py（M2 的
+    任务描述原文就是这么写的），但 `FormulaCandidate.safety: FormulaSafety
+    | None` 必须是一个真实的 pydantic 字段类型（不是裸 dict，"所有结构化数据
+    都用 pydantic 承接"是这个项目从第一个模块就守的规矩），而 FormulaCandidate
+    定义在这个文件里——如果 FormulaSafety 留在 core/safety_output.py，
+    core.schemas 要 import core.safety_output 来拿类型，core.safety_output
+    本来就要 import core.schemas 拿 HerbItem，两边互相导入会在模块加载时炸。
+    放在这里，core.safety_output 单向依赖 core.schemas（导入 HerbItem/
+    DoseViolation/FormulaSafety），跟这份文件已有的方向（core.schemas 依赖
+    core.herbs、不依赖任何业务逻辑模块）一致，不新开一条依赖边。
+
+    blocking 分两级：incompatible（十八反十九畏）和 dose_violations（剂量超限）
+    是拦截级——命中就该让 run_physician 重开一次；thermal_warning（寒热方向）/
+    decoction_missing（缺必要煎法）/ toxic_herbs（含毒性药材）是警告级，只展示
+    不打回——寒热错杂本来就寒热并用、毒性药材的常规用量本就贴着上限、煎法漏标
+    不代表方子本身有问题，这三类逼模型重开只会把本来对的方子改坏。
+    """
+
+    incompatible: list[tuple[str, str]] = Field(default_factory=list)
+    thermal_warning: str | None = None
+    dose_violations: list[DoseViolation] = Field(default_factory=list)
+    decoction_missing: list[str] = Field(default_factory=list)
+    toxic_herbs: list[str] = Field(default_factory=list)
+
+    @property
+    def blocking(self) -> bool:
+        return bool(self.incompatible) or bool(self.dose_violations)
+
+
 class FormulaCandidate(BaseModel):
     """一个候选方。三种来源的可信度不同，前端必须视觉区分（M6/M7）：
       classic  —— 现有经典方，原方名照写
@@ -312,6 +365,10 @@ class FormulaCandidate(BaseModel):
     herb_items: list[HerbItem] = Field(min_length=1)
     doses_count: int | None = None  # 剂数
     usage: str | None = None  # 用法，如"水煎服，每日1剂，分2次温服"
+    # M2：X2 输出侧安全汇总。不由模型生成——安全判定必须是确定性规则，不能让
+    # 模型自己说"我这个方是安全的"。默认 None，S3 生成后由
+    # core.safety_output.assess_formula_safety() 填充（core/chain.py 里做）。
+    safety: FormulaSafety | None = None
 
     @model_validator(mode="after")
     def _check_base_formula(self) -> "FormulaCandidate":

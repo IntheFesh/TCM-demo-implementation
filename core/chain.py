@@ -32,11 +32,7 @@ from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
 from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
 from core.retrieval_hybrid import ALLOWED_MODES
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
-from core.safety_output import (
-    check_incompatible,
-    check_thermal_consistency,
-    format_conflicts,
-)
+from core.safety_output import assess_formula_safety, format_blocking_issues
 from core.schemas import (
     CaseRecord, FollowupResult, S1Normalize, S2Elements, S3Syndrome, S3SyndromeUnreferenced,
 )
@@ -331,24 +327,28 @@ def run_physician(
     # 拆好的（M1 之前这里对 herbs 混西药的拟合方式做了一次真实回归，见 SOURCES.md）。
     s3 = get_llm().generate(system=s3_system, user="", schema=s3_schema)
 
-    # X2 输出侧安全：十八反十九畏命中就把冲突写进 prompt 重开一次。
-    # 只重开一次、不循环——循环会让 llm_calls 变成不可预测的数，
+    # X2 输出侧安全（M2 起覆盖五条规则，见 core/safety_output.assess_formula_safety
+    # 的文档字符串）：给每个候选方都算一份 FormulaSafety，不是只算 selected 那个——
+    # M5 的图要在每个候选方节点上标安全状态，选中的和没选中的都要有数据可用。
+    # 拦截判据只看 selected 那个：incompatible/dose_violations 命中就把问题写进
+    # prompt 重开一次。只重开一次、不循环——循环会让 llm_calls 变成不可预测的数，
     # manifest 里那个调用数就没法用来算成本和比较配置了。
-    incompatible = check_incompatible(s3.herbs)
+    for cand in s3.formula_candidates:
+        cand.safety = assess_formula_safety(s3.syndrome, cand)
+    selected_safety = s3.formula_candidates[s3.selected].safety
     revised = False
-    if incompatible:
+    if selected_safety.blocking:
         retry_system = s3_system + (
-            f"\n\n【配伍禁忌】上一次拟的方中存在中药十八反十九畏配伍禁忌："
-            f"{format_conflicts(incompatible)}。请重新拟方避开这些配伍，"
-            "其余要求不变。"
+            f"\n\n【安全问题】上一次拟的方（当前选中的候选方）存在以下必须修正的"
+            f"问题：{format_blocking_issues(selected_safety)}。请重新拟方解决这些"
+            "问题，其余要求不变。"
         )
         s3 = get_llm().generate(system=retry_system, user="", schema=s3_schema)
+        for cand in s3.formula_candidates:
+            cand.safety = assess_formula_safety(s3.syndrome, cand)
         revised = True
-        # 重开之后再查一次：还有冲突就保留结果并如实标出来，不再重开。
-        incompatible = check_incompatible(s3.herbs)
-
-    # 寒热一致性只警告不打回（寒热错杂本来就寒热并用，打回会改坏正确的方子）
-    thermal_warning = check_thermal_consistency(s3.syndrome, s3.herbs)
+        # 重开之后再查一次：还有问题就保留结果并如实标出来，不再重开。
+        selected_safety = s3.formula_candidates[s3.selected].safety
 
     # 幻觉检查要放在可能的重开之后——查的是最终留下的那版方子。
     # 白名单 = 本函数检索到的 refs ∪ ReAct 里 search_cases 真实返回过的 id：
@@ -370,9 +370,14 @@ def run_physician(
         "hallucinated": hallucinated,
         # 只在 EVAL_MODE 下可能非空：demo 模式命中这里就抛 SafetyVeto 了，走不到返回。
         "safety_flag": react_safety_flag,
+        # 只保留 incompatible/thermal_warning/revised 三个键，跟 M2 之前的形状
+        # 一字不差——api/main.py 和 web/index.html 已经在消费这三个键，M2 不碰
+        # 那一层。dose_violations/decoction_missing/toxic_herbs 不在这里重复一份，
+        # 它们已经在 s3.formula_candidates[i].safety 里，读那边就有，不用两处维护
+        # 同一份数据（这正是 CLAUDE.md「同一概念只能有一处实现」要防的重复）。
         "safety_output": {
-            "incompatible": incompatible,
-            "thermal_warning": thermal_warning,
+            "incompatible": selected_safety.incompatible,
+            "thermal_warning": selected_safety.thermal_warning,
             "revised": revised,
         },
         "react_trace": trace,

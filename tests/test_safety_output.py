@@ -216,3 +216,264 @@ def test_majority_is_relative_to_formula_size():
 def test_case_record_spellings_still_trigger_incompatibility(a, b):
     """医案原文里实际出现、S3 模仿医家风格时很可能照写的别名。"""
     assert check_incompatible([a, b]) != [], f"{a} 与 {b} 漏检"
+
+
+# ================= M2：剂量安全层 =================
+
+from core.schemas import DoseViolation, FormulaCandidate, FormulaSafety, HerbItem  # noqa: E402
+from core.safety_output import (  # noqa: E402
+    DOSE_LIMITS,
+    REQUIRED_DECOCTION,
+    TOXIC_HERBS,
+    assess_formula_safety,
+    check_dose_limits,
+    check_required_decoction,
+    check_toxic_herbs,
+    format_blocking_issues,
+    format_dose_violations,
+    to_grams,
+)
+
+
+# ---------- to_grams：单位换算 ----------
+
+
+@pytest.mark.parametrize("dose,unit,expected", [
+    (1, "g", 1.0),
+    (1, "钱", 3.125),
+    (1, "两", 31.25),
+    (1, "分", 0.3125),
+    (2, "钱", 6.25),
+])
+def test_to_grams_converts_known_units(dose, unit, expected):
+    assert to_grams(dose, unit) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("unit", ["枚", "片"])
+def test_to_grams_returns_none_for_count_units(unit):
+    """枚/片是计数单位，没有统一克重——不能换算，不能当成 0。
+    0 意味着"剂量是 0"，None 意味着"这个单位没法换算成克"，两者是不同信号。"""
+    assert to_grams(3, unit) is None
+
+
+def test_to_grams_returns_none_when_dose_is_none():
+    assert to_grams(None, "g") is None
+
+
+# ---------- check_dose_limits：40+ 味逐条参数化 ----------
+
+
+@pytest.mark.parametrize("herb,limit_g", sorted(DOSE_LIMITS.items(), key=lambda kv: kv[0]))
+def test_dose_limit_table_has_at_least_forty_entries(herb, limit_g):
+    """哨兵测试：真正的断言在下面 test_exceeding_the_limit_is_flagged /
+    test_at_or_under_the_limit_is_not_flagged 里，这条只是把参数化列表铺开，
+    让"这张表有多少味"在测试报告里一眼可数——parametrize 用的就是 DOSE_LIMITS
+    本身，表加一条这里自动多一条用例，不用手动同步列表。"""
+    limit, reason = limit_g
+    assert limit >= 0.0
+    assert reason  # 每条都必须有非空的出处/原因说明，不能空着
+
+
+def test_dose_limits_table_size_meets_the_gate():
+    assert len(DOSE_LIMITS) >= 40, f"目标 40+ 味，实际 {len(DOSE_LIMITS)} 味"
+
+
+@pytest.mark.parametrize("herb,limit_g", sorted(DOSE_LIMITS.items(), key=lambda kv: kv[0]))
+def test_exceeding_the_limit_is_flagged(herb, limit_g):
+    limit, _reason = limit_g
+    over = limit + 1.0  # 上限为 0（生品禁止内服）时，任何正剂量都该超限
+    v = check_dose_limits([HerbItem(name=herb, dose=over, dose_unit="g")])
+    assert len(v) == 1 and v[0].herb == herb and v[0].limit_g == limit
+
+
+@pytest.mark.parametrize("herb,limit_g", sorted(DOSE_LIMITS.items(), key=lambda kv: kv[0]))
+def test_at_or_under_the_limit_is_not_flagged(herb, limit_g):
+    limit, _reason = limit_g
+    if limit == 0.0:
+        pytest.skip(f"{herb} 上限为 0（生品禁止内服），没有「不超限」的正剂量可测")
+    v = check_dose_limits([HerbItem(name=herb, dose=limit, dose_unit="g")])
+    assert v == [], f"{herb} 恰好等于上限不该被判超限"
+
+
+def test_missing_dose_is_not_a_violation():
+    """没写剂量不是"剂量超限"，是另一种信号——HerbItem 的既有纪律。"""
+    assert check_dose_limits([HerbItem(name="附子")]) == []
+
+
+def test_count_unit_never_false_positives_a_dose_violation():
+    """"三枚""五片"这类计数单位没法换算成克，不能拿计数值直接当克数比，
+    否则"附子 20 枚"会被当成"附子 20g"误判超限（20 枚的实际重量可能远超或
+    远低于 20g，两者不是同一个量纲）。"""
+    assert check_dose_limits([HerbItem(name="附子", dose=20, dose_unit="枚")]) == []
+
+
+def test_dose_limits_reasons_are_all_non_empty_and_distinguish_shengpin_from_zhipin():
+    """生品与制品的限量必须不同——这是 M2 spec 明确要求的区分（附子/川乌/草乌/
+    半夏/南星的生品毒性远高于制品）。"""
+    assert DOSE_LIMITS["附子"][0] > DOSE_LIMITS["生附子"][0]
+    assert DOSE_LIMITS["川乌"][0] > DOSE_LIMITS["生川乌"][0]
+    assert DOSE_LIMITS["草乌"][0] > DOSE_LIMITS["生草乌"][0]
+    assert DOSE_LIMITS["半夏"][0] > DOSE_LIMITS["生半夏"][0]
+
+
+def test_processed_form_spellings_resolve_through_normalize_or_explicit_alias():
+    """"黑顺片"这类写法 normalize_herb 会剥过头（剥成"黑顺"），DOSE_LIMITS 必须
+    显式收录这些写法本身，不能只指望归一。"""
+    for spelling in ["黑顺片", "白附片", "淡附片", "熟附子", "附片", "熟附片", "炮附子"]:
+        v = check_dose_limits([HerbItem(name=spelling, dose=100, dose_unit="g")])
+        assert v and v[0].herb == spelling, f"{spelling} 没有命中剂量表"
+
+
+# ---------- check_required_decoction ----------
+
+
+def test_required_decoction_table_size_meets_the_gate():
+    assert len(REQUIRED_DECOCTION) >= 25, f"目标 25+ 味，实际 {len(REQUIRED_DECOCTION)} 味"
+
+
+def test_shengbanxia_matches_on_the_raw_spelling_before_any_normalization():
+    """"生半夏"必须直接命中原始写法——REQUIRED_DECOCTION 里"生半夏"和"半夏"是
+    两条不同的条目（只有生品要求先煎，法半夏/姜半夏/制半夏不要求），如果查表
+    顺序先归一再查，"生半夏"会被 normalize_herb 保留原样（"生"前缀不剥）仍能
+    命中，但换成会被剥掉前缀的场景就查不到了——这条测试钉住的是"原始写法优先"
+    这个顺序本身，不是这一个词恰好能匹配。"""
+    assert check_required_decoction([HerbItem(name="生半夏", decoction=None)]) == ["生半夏"]
+
+
+def test_processed_forms_of_fuzi_match_through_normalize_herb():
+    """模型很可能写"制附子"而不是"附子"——REQUIRED_DECOCTION 只收了"附子"这一个
+    键，"制附子"查原始写法查不到，要靠 normalize_herb 归一成"附子"才命中，
+    这条测试钉住"查不到再归一"这第二步真的生效，不是查表顺序看着对但实际上
+    从没走到第二步。"""
+    assert check_required_decoction([HerbItem(name="制附子", decoction=None)]) == ["制附子"]
+    assert check_required_decoction([HerbItem(name="附子", decoction=None)]) == ["附子"]
+
+
+def test_correct_decoction_is_not_flagged():
+    assert check_required_decoction([HerbItem(name="附子", decoction="先煎")]) == []
+
+
+def test_wrong_decoction_is_flagged_same_as_missing():
+    """标了但标错跟完全没标是同一类问题——一个写着"包煎"的附子看起来"已经
+    处理过"，实际上该先煎的没先煎，比空白字段更容易被忽略，不能因为"填了
+    点什么"就放过。"""
+    assert check_required_decoction([HerbItem(name="附子", decoction="包煎")]) == ["附子"]
+
+
+def test_herb_without_a_special_requirement_is_never_flagged():
+    assert check_required_decoction([HerbItem(name="党参", decoction=None)]) == []
+
+
+@pytest.mark.parametrize("herb,method", sorted(REQUIRED_DECOCTION.items()))
+def test_required_decoction_table_entries_round_trip(herb, method):
+    assert check_required_decoction([HerbItem(name=herb, decoction=None)]) == [herb]
+    assert check_required_decoction([HerbItem(name=herb, decoction=method)]) == []
+
+
+# ---------- check_toxic_herbs ----------
+
+
+def test_toxic_herbs_table_is_non_trivial():
+    assert len(TOXIC_HERBS) >= 30
+
+
+def test_toxic_herb_is_flagged():
+    assert check_toxic_herbs([HerbItem(name="附子")]) == ["附子"]
+
+
+def test_non_toxic_herb_is_not_flagged():
+    assert check_toxic_herbs([HerbItem(name="党参")]) == []
+
+
+def test_toxic_check_matches_through_normalization():
+    """"制附子"要能匹配到 TOXIC_HERBS 里的条目——跟剂量表同一条查表顺序。"""
+    assert check_toxic_herbs([HerbItem(name="姜半夏")]) == ["姜半夏"]
+
+
+# ---------- FormulaSafety.blocking 分级 ----------
+
+
+def test_incompatible_and_dose_violations_are_blocking():
+    assert FormulaSafety(incompatible=[("a", "b")]).blocking is True
+    dv = [DoseViolation(herb="x", dose=99, unit="g", limit_g=1, reason="r")]
+    assert FormulaSafety(dose_violations=dv).blocking is True
+
+
+def test_thermal_decoction_toxic_are_not_blocking():
+    """寒热错杂本来就寒热并用、毒性药材常规用量本就贴着上限、煎法漏标不代表
+    方子本身有问题——这三类只警告，逼模型重开只会把对的方子改坏。"""
+    fs = FormulaSafety(thermal_warning="w", decoction_missing=["附子"], toxic_herbs=["附子"])
+    assert fs.blocking is False
+
+
+def test_empty_formula_safety_is_not_blocking():
+    assert FormulaSafety().blocking is False
+
+
+# ---------- assess_formula_safety：唯一组装点 ----------
+
+
+def _candidate(herb_items):
+    return FormulaCandidate(
+        name="x", source="composed", confidence="low", rationale="r",
+        herb_items=herb_items,
+    )
+
+
+def test_assess_formula_safety_runs_all_five_checks():
+    cand = _candidate([
+        HerbItem(name="甘草", dose=5, dose_unit="g"),
+        HerbItem(name="海藻", dose=5, dose_unit="g"),
+        HerbItem(name="附子", dose=20, dose_unit="g", decoction=None),
+    ])
+    safety = assess_formula_safety("脾胃虚寒证", cand)
+    assert safety.incompatible == [("甘草", "海藻")]
+    assert len(safety.dose_violations) == 1 and safety.dose_violations[0].herb == "附子"
+    assert safety.decoction_missing == ["附子"]
+    assert safety.toxic_herbs == ["附子"]
+    assert safety.blocking is True
+
+
+def test_assess_formula_safety_excludes_western_drug_items():
+    """herb_items 里混进的西药不参与任何一项检查——十八反/寒热/剂量/煎法/毒性
+    表全部是中药知识，喂西药名进去要么查不到、要么在极端情况下误判。跟
+    S3Syndrome.herbs（M1 派生字段）用的是同一条 is_western_drug 过滤规则。"""
+    cand = _candidate([
+        HerbItem(name="党参", dose=9, dose_unit="g"),
+        HerbItem(name="西药阿斯匹林", dose=9999, dose_unit="g"),
+    ])
+    safety = assess_formula_safety("脾胃气虚", cand)
+    assert safety.dose_violations == []
+    assert safety.toxic_herbs == []
+
+
+def test_assess_formula_safety_clean_formula_has_no_warnings():
+    cand = _candidate([HerbItem(name="党参", dose=15, dose_unit="g"),
+                       HerbItem(name="白术", dose=10, dose_unit="g")])
+    safety = assess_formula_safety("脾胃气虚", cand)
+    assert safety.incompatible == [] and safety.dose_violations == []
+    assert safety.decoction_missing == [] and safety.toxic_herbs == []
+    assert safety.blocking is False
+
+
+# ---------- format_dose_violations / format_blocking_issues ----------
+
+
+def test_format_dose_violations_names_every_herb():
+    v = [DoseViolation(herb="附子", dose=20, unit="g", limit_g=15, reason="致死风险")]
+    text = format_dose_violations(v)
+    assert "附子" in text and "20" in text and "15" in text and "致死风险" in text
+
+
+def test_format_blocking_issues_combines_both_kinds_of_blocking_problems():
+    safety = FormulaSafety(
+        incompatible=[("甘草", "海藻")],
+        dose_violations=[DoseViolation(herb="附子", dose=20, unit="g", limit_g=15, reason="r")],
+    )
+    text = format_blocking_issues(safety)
+    assert "甘草" in text and "海藻" in text and "附子" in text and "20" in text
+
+
+def test_format_blocking_issues_omits_warning_level_fields():
+    safety = FormulaSafety(thermal_warning="寒热相悖", decoction_missing=["附子"], toxic_herbs=["附子"])
+    assert format_blocking_issues(safety) == ""
