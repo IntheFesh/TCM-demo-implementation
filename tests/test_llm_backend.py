@@ -403,6 +403,76 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         assert found == expected[path.stem], f"{path.name} 的占位符变了：{found}"
 
 
+# ---------- M3：s3_syndrome.yaml 的嵌入示例与硬约束 ----------
+
+
+def _s3_prompt_embedded_example() -> dict:
+    """s3_syndrome.yaml 末尾嵌了一段完整的输出示例——schema hint 对嵌套结构
+    表达力有限，实测（M1）证实了这一点，示例能显著降低格式错误率。这段示例
+    是手写的 JSON，藏在一大段 prose 里，改 prompt 时最容易被顺手改坏（多一个
+    逗号、少一个引号）而不会有任何报错提示——除非有测试盯着它。"""
+    import json
+
+    from core.llm import load_prompt
+
+    system = load_prompt("s3_syndrome")["system"]
+    lines = system.split("\n")
+    opening_braces = [i for i, line in enumerate(lines) if line.strip() == "{"]
+    assert opening_braces, "s3_syndrome.yaml 里没找到嵌入的 JSON 示例（顶格的 { 都没有）"
+    example_text = "\n".join(lines[opening_braces[0]:])
+    return json.loads(example_text)
+
+
+def test_s3_prompt_embedded_example_is_valid_json():
+    _s3_prompt_embedded_example()  # 解析失败会直接抛 JSONDecodeError
+
+
+def test_s3_prompt_embedded_example_validates_against_the_real_schema():
+    """不仅要是合法 JSON，还要真的能喂进 core.schemas.S3Syndrome——包括 M1/M2
+    加的那些 model_validator（selected 越界检查、base_formula 双向约束）。
+    示例本身违反自己教模型遵守的约束，比没有示例更糟。"""
+    from core.schemas import S3Syndrome
+
+    obj = _s3_prompt_embedded_example()
+    s3 = S3Syndrome.model_validate(obj)
+    assert s3.formula == "柴胡疏肝散"  # 对应 selected=0 那个 classic 候选方
+
+
+def test_s3_prompt_embedded_example_demonstrates_all_three_sources_and_varied_confidence():
+    """示例存在的意义是"教会模型怎么填三种来源、置信度不能都填 high"——如果
+    示例自己三个都写 classic 或者三个都 high，等于示范了一个错误答案。"""
+    obj = _s3_prompt_embedded_example()
+    cands = obj["formula_candidates"]
+    assert 2 <= len(cands) <= 3
+    assert {c["source"] for c in cands} == {"classic", "modified", "composed"}
+    assert len({c["confidence"] for c in cands}) > 1, "示例不该三个候选方置信度都一样"
+    assert any(c["source"] == "classic" for c in cands)
+
+
+@pytest.mark.parametrize("phrase", [
+    "至少要有一个",  # 至少一个 classic 候选方的硬约束
+    "不要三个候选方都填high",
+    "剂量不确定时填null，不要猜一个数",
+    "这个字段关系到用药安全",  # decoction 字段的安全性说明
+])
+def test_s3_prompt_contains_the_hard_constraints(phrase):
+    """这几句不是随手写的修饰语，是 M3 要解决的具体问题（模型倾向三个都填
+    high、role 大量为 null）对应的明文约束——被误删或改写成模糊表述时，
+    这条测试要能先红，而不是等真实调用跑出退步的格式遵从度才发现。
+
+    yaml 里的 prose 为了可读性手动折行，逐字匹配会被行内换行拆散（"不要\n
+    三个候选方都填 high" 这种），所以先把连续空白（含换行）压成单个空格再比对，
+    这样只要语义短语完整、不管折在哪一行都能测到——真正要盯住的是"这句话
+    还在不在"，不是"它有没有被折成两行"。
+    """
+    import re
+
+    from core.llm import load_prompt
+
+    normalized = re.sub(r"\s+", "", load_prompt("s3_syndrome")["system"])
+    assert re.sub(r"\s+", "", phrase) in normalized
+
+
 # ---------- 传输错误重试之间的退避 ----------
 
 
