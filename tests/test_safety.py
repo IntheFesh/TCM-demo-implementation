@@ -1,5 +1,6 @@
-import pytest
 """core/safety.py 的离线测试：危重症状拦截，纯关键词匹配，不需要网络。"""
+import pytest
+
 from core.safety import check_safety
 
 

@@ -67,21 +67,31 @@ class DenseRetriever(Retriever):
     def _ensure_encoded(self) -> None:
         # 冷启动时两个并发请求会各加载一份模型（几百 MB × 2）。
         # 双重检查：锁外先判一次避免每次请求都抢锁，锁内再判一次防竞态。
-        if self._model is not None:
+        #
+        # 锁外快路径看的必须是 _embeddings 而不是 _model：_load() 里加载模型
+        # 只要一两秒，随后给 839 条医案编码要十几秒——这段时间里 _model 已经
+        # 非 None 而 _embeddings 还是 None。审计里实测过这个交错：线程 A 持锁
+        # 在编码，线程 B 锁外看到 _model 就位直接放行，走到
+        # `self._embeddings[i] @ query_vec` 时拿到的是 None，TypeError。
+        # 所以 _load() 最后才发布 _embeddings，这里只认它。
+        if self._embeddings is not None:
             return
         with self._encode_lock:
-            if self._model is not None:
+            if self._embeddings is not None:
                 return
             self._load()
 
     def _load(self) -> None:
         from sentence_transformers import SentenceTransformer
 
-        self._model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+        # 先在局部变量里把两样东西都建好，再按 _model → _embeddings 的顺序发布。
+        # _ensure_encoded 的锁外快路径只认 _embeddings，它最后一个写入，
+        # 别的线程看到它非 None 时 _model 一定已经就位。
+        model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
         texts = [_case_to_text(c) for c in self._cases]
-        self._embeddings = self._model.encode(
-            texts, normalize_embeddings=True, convert_to_numpy=True
-        )
+        embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        self._model = model
+        self._embeddings = embeddings
 
     # 初诊在排序时的加成。复诊段症状简短、内容是疗效描述，
     # 作为"该医家如何辨证"的参考价值低于初诊，但不完全排除——
@@ -116,6 +126,11 @@ class DenseRetriever(Retriever):
 
 
 _retriever_singleton: Retriever | None = None
+# 建单例要读整份 cases.json 并逐条 model_validate，几百毫秒；没有这把锁时两个
+# 冷启动并发请求会各建一份 HybridRetriever，输的那份被在途请求引用着、之后又
+# 各自加载一份几百 MB 的模型——DenseRetriever 那把 _encode_lock 是类属性，只能
+# 让两次加载排队，挡不住加载两次。
+_retriever_lock = threading.Lock()
 
 
 def get_retriever() -> Retriever:
@@ -128,9 +143,11 @@ def get_retriever() -> Retriever:
     """
     global _retriever_singleton
     if _retriever_singleton is None:
-        from core.retrieval_hybrid import HybridRetriever
+        with _retriever_lock:
+            if _retriever_singleton is None:
+                from core.retrieval_hybrid import HybridRetriever
 
-        _retriever_singleton = HybridRetriever()
+                _retriever_singleton = HybridRetriever()
     return _retriever_singleton
 
 

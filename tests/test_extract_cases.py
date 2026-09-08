@@ -194,7 +194,6 @@ def test_visit_total_cross_validation_triggers_independently(tmp_path, monkeypat
 def test_main_prints_visit_index_dup_warning_without_keyerror(tmp_path, monkeypatch, capsys):
     """check_visit_index_dup 的告警没有 llm_count/regex_count；原来 main() 直接下标，
     第一条这种告警就 KeyError，整批结果丢失、cases.json 写不出来。"""
-    import json
     from offline import extract_cases as ec
     from core.schemas import CaseRecord
 

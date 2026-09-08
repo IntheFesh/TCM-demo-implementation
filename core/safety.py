@@ -12,6 +12,7 @@ S2/S3，不产出任何方药，不是在结果的 note 字段里事后提一句
 from __future__ import annotations
 
 import os
+import re
 
 # 覆盖这个 demo 脾胃门范围内、临床上需要立即转诊而不是继续辨证的信号：
 # 消化道出血（呕血/黑便/柏油样便/咖啡渣样呕吐物）、意识改变（昏迷/晕厥/不省人事）、
@@ -116,20 +117,29 @@ def _keyword_context_ok(text: str, m) -> bool:
     return not _negated(text, m.start())
 
 
-def _scan(text: str, honor_negation: bool) -> list[str]:
-    import re
+# 表里存的是字符串（读起来是表，改起来也是表），编译一次放这里。之前 _scan 在
+# 循环里对每个起始位置都 re.compile 一次：200 字的主诉 × 12 条模式 ≈ 2400 次
+# 编译缓存查找，而这是每个请求都要过的热路径。
+_DANGER_KEYWORD_RES: list[tuple[str, re.Pattern]] = [
+    (kw, re.compile(re.escape(kw))) for kw in DANGER_KEYWORDS
+]
+_DANGER_PATTERN_RES: list[tuple[re.Pattern, str]] = [
+    (re.compile(pattern), label) for pattern, label in DANGER_PATTERNS
+]
 
+
+def _scan(text: str, honor_negation: bool) -> list[str]:
     hits: list[str] = []
-    for kw in DANGER_KEYWORDS:
+    for kw, kw_re in _DANGER_KEYWORD_RES:
         if any(not honor_negation or _keyword_context_ok(text, m)
-               for m in re.finditer(re.escape(kw), text)):
+               for m in kw_re.finditer(text)):
             hits.append(_LABEL_CANON.get(kw, kw))
-    for pattern, label in DANGER_PATTERNS:
+    for pattern_re, label in _DANGER_PATTERN_RES:
         # 不能命中一次就 break：finditer 是非重叠的，被否定跳过的那个最左匹配会把
         # 后面真正的危重表述一起吞掉（「无便血但大便黑」旧写法整句放行）。
         # 用 overlapped 扫法——每个位置都起一次匹配。
         for i in range(len(text)):
-            m = re.compile(pattern).match(text, i)
+            m = pattern_re.match(text, i)
             if not m:
                 continue
             if honor_negation and (_negated(text, m.start()) or _object_negated(text, m.start("obj"))):
@@ -181,8 +191,37 @@ def check_safety(symptoms: list[str]) -> str | None:
         hits.extend(_scan(text, honor_negation=True))
     if not hits:
         return None
-    matched = "、".join(dict.fromkeys(hits))  # 去重且保持命中顺序
+    return veto_message("、".join(dict.fromkeys(hits)))  # 去重且保持命中顺序
+
+
+def veto_message(matched: str) -> str:
+    """拒绝辨证的文案，**全项目只在这里拼一次**。之前 check_safety、chain.py 的
+    ReAct ask_user 路径、followup.py 的十问歌兜底各拼了一份一字不差的字符串——
+    改措辞时必然漏改一处，而这三处恰恰是 CLAUDE.md 点名不能分叉的安全后门。"""
     return (
         f"检测到危重症状信号（{matched}），本 demo 不适用于此类情况，"
         "请立即就医或拨打急救电话，本次不提供辨证结果。"
     )
+
+
+def danger_confirmed_by_answer(
+    question: str, answer_verdict: str, symptom: str | None = None
+) -> str | None:
+    """追问的第二道门：**问的本身是危重症状、患者没有明确否认** → 返回拒绝理由，
+    否则 None。回答原文里往往没有危重词（「有没有便血？」→「有」），check_safety
+    单独看回答是放行的，这条判据补的就是这个缺口。
+
+    只有明确否认（answer_verdict == "no"）才放行。yes 固然要拦，**unknown 也要拦**：
+    「时有时无」「拉过两次」既不是否认也不构成排除，按危重处理是安全侧该有的
+    非对称——漏拦一次的代价远大于多拦一次。
+
+    symptom 是提问方知道的候选症状名（G3 追问带着它，ReAct 的 ask_user 只有问题
+    文本）。给了就先看它，再看问题原文——两个都看是取并集，比任一单独看都保守。
+    这条判据此前在 core/chain.py 和 core/followup.py 各写了一套，两边看的文本
+    不同、否定语义也不同（一边 honor_negation=False 一边 True）——正是 CLAUDE.md
+    "同一个判断两处实现、各自测都对、放进同一条链才看出矛盾"那堵墙。
+    """
+    asked = (mentions_danger(symptom) if symptom else None) or mentions_danger(question)
+    if asked and answer_verdict != "no":
+        return veto_message(asked)
+    return None

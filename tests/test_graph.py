@@ -10,8 +10,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _make_results() -> list[dict]:
-    s1_symptoms = ["纳差", "乏力", "口苦"]
-
     s2_ye = S2Elements(
         elements=[
             ElementHit(

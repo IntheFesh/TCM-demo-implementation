@@ -11,7 +11,7 @@ import pytest
 from core import chain, react
 from core.followup import fast_mode_enabled
 from core.schemas import ReActStep, S3Syndrome
-from tests.test_chain import FakeLLM, FakeRetriever, ReActFakeLLM, _fake_cases
+from tests.test_chain import FakeRetriever, ReActFakeLLM, _fake_cases
 
 
 @pytest.fixture(autouse=True)

@@ -19,9 +19,9 @@ from __future__ import annotations
 import os
 from typing import Callable
 
-from core.safety import check_safety, mentions_danger
+from core.safety import check_safety, danger_confirmed_by_answer, mentions_danger, veto_message
 from core.schemas import FollowupResult, HistoryItem
-from core.tools import is_safety_relevant, question_candidates
+from core.tools import question_candidates
 
 MAX_ASK_ROUNDS = 3
 
@@ -126,23 +126,17 @@ def run_followup(
         # safety_relevant 标记全仓库没有任何消费方，实测答「有」就把「便血」写进了
         # asserted、S2/S3 照常开方——正是 CLAUDE.md 那条约定要堵的后门。
         reject = check_safety([answer])
-        # 问的本身是危重症状时，只有明确否认才放行。yes 固然要拦，**unknown 也要拦**：
-        # 「时有时无」「拉过两次」这类回答既不是否认也不构成排除，按危重处理是安全侧
-        # 该有的非对称——漏拦一次的代价远大于多拦一次。
-        asked_danger = top.get("symptom") and (
-            top.get("safety_relevant") or is_safety_relevant(top["symptom"])
-        )
-        if reject is None and asked_danger and verdict != "no":
-            reject = check_safety([top["symptom"]])
+        # 问的本身是危重症状时，只有明确否认才放行（yes 拦，unknown 也拦）。判据在
+        # core.safety.danger_confirmed_by_answer 一处实现，ReAct 的 ask_user 路径
+        # （core/chain.py）调的是同一个函数——之前两边各写一套、看的文本还不一样。
+        if reject is None:
+            reject = danger_confirmed_by_answer(top["question"], verdict, symptom=top.get("symptom"))
         # 十问歌后备问的是话题（symptom 为 None），答案里若提到危重内容，check_safety
         # 已经在上面拦了；这里再用 mentions_danger 兜一层"提到但被当成否定句式"的情况，
         # 例如「解的是黑的」这种没有明确否定词、check_safety 也认得，但换成
         # 「不太成形，颜色发黑」时前置否定规则可能误判。
         if reject is None and verdict != "no" and mentions_danger(answer):
-            reject = check_safety([f"患者自述：{answer}"]) or (
-                f"检测到危重症状信号（{mentions_danger(answer)}），本 demo 不适用于此类情况，"
-                "请立即就医或拨打急救电话，本次不提供辨证结果。"
-            )
+            reject = check_safety([f"患者自述：{answer}"]) or veto_message(mentions_danger(answer))
         if reject is not None:
             history.append(HistoryItem(
                 question=top["question"], answer=answer,

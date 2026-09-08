@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,30 +60,41 @@ def reset_tool_caches() -> None:
     _case_triples = None
 
 
+# 三个惰性加载器共用一把锁：它们都是"读文件 → 赋给模块全局"，没有锁时两个
+# 冷启动并发请求会各读一遍 data/graph.json（171KB 解析成 NetworkX 图要几十
+# 毫秒）并各自发布一份——不会读到半成品（都是建好再赋值），只是重复劳动，
+# 而且在途的两个请求会拿着两份不同的图对象。锁内再判一次 None 是双重检查。
+_load_lock = threading.Lock()
+
+
 def get_graph_store() -> NetworkXStore | None:
     """加载国标层图谱。文件不存在返回 None 而不是抛异常——见模块约束 2。"""
     global _graph_store
     if _graph_store is None:
-        if not GRAPH_PATH.exists():
-            return None
-        store = NetworkXStore()
-        store.load(GRAPH_PATH)
-        _graph_store = store
+        with _load_lock:
+            if _graph_store is None:
+                if not GRAPH_PATH.exists():
+                    return None
+                store = NetworkXStore()
+                store.load(GRAPH_PATH)
+                _graph_store = store
     return _graph_store
 
 
 def _load_standard() -> list[dict]:
     global _standard_defs
     if _standard_defs is None:
-        if not STANDARD_PATH.exists():
-            _standard_defs = []
-        else:
-            defs = []
-            for line in STANDARD_PATH.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line:
-                    defs.append(json.loads(line))
-            _standard_defs = defs
+        with _load_lock:
+            if _standard_defs is None:
+                if not STANDARD_PATH.exists():
+                    _standard_defs = []
+                else:
+                    defs = []
+                    for line in STANDARD_PATH.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line:
+                            defs.append(json.loads(line))
+                    _standard_defs = defs
     return _standard_defs
 
 
@@ -90,7 +102,11 @@ def _load_case_triples() -> list[dict] | None:
     """None = 文件还没生成（跟"文件存在但里面没有三元组"要区分开：
     前者是"这步还没跑"，后者是"跑了但没抽出东西"，对模型是两个不同的信号）。"""
     global _case_triples
-    if _case_triples is None:
+    if _case_triples is not None:
+        return _case_triples
+    with _load_lock:
+        if _case_triples is not None:
+            return _case_triples
         if not CASE_TRIPLES_PATH.exists():
             return None
         rows = []
@@ -110,7 +126,7 @@ def _load_case_triples() -> list[dict] | None:
             # 合法 JSON 但不是对象（数组/字符串）同样按坏行处理，否则后面 .get 直接炸
             rows.append(row if isinstance(row, dict) else {"_bad_line": lineno})
         _case_triples = rows
-    return _case_triples
+        return _case_triples
 
 
 # ---------- 工具注册表 ----------
@@ -312,8 +328,10 @@ def query_case_graph(symptom: str | None = None, predicate: str | None = None,
         if predicate is not None and predicate not in (r.get("p") or ""):
             continue
         if symptom is not None:
-            def _rel(x): return bool(x) and (symptom in x or x in symptom)
-            if not (_rel(s) or _rel(o)):
+            # 「症状文本是否对得上」只有 _symptom_text_matches 一处实现：之前这里是
+            # 裸的双向子串，而同模块的 _match_graph_symptoms 还会拆「胃脘胀满或疼痛」
+            # 这种并列名——同一个词，两个工具给出不同答案（CLAUDE.md 第三次撞墙）。
+            if not (_symptom_text_matches(s, symptom) or _symptom_text_matches(o, symptom)):
                 continue
         matched.append(r)
 
@@ -444,6 +462,17 @@ def _symptom_fragments(name: str) -> list[str]:
     return [p for p in parts if len(p) >= 2 and p not in _GENERIC_FRAGMENTS]
 
 
+def _symptom_text_matches(name: str, patient_symptom: str) -> bool:
+    """标准症状名（或三元组里的症状文本）跟患者原话对不对得上：双向包含，
+    对不上再按并列片段试一次。**全模块唯一的症状文本匹配器**——
+    _match_graph_symptoms 和 query_case_graph 都走这里。"""
+    if not name or not patient_symptom:
+        return False
+    if name in patient_symptom or patient_symptom in name:
+        return True
+    return any(f in patient_symptom for f in _symptom_fragments(name))
+
+
 def _match_graph_symptoms(store: NetworkXStore, patient_symptom: str) -> list[str]:
     """患者原话 -> 图里的标准症状节点 id。刻意只做字面（片段级双向包含）匹配，
     不引入向量相似度：这一层必须离线可跑、确定性可测。匹配不上的症状会被单独
@@ -452,12 +481,7 @@ def _match_graph_symptoms(store: NetworkXStore, patient_symptom: str) -> list[st
     hits = []
     for sym_id in store.find_nodes("symptom"):
         name = (store.get_node(sym_id) or {}).get("name", "")
-        if not name:
-            continue
-        if name in patient_symptom or patient_symptom in name:
-            hits.append(sym_id)
-            continue
-        if any(f in patient_symptom for f in _symptom_fragments(name)):
+        if _symptom_text_matches(name, patient_symptom):
             hits.append(sym_id)
     return hits
 
@@ -765,6 +789,9 @@ def _shiwen_fallback(k: int, asked: set[str], reason: str) -> list[dict]:
             "if_yes_top": None,
             "if_no_top": None,
             "prior_entropy": None,
+            # 键集必须跟 graph_ig 那一支完全一致：消费方按同一份契约读。十问歌问的
+            # 是话题不是具体症状，答案里的危重内容由 check_safety 兜，这里恒 False。
+            "safety_relevant": False,
         })
         if len(out) >= k:
             break

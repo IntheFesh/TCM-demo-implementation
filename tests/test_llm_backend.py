@@ -7,7 +7,6 @@ import subprocess
 import pytest
 from pydantic import BaseModel, Field
 
-from core import llm as llm_mod
 from core.llm import (
     ClaudeCLIBackend,
     LLMBackend,
@@ -402,3 +401,54 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
     for path in (PROMPTS_ROOT / "v1").glob("*.yaml"):
         found = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?", load_prompt(path.stem)["system"]))
         assert found == expected[path.stem], f"{path.name} 的占位符变了：{found}"
+
+
+# ---------- 传输错误重试之间的退避 ----------
+
+
+class _FlakyThenOk(LLMBackend):
+    """前 n_fail 次 _complete 抛传输错误，之后返回合法 JSON。"""
+
+    RETRY_BACKOFF_SECONDS = (1.0, 2.0)  # conftest 把基类清零了，这里显式设回真实值
+
+    def __init__(self, n_fail: int):
+        self.n_fail = n_fail
+        self.calls = 0
+        self.sleeps: list[float] = []
+        self._sleep = self.sleeps.append  # 不真睡，只记录
+
+    def model_name(self):
+        return "m"
+
+    def backend_id(self):
+        return "t"
+
+    def _complete(self, messages, temperature, **kw):
+        self.calls += 1
+        if self.calls <= self.n_fail:
+            raise TimeoutError("超时")
+        return '{"ok": true, "note": "x"}'
+
+
+def test_transport_retry_backs_off_1s_then_2s():
+    b = _FlakyThenOk(n_fail=2)
+    assert b.generate(system="s", user="u", schema=Tiny).ok is True
+    assert b.sleeps == [1.0, 2.0]
+
+
+def test_no_backoff_after_the_last_attempt():
+    """三次全挂：只退避两次（两次尝试之间），最后一次失败后直接抛，不再白等。"""
+    b = _FlakyThenOk(n_fail=3)
+    with pytest.raises(LLMError):
+        b.generate(system="s", user="u", schema=Tiny)
+    assert b.sleeps == [1.0, 2.0]
+
+
+def test_validation_errors_retry_immediately_without_backoff():
+    """校验错误是模型格式没对，回灌错误信息立刻重问才有意义，等一秒不会答得更对。"""
+    b = ScriptedBackend(['{"ok": true}', '{"ok": true, "note": "x"}'])  # 第一次少 note
+    sleeps: list[float] = []
+    b._sleep = sleeps.append
+    b.RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+    assert b.generate(system="s", user="u", schema=Tiny).note == "x"
+    assert sleeps == []

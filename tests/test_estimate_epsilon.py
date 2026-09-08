@@ -4,7 +4,6 @@ monkeypatch 换掉。
 """
 import json
 
-import pytest
 
 from core.schemas import (
     ElementHit, S1Normalize, S2Elements, S3Syndrome, SegmentPatients,

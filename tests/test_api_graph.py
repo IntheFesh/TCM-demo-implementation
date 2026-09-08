@@ -168,6 +168,8 @@ def test_persistent_graph_to_cytoscape_preserves_is_category_and_label():
 
 def test_persistent_graph_to_cytoscape_falls_back_to_id_when_name_missing():
     store = NetworkXStore()
-    store.add_node("weird::node", node_type="weird")  # 没有 name 字段的边界情况
+    # 没有 name 字段的边界情况。node_type 用合法值：add_node 现在对着
+    # core/graph/schema.py 的词表校验类型，这条测的是缺 name 不是类型。
+    store.add_node("weird::node", node_type="symptom")
     graph = api_main._persistent_graph_to_cytoscape(store)
     assert graph["nodes"][0]["data"]["label"] == "weird::node"

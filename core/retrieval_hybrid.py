@@ -44,6 +44,8 @@ from core.retrieval_graph import ElementRetriever
 from core.schemas import CaseRecord
 
 JIEBA_DICT_PATH = Path(__file__).resolve().parent.parent / "data" / "jieba_dict.txt"
+# 见 _ensure_jieba：守的是 jieba 的全局词典，不是某个实例
+_JIEBA_GLOBAL_LOCK = threading.Lock()
 
 # RRF 的经验常数，见模块文档字符串。
 RRF_K = 60
@@ -89,8 +91,14 @@ class HybridRetriever(DenseRetriever):
                 return
             import jieba
 
-            if JIEBA_DICT_PATH.exists():
-                jieba.load_userdict(str(JIEBA_DICT_PATH))
+            # jieba 的词典 trie 是进程级全局的，load_userdict 改的是它，不是
+            # 这个实例的东西。_jieba_ready/_jieba_lock 按实例记是为了让测试能
+            # 换词典路径重建实例，但真正写全局态的那一步要用模块级的锁排队——
+            # 否则两个实例（测试里常见；服务里靠 get_retriever 的锁保证只有一个）
+            # 同时 load_userdict 会一起改同一棵 trie。
+            with _JIEBA_GLOBAL_LOCK:
+                if JIEBA_DICT_PATH.exists():
+                    jieba.load_userdict(str(JIEBA_DICT_PATH))
             self._jieba_ready = True
 
     def _tokenize(self, text: str) -> list[str]:

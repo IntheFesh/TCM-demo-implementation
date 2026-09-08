@@ -60,16 +60,15 @@ def test_safety_bypassed_defaults_to_off():
     assert safety_bypassed(None) is False
 
 
-def test_safety_bypassed_reads_env_var():
-    import os
-
+def test_safety_bypassed_reads_env_var(monkeypatch):
+    # 用 monkeypatch 而不是直接写 os.environ：中途一条断言失败的话，直接写的
+    # 那个 EVAL_MODE 会漏到后面的用例里，把安全否决静默关掉。
     for truthy in ("1", "true", "TRUE", "yes"):
-        os.environ["EVAL_MODE"] = truthy
+        monkeypatch.setenv("EVAL_MODE", truthy)
         assert safety_bypassed() is True, truthy
     for falsy in ("0", "no", "", "off"):
-        os.environ["EVAL_MODE"] = falsy
+        monkeypatch.setenv("EVAL_MODE", falsy)
         assert safety_bypassed() is False, falsy
-    os.environ.pop("EVAL_MODE", None)
 
 
 def test_explicit_argument_beats_env_var(monkeypatch):

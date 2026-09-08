@@ -9,7 +9,7 @@ def test_chunk_chapter_respects_max_len():
     chunks = chunk_chapter(body, max_len=100, soft_min=20)
     assert len(chunks) > 1
     for chunk_lines in chunks:
-        assert sum(len(l) for l in chunk_lines) <= 100 + max(len(l) for l in chunk_lines)
+        assert sum(len(ln) for ln in chunk_lines) <= 100 + max(len(ln) for ln in chunk_lines)
 
 
 def test_chunk_chapter_breaks_at_blank_line_once_past_soft_min():
@@ -32,7 +32,7 @@ def test_chunk_chapter_ignores_blank_line_before_soft_min():
 def test_chunk_chapter_drops_tail_markers():
     body = "某 正文内容。\n徐评：这是编者按语，不应该进入任何粗段。\n某二 另一段正文。"
     chunks = chunk_chapter(body, max_len=1000, soft_min=1)
-    joined = clean([l for chunk in chunks for l in chunk])
+    joined = clean([ln for chunk in chunks for ln in chunk])
     assert "徐评" not in joined
     assert "另一段正文" in joined
 

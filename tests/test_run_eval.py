@@ -174,7 +174,7 @@ def test_retrieval_mode_comparison_identical_modes_zero_discordant():
 
 
 def test_build_report_shape(monkeypatch):
-    monkeypatch.setattr(re, "_load_epsilon_online", lambda: 0.2)
+    monkeypatch.setattr(re, "load_epsilon_online", lambda: 0.2)
     results = [_consult_result(herb_jaccard=0.5, physician_results=[_physician_result()])]
     report = re.build_report(results)
     assert report["n_queries"] == 1
@@ -184,7 +184,7 @@ def test_build_report_shape(monkeypatch):
 
 
 def test_render_markdown_includes_all_sections(monkeypatch):
-    monkeypatch.setattr(re, "_load_epsilon_online", lambda: None)
+    monkeypatch.setattr(re, "load_epsilon_online", lambda: None)
     report = re.build_report([_consult_result()])
     md = re.render_markdown(report)
     assert "分歧度" in md and "幻觉率" in md and "安全否决" in md and "检索模式" in md
@@ -214,7 +214,7 @@ def test_main_writes_report_json_and_md(tmp_path, monkeypatch):
 
     fake_result = _consult_result(herb_jaccard=0.3, physician_results=[_physician_result()])
     monkeypatch.setattr("core.chain.consult", lambda q: fake_result)
-    monkeypatch.setattr(re, "_load_epsilon_online", lambda: 0.1)
+    monkeypatch.setattr(re, "load_epsilon_online", lambda: 0.1)
 
     re.main(["--queries-path", str(queries_path), "--out-json", str(out_json), "--out-md", str(out_md)])
 

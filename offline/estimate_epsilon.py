@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 
 from core.chain import consult, infer_elements, normalize
-from core.herbs import normalize_herb
+from core.herbs import normalized_herb_set
 from core.llm import get_llm
 from core.physicians import PHYSICIANS
 from core.safety import check_safety
@@ -96,7 +96,7 @@ def estimate_epsilon_online(
                 n_insufficient += 1
                 continue
             for r in outcome["results"]:
-                herbs = {h for h in (normalize_herb(x) for x in (r["s3"].herbs or [])) if h}
+                herbs = normalized_herb_set(r["s3"].herbs)
                 herb_sets_by_physician.setdefault(r["physician"], []).append(herbs)
 
         if n_rejected == n_repeats:
@@ -272,6 +272,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--dry-run", action="store_true", help="只打印将要发起的调用数，不真跑")
     args = ap.parse_args(argv)
 
+    if not args.queries_path.exists():
+        raise FileNotFoundError(f"未找到 {args.queries_path}")
     queries = [
         q.strip() for q in args.queries_path.read_text(encoding="utf-8").splitlines() if q.strip()
     ]
@@ -290,9 +292,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.dry_run:
         print("\n--dry-run：不发起任何调用。确认无误后去掉这个参数重跑。")
         return
-
-    if not args.queries_path.exists():
-        raise FileNotFoundError(f"未找到 {args.queries_path}")
 
     t0 = time.time()
     print("\n=== epsilon_online ===")

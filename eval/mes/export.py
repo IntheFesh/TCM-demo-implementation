@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     queries = [
-        l.strip() for l in args.queries_path.read_text(encoding="utf-8").splitlines() if l.strip()
+        line.strip() for line in args.queries_path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
     if args.limit is not None:
         queries = queries[: args.limit]
@@ -97,10 +97,13 @@ def main(argv: list[str] | None = None) -> None:
         print(f"--dry-run：预估调用数 ≈ {len(queries) * 6}（{len(queries)} 条查询），不真的调用")
         return
 
-    from core.chain import consult
+    from core.chain import consult_many
 
-    results = [consult(q) for q in queries]
-    items, answer_key = build_blind_items(queries, results, seed=args.seed)
+    results, failures = consult_many(queries)
+    if failures:
+        print(f"注意：{len(failures)}/{len(queries)} 条主诉失败，盲评表里不含它们")
+    ok = [(q, r) for q, r in zip(queries, results) if r is not None]
+    items, answer_key = build_blind_items([q for q, _ in ok], [r for _, r in ok], seed=args.seed)
 
     args.out_items.parent.mkdir(parents=True, exist_ok=True)
     args.out_items.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -56,5 +56,18 @@ def _ensure_graph_json(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def _isolate_runtime_env(monkeypatch):
-    for var in ("USE_REACT", "FAST_MODE"):
+    # EVAL_MODE 会让安全否决不中止、RETRIEVER_MODE 会改检索默认路——都是
+    # consult() 的行为开关，跟 USE_REACT/FAST_MODE 一样要跟外面的 shell 隔开。
+    for var in ("USE_REACT", "FAST_MODE", "EVAL_MODE", "RETRIEVER_MODE"):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_retry_backoff(monkeypatch):
+    """generate() 在传输错误重试之间会退避 1s、2s（core/llm.py）。测试里的假后端
+    故意抛超时来测重试语义，真等的话一条测试就多 3 秒、整个 tests/ 不再"秒级"。
+    这里全局清零；退避本身有专门的测试（test_llm_backend.py）在子类上显式设回
+    非零值验证。"""
+    from core.llm import LLMBackend
+
+    monkeypatch.setattr(LLMBackend, "RETRY_BACKOFF_SECONDS", (0.0, 0.0))

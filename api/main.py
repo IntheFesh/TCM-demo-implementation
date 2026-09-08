@@ -1,31 +1,49 @@
 """FastAPI 服务：/api/consult 跑推理链并把结果拼成前端可渲染的图数据。"""
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import queue
 import secrets
+import sys
 import threading
+import time
+import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from core.chain import consult
+from core.chain import consult, explained_symptoms
 from core.herbs import strip_dose_and_parens
 from core.physicians import PHYSICIANS
 from core.schemas import S1Normalize
 from core.tools import GRAPH_PATH, get_graph_store
 from offline.graph_stats import compute_stats, lambda1_note
 
-WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+ROOT = Path(__file__).resolve().parent.parent
+WEB_ROOT = ROOT / "web"
 
-app = FastAPI(title="名医辨证对照 demo")
+# 同时在跑的问诊数上限（/api/consult 与 /api/consult/stream 合计）。每条问诊
+# 占一根线程、十几次 LLM 调用、几十秒到几分钟；不设上限的话一个 for 循环里的
+# curl 就能开出几千根线程、把 API key 的额度烧光。这是部署侧的进程级设置
+# （跟 retriever_mode 那种逐请求的行为开关不是一回事），所以读环境变量没问题。
+MAX_CONCURRENT_CONSULTS = int(os.environ.get("MAX_CONCURRENT_CONSULTS", "4"))
+_consult_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONSULTS)
+
+# 主诉/追问回答的长度上限。主诉超过这个数几乎肯定是整篇病历粘进来了——
+# 一整段原样进 S1 的 prompt，费用随长度线性涨；而且 uvicorn 会把整个请求体
+# 读进内存，没有上限的话一个几百 MB 的 complaint 字段能直接把进程 OOM。
+MAX_COMPLAINT_CHARS = 2000
+MAX_ANSWER_CHARS = 500
 
 
-@app.on_event("startup")
 def _warmup() -> None:
     """启动时预热检索器，把首请求那几十秒（加载模型 + 编码 839 条医案）
     挪到启动阶段。失败不阻塞启动——没有 cases.json 时服务仍应能起来。"""
@@ -33,12 +51,43 @@ def _warmup() -> None:
         from core.retrieval import get_retriever
 
         get_retriever()._ensure_encoded()
-    except Exception as e:  # noqa: BLE001
-        print(f"[warmup] 检索器预热跳过：{e}")
+    except Exception as e:  # noqa: BLE001 - 预热失败只是没有预热，服务照常起
+        print(f"[warmup] 检索器预热跳过：{e}", file=sys.stderr)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """FastAPI 已把 on_event 标成 deprecated，改成 lifespan。预热是同步的
+    重 IO（加载模型、编码语料），丢进线程池跑而不是直接在事件循环上跑——
+    启动阶段本来也不对外服务，但直接阻塞循环会让 uvicorn 的信号处理一起卡住，
+    这段时间 Ctrl-C 都停不下来。"""
+    await run_in_threadpool(_warmup)
+    yield
+
+
+app = FastAPI(title="名医辨证对照 demo", lifespan=_lifespan)
+
+
+def _public_text(text: str) -> str:
+    """把要发给客户端的文字里的项目绝对路径抹掉。core 层的报错（`未找到
+    /home/xxx/data/element_index.json`）对命令行用户是有用信息，对匿名的 HTTP
+    调用方就是在泄露部署布局。只抹路径，文件名留着——用户要知道缺的是哪个文件。"""
+    return text.replace(str(ROOT) + "/", "").replace(str(ROOT), "<项目目录>")
+
+
+def _public_error_detail(exc: Exception) -> str:
+    """后台线程里的未预期异常，给客户端的只有异常类型和一个错误编号；完整内容
+    （LLMError 带着后端名、模型名、模型原始输出前 500 字，claude_cli 后端还带
+    子进程的整段 stderr）只打到服务端 stderr。之前是 str(e) 原样下发。
+    编号是为了让用户报障时能对上服务端那一行，不是安全措施。"""
+    error_id = secrets.token_hex(4)
+    print(f"[consult-error {error_id}] {exc!r}", file=sys.stderr)
+    traceback.print_exception(exc, file=sys.stderr)
+    return f"服务端处理失败（{type(exc).__name__}，错误编号 {error_id}），详细原因见服务端日志。"
 
 
 class ConsultRequest(BaseModel):
-    complaint: str
+    complaint: str = Field(min_length=1, max_length=MAX_COMPLAINT_CHARS)
     # 逐请求的检索模式。**刻意不做成服务端的全局设置**：RETRIEVER_MODE 那个
     # 环境变量是进程级的，一个请求设了它，同一进程里并发的另一个请求就跟着变了。
     # 这个字段一路作为函数参数传到检索层，任何时候都不写进程状态。
@@ -49,7 +98,10 @@ class ConsultRequest(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
+    """async def 而不是 def：同步端点跑在 anyio 的线程池里（默认 40 个槽），
+    几十条并发问诊把槽占满时，存活探针也跟着排队、超时，编排器会把一个其实
+    还活着的进程重启掉。这个端点不做任何 IO，直接在事件循环上答。"""
     return {"status": "ok"}
 
 
@@ -73,7 +125,7 @@ def api_trajectories(physician: str) -> dict:
     try:
         trajectories = load_trajectories()
     except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+        raise HTTPException(status_code=503, detail=_public_text(str(e))) from e
 
     return {"physician": physician, "trajectories": trajectories.get(physician, [])}
 
@@ -131,7 +183,7 @@ def api_graph() -> dict:
     if store is None:
         raise HTTPException(
             status_code=503,
-            detail=f"未找到 {GRAPH_PATH}。先跑 offline/build_graph.py 建图谱骨架。",
+            detail=_public_text(f"未找到 {GRAPH_PATH}。先跑 offline/build_graph.py 建图谱骨架。"),
         )
 
     stats = compute_stats(store)
@@ -150,8 +202,23 @@ def api_graph() -> dict:
     }
 
 
+def _acquire_consult_slot() -> threading.BoundedSemaphore:
+    """拿不到就 503 + Retry-After，不排队：排队的请求照样占着连接和线程池的槽，
+    客户端也不知道自己在等什么。返回拿到的那把信号量，调用方 release 的必须是
+    同一把（测试里会整个换掉模块级的那把）。"""
+    slots = _consult_slots
+    if not slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail=f"同时进行的问诊已达上限（{MAX_CONCURRENT_CONSULTS}），请稍后再试。",
+            headers={"Retry-After": "10"},
+        )
+    return slots
+
+
 @app.post("/api/consult")
 def api_consult(req: ConsultRequest) -> dict:
+    slots = _acquire_consult_slot()
     try:
         outcome = consult(req.complaint, retriever_mode=req.retriever_mode)
     except ValueError as e:
@@ -159,6 +226,8 @@ def api_consult(req: ConsultRequest) -> dict:
         # 从 consult() 冒到这里（consult 开头就校验了 retriever_mode，其余路径
         # 的检索问题都被包成 RetrievalUnavailable 走返回值，不抛异常）。
         raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        slots.release()
     return _consult_response(outcome)
 
 
@@ -173,87 +242,51 @@ def _consult_response(outcome: dict) -> dict:
     在两处实现，改一边会看不出会不会连带影响另一边）。
     """
     s1: S1Normalize = outcome["s1"]
+    # 四个分支返回**同一套键**：前端按同一份契约读，缺键就是 undefined 悄悄进渲染。
+    # core/chain.py 的七个返回点守着 14 键一致，这里是它上面那一层，同一条纪律。
+    base = {
+        "s1": s1.model_dump(),
+        "rejected": False,
+        "reject_reason": None,
+        # EVAL_MODE 下非空 = 这条主诉本该被安全层拦下，但评测模式让它跑完了。
+        # demo 模式下正常分支的它恒为 None（命中就走 rejected 分支了）。
+        "safety_flag": outcome.get("safety_flag"),
+        "retrieval_error": None,
+        "insufficient": False,
+        "insufficient_reason": None,
+        "coverage": outcome.get("coverage"),
+        "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
+        "residual": _serialize_residual(outcome.get("residual")),
+        # 拒绝也要带追问记录：被拦下来的原因可能正是追问问出来的，
+        # 只回一句"检测到危重症状"而不显示是哪一问问出来的，用户无从判断。
+        "followup": _serialize_followup(outcome.get("followup")),
+        "results": [],
+        "divergence": None,
+        "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
+        "manifest": outcome.get("manifest"),
+    }
 
     if outcome["rejected"]:
         # 安全否决命中：S2/S3 从未被调用，没有 results 可以拼图，直接返回空图。
-        return {
-            "s1": s1.model_dump(),
-            "rejected": True,
-            "reject_reason": outcome["reject_reason"],
-            "safety_flag": outcome.get("safety_flag"),
-            "retrieval_error": outcome.get("retrieval_error"),
-            "results": [],
-            "divergence": None,
-            "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
-            # 拒绝也要带追问记录：被拦下来的原因可能正是追问问出来的，
-            # 只回一句"检测到危重症状"而不显示是哪一问问出来的，用户无从判断。
-            "followup": _serialize_followup(outcome.get("followup")),
-            "manifest": outcome.get("manifest"),
-        }
+        return {**base, "rejected": True, "reject_reason": outcome["reject_reason"]}
 
     if outcome.get("retrieval_error"):
         # 选的检索模式这台机器上没有对应数据。单独一个分支而不是混进
         # insufficient：那个字段的意思是"你给的信息不够辨证"，这里是
         # "服务端这条检索路跑不起来"，混成一个会把服务端的问题说成用户的问题。
-        return {
-            "s1": s1.model_dump(),
-            "rejected": False,
-            "reject_reason": None,
-            "safety_flag": outcome.get("safety_flag"),
-            "retrieval_error": outcome["retrieval_error"],
-            "insufficient": False,
-            "insufficient_reason": None,
-            "coverage": outcome.get("coverage"),
-            "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
-            "residual": _serialize_residual(outcome.get("residual")),
-            "followup": _serialize_followup(outcome.get("followup")),
-            "results": [],
-            "divergence": None,
-            "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
-            "manifest": outcome.get("manifest"),
-        }
+        return {**base, "retrieval_error": _public_text(outcome["retrieval_error"])}
 
     if outcome.get("insufficient"):
-        return {
-            "s1": outcome["s1"].model_dump(),
-            "rejected": False,
-            "safety_flag": outcome.get("safety_flag"),
-            "retrieval_error": outcome.get("retrieval_error"),
-            "insufficient": True,
-            "insufficient_reason": outcome["insufficient_reason"],
-            "coverage": outcome.get("coverage"),
-            "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
-            "residual": _serialize_residual(outcome.get("residual")),
-            "followup": _serialize_followup(outcome.get("followup")),
-            "results": [],
-            "divergence": None,
-            "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
-            "manifest": outcome.get("manifest"),
-        }
+        return {**base, "insufficient": True, "insufficient_reason": outcome["insufficient_reason"]}
 
     results = outcome["results"]
-    residual = outcome.get("residual")
-    graph = to_graph(s1, results, outcome.get("s2"), residual)
+    graph = to_graph(s1, results, outcome.get("s2"), outcome.get("residual"))
     assert_graph_edges_valid(graph)
-
     return {
-        "s1": s1.model_dump(),
-        "rejected": False,
-        "reject_reason": None,
-        # EVAL_MODE 下非空 = 这条主诉本该被安全层拦下，但评测模式让它跑完了。
-        # demo 模式下这个分支的它恒为 None（命中就走上面 rejected 分支了）。
-        "safety_flag": outcome.get("safety_flag"),
-        "retrieval_error": outcome.get("retrieval_error"),
+        **base,
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
-        "insufficient": False,
-        "insufficient_reason": None,
-        "coverage": outcome.get("coverage"),
-        "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
-        "residual": _serialize_residual(residual),
-        "followup": _serialize_followup(outcome.get("followup")),
         "graph": graph,
-        "manifest": outcome.get("manifest"),
     }
 
 
@@ -280,8 +313,104 @@ def _consult_response(outcome: dict) -> dict:
 # 不必给每个问题各开一个。
 
 ANSWER_TIMEOUT_SECONDS = 300  # 没人回答时的兜底：不能让后台线程无限期挂着
-_answer_queues: dict[str, queue.Queue] = {}
-_answer_queues_lock = threading.Lock()
+_STREAM_POLL_SECONDS = 0.05  # 生成器轮询事件队列的间隔，见 _ConsultStream 文档
+
+
+class StreamClosed(Exception):
+    """客户端已经断开，后台线程没必要再往下跑。在 on_step/ask_fn 里抛出，
+    consult() 不认识它、不会捕获，会一路冒到 worker 的兜底 except——那里把它
+    当"正常提前结束"处理，不发 error 事件（也没人读了）。取消的粒度是
+    "下一次回调"，即最多再跑完当前这一次 LLM 调用；线程没法从外面杀。"""
+
+
+class _ConsultStream:
+    """一次 SSE 问诊的后台线程和 HTTP 生成器之间的桥。三样东西：
+
+    events_q  ——后台线程往里塞进度事件，生成器读出来转成 SSE 帧。
+    cancel    ——生成器一结束（客户端断开、或正常收尾）就置位；后台线程的每次
+                回调都先看它，置位就抛 StreamClosed 提前结束，不再花 LLM 调用。
+                之前没有这条路：标签页一关，后台线程照样把 S1→S3 全跑完、
+                每次调用照样计费，遇到追问还要傻等满 300 秒。
+    pending   ——**只在有一个问题正在等回答时**才非 None 的答案队列，容量 1，
+                每个问题一条新队列。之前是整条流共用一条、流一开就登记，带来
+                两个问题：(1) 还没提问就能往里塞答案，下一个问题一问出来立刻
+                被这个预先塞的答案"回答"了；(2) 上一问超时之后迟到的答案会
+                留在队列里，喂给下一问——追问「有没有便血」如果吃到上一问的
+                「有」，会凭空触发一次安全否决。
+
+    生成器是 async 的、用 get_nowait + sleep 轮询而不是 iterate_in_threadpool
+    阻塞在 events_q.get() 上：后者会让每条开着的流长期占一个线程池的槽（默认
+    40 个），几十条流就把 /health 一起饿死；而且 to_thread 里的阻塞 get 不可
+    取消，客户端断开后 Starlette 的取消要等到下一个事件才生效。轮询 50ms 的
+    延迟对人看进度没有区别。
+    """
+
+    def __init__(self, stream_id: str, slots: threading.BoundedSemaphore) -> None:
+        self.stream_id = stream_id
+        self.events_q: queue.Queue = queue.Queue()
+        self.cancel = threading.Event()
+        self._slots = slots
+        self._pending: queue.Queue | None = None
+        self._pending_lock = threading.Lock()
+
+    # ---- 后台线程侧（consult 的回调）----
+
+    def emit(self, name: str, data: dict) -> None:
+        if self.cancel.is_set():
+            raise StreamClosed()
+        self.events_q.put((name, data))
+
+    def ask(self, question: str) -> str | None:
+        answer_q: queue.Queue = queue.Queue(maxsize=1)
+        with self._pending_lock:
+            self._pending = answer_q
+        try:
+            # 先登记再发 need_input：客户端收到事件时答案一定已经有地方接
+            self.emit("need_input", {"question": question})
+            deadline = time.monotonic() + ANSWER_TIMEOUT_SECONDS
+            while True:
+                if self.cancel.is_set():
+                    raise StreamClosed()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # AskFn 的既有契约（core/followup.py）：返回 None = 提问方不打算
+                    # 回答。这里的"不打算"是等到超时，对下游来说是同一件事——
+                    # 这个问题问不出答案了，不需要为"超时"另开一条分支。
+                    return None
+                try:
+                    answer = answer_q.get(timeout=min(1.0, remaining))
+                    break
+                except queue.Empty:
+                    continue  # 每秒醒一次看 cancel，不然断开后要等满 300 秒
+        finally:
+            with self._pending_lock:
+                self._pending = None
+        self.emit("followup_answered", {"question": question, "answer": answer})
+        return answer
+
+    # ---- HTTP 侧 ----
+
+    def deliver_answer(self, answer: str) -> bool:
+        """False = 当前没有问题在等回答（还没问、已超时、或已经答过）。"""
+        with self._pending_lock:
+            q = self._pending
+            if q is None:
+                return False
+            try:
+                q.put_nowait(answer)
+            except queue.Full:
+                return False
+            return True
+
+    def finish(self) -> None:
+        self.events_q.put((None, None))  # 哨兵：告诉生成器可以收工了
+        self._slots.release()
+        with _streams_lock:
+            _streams.pop(self.stream_id, None)
+
+
+_streams: dict[str, _ConsultStream] = {}
+_streams_lock = threading.Lock()
 
 
 def _sse(event: str, data: dict) -> str:
@@ -296,69 +425,68 @@ def api_consult_stream(req: ConsultRequest) -> StreamingResponse:
     把同一个判断连同错误文案实现两遍。worker 里 consult() 抛的 ValueError 会
     被兜成 error 事件，消息跟 400 那条完全一样，前端的 error 分支照样能显示。
     """
-    stream_id = secrets.token_urlsafe(12)
-    events_q: queue.Queue = queue.Queue()
-    answer_q: queue.Queue = queue.Queue()
-    with _answer_queues_lock:
-        _answer_queues[stream_id] = answer_q
-
-    def stream_ask_fn(question: str) -> str | None:
-        events_q.put(("need_input", {"question": question}))
-        try:
-            answer = answer_q.get(timeout=ANSWER_TIMEOUT_SECONDS)
-        except queue.Empty:
-            # AskFn 的既有契约（core/followup.py）：返回 None = 提问方不打算
-            # 回答。这里的"不打算"是等到超时，不是真的有人主动关掉了对话框，
-            # 但对下游（run_followup / run_physician）来说是同一件事——这个
-            # 问题问不出答案了，不需要为"超时"另开一条分支。
-            return None
-        events_q.put(("followup_answered", {"question": question, "answer": answer}))
-        return answer
+    slots = _acquire_consult_slot()
+    stream = _ConsultStream(secrets.token_urlsafe(12), slots)
+    with _streams_lock:
+        _streams[stream.stream_id] = stream
 
     def worker() -> None:
         try:
             outcome = consult(
                 req.complaint,
-                ask_fn=stream_ask_fn,
-                on_step=lambda name, data: events_q.put((name, data)),
+                ask_fn=stream.ask,
+                on_step=stream.emit,
                 retriever_mode=req.retriever_mode,
             )
-            events_q.put(("done", _consult_response(outcome)))
+            stream.events_q.put(("done", _consult_response(outcome)))
+        except StreamClosed:
+            pass  # 客户端已断开，没人读了，正常提前结束
+        except ValueError as e:
+            # 跟 /api/consult 的 400 同一类：请求本身写错（模式名不认识），
+            # 消息是给用户看的、不含内部信息，原样发
+            stream.events_q.put(("error", {"detail": str(e)}))
         except Exception as e:  # noqa: BLE001 - 后台线程的异常不会自己冒泡到 HTTP
             # 响应里，必须在这兜住转成一个 error 事件；不然客户端只会看到连接
             # 挂在那不动，什么错误信息都拿不到。
-            events_q.put(("error", {"detail": str(e)}))
+            stream.events_q.put(("error", {"detail": _public_error_detail(e)}))
         finally:
-            events_q.put((None, None))  # 哨兵：告诉下面的生成器可以收工了
-            with _answer_queues_lock:
-                _answer_queues.pop(stream_id, None)
+            stream.finish()
 
     threading.Thread(target=worker, daemon=True).start()
 
-    def gen() -> Iterator[str]:
-        yield _sse("stream_id", {"stream_id": stream_id})
-        while True:
-            name, data = events_q.get()
-            if name is None:
-                return
-            yield _sse(name, data)
+    async def gen() -> AsyncIterator[str]:
+        try:
+            yield _sse("stream_id", {"stream_id": stream.stream_id})
+            while True:
+                try:
+                    name, data = stream.events_q.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(_STREAM_POLL_SECONDS)
+                    continue
+                if name is None:
+                    return
+                yield _sse(name, data)
+        finally:
+            # 正常收尾时后台线程早已结束，置位无害；客户端断开时 Starlette 取消
+            # 这个生成器、走到这里，后台线程下一次回调就会看到并退出。
+            stream.cancel.set()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 class ConsultStreamAnswer(BaseModel):
-    answer: str
+    answer: str = Field(max_length=MAX_ANSWER_CHARS)
 
 
 @app.post("/api/consult/stream/{stream_id}/answer")
 def api_consult_stream_answer(stream_id: str, req: ConsultStreamAnswer) -> dict:
-    with _answer_queues_lock:
-        q = _answer_queues.get(stream_id)
-    if q is None:
-        # 两种情况都会落到这——stream_id 写错，或者这个 stream 已经跑完/当前
-        # 没有待回答的问题。404 而不是静默忽略：前端要知道这次回答没地方接。
+    with _streams_lock:
+        stream = _streams.get(stream_id)
+    if stream is None or not stream.deliver_answer(req.answer):
+        # 三种情况都落到这——stream_id 写错、这个 stream 已经跑完、或者当前
+        # 没有待回答的问题（还没问 / 已超时 / 刚才已经答过）。404 而不是静默
+        # 忽略：前端要知道这次回答没地方接。
         raise HTTPException(status_code=404, detail="stream 不存在，或当前没有待回答的问题")
-    q.put(req.answer)
     return {"ok": True}
 
 
@@ -435,18 +563,16 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
 
     # layer 0 症状：「已解释」用 core.chain.explained_symptoms 这一处实现——S2 全局共享，
     # 各医家的 r["s2"] 是同一份，这里不再各自汇总一遍
-    from core.chain import explained_symptoms as _explained
-
     if s2 is None and results:
         s2 = results[0]["s2"]  # S2 全局共享，各医家拿到的是同一份
-    explained_symptoms: set[str] = _explained(s1, s2) if s2 is not None else set()
+    explained: set[str] = explained_symptoms(s1, s2) if s2 is not None else set()
 
     # 「已解释」的判据只有 core.chain.explained_symptoms 一处（上面），这里不再
     # 叠一层对 unexplained_symptoms 的处理——叠了就会跟 coverage、残差报的数打架。
     residual_explained = set((residual or {}).get("newly_explained") or [])
 
     for sym in s1.symptoms:
-        if sym in explained_symptoms:
+        if sym in explained:
             state = "explained"
         elif sym in residual_explained:
             state = "residual"  # 初轮没解释，残差辨证补上了

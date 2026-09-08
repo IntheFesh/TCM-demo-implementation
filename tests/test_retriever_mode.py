@@ -178,8 +178,10 @@ def test_concurrent_consults_do_not_leak_modes(monkeypatch):
 
     t1 = threading.Thread(target=run, args=("bm25",), name="T-bm25")
     t2 = threading.Thread(target=run, args=("graph",), name="T-graph")
-    t1.start(); t2.start()
-    t1.join(timeout=15); t2.join(timeout=15)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
 
     assert not errors, errors
     assert seen["T-bm25"] == ["bm25", "bm25"], seen
@@ -249,3 +251,27 @@ def test_allowed_modes_come_from_the_retrieval_layer():
     from core.retrieval_hybrid import ALLOWED_MODES
 
     assert chain.ALLOWED_MODES is ALLOWED_MODES
+
+
+def test_default_mode_unavailable_does_not_suggest_switching_to_default(monkeypatch, tmp_path):
+    """真实冒烟踩到的：沙箱没有 cases.json，默认模式自己就跑不了，文案却还说
+    "换用默认模式可以正常辨证"。只有显式选了别的模式才该这么建议。"""
+    from core import chain
+    from core.retrieval import Retriever
+
+    class Missing(Retriever):
+        def search(self, *a, **kw):
+            raise FileNotFoundError("未找到 cases.json。")
+
+    from tests.test_chain import _s3
+    fake_llm = FakeLLM({"叶天士": _s3("脾胃气虚", ["党参"], "ye_tianshi-001"),
+                        "吴鞠通": _s3("脾胃气虚", ["党参"], "wu_jutong-001")})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: Missing())
+
+    default = chain.consult("纳差乏力")["retrieval_error"]
+    assert "换用默认模式" not in default
+    assert "哪个模式都跑不了" in default
+
+    explicit = chain.consult("纳差乏力", retriever_mode="bm25")["retrieval_error"]
+    assert "换用默认模式" in explicit

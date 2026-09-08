@@ -79,7 +79,7 @@ def test_describe_progress_event_returns_null_for_transport_level_events():
         for n in ["stream_id", "need_input", "done", "error"]
     )
     out = _run_node(js).strip().splitlines()
-    assert [json.loads(l) for l in out] == [None, None, None, None]
+    assert [json.loads(line) for line in out] == [None, None, None, None]
 
 
 # ---------- readSSE ----------
@@ -211,3 +211,41 @@ def test_request_body_survives_a_page_without_the_selector():
     process.stdout.write(JSON.stringify(buildConsultRequestBody("纳差")));
     """
     assert json.loads(_run_node(js)) == {"complaint": "纳差"}
+
+
+# ---------- 企业化整改：XSS 与 EVAL_MODE 横幅 ----------
+
+
+def test_card_html_escapes_hallucinated_case_ids():
+    """hallucinated 里的 id 是模型原样吐出来的字符串（core/chain.py 里
+    cited_case_ids 减去检索结果），之前是整个卡片里唯一一处没过 escapeHtml
+    就进 innerHTML 的插值——恰恰因为它是"不可信输出"的警告。"""
+    result = {
+        "physician": "ye_tianshi", "physician_name": "叶天士",
+        "s3": {"syndrome": "脾虚", "reasoning": "r", "treatment_principle": "t",
+               "herbs": ["党参"], "cited_case_ids": ["<img src=x onerror=alert(1)>"]},
+        "hallucinated": ["<img src=x onerror=alert(1)>"],
+        "refs": [],
+    }
+    js = f"process.stdout.write(cardHtml({json.dumps(result, ensure_ascii=False)}));"
+    out = _run_node(js)
+    assert "<img" not in out
+    assert "&lt;img src=x onerror=alert(1)&gt;" in out
+
+
+def test_escape_html_also_escapes_quotes():
+    js = 'process.stdout.write(escapeHtml(`a"b\'c<d>&e`));'
+    assert _run_node(js) == "a&quot;b&#39;c&lt;d&gt;&amp;e"
+
+
+def test_describe_safety_flag():
+    """safety_flag 非空 = 服务端开着 EVAL_MODE、这条主诉本该被拦。之前 JSON 里
+    带着这个字段但页面上什么都不显示，方药照常开。"""
+    js = """
+    process.stdout.write(JSON.stringify([
+      describeSafetyFlag(null), describeSafetyFlag(""), describeSafetyFlag("柏油样便"),
+    ]));
+    """
+    out = json.loads(_run_node(js))
+    assert out[0] is None and out[1] is None
+    assert "EVAL_MODE" in out[2] and "柏油样便" in out[2] and "不产出任何方药" in out[2]

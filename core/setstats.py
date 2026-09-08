@@ -29,9 +29,9 @@ def jaccard_distance(a: set, b: set) -> float:
 
 
 def _percentile(sorted_values: list[float], q: float) -> float:
-    """最近邻插值分位数。不引入 numpy/scipy：这个项目的 requirements.txt 里没有
-    它们（SDT 评测的 pandas 是评测环境的隐式依赖，不是我们主动要的），
-    为了算一个分位数不值得加一个新依赖。"""
+    """最近邻插值分位数。不引入 scipy（requirements.txt 里没有）；numpy 虽然在
+    依赖里（检索层用），但这个模块要在 eval/ 的纯 Python 路径上也能跑，
+    为了算一个分位数不值得让它多一个重依赖。"""
     if not sorted_values:
         return 0.0
     idx = min(len(sorted_values) - 1, max(0, round(q * (len(sorted_values) - 1))))

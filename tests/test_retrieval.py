@@ -1,5 +1,4 @@
 """core/retrieval.py 的离线测试：只测不需要下载 embedding 模型的部分。"""
-from pathlib import Path
 
 import pytest
 

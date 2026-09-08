@@ -178,7 +178,7 @@ def collect_segments(pid, cfg, books_dir=".", max_len=1500):
         # 不走 chunk_chapter，TAIL 规则（丢弃 <篇名>/<目录>/编者按语行）要在这里补上，
         # 否则 43 段每段正文第一行都是 "<篇名>1．……" 这种结构标记
         chunks = [
-            [l for l in body.split("\n") if not TAIL.match(l.strip())]
+            [line for line in body.split("\n") if not TAIL.match(line.strip())]
             for _, body in secs
         ]
     elif cfg.get("concat_gates"):
@@ -219,10 +219,9 @@ PATIENT_MARKER = "属性"
 
 def structural_patient_check(segments):
     """数每段里的 属性： 行。返回 (恰好 1 个的段数, 总段数, 分布)。"""
-    from collections import Counter as _C
 
     counts = [seg["text"].count(PATIENT_MARKER) for seg in segments]
-    return sum(1 for c in counts if c == 1), len(counts), dict(_C(counts))
+    return sum(1 for c in counts if c == 1), len(counts), dict(Counter(counts))
 
 
 def print_segment_stats(pid, segments, cfg=None):

@@ -37,10 +37,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.retrieval import MIN_RETRIEVAL_SCORE
+# ε 文件的路径和读法只在 core/chain.py 一处：这里之前有一份逐字相同的拷贝
+from core.chain import EPSILON_PATH, load_epsilon_online
 from eval.mcnemar import mcnemar_test, paired_outcomes_to_bc
 
 ROOT = Path(__file__).resolve().parent.parent
-EPSILON_PATH = ROOT / "eval" / "epsilon.json"
 DEFAULT_QUERIES_PATH = ROOT / "tests" / "queries.txt"
 DEFAULT_REPORT_JSON_PATH = ROOT / "eval" / "report.json"
 DEFAULT_REPORT_MD_PATH = ROOT / "eval" / "report.md"
@@ -220,16 +221,6 @@ def retrieval_mode_comparison(
 # ---------- 汇总与报告 ----------
 
 
-def _load_epsilon_online() -> float | None:
-    if not EPSILON_PATH.exists():
-        return None
-    try:
-        data = json.loads(EPSILON_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return (data.get("epsilon_online") or {}).get("mean")
-
-
 def build_report(
     consult_results: list[dict],
     retrieval_comparisons: list[dict] | None = None,
@@ -237,7 +228,7 @@ def build_report(
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "n_queries": len(consult_results),
-        "divergence_vs_epsilon": divergence_vs_epsilon(consult_results, _load_epsilon_online()),
+        "divergence_vs_epsilon": divergence_vs_epsilon(consult_results, load_epsilon_online()),
         "hallucination": hallucination_by_reference_availability(consult_results),
         "safety_veto": safety_veto_summary(consult_results),
         "retrieval_mode_comparisons": retrieval_comparisons or [],
@@ -281,7 +272,7 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     queries = [
-        l.strip() for l in args.queries_path.read_text(encoding="utf-8").splitlines() if l.strip()
+        line.strip() for line in args.queries_path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
     if args.limit is not None:
         queries = queries[: args.limit]
@@ -293,10 +284,14 @@ def main(argv: list[str] | None = None) -> None:
               "含 2 位医家 S3、配伍禁忌可能重开），不真的调用")
         return
 
-    from core.chain import consult
+    from core.chain import consult_many
 
-    results = [consult(q) for q in queries]
-    report = build_report(results)
+    results, failures = consult_many(queries)
+    report = build_report([r for r in results if r is not None])
+    # 失败的主诉进报告而不是只打在终端：n_queries 少了几条要能从报告本身看出来
+    report["failed_queries"] = failures
+    if failures:
+        print(f"注意：{len(failures)}/{len(queries)} 条主诉失败，已写进 report.json 的 failed_queries")
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")

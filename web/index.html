@@ -195,6 +195,9 @@
     white-space: pre-wrap;
   }
   #error-box.show { display: block; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; }
+  /* EVAL_MODE 旁路了安全否决时的横幅：不能只在 JSON 里带个 safety_flag 字段、页面上看不出来 */
+  #safety-flag-note { display: none; margin: 8px 0; padding: 10px 12px; border: 2px solid #B91C1C; background: #FEF2F2; color: #7F1D1D; font-size: 13px; border-radius: 6px; }
+  #safety-flag-note.show { display: block; }
   #results {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -493,6 +496,7 @@
 <div id="tab-consult" class="tab-panel">
   <div id="divergence-banner"></div>
   <div id="error-box"></div>
+  <div id="safety-flag-note"></div>
 
   <div id="graph-panel">
     <div id="graph-toolbar">
@@ -1478,7 +1482,7 @@ function cardHtml(result) {
   const color = PHYSICIAN_COLORS[result.physician] || "#333";
   const s3 = result.s3;
   const hallucinationHtml = result.hallucinated && result.hallucinated.length > 0
-    ? `<div class="hallucination-warning">⚠ 检测到可能的幻觉引用：模型引用了检索结果之外的医案 id（${result.hallucinated.join("、")}），请勿采信该结论中的引用。</div>`
+    ? `<div class="hallucination-warning">⚠ 检测到可能的幻觉引用：模型引用了检索结果之外的医案 id（${escapeHtml(result.hallucinated.join("、"))}），请勿采信该结论中的引用。</div>`
     : "";
 
   // X2：incompatible 非空说明重开一次之后仍有禁忌，这时红标签必须显示——
@@ -1545,11 +1549,15 @@ function westernDrugsHtml(s3) {
 }
 
 function escapeHtml(str) {
+  // 引号也转：这个函数的输出偶尔会被放进属性值里（title="..."），只转尖括号
+  // 的话一个带引号的医案 id 就能从属性里逃出来。
   if (str === null || str === undefined) return "";
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function renderResults(results) {
@@ -1567,6 +1575,7 @@ function resetSecondaryPanels() {
     const el = document.getElementById(id);
     if (el) { el.textContent = ""; el.style.display = "none"; }
   }
+  renderSafetyFlag(null);
   const footer = document.getElementById("manifest-footer");
   if (footer) footer.textContent = "";
 }
@@ -1598,6 +1607,23 @@ function showError(message) {
   const box = document.getElementById("error-box");
   box.textContent = message;
   box.classList.add("show");
+}
+
+function describeSafetyFlag(flag) {
+  // safety_flag 非空 = 服务端开着 EVAL_MODE，这条主诉本该在辨证前被拦下、
+  // 不产出任何方药，但评测模式让它跑完了。README 说"不要在对外演示的机器上
+  // 打开"，可是之前页面上完全看不出来它开着——结果照常显示、方药照常开。
+  // 返回 null 表示不需要横幅。
+  if (!flag) return null;
+  return `⚠ 评测模式（EVAL_MODE）已开启：这条主诉命中了安全否决（${flag}），正常情况下会在辨证前被拦截、不产出任何方药。下面的结果只用于评测，不要用于演示或作为参考。`;
+}
+
+function renderSafetyFlag(flag) {
+  const box = document.getElementById("safety-flag-note");
+  if (!box) return;
+  const text = describeSafetyFlag(flag);
+  box.textContent = text || "";
+  box.classList.toggle("show", !!text);
 }
 
 function clearError() {
@@ -1649,6 +1675,7 @@ function renderConsultResult(data) {
     renderGraph(data.graph);
     return;
   }
+  renderSafetyFlag(data.safety_flag);
   PHYSICIAN_COLORS = {};
   PHYSICIAN_NAMES = {};
   for (const r of data.results) {

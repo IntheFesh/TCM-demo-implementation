@@ -1,0 +1,31 @@
+# 每次 push / PR 跑一遍 tests/ 和 lint。tests/ 的性质是"不需要网络、不需要 API key、
+# 秒级跑完"（CLAUDE.md），所以这里不配任何 secret；需要真实 LLM 的评测在 eval/，
+# 不进 CI。data/graph.json 是 gitignore 的生成物，tests/conftest.py 缺了会现建。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install (CPU torch first so sentence-transformers does not pull the CUDA build)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt ruff
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: python -m pytest -q -p no:cacheprovider

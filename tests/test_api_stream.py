@@ -246,7 +246,14 @@ def test_ask_fn_returns_none_when_answer_times_out(monkeypatch):
 # ---------- 异常与资源清理 ----------
 
 
-def test_exception_in_worker_becomes_error_event(monkeypatch):
+def test_exception_in_worker_becomes_error_event(monkeypatch, capsys):
+    """契约变更（企业化整改）：error 事件的 detail 不再是 str(e) 原样下发。
+    LLMError 的文本带着后端名、模型名、模型原始输出前 500 字，claude_cli 后端
+    还带子进程整段 stderr——对匿名 HTTP 调用方就是泄露。现在客户端拿到的是
+    异常类型 + 错误编号，完整异常只打到服务端 stderr，两边靠编号对上。
+    之前这里断言的是 "LLM 后端挂了" in detail，那条断言现在反过来：原文
+    **不能**出现在 detail 里。"""
+
     def fake_consult(complaint, ask_fn=None, on_step=None, **kw):
         on_step("s1_done", {"symptoms": ["纳差"]})
         raise RuntimeError("LLM 后端挂了")
@@ -261,8 +268,32 @@ def test_exception_in_worker_becomes_error_event(monkeypatch):
         events.append(out_q.get())
     names = [e[0] for e in events]
     assert names == ["stream_id", "s1_done", "error"]
-    error_data = next(d for name, d in events if name == "error")
-    assert "LLM 后端挂了" in error_data["detail"]
+    detail = next(d for name, d in events if name == "error")["detail"]
+    assert "LLM 后端挂了" not in detail, "异常原文不该下发给客户端"
+    assert "RuntimeError" in detail and "错误编号" in detail
+    error_id = detail.split("错误编号 ")[1].split("）")[0]
+    # 服务端 stderr 上有同一个编号 + 原文，运维凭编号能对上
+    err = capsys.readouterr().err
+    assert f"[consult-error {error_id}]" in err and "LLM 后端挂了" in err
+
+
+def test_user_facing_value_error_is_passed_through_unchanged(monkeypatch):
+    """模式名不认识那条 ValueError 是用户的请求写错，文案是给用户看的、不含
+    内部信息，跟 /api/consult 的 400 一字不差地发——不能被上面那条脱敏规则
+    误伤成"服务端处理失败"。"""
+
+    def fake_consult(complaint, ask_fn=None, on_step=None, **kw):
+        raise ValueError("未知的 retriever_mode：'没有这个模式'")
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+    out_q: queue.Queue = queue.Queue()
+    _read_stream_into(client, "纳差", out_q)
+    events = []
+    while not out_q.empty():
+        events.append(out_q.get())
+    detail = next(d for name, d in events if name == "error")["detail"]
+    assert detail == "未知的 retriever_mode：'没有这个模式'"
 
 
 def test_stream_id_is_removed_after_stream_finishes(monkeypatch):
@@ -281,3 +312,129 @@ def test_stream_id_is_removed_after_stream_finishes(monkeypatch):
 
     resp = client.post(f"/api/consult/stream/{stream_id}/answer", json={"answer": "有"})
     assert resp.status_code == 404
+
+
+# ---------- _ConsultStream：答案只在有问题挂起时才收，断开就取消 ----------
+
+
+def _bridge() -> api_main._ConsultStream:
+    sem = threading.BoundedSemaphore(1)
+    sem.acquire()
+    return api_main._ConsultStream("test-stream", sem)
+
+
+def _drain(q: queue.Queue) -> list:
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except queue.Empty:
+            return out
+
+
+def test_answer_before_any_question_is_rejected():
+    """之前流一开就登记答案队列，还没提问就能往里塞答案，下一个问题一问出来
+    立刻被这个预先塞的答案"回答"——外人拿到 stream_id 就能替用户答追问。"""
+    s = _bridge()
+    assert s.deliver_answer("有") is False
+
+
+def test_stale_answer_after_timeout_never_reaches_the_next_question(monkeypatch):
+    """第一问超时之后迟到的答案不能留着喂给第二问。追问「有没有便血」如果吃到
+    上一问的「有」，会凭空触发一次安全否决。"""
+    monkeypatch.setattr(api_main, "ANSWER_TIMEOUT_SECONDS", 0.2)
+    s = _bridge()
+    assert s.ask("有没有便血？") is None  # 没人答，超时
+    assert s.deliver_answer("有") is False, "问题已经超时，迟到的答案没地方接"
+
+    def answer_second_question_with_no():
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if s.deliver_answer("没有"):
+                return
+            time.sleep(0.01)
+
+    t = threading.Thread(target=answer_second_question_with_no, daemon=True)
+    t.start()
+    assert s.ask("有没有口苦？") == "没有"
+    t.join(3)
+    answered = [d for name, d in _drain(s.events_q) if name == "followup_answered"]
+    assert answered == [{"question": "有没有口苦？", "answer": "没有"}]
+
+
+def test_second_answer_to_the_same_question_is_rejected():
+    s = _bridge()
+    got = {}
+
+    def ask():
+        got["answer"] = s.ask("有没有口苦？")
+
+    t = threading.Thread(target=ask, daemon=True)
+    t.start()
+    deadline = time.time() + 3
+    while time.time() < deadline and not s.deliver_answer("有"):
+        time.sleep(0.01)
+    t.join(3)
+    assert got["answer"] == "有"
+    assert s.deliver_answer("没有") is False, "同一个问题答过一次之后不该再收"
+
+
+def test_cancel_unblocks_a_pending_question_with_stream_closed(monkeypatch):
+    """客户端断开后不能让后台线程傻等满 ANSWER_TIMEOUT_SECONDS（300 秒）。"""
+    monkeypatch.setattr(api_main, "ANSWER_TIMEOUT_SECONDS", 300)
+    s = _bridge()
+    result = {}
+
+    def ask():
+        try:
+            s.ask("有没有口苦？")
+        except api_main.StreamClosed:
+            result["closed"] = True
+
+    t = threading.Thread(target=ask, daemon=True)
+    t.start()
+    time.sleep(0.1)
+    s.cancel.set()
+    t.join(3)
+    assert not t.is_alive() and result.get("closed") is True
+
+
+def test_emit_after_cancel_raises_stream_closed():
+    s = _bridge()
+    s.cancel.set()
+    with pytest.raises(api_main.StreamClosed):
+        s.emit("s1_done", {"symptoms": []})
+
+
+def test_client_disconnect_stops_the_worker(monkeypatch, live_server):
+    """标签页一关，后台线程要在下一次回调就停下来，不能把 S1→S3 全跑完、每次
+    LLM 调用照样计费。要真实 socket：断开这件事只有真实连接能发生。"""
+    steps: list[int] = []
+    finished = threading.Event()
+    closed = {}
+
+    def fake_consult(complaint, ask_fn=None, on_step=None, **kw):
+        try:
+            for i in range(200):
+                on_step("react_step", {"step": i})
+                steps.append(i)
+                time.sleep(0.02)
+        except api_main.StreamClosed:
+            closed["yes"] = True
+            raise
+        finally:
+            finished.set()
+        return _fake_outcome()
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+
+    with httpx.stream("POST", f"{live_server}/api/consult/stream",
+                      json={"complaint": "纳差"}, timeout=10) as resp:
+        for line in resp.iter_lines():
+            if line.startswith("event: react_step"):
+                break
+    # 退出 with 块 = 客户端关掉连接
+
+    assert finished.wait(3), "客户端断开 3 秒后后台线程还在跑——取消没有生效"
+    assert closed.get("yes") is True
+    assert len(steps) < 200

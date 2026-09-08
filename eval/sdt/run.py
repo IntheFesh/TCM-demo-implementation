@@ -16,7 +16,7 @@ from pathlib import Path
 
 from core.safety import safety_bypassed
 from eval.sdt.adapter import SOLVERS
-from eval.sdt.data import attach_gold, load_split, read_gold, write_submission
+from eval.sdt.data import load_split, write_submission
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -41,7 +41,9 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     records = load_split(args.sdt_dir, args.split)
-    attach_gold(records, read_gold(args.sdt_dir, args.split, strip_bom=True))
+    # 不在这里 attach_gold：solver 只读 clinical_data 和选项，金标准谁也不看，
+    # 白读一遍不说，Results/*.txt 缺失还会让整次跑直接挂。金标准是官方
+    # evaluate.py 计分时用的，不是生成答案时用的。
     if args.only_ids:
         wanted = {x.strip() for x in args.only_ids.split(",") if x.strip()}
         missing = wanted - {r.record_id for r in records}

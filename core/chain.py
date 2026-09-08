@@ -14,12 +14,15 @@ S1 必须只跑一次：如果对每位医家各跑一次，两次输出的症�
 """
 from __future__ import annotations
 
+import hashlib
+import sys
+
 import json
 import time
 from pathlib import Path
 
 from core import herbs as _herbs
-from core.elements import ELEMENTS, LOCATIONS, NATURES
+from core.elements import LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
 from core.followup import (
     AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
@@ -28,7 +31,7 @@ from core.physicians import PHYSICIANS
 from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
 from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
 from core.retrieval_hybrid import ALLOWED_MODES
-from core.safety import check_safety, mentions_danger, safety_bypassed
+from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
 from core.safety_output import (
     check_incompatible,
     check_thermal_consistency,
@@ -48,7 +51,7 @@ from core.schemas import (
 EPSILON_PATH = Path(__file__).resolve().parent.parent / "eval" / "epsilon.json"
 
 
-def _load_epsilon_online() -> float | None:
+def load_epsilon_online() -> float | None:
     if not EPSILON_PATH.exists():
         return None
     try:
@@ -91,14 +94,11 @@ class RetrievalUnavailable(Exception):
 # 结果两位医家共用——这比原方案（每位医家各跑一轮）省一半调用，也更一致。
 RESIDUAL_MIN_COUNT = 2
 RESIDUAL_THRESHOLD = 0.30
-RESIDUAL_MAX_ROUNDS = 1
 
 
 # 药名归一挪到 core/herbs.py 了：core/safety_output.py 也要用它，留在这里会
-# 造成 chain ↔ safety_output 循环导入。这里 re-export，老调用方不受影响。
-HERB_ALIASES = _herbs.HERB_ALIASES
+# 造成 chain ↔ safety_output 循环导入。这里只留本模块真正用到的两个名字。
 normalize_herb = _herbs.normalize_herb
-strip_dose = _herbs.strip_dose
 split_western_drugs = _herbs.split_western_drugs
 
 
@@ -318,16 +318,12 @@ def run_physician(
         if trace.terminated_by == "ask_user" and trace.pending_question and ask_fn is not None:
             answer = ask_fn(trace.pending_question)
             if answer is not None:
-                reject = check_safety([answer])
-                # 跟 G3 追问同一条判据：模型问的本身是危重症状（「有没有便血？」）时，
-                # 只有明确否认才放行。答「有」「是的」「有一点」都要拦——回答原文里
-                # 没有危重词，check_safety 单独看它是放行的。
-                asked = mentions_danger(trace.pending_question)
-                if reject is None and asked and parse_answer(answer) != "no":
-                    reject = (
-                        f"检测到危重症状信号（{asked}），本 demo 不适用于此类情况，"
-                        "请立即就医或拨打急救电话，本次不提供辨证结果。"
-                    )
+                # 回答先过 check_safety；问的本身是危重症状而患者没有明确否认时也拦
+                # （「有没有便血？」→「有」）。后一条判据跟 G3 追问共用
+                # core.safety.danger_confirmed_by_answer，不在这里另写一套。
+                reject = check_safety([answer]) or danger_confirmed_by_answer(
+                    trace.pending_question, parse_answer(answer)
+                )
                 if reject is not None:
                     if not bypass_safety:
                         raise SafetyVeto(reject, llm_calls=trace.llm_calls)
@@ -394,11 +390,8 @@ def run_physician(
 def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
-    import hashlib
-    from pathlib import Path as _P
-
     cases_sha = None
-    cp = _P(__file__).resolve().parent.parent / "cases.json"
+    cp = Path(__file__).resolve().parent.parent / "cases.json"
     if cp.exists():
         cases_sha = hashlib.sha256(cp.read_bytes()).hexdigest()[:12]
 
@@ -691,8 +684,11 @@ def consult(
             "safety_flag": safety_flag,
             "retrieval_error": (
                 f"检索模式「{e.mode}」在这台机器上不可用：{e.detail} "
-                "换用默认模式可以正常辨证；本次没有降级到别的模式跑，"
-                "是为了不让你以为看到的是这个模式的结果。"
+                # 真实冒烟里踩到的：默认模式本身跑不了（没有 cases.json）时还建议
+                # "换用默认模式"，等于指一条不存在的路。显式选了别的模式才这么说。
+                + ("换用默认模式可以正常辨证；" if retriever_mode is not None
+                   else "这台机器还没有生成检索数据，哪个模式都跑不了；")
+                + "本次没有降级到别的模式跑，是为了不让你以为看到的是这个模式的结果。"
             ),
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
@@ -719,7 +715,7 @@ def consult(
     # s3.herbs 在 S3 边界已经被 _split_western_into_s3 清过西药，这里不用再滤一次
     # ——清洗只在那一处做，下游全都看到干净数据。
     herb_sets = [
-        {h for h in (normalize_herb(x) for x in (r["s3"].herbs or [])) if h}
+        _herbs.normalized_herb_set(r["s3"].herbs)
         for r in results
     ]
     if len(herb_sets) >= 2 and any(herb_sets):
@@ -767,7 +763,7 @@ def consult(
         # 噪声地板：herb_jaccard 本身没有意义，除非知道"同一设定重复跑，本来就会
         # 抖多少"。None = 还没跑过 offline/estimate_epsilon.py，前端要如实展示
         # "未测"，不能假装这个数已经有对照（CLAUDE.md「任何数字都必须带对照」）。
-        "epsilon_online": _load_epsilon_online(),
+        "epsilon_online": load_epsilon_online(),
     }
 
     return {
@@ -799,6 +795,28 @@ def consult(
             use_react,
         ),
     }
+
+
+def consult_many(queries: list[str], consult_fn=None) -> tuple[list[dict | None], list[dict]]:
+    """逐条跑 consult，**一条挂了不拖累其余**。返回 (与 queries 对齐的结果列表，
+    失败记录)；失败的位置是 None。
+
+    eval/run_eval.py 和 eval/mes/export.py 之前各自写的是 `[consult(q) for q in
+    queries]`：第 9 条主诉的 LLMError 会把前 8 条已经花钱跑完的结果一起丢掉。
+    run_batch 的文档记过同一个坑（insufficient 分支 AttributeError 整批挂掉），
+    教训没有传到后来的两个批处理入口——所以抽成一处，两边都调它。
+    """
+    fn = consult_fn or consult
+    results: list[dict | None] = []
+    failures: list[dict] = []
+    for i, complaint in enumerate(queries, 1):
+        try:
+            results.append(fn(complaint))
+        except Exception as e:  # noqa: BLE001 - 一条主诉的失败不能把整批已完成的结果一起丢掉
+            print(f"[consult_many] 第 {i} 条失败：{type(e).__name__}: {e}", file=sys.stderr)
+            results.append(None)
+            failures.append({"index": i, "query": complaint, "error": f"{type(e).__name__}: {e}"})
+    return results, failures
 
 
 def run_batch(queries: list[str], consult_fn=None) -> dict:

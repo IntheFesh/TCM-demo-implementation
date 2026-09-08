@@ -4,11 +4,10 @@
 （工具名写错、参数不合法、原地重复）都不会让循环崩掉——ReAct 里一个异常
 等于整条问诊挂掉。
 """
-import json
 
 import pytest
 
-from core import chain, react
+from core import react
 from core.react import (
     MAX_OBSERVATION_CHARS,
     MAX_STEPS,

@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Protocol
 
+from core.graph.schema import EDGE_TYPES, NODE_TYPES
+
 
 class GraphStore(Protocol):
     def add_node(self, node_id: str, **attrs) -> None: ...
@@ -47,6 +49,11 @@ class NetworkXStore:
         return self._g
 
     def add_node(self, node_id: str, **attrs) -> None:
+        # 节点/边类型的词表在 core/graph/schema.py，这里是唯一的落地检查点：
+        # 建图脚本手误写成 "Symptom" 会在建图时炸，而不是等到工具层查不到节点。
+        node_type = attrs.get("node_type")
+        if node_type is not None and node_type not in NODE_TYPES:
+            raise ValueError(f"未知的 node_type {node_type!r}，合法值：{sorted(NODE_TYPES)}")
         self.g.add_node(node_id, **attrs)
 
     def add_edge(self, src: str, dst: str, *, edge_key: str | None = None, **attrs) -> None:
@@ -59,7 +66,10 @@ class NetworkXStore:
         （实测丢掉 323 条事实里的 29 条，其中 4 条连主症/次症标注都被改写）。
         丢的还恰好是跨证候共现的症状——那正是辨别证候时最有信息量的一批。
         """
-        self.g.add_edge(src, dst, key=edge_key or attrs.get("edge_type"), **attrs)
+        edge_type = attrs.get("edge_type")
+        if edge_type is not None and edge_type not in EDGE_TYPES:
+            raise ValueError(f"未知的 edge_type {edge_type!r}，合法值：{sorted(EDGE_TYPES)}")
+        self.g.add_edge(src, dst, key=edge_key or edge_type, **attrs)
 
     def get_node(self, node_id: str) -> dict | None:
         if node_id not in self.g:

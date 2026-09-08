@@ -5,6 +5,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from string import Template
@@ -36,7 +38,7 @@ def render(template_str: str, **kwargs) -> str:
     """用 string.Template 渲染，**缺变量直接报错**。
 
     原来用 safe_substitute 是为"可选段落缺变量时不抛异常"留的口子，但审查时数了一遍：
-    9 个 yaml 的占位符集合与 9 处 render() 的 kwargs 逐一吻合，没有任何调用方在用
+    10 个 yaml 的占位符集合与 10 处 render() 的 kwargs 逐一吻合，没有任何调用方在用
     这个口子。留着它的代价是：将来 yaml 加一个 $var 而调用方漏传，占位符会原样留在
     prompt 里（模型看到一个字面的 "$refs"），全部测试照样通过——静默 bug。
     仍用 safe_substitute 做替换本身（模板里若有 $$ 之类不影响），但先检查缺失。
@@ -71,6 +73,12 @@ class LLMBackend(ABC):
     """
 
     MAX_ATTEMPTS = 3  # 首次 + 最多 2 次重试
+    # 传输类错误（超时、429、连接断）两次重试之间的等待秒数，按重试序号取。
+    # 只对传输错误退避：校验错误是模型输出格式不对，回灌错误信息立刻重问才有
+    # 意义，等一秒不会让它答得更对。之前是零间隔立刻重试，429 会变成三个
+    # 连续的 429。测试里把它 monkeypatch 成 (0, 0)，不真等。
+    RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0)
+    _sleep = staticmethod(time.sleep)  # 留个缝给测试换掉，不真睡
 
     @abstractmethod
     def _complete(self, messages: list[dict], temperature: float, **kwargs) -> str:
@@ -136,8 +144,11 @@ class LLMBackend(ABC):
                 raw = self._complete(messages, temperature, **kwargs)
             except Exception as e:  # noqa: BLE001 - 传输类错误：超时/非零退出/API 异常
                 # 这一类没有"上一次输出"可回灌——回灌上一轮的陈旧 raw 或空串只会让
-                # 模型收到文不对题的纠错指令。直接原样重试。
+                # 模型收到文不对题的纠错指令。原样重试，但重试前先退避一下。
                 last_error = e
+                if attempt < self.MAX_ATTEMPTS - 1:
+                    backoff = self.RETRY_BACKOFF_SECONDS
+                    self._sleep(backoff[min(attempt, len(backoff) - 1)])
                 continue
             last_raw = raw
             try:
@@ -378,13 +389,21 @@ def get_backend() -> LLMBackend:
 
 
 _llm_singleton: LLMBackend | None = None
+_llm_lock = threading.Lock()
 
 
 def get_llm() -> LLMBackend:
-    """惰性单例。模块底部不创建全局实例，避免模块导入时就要求环境变量齐全。"""
+    """惰性单例。模块底部不创建全局实例，避免模块导入时就要求环境变量齐全。
+
+    加锁不是因为建后端对象重（它很轻），而是 manifest 里的 model/backend
+    从这个对象问：两个线程各建一份、在途请求引用着不同的那份，同一批评测里
+    两条记录就可能标着不同的后端。
+    """
     global _llm_singleton
     if _llm_singleton is None:
-        _llm_singleton = get_backend()
+        with _llm_lock:
+            if _llm_singleton is None:
+                _llm_singleton = get_backend()
     return _llm_singleton
 
 

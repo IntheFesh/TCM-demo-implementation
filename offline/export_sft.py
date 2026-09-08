@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -25,10 +26,14 @@ def load_cases() -> list[CaseRecord]:
 
 def filter_public_domain(cases: list[CaseRecord]) -> list[CaseRecord]:
     """版权合规的代码级强制点：现代出版书籍将来接入时若标了 copyrighted，
-    这里必须把它挡在训练集之外。断言而不是静默过滤，是为了让违规数据
-    在开发期就能被立刻发现，而不是悄悄漏进 sft.jsonl。"""
+    这里必须把它挡在训练集之外。过滤掉的条数打到 stderr，不静默——违规数据
+    要在开发期就被看见。之前这里有一句 assert，断言的是过滤之后的列表全是
+    public_domain：那是过滤的定义本身，永远为真，而且 python -O 会把它删掉。"""
     kept = [c for c in cases if c.copyright_status == "public_domain"]
-    assert all(c.copyright_status == "public_domain" for c in kept)
+    excluded = [c.case_id for c in cases if c.copyright_status != "public_domain"]
+    if excluded:
+        print(f"[export_sft] 排除 {len(excluded)} 条非公有领域医案：{excluded[:10]}"
+              f"{'…' if len(excluded) > 10 else ''}", file=sys.stderr)
     return kept
 
 

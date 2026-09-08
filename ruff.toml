@@ -1,0 +1,13 @@
+# 项目的 lint 基线。规则集刻意只取默认的 E/F（语法级错误、未用的名字、
+# 重复的字典键），不上风格类规则：这个仓库的注释和行宽是按"写给人看的中文
+# 说明"来的，行宽 88 会把注释切得七零八落，换不来任何 bug。
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# pytest 的夹具约定：`def test_x(fake_llm)` 里的参数名跟模块级夹具函数同名，
+# ruff 会报"重定义未使用的名字"（F811），那正是 pytest 注入夹具的方式。
+"tests/*" = ["F811"]

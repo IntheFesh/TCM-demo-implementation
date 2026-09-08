@@ -1,6 +1,6 @@
 """从 data/standard/syndromes.jsonl 建知识图谱骨架。
 
-第一批数据（13 条脾胃相关证候，见 data/standard/syndromes.jsonl）不是 GB/T
+第一批数据（17 条脾胃相关证候，见 data/standard/syndromes.jsonl）不是 GB/T
 16751.2 原文——那份文件目前仍拿不到全文（网页版可在线读、不可批量下载）——而是
 7 个独立、可核验、彼此不矛盾的来源交叉确认后录入的：WFCMS 国际标准、两篇同行评审
 论文（各带 GB/T 15657 官方编码）、一份团体标准公示稿、医学教育网、39健康网、

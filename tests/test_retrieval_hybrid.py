@@ -374,7 +374,7 @@ def test_search_hybrid_mode_without_query_elements_stays_two_way(tmp_path):
         query_vectors={query: [1.0, 0.0]},
         with_filler=True,
     )
-    hits = retriever.search(query, "ye_tianshi", k=1, mode="hybrid")
+    retriever.search(query, "ye_tianshi", k=1, mode="hybrid")
     assert retriever._element_retriever is None  # 没传 query_elements，不该去碰它
 
 

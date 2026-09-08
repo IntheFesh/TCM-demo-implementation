@@ -32,3 +32,7 @@ venv/
 *.swm
 # 古籍原文，从 GitHub 公开仓库可下载，不入版本控制
 books/
+# pytest-cov 的产物
+.coverage
+htmlcov/
+.ruff_cache/

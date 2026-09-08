@@ -18,6 +18,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
@@ -75,7 +77,6 @@ def filter_valid_options(chosen: list[str], options: dict[str, str]) -> list[str
     正确集合里的字母只会增加 wrong_count、拉低分母，一个根本不存在的选项
     永远不可能是对的。丢掉它是格式修正，不是挑答案。**有效字母一个都不丢。**
     """
-    import re
 
     valid: set[str] = set()
     text_to_key = {v: k for k, v in options.items()}

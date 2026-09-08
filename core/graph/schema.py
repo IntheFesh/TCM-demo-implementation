@@ -1,6 +1,7 @@
-"""知识图谱的节点/边类型常量。只集中定义类型名和它们的含义说明，不做校验框架——
-这些字符串会被 build_graph.py、weights.py、tools.py 反复用到，集中定义是为了不让
-"symptom" 和 "Symptom" 这种手误各处散落，不是为了搞一套类型系统。
+"""知识图谱的节点/边类型词表。core/graph/store.py 的 add_node/add_edge 对着它
+校验 node_type / edge_type——这是它唯一的消费方，也是"symptom"和"Symptom"这种
+手误唯一能被拦住的地方（建图脚本、weights.py、tools.py 里写的都是字面量，
+之前这张表谁也不读，纯装饰）。不做更多：不是类型系统。
 
 K1 目前只填充 symptom / element / syndrome 三类节点和 indicates / composes / is_a
 三类边（见 offline/build_graph.py）。therapy / formula / herb / case / physician
@@ -30,6 +31,7 @@ EDGE_TYPES = {
     "practiced_by": "case -> physician  医案属于医家",
 }
 
-# 每条边的 source 属性只能是这三种之一——用来区分"这条边是标准骨架"还是
-# "数据权重/证据"，是后面 K2 层级回退收缩的判据来源，不能省。
-EDGE_SOURCES = ("standard", "case", "textbook")
+# 边的 source（出处）属性刻意**不**在这里列词表：data/graph.json 里实际出现的是
+# official_consensus / secondary_verified / journal / group_standard / manual，
+# 医案层挂上去之后还有 case——它是数据标注的自由文本，不是封闭枚举。之前这里
+# 写着 ("standard", "case", "textbook")，跟数据对不上，谁也没读它。

@@ -50,9 +50,10 @@ def _gold_line(r, bom=False):
 def sdt_dir(tmp_path):
     (tmp_path / "data").mkdir()
     (tmp_path / "Results").mkdir()
-    blank = lambda r: {**r, "Clinical Information": "", "Answers of TCM Pathogenesis": "",
-                       "Answers of TCM Syndrome": "", "Explanatory Summary": "",
-                       "Syndrome Differentiation": ""}
+    def blank(r):
+        return {**r, "Clinical Information": "", "Answers of TCM Pathogenesis": "",
+                "Answers of TCM Syndrome": "", "Explanatory Summary": "",
+                "Syndrome Differentiation": ""}
     (tmp_path / "data" / "Train_TCM_Data_v1.json").write_text(
         json.dumps([REC_A, REC_DANGER], ensure_ascii=False), encoding="utf-8")
     (tmp_path / "data" / "Validation_TCM_Data_v1.json").write_text(

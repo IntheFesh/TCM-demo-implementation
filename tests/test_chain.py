@@ -2,7 +2,14 @@
 import json
 from core import chain
 from core.retrieval import Retriever
-from core.schemas import CaseRecord, ElementHit, S1Normalize, S2Elements, S3Syndrome
+from core.schemas import (
+    CaseRecord,
+    ElementHit,
+    S1Normalize,
+    S2Elements,
+    S3Syndrome,
+    S3SyndromeUnreferenced,
+)
 
 
 import pytest
@@ -432,7 +439,7 @@ def test_react_does_not_weaken_the_hallucination_check(monkeypatch):
 
 
 def test_use_react_none_reads_environment(monkeypatch):
-    fake_llm = _react_setup(monkeypatch)
+    _react_setup(monkeypatch)
     monkeypatch.setenv("USE_REACT", "1")
     assert chain.consult("纳差乏力")["manifest"]["use_react"] is True
     monkeypatch.setenv("USE_REACT", "0")
@@ -525,8 +532,6 @@ def test_fast_mode_skips_followup_in_consult(monkeypatch):
 
 
 # ---------- 审查修复 ----------
-
-from core.schemas import S3SyndromeUnreferenced
 
 
 class EmptyRetriever(Retriever):
