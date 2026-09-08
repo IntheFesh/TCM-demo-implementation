@@ -19,7 +19,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 import api.main as api_main
-from tests.test_api import _fake_outcome
+from tests.test_api import _fake_outcome, _rich_outcome
 
 
 def _parse_sse(lines):
@@ -140,6 +140,47 @@ def test_done_event_payload_matches_consult_response_shape(monkeypatch):
         events.append(out_q.get())
     done_data = next(d for name, d in events if name == "done")
 
+    assert done_data == expected
+
+
+def _read_stream_into_with_role(client: TestClient, complaint: str, role: str, out_q: queue.Queue) -> None:
+    with client.stream(
+        "POST", "/api/consult/stream", json={"complaint": complaint, "role": role}
+    ) as resp:
+        for event_name, data in _parse_sse(resp.iter_lines()):
+            out_q.put((event_name, data))
+
+
+def test_stream_role_reaches_done_event_same_as_post_consult(monkeypatch):
+    """M6：/api/consult/stream 的 worker 里 `_consult_response(outcome, role=req.role)`
+    这一行是照抄 /api/consult 加的，两条路径共用同一个裁剪函数（见上一条测试的
+    注释），但"接线接对了没有"要单独证一次——`role` 是 ConsultRequest 新加的
+    字段，FastAPI 请求体解析、SSE worker 参数传递、_consult_response 调用，
+    这条链路上任何一处漏传都不会报错，只会让 patient 角色的流悄悄拿到
+    researcher 的完整字段集，跟 /api/consult 走两条完全独立的代码路径，
+    对 /api/consult 的裁剪测试再多也测不出这条。这里用 formula_candidates
+    这个字段的有无做探针——patient 角色下它必须整个键都不存在（安全边界，
+    不是"存在但为空"，跟 test_api.py 里那条同名断言的理由一致）。"""
+    outcome = _rich_outcome()
+
+    def fake_consult(complaint, ask_fn=None, on_step=None, **kw):
+        return outcome
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+
+    resp = client.post("/api/consult", json={"complaint": "胸痛", "role": "patient"})
+    expected = resp.json()
+    assert "formula_candidates" not in expected["results"][0]["s3"]
+
+    out_q: queue.Queue = queue.Queue()
+    _read_stream_into_with_role(client, "胸痛", "patient", out_q)
+    events = []
+    while not out_q.empty():
+        events.append(out_q.get())
+    done_data = next(d for name, d in events if name == "done")
+
+    assert "formula_candidates" not in done_data["results"][0]["s3"]
     assert done_data == expected
 
 

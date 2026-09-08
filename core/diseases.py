@@ -117,3 +117,39 @@ def match_disease(symptoms: list[str], elements: list[str]) -> list[tuple[str, f
             scored.append((d.name, round(score, 3)))
     scored.sort(key=lambda pair: -pair[1])
     return scored
+
+
+def triage_advice(disease: Disease) -> str:
+    """M6：从 triage_dept/triage_urgency/red_flags 三个已经核实过的结构化
+    字段拼一句人话建议，不是另外维护一批自由文本的"advice"句子——那样
+    每条都要重新走一遍 M4 定下的"有出处、不确定就留白"核实流程，维护成本
+    和出错面都远大于从三个字段拼模板。三个字段本身的可信度不因为这里被
+    拼成一句话而改变：dept 为 None 时如实说"具体科室建议现场分诊"，不替
+    M4 已经决定"留空"的字段编一个具体科室出来。
+    """
+    urgency = disease.triage_urgency
+    if disease.triage_dept:
+        dept_clause = f"，建议就诊{disease.triage_dept}"
+    else:
+        dept_clause = "，建议及时就医（具体科室建议现场分诊）"
+
+    if urgency == "high":
+        base = f"{disease.name}类症状需要提高警惕{dept_clause}，建议尽快就诊"
+    elif urgency == "medium":
+        base = f"{disease.name}类症状{dept_clause}，建议近期就诊"
+    elif urgency == "low":
+        base = f"{disease.name}类症状{dept_clause}，可先观察，如症状持续或加重再就诊"
+    else:
+        # urgency 未知（M4 有意留空的病名，如"肿胀""痰饮"——真实病因跨科，
+        # 强行给一个紧急度等级比不给更危险），不假装知道紧急程度。
+        base = f"{disease.name}类症状建议咨询医师{dept_clause}"
+
+    if disease.red_flags:
+        # 措辞故意跟 core/safety.py 的否决文案不一样（那句是"整个请求被拒绝、
+        # 不产出任何辨证结果"的否决用语，tests/test_dedup_contracts.py 钉死它
+        # 只能出现在 safety.py 一处）：这里回答的是另一个问题——"辨证已经给出
+        # 结果，但这类病如果出现这些红旗症状要立刻升级去急诊"，是附加在正常
+        # 产出上的提示，不是拒绝服务。两处字面接近但概念不同，用词上刻意
+        # 错开，不去踩 dedup 测试的边界。
+        base += f"；如出现以下情况请立即拨打120或前往急诊：{'、'.join(disease.red_flags)}"
+    return base

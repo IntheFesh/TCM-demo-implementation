@@ -12,7 +12,7 @@ import time
 import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -20,11 +20,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.chain import consult, explained_symptoms
+from core.diseases import get_disease, triage_advice
 from core.herbs import is_western_drug, strip_dose_and_parens
 from core.physicians import PHYSICIANS
 from core.schemas import S1Normalize
 from core.tools import GRAPH_PATH, get_graph_store
 from offline.graph_stats import compute_stats, lambda1_note
+
+# M6：四种角色。前端按角色显示不同的 UI，但**字段裁剪在这里做，不在前端做**
+# ——前端过滤等于把汤剂处方发到客户端再藏起来，患者打开 devtools 照样能看到。
+Role = Literal["patient", "doctor", "student", "researcher"]
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_ROOT = ROOT / "web"
@@ -109,6 +114,14 @@ class ConsultRequest(BaseModel):
     # （对着 ALLOWED_MODES），这里卡一遍等于把同一个判断实现两遍，
     # 加新模式时必然漏改一处。
     retriever_mode: str | None = None
+    # M6：逐请求的显示角色，**不是服务端全局设置**——跟 retriever_mode 同一条
+    # 理由：role 决定的是"这次响应给谁看"，不同请求可能是不同角色的人在用，
+    # 写进程状态会互相污染。这里用 Literal 卡合法值（跟 retriever_mode 故意
+    # 不卡是两回事）：非法角色应该在请求校验阶段就拒绝，不该让它混进
+    # core.chain.consult()——consult() 本身完全不知道 role 这个概念，
+    # 字段裁剪只发生在 _consult_response() 这一层，role 传得太深只会让
+    # consult() 背上一个它不需要关心的参数。
+    role: Role = "researcher"
 
 
 @app.get("/health")
@@ -242,11 +255,11 @@ def api_consult(req: ConsultRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
         slots.release()
-    return _consult_response(outcome)
+    return _consult_response(outcome, role=req.role)
 
 
-def _consult_response(outcome: dict) -> dict:
-    """把 consult() 的原始返回值拼成前端要的 JSON 形状。
+def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
+    """把 consult() 的原始返回值拼成前端要的 JSON 形状，按 role 裁剪。
 
     **全项目"consult() 结果怎么序列化给前端"这件事唯一的实现**：/api/consult
     和 /api/consult/stream 的终值事件都调这一个函数，不是各写一份——两条路径
@@ -254,6 +267,13 @@ def _consult_response(outcome: dict) -> dict:
     和非流式端点的响应体就成了两份分叉的契约，前端的渲染函数没法共用
     （CLAUDE.md 第二次撞墙那条：字面上看着像"抄一份改改"，实际是同一个判断
     在两处实现，改一边会看不出会不会连带影响另一边）。
+
+    role 裁剪统一走 `_filter_response_by_role()`，在函数末尾**每一个**分支
+    返回前都过一遍——包括 rejected/retrieval_error/insufficient 这几个空
+    results 的分支：role 是"这次响应给谁看"，跟这次辨证有没有产出结果是
+    两个维度，不能因为没有结果就跳过角色裁剪，那样 patient 角色在这几个
+    分支下会拿到跟 researcher 一样的（虽然当下是空的）响应形状，字段存在性
+    本身就不该因为分支不同而不一致。
     """
     s1: S1Normalize = outcome["s1"]
     # 四个分支返回**同一套键**：前端按同一份契约读，缺键就是 undefined 悄悄进渲染。
@@ -282,26 +302,38 @@ def _consult_response(outcome: dict) -> dict:
 
     if outcome["rejected"]:
         # 安全否决命中：S2/S3 从未被调用，没有 results 可以拼图，直接返回空图。
-        return {**base, "rejected": True, "reject_reason": outcome["reject_reason"]}
+        return _filter_response_by_role(
+            {**base, "rejected": True, "reject_reason": outcome["reject_reason"]}, role, []
+        )
 
     if outcome.get("retrieval_error"):
         # 选的检索模式这台机器上没有对应数据。单独一个分支而不是混进
         # insufficient：那个字段的意思是"你给的信息不够辨证"，这里是
         # "服务端这条检索路跑不起来"，混成一个会把服务端的问题说成用户的问题。
-        return {**base, "retrieval_error": _public_text(outcome["retrieval_error"])}
+        return _filter_response_by_role(
+            {**base, "retrieval_error": _public_text(outcome["retrieval_error"])}, role, []
+        )
 
     if outcome.get("insufficient"):
-        return {**base, "insufficient": True, "insufficient_reason": outcome["insufficient_reason"]}
+        return _filter_response_by_role(
+            {**base, "insufficient": True, "insufficient_reason": outcome["insufficient_reason"]},
+            role, [],
+        )
 
     results = outcome["results"]
-    graph = to_graph(s1, results, outcome.get("s2"), outcome.get("residual"))
+    # role 传进 to_graph()：patient 角色从图构造这一步起就不生成方剂/药材层
+    # （layer 3/4），不是先生成完整图再事后过滤掉那两层——图节点本身就带着
+    # 药名，事后过滤等于先把处方发出去一半再藏起来，跟"裁剪必须在后端做"
+    # 是同一条安全边界、同一个理由。
+    graph = to_graph(s1, results, outcome.get("s2"), outcome.get("residual"), role=role)
     assert_graph_edges_valid(graph)
-    return {
+    full = {
         **base,
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
         "graph": graph,
     }
+    return _filter_response_by_role(full, role, results)
 
 
 # ---------- SSE 分步进度 ----------
@@ -452,7 +484,7 @@ def api_consult_stream(req: ConsultRequest) -> StreamingResponse:
                 on_step=stream.emit,
                 retriever_mode=req.retriever_mode,
             )
-            stream.events_q.put(("done", _consult_response(outcome)))
+            stream.events_q.put(("done", _consult_response(outcome, role=req.role)))
         except StreamClosed:
             pass  # 客户端已断开，没人读了，正常提前结束
         except ValueError as e:
@@ -545,10 +577,156 @@ def _serialize_result(r: dict) -> dict:
     }
 
 
+# ---------- M6：role 字段裁剪 ----------
+#
+# 四种角色的字段表（见模块报告，逐条对齐 M6 任务描述原文的表格）：
+#   字段              | patient | doctor | student | researcher
+#   disease/syndrome  |    ✅   |   ✅   |   ✅    |    ✅
+#   triage            |    ✅   |   ✅   |   —     |    —
+#   formula_candidates|    ❌   |   ✅   |   ✅    |    ✅
+#   食疗/中成药        |    ✅   |   ✅   |   —     |    —
+#   reasoning         |  简化   |   ✅   |   ✅    |    ✅
+#   react_trace       |    ❌   |   ❌   |   ✅    |    ✅
+#   refs              |    ❌   |   ✅   |   ✅    |    ✅
+#   divergence        |    ❌   |   ❌   |   ✅    |    ✅
+#   manifest          |    ❌   |   ❌   |   —     |    ✅
+#   safety 详情        |  简化   |   ✅   |   ✅    |    ✅
+# student 在这张表里跟 researcher 唯一的差别是 manifest（技术/后端元数据，
+# 跟教学用途无关）——这也是下面的实现顺着这张表从 researcher 开始逐步收窄
+# 的原因：先剥 manifest（覆盖 student），再剥 divergence/react_trace（覆盖
+# patient+doctor），最后 patient 单独再剥一层跟处方直接相关的字段。
+
+
+def _apply_medication_gate(items: list, urgency: str | None) -> list:
+    """urgency=high 时无条件不给任何用药相关建议——包括食疗，哪怕将来 M9
+    接入了真实食疗/中成药数据源，这个函数都是唯一要改的地方。高危症状类别
+    下，任何看起来"温和"的建议都可能让患者放松警惕、延误真正需要的急诊
+    处置，这条边界故意写得比"看起来过度保守"更硬，不因为"食疗数据这轮还是
+    空的、看起来测不出差别"就不实现——数据源接上的那天，这道闸门必须已经
+    在这里等着，不能指望 M9 的人记得回来加。"""
+    if urgency == "high":
+        return []
+    return items
+
+
+def _compute_triage(results: list[dict]) -> dict | None:
+    """患者导诊：取所有医家诊断病名里紧急度最高的一个作为总体建议——错过
+    真实红旗症状比给一个偏保守的建议危险得多，宁可保守，不因为"多数医家
+    没那么紧急"压低。找不到任何一个医家的病名在参考表里（包括模型没填
+    disease、或填了但不在 M4 建的 15 条参考表里）时返回 None，如实说明
+    没有导诊依据，不伪造一个。"""
+    urgency_rank = {"high": 2, "medium": 1, "low": 0}
+    candidates = []
+    for r in results:
+        s3 = r["s3"]
+        d = get_disease(s3.disease) if s3.disease else None
+        if d is not None:
+            candidates.append(d)
+    if not candidates:
+        return None
+    chosen = max(candidates, key=lambda d: urgency_rank.get(d.triage_urgency, -1))
+    return {
+        "dept": chosen.triage_dept,
+        "urgency": chosen.triage_urgency,
+        "red_flags": list(chosen.red_flags),
+        "advice": triage_advice(chosen),
+    }
+
+
+def _simplify_safety_output(safety_output: dict | None) -> dict | None:
+    """patient 角色的"安全详情简化"：原始 safety_output 里 incompatible
+    （配伍禁忌的药对）、thermal_warning（寒热警告文本）都会提到具体药材
+    名——而 patient 角色本来就看不到 formula_candidates，如果 safety_output
+    原样下发，等于从这条后门把药名重新泄露回去。压成一个不含药名的布尔
+    摘要，但不整个丢掉：'方子有没有被系统标记过问题'这件事本身对患者是
+    有意义的信息（比如可以提示"医生模式能看到更详细的提示"）。"""
+    if not safety_output:
+        return safety_output
+    return {
+        "has_safety_note": bool(
+            safety_output.get("incompatible") or safety_output.get("thermal_warning")
+        ),
+        "revised": safety_output.get("revised", False),
+    }
+
+
+def _filter_s3_for_role(s3: dict, role: Role) -> dict:
+    """按角色裁剪单个 s3 字典。只有 patient 角色需要动这一层——doctor/
+    student/researcher 三者的 s3 内容完全一致（表里 disease/syndrome/
+    formula_candidates/reasoning 四行这三者都是 ✅/✅/full）。"""
+    if role != "patient":
+        return s3
+    s3 = dict(s3)
+    # reasoning 换成通俗版：reasoning_plain 缺失时**不退回显示 reasoning**
+    # ——那样会让"这个字段允许为空"这个 schema 层的宽松决定，悄悄破坏掉
+    # patient 角色不该看到专业推理文本这条安全边界。缺失时给一句明确的
+    # 占位说明，不是伪造内容也不是泄露原文。
+    s3["reasoning"] = s3.get("reasoning_plain") or "（本次未生成通俗版说明，具体病机建议咨询医师）"
+    s3.pop("reasoning_plain", None)
+    # 候选方/药材相关字段全部摘掉——这几个字段本身就会泄露具体方名药名，
+    # 不是"藏起来"，是压根不下发。selected 是候选方数组的下标，没有
+    # formula_candidates 时这个数字没有意义，一并摘掉避免误导。
+    for key in ("formula_candidates", "formula", "herbs", "western_drugs", "selected"):
+        s3.pop(key, None)
+    return s3
+
+
+def _filter_response_by_role(response: dict, role: Role, results: list[dict]) -> dict:
+    """把 _consult_response() 拼好的完整响应按角色裁剪。**全项目角色裁剪
+    唯一的实现**——前端不做任何字段过滤，过滤在这里一次性做完，服务端
+    就不下发患者不该看到的字段（不是发了再让前端藏起来，那样打开
+    devtools 照样能看到）。
+
+    results 是这次 consult() 的原始 per-physician 结果（不是已经序列化过的
+    response["results"]）——_compute_triage 需要读 r["s3"].disease（pydantic
+    对象上的字段），序列化后的 dict 也有同名字段，但直接传原始对象更清楚
+    "这里读的是模型的真实判断，不是已经被裁剪过的展示层数据"。
+    """
+    if role == "researcher":
+        # 默认角色，闸门要求跟改造前逐字节一致——不做任何处理、连 dict() 拷贝
+        # 都不做，返回的就是 _consult_response() 刚拼好的那个对象本身。
+        return response
+
+    response = dict(response)
+    response.pop("manifest", None)  # 除 researcher 外，manifest 一律不下发
+
+    if role == "student":
+        # student 相对 researcher 唯一的差别就是 manifest，到这里就结束了。
+        return response
+
+    # 走到这里说明 role 是 "patient" 或 "doctor"。
+    response.pop("divergence", None)
+
+    triage = _compute_triage(results)
+    response["triage"] = triage
+    urgency = triage.get("urgency") if triage else None
+    # 食疗/中成药需要 data/patent_medicines.jsonl（M9 才建），这一轮先把字段
+    # 留好、返回空列表——但空列表不是这里的安全边界，_apply_medication_gate
+    # 才是：urgency=high 时无论 M9 接了什么内容都必须继续返回空列表。
+    response["food_therapy"] = _apply_medication_gate([], urgency)
+    response["patent_medicines"] = _apply_medication_gate([], urgency)
+
+    new_results = []
+    for r in response["results"]:
+        r = dict(r)
+        r.pop("react_trace", None)  # patient/doctor 都拿不到取证轨迹
+        if role == "patient":
+            r["s3"] = _filter_s3_for_role(r["s3"], role)
+            r["refs"] = []
+            r["safety_output"] = _simplify_safety_output(r.get("safety_output"))
+        new_results.append(r)
+    response["results"] = new_results
+
+    return response
+
+
 # ---------- 图数据 ----------
 
 
-def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | None = None) -> dict:
+def to_graph(
+    s1: S1Normalize, results: list[dict], s2=None, residual: dict | None = None,
+    role: Role = "researcher",
+) -> dict:
     """构造 Cytoscape 格式的图：{nodes: [{"data": {...}}], edges: [{"data": {...}}]}。
 
     六层（M5）：症状(0) -> 证素(1) -> 病名·证型(2) -> 方剂(3) -> 药材(4)。
@@ -558,6 +736,12 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
     formula->herb 的边**——画了会在图上出现重复的连线。
 
     节点去重用 seen 集合，同 id 只加一次。
+
+    M6：role="patient" 时压根不产出方剂(3)/药材(4) 层——图节点本身就带着
+    真实药名（label/id 都是），如果先建出完整六层图、再在 `_consult_response`
+    那层把 `results[].s3.formula_candidates` 摘掉，图里这两层节点依然会把
+    同样的药名重新泄露给前端。跟"字段裁剪必须在后端做、不能指望前端藏起来"
+    是同一条安全边界：这里的做法是"根本不生成"，不是"生成了再删"。
     """
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -641,6 +825,11 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
         # selected 那一个——前端要能摆出 2-3 个方框各自装着自己的药，
         # 「点哪个方剂看哪些药」是候选方对比的核心卖点，只画 selected 会把
         # 另外 1-2 个候选方在图上变得不可见。
+        #
+        # M6：role="patient" 时整段跳过——不生成方剂/药材层，不是生成了再
+        # 从响应里摘掉（见函数文档字符串）。
+        if role == "patient":
+            continue
         for i, cand in enumerate(s3.formula_candidates):
             # 同一位医家的多个候选方可能撞同一个方名（真实产出里少见，但不能假设
             # 不会发生）——formula_id 只按 physician+name 拼，重名候选方会被
@@ -674,6 +863,9 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
                     parent=formula_id,
                     dose=item.dose, unit=item.dose_unit,
                     processing=item.processing, decoction=item.decoction,
+                    # 这里的 role（君/臣/佐/使）是 HerbItem 自己的字段，跟本函数
+                    # 参数 role（patient/doctor/...角色）只是同名，语义完全不同，
+                    # 不要看到 role= 就以为在传角色参数。
                     role=item.role, function_in_formula=item.function_in_formula,
                     is_western=is_western_drug(item.name),
                 )

@@ -449,11 +449,26 @@ def test_s3_prompt_embedded_example_demonstrates_all_three_sources_and_varied_co
     assert any(c["source"] == "classic" for c in cands)
 
 
+def test_s3_prompt_embedded_example_includes_reasoning_plain_without_jargon():
+    """M6：reasoning_plain 是可选 schema 字段（不逼旧构造点都补），但 prompt
+    层面是硬要求——示例本身要示范"这是什么样子"，而且不能自己就带着专业
+    术语（反面示范比没有示范更糟）。"""
+    obj = _s3_prompt_embedded_example()
+    assert obj.get("reasoning_plain"), "示例里 reasoning_plain 不能是空的"
+    jargon = ["肝木乘土", "中焦气机", "阴虚阳亢", "横逆犯胃", "疏泄"]
+    for term in jargon:
+        assert term not in obj["reasoning_plain"], (
+            f"reasoning_plain 示例文本里出现了专业术语「{term}」，"
+            "这是给患者看的通俗版，不该带这类词"
+        )
+
+
 @pytest.mark.parametrize("phrase", [
     "至少要有一个",  # 至少一个 classic 候选方的硬约束
     "不要三个候选方都填high",
     "剂量不确定时填null，不要猜一个数",
     "这个字段关系到用药安全",  # decoction 字段的安全性说明
+    "不能出现",  # reasoning_plain 禁止专业术语那句的开头
 ])
 def test_s3_prompt_contains_the_hard_constraints(phrase):
     """这几句不是随手写的修饰语，是 M3 要解决的具体问题（模型倾向三个都填

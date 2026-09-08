@@ -1,7 +1,8 @@
 """core/diseases.py 的离线测试：不需要网络，data/standard/diseases.jsonl 是静态文件。"""
 import pytest
 
-from core.diseases import get_disease, load_diseases, match_disease
+from core.diseases import get_disease, load_diseases, match_disease, triage_advice
+from core.schemas import Disease
 
 
 def test_load_diseases_parses_every_line_as_a_valid_disease():
@@ -106,3 +107,53 @@ def test_every_disease_location_is_a_valid_element_location(d):
 @pytest.mark.parametrize("d", load_diseases())
 def test_every_disease_triage_urgency_is_a_valid_level_or_none(d):
     assert d.triage_urgency in ("low", "medium", "high", None)
+
+
+# ---------- M6：triage_advice() ----------
+
+
+def _disease(**overrides) -> Disease:
+    base = dict(
+        name="测试病", aliases=[], location=["胃"], cardinal=["测试症状"],
+        common_syndromes=[], corpus_gate=[], triage_dept="消化内科",
+        triage_urgency="medium", red_flags=[],
+    )
+    base.update(overrides)
+    return Disease(**base)
+
+
+def test_triage_advice_high_urgency_says_urgent_and_names_dept():
+    advice = triage_advice(_disease(triage_urgency="high", triage_dept="心内科"))
+    assert "心内科" in advice
+    assert "尽快就诊" in advice or "提高警惕" in advice
+
+
+def test_triage_advice_low_urgency_suggests_observation():
+    advice = triage_advice(_disease(triage_urgency="low"))
+    assert "观察" in advice
+
+
+def test_triage_advice_none_urgency_does_not_fabricate_a_level():
+    """M4 把 triage_urgency 留空的病名（真实归科有歧义），拼句子时不能悄悄
+    给它派一个紧急度等级——那正是 M4 报告里强调过的"错误指向比不给更糟"。"""
+    advice = triage_advice(_disease(triage_urgency=None))
+    assert "尽快" not in advice
+    assert "观察" not in advice
+    assert "咨询医师" in advice
+
+
+def test_triage_advice_none_dept_says_see_a_doctor_on_site_not_a_made_up_department():
+    advice = triage_advice(_disease(triage_dept=None))
+    assert "现场分诊" in advice
+
+
+def test_triage_advice_includes_red_flags_verbatim_when_present():
+    advice = triage_advice(_disease(red_flags=["胸痛持续超过20分钟", "冷汗"]))
+    assert "胸痛持续超过20分钟" in advice
+    assert "冷汗" in advice
+    assert "120" in advice or "急救" in advice
+
+
+def test_triage_advice_omits_red_flag_clause_when_none():
+    advice = triage_advice(_disease(red_flags=[]))
+    assert "急救" not in advice

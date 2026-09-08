@@ -464,6 +464,21 @@ class _S3Base(BaseModel):
     disease: str | None = None  # 病名（M4 起才真正校验/匹配，这里先只是字段）
     syndrome: str
     reasoning: str
+    # M6：患者模式用的通俗语言版推理——不能直接给患者看"肝木乘土，中焦气机
+    # 不利"这种专业表述。在 prompt 里让模型跟 reasoning 一起生成（而不是
+    # 事后再调一次 LLM 翻译）：模型生成时就知道要给两个版本，比事后翻译准，
+    # 也省一次调用。
+    #
+    # 定义成 `str | None = None` 而不是必填：必填会让全项目现存的几十处
+    # `S3Syndrome(...)` 旧式构造（测试 fixture、eval/、CLI）全部要补这个字段，
+    # 而这个字段的安全属性不靠 schema 层的"必填"来保证——真正兜底的是
+    # `api/main.py::_filter_s3_for_role`：patient 角色下，`reasoning_plain`
+    # 为空时展示的是一句明确的占位说明，不会退回显示原始的 `reasoning`
+    # 专业文本（那样会让"选做可选字段"这个决定悄悄破坏掉 M6 要守的安全
+    # 边界）。真实 S3 prompt 会要求模型每次都给出这个字段（见
+    # prompts/v1/s3_syndrome.yaml），schema 层的"可选"只是不逼旧构造点
+    # 都跟着改，不是说这个字段在真实产出里可以随意缺失。
+    reasoning_plain: str | None = None
     treatment_principle: str
     formula_candidates: list[FormulaCandidate] = Field(min_length=1, max_length=3)
     selected: int = 0  # 默认选第几个候选方；下面的 after 校验器负责越界检查
