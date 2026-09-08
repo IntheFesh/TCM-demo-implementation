@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.chain import consult, explained_symptoms
-from core.herbs import strip_dose_and_parens
+from core.herbs import is_western_drug, strip_dose_and_parens
 from core.physicians import PHYSICIANS
 from core.schemas import S1Normalize
 from core.tools import GRAPH_PATH, get_graph_store
@@ -547,13 +547,16 @@ def _serialize_result(r: dict) -> dict:
 
 # ---------- 图数据 ----------
 
-MAX_HERBS_PER_PHYSICIAN = 6
-
 
 def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | None = None) -> dict:
     """构造 Cytoscape 格式的图：{nodes: [{"data": {...}}], edges: [{"data": {...}}]}。
 
-    四层：症状(0) -> 证素(1) -> 证型(2) -> 药物(3)。
+    六层（M5）：症状(0) -> 证素(1) -> 病名·证型(2) -> 方剂(3) -> 药材(4)。
+    治法不单独成层，做成 layer2 -> layer3 边的 label（六层已经够宽，七层会挤到
+    看不清）。方剂(3)/药材(4) 是 compound 关系：药材节点的 `parent` 字段指向
+    它所属的方剂节点，父子关系由 cytoscape 内建机制表达，**不额外画一条
+    formula->herb 的边**——画了会在图上出现重复的连线。
+
     节点去重用 seen 集合，同 id 只加一次。
     """
     nodes: list[dict] = []
@@ -634,25 +637,58 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
             elem_id = f"elem::{hit.element}"
             add_edge(elem_id, syn_id, phys=physician)
 
-        # layer 3 药物：每位医家最多取 6 味
-        for herb in r["s3"].herbs[:MAX_HERBS_PER_PHYSICIAN]:
-            # id 必须保留原始写法（含剂量）：前端侧栏 buildEvidenceIndex() 用同一个
-            # 拼法（herb::{physician}::{原始 herb}）反查证据，id 一变两边就对不上了。
-            # label 单独剥掉剂量——"党参三钱""黄芪一两二钱"这种全串塞进节点，
-            # text-max-width:90px 一折就是三四行，图挤得看不清药名本身。
-            # 剥剂量只用 strip_dose_and_parens，不用 normalize_herb：后者还会查
-            # 别名表、剥炮制前缀，会把模型实际写的"广皮"显示成"陈皮"，
-            # label 要的是"同一个名字去掉剂量"，不是"归一到另一个名字"。
-            herb_id = f"herb::{physician}::{herb}"
-            label = strip_dose_and_parens(herb) or herb  # 剥空了（纯剂量字符串之类的脏数据）就退回原文，节点不能没有 label
-            add_node(herb_id, label=label, layer=3, phys=physician)
-            add_edge(syn_id, herb_id, phys=physician)
+        # layer 3 方剂 + layer 4 药材（M5）：每个候选方都出节点，不是只画
+        # selected 那一个——前端要能摆出 2-3 个方框各自装着自己的药，
+        # 「点哪个方剂看哪些药」是候选方对比的核心卖点，只画 selected 会把
+        # 另外 1-2 个候选方在图上变得不可见。
+        for i, cand in enumerate(s3.formula_candidates):
+            # 同一位医家的多个候选方可能撞同一个方名（真实产出里少见，但不能假设
+            # 不会发生）——formula_id 只按 physician+name 拼，重名候选方会被
+            # add_node 的去重逻辑合并成一个节点，这是已知的、可接受的边界情况
+            # （见 tests/test_graph.py 的对应测试）：图上没有"同名候选方各画一份"
+            # 的必要，两个同名候选方本来就该被当成同一个方剂节点。
+            formula_id = f"formula::{physician}::{cand.name}"
+            add_node(
+                formula_id, label=cand.name, layer=3, phys=physician,
+                # 前端按 source 区分边框（classic 实线/modified 虚线/composed
+                # 点线）、selected 高亮选中的那个、safety_blocking 为真时标红。
+                source=cand.source, confidence=cand.confidence,
+                selected=(i == s3.selected),
+                safety_blocking=cand.safety.blocking if cand.safety else False,
+            )
+            # 边 label 用 treatment_principle：治法不单独成层，挂在这条边上。
+            add_edge(syn_id, formula_id, phys=physician, label=s3.treatment_principle)
+
+            for item in cand.herb_items:
+                # herb_id 必须带方剂名：同一味药可能出现在这位医家的多个候选方里
+                # （比如"甘草"作为使药几乎每个方都有），不带方名会被 add_node 的
+                # 去重逻辑合并成一个节点、同时挂在两个 parent 上，cytoscape 会报错。
+                # id 用 item.name 原始写法（旧式合成路径下可能仍带剂量文本，见
+                # core.schemas._S3Base 的向后兼容合成），label 单独剥剂量——
+                # 跟"药名剥剂量"那次「label 剥、id 保原样」是同一条理由，前端
+                # buildEvidenceIndex() 用同一个拼法反查证据，id 一变就断链。
+                herb_id = f"herb::{physician}::{cand.name}::{item.name}"
+                label = strip_dose_and_parens(item.name) or item.name
+                add_node(
+                    herb_id, label=label, layer=4, phys=physician,
+                    parent=formula_id,
+                    dose=item.dose, unit=item.dose_unit,
+                    processing=item.processing, decoction=item.decoction,
+                    role=item.role, function_in_formula=item.function_in_formula,
+                    is_western=is_western_drug(item.name),
+                )
+                # 方剂 -> 药材的关系由上面的 parent 字段（compound node）表达，
+                # 这里不额外画边——画了会在图上出现重复的连线，这是这个模块
+                # 最容易漏改的一条。
 
     return {"nodes": nodes, "edges": edges, "dropped_edges": len(dropped)}
 
 
 def assert_graph_edges_valid(graph: dict) -> None:
-    """断言每条边的两端节点都存在于 nodes 里。已知易错点，务必保留这个检查。"""
+    """断言每条边的两端节点都存在于 nodes 里，以及（M5 起）每个 compound
+    子节点的 `parent` 也指向一个真实存在的节点。已知易错点，务必保留这个检查
+    ——`parent` 不是走 edges 数组表达的关系，跟"边两端都存在"是同一类"不能有
+    悬空引用"的问题，放进同一个函数里查，不另开一个只测 parent 的检查点。"""
     # 用 raise 不用 assert：python -O 会把 assert 整个优化掉，
     # 这道检查就在生产模式下静默失效了。
     node_ids = {n["data"]["id"] for n in graph["nodes"]}
@@ -661,6 +697,10 @@ def assert_graph_edges_valid(graph: dict) -> None:
             raise ValueError(f"边的 source 不存在：{e}")
         if e["data"]["target"] not in node_ids:
             raise ValueError(f"边的 target 不存在：{e}")
+    for n in graph["nodes"]:
+        parent = n["data"].get("parent")
+        if parent is not None and parent not in node_ids:
+            raise ValueError(f"节点的 parent 不存在：{n}")
 
 
 # 静态文件挂在 /app，不要挂在根路径——否则会遮蔽上面的 API 路由。

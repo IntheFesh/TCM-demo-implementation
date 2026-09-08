@@ -574,7 +574,10 @@ let PHYSICIAN_COLORS = {};
 // herb 没有——to_graph() 没为 herb 节点重复存一份，这里在前端补一份映射，不是
 // 因为后端漏了字段，是没必要为一个纯展示用途改后端契约（模块6"不改后端"）。
 let PHYSICIAN_NAMES = {};
-const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640 };
+// layer 4（药材）跟 layer 3（方剂）的 x 只差一小段——compound 子节点要贴着
+// 父节点画，隔太远 cytoscape 算出来的方剂包围盒会变成横跨整个画布的细长条，
+// 不会像"一个方框里装着自己的药"。
+const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640, 4: 730 };
 const Y_MIN = 60, Y_MAX = 460;
 
 let cy = null;
@@ -586,10 +589,10 @@ function evenY(index, total) {
 
 function computeLayout(nodes, edges) {
   const positions = {};
-  const byLayer = { 0: [], 1: [], 2: [], 3: [] };
+  const byLayer = { 0: [], 1: [], 2: [], 3: [], 4: [] };
   for (const n of nodes) {
     const L = Number(n.data.layer);
-    if (!byLayer[L]) byLayer[L] = [];   // 兜底：layer 不在 0-3 时不要整页崩
+    if (!byLayer[L]) byLayer[L] = [];   // 兜底：layer 不在 0-4 时不要整页崩
     byLayer[L].push(n);
   }
 
@@ -621,20 +624,27 @@ function computeLayout(nodes, edges) {
     });
   }
 
-  // layer 2 证型：按医家分上下两带，与 layer 3 的药物带对齐。
+  // layer 2 证型：按医家分上下两带，与 layer 3 的方剂带对齐。
   // 不能用重心排序——两位医家的证型上游证素高度重叠，重心值接近，
   // 排序结果近乎随机，会把两个证型甩到画布上下两端，边被迫斜穿全图。
   const physOrder = [];
   for (const n of byLayer[2]) {
     if (!physOrder.includes(n.data.phys)) physOrder.push(n.data.phys);
   }
-  const herbsByPhys = {};
+  const formulaByPhys = {};
   for (const n of byLayer[3]) {
-    (herbsByPhys[n.data.phys] = herbsByPhys[n.data.phys] || []).push(n);
+    (formulaByPhys[n.data.phys] = formulaByPhys[n.data.phys] || []).push(n);
+  }
+  // M5：药材（layer 4）现在是方剂（layer 3）的 compound 子节点，按 parent
+  // 分组而不是按医家分组——同一位医家的 2-3 个候选方各自带一群不同的药，
+  // 混在一个医家带里排布会让不同方剂的药材彼此穿插。
+  const herbsByFormula = {};
+  for (const n of byLayer[4]) {
+    (herbsByFormula[n.data.parent] = herbsByFormula[n.data.parent] || []).push(n);
   }
   const gap = 40;
 
-  // layer 2 按同一套医家带排布，保证证型与它的药物在同一水平区间
+  // layer 2 按同一套医家带排布，保证证型与它的方剂在同一水平区间
   const synByPhys = {};
   for (const n of byLayer[2]) {
     (synByPhys[n.data.phys] = synByPhys[n.data.phys] || []).push(n);
@@ -651,14 +661,29 @@ function computeLayout(nodes, edges) {
       positions[n.data.id] = { x: LAYER_X[2], y };
     });
   });
+
+  // layer 3 方剂：跟 layer 2 一样按医家分带排布。每个方剂算出 y 之后，
+  // 它下属的每味药材（layer 4）紧贴着这个 y 纵向小间距聚成一小簇——
+  // cytoscape compound 节点的包围盒是按子节点位置自动算出来的，子节点越贴近
+  // 父节点给定的位置，画出来的方剂框就越像"一个方框里装着自己的药"，
+  // 而不是横跨整个画布的细长条。
   const bandCount = physOrder.length || 1;
   const bandHeight = (Y_MAX - Y_MIN - gap * (bandCount - 1)) / bandCount;
   physOrder.forEach((phys, bandIdx) => {
     const bandTop = Y_MIN + bandIdx * (bandHeight + gap);
-    const items = herbsByPhys[phys] || [];
+    const items = formulaByPhys[phys] || [];
     items.forEach((n, i) => {
       const y = items.length <= 1 ? bandTop + bandHeight / 2 : bandTop + (bandHeight * i) / (items.length - 1);
       positions[n.data.id] = { x: LAYER_X[3], y };
+
+      const herbs = herbsByFormula[n.data.id] || [];
+      const herbSpan = Math.min(90, 16 * Math.max(herbs.length - 1, 0));
+      herbs.forEach((h, hi) => {
+        const hy = herbs.length <= 1
+          ? y
+          : y - herbSpan / 2 + (herbSpan * hi) / (herbs.length - 1);
+        positions[h.data.id] = { x: LAYER_X[4], y: hy };
+      });
     });
   });
 
@@ -720,6 +745,29 @@ function buildStylesheet() {
       },
     },
     {
+      // M5：方剂（layer 3）现在是 compound 父节点，:parent 是 cytoscape 内建的
+      // 伪类选择器，匹配"带子节点的节点"，不用按 layer 另判一次。父节点框要
+      // 半透明——不透明会把里面的药材（子节点）整个盖住看不见。
+      selector: "node:parent",
+      style: {
+        "background-opacity": 0.12,
+        "border-width": 2,
+        "text-valign": "top",
+        "text-halign": "center",
+        padding: "14px",
+      },
+    },
+    {
+      // source 三档的边框区分：classic 用默认实线不用另写规则，
+      // modified 虚线，composed 点线。
+      selector: 'node[layer = 3][source = "modified"]',
+      style: { "border-style": "dashed" },
+    },
+    {
+      selector: 'node[layer = 3][source = "composed"]',
+      style: { "border-style": "dotted" },
+    },
+    {
       selector: "edge",
       style: {
         width: 1.4,
@@ -742,6 +790,20 @@ function buildStylesheet() {
       style: { "line-color": color, "target-arrow-color": color },
     });
   }
+  // selected/safety_blocking 要放在医家配色循环之后：医家配色规则也会设
+  // border-color，样式表按声明顺序层叠（后面的覆盖前面同名属性），选中框和
+  // 安全拦截的红框必须始终盖过医家色，不能被医家配色循环反过来盖掉。
+  style.push({
+    // [?field] 是 cytoscape 的"布尔真值"选择器，跟内建的 :selected（用户
+    // 交互选中状态）是两回事——这里选的是我们自己的数据字段
+    // data.selected（这位医家当前选中的候选方），别选错成 :selected。
+    selector: "node[?selected]",
+    style: { "border-width": 3 },
+  });
+  style.push({
+    selector: "node[?safety_blocking]",
+    style: { "border-color": "#dc2626", "border-width": 3 },
+  });
   return style;
 }
 
@@ -755,8 +817,9 @@ function buildStylesheet() {
 // 组装逻辑，因为回答的不是同一个问题（同一条例外，CLAUDE.md 对
 // core/safety.py 危重词表不并进 SYNONYMS 是同一个理由）。
 //
-// 四种节点类型（层 0-3：症状/证素/证型/用药）各一句 + 边一句，加起来是
-// "5 种可 hover 的东西"——不是又多出一种新节点类型，是 4 类节点 + 边。
+// 五种节点类型（层 0-4：症状/证素/病名证型/方剂/药材，M5 把原来的层 3
+// "用药" 拆成方剂+药材两层）各一句 + 边一句，加起来是"6 种可 hover 的
+// 东西"——不是又多出一种新节点类型，是 5 类节点 + 边。
 
 // data.node_type 存在 = 持久知识图谱（图谱浏览器，模块7）的节点；
 // data.layer 存在 = 单次问诊图（模块6）的节点。两种数据形状不同，但都回答
@@ -795,8 +858,22 @@ function describeNodeTooltip(data) {
     }
     case 2:
       return `<b>证型</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(physName)}</div>`;
-    case 3:
-      return `<b>用药</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(physName)}</div>`;
+    case 3: {
+      // M5：层 3 从"用药"改成"方剂"，用药下沉到层 4。
+      const srcLabel = { classic: "经典方", modified: "加减方", composed: "自拟方" }[data.source] || data.source || "";
+      const flags = [];
+      if (data.selected) flags.push("★已选");
+      if (data.safety_blocking) flags.push("⚠ 安全拦截");
+      const meta = [physName, srcLabel, flags.join("　")].filter(Boolean).join("　");
+      return `<b>方剂</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(meta)}</div>`;
+    }
+    case 4: {
+      const parts = [physName];
+      if (data.role) parts.push(`${data.role}药`);
+      if (data.dose != null) parts.push(`${data.dose}${data.unit || ""}`);
+      if (data.decoction) parts.push(data.decoction);
+      return `<b>药材</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(parts.filter(Boolean).join("　"))}</div>`;
+    }
     default:
       return escapeHtml(data.label || data.id || "");
   }
@@ -954,8 +1031,9 @@ function ensureGraphBrowserCanvas() {
     container: document.getElementById("gb-cy"),
     elements: [],
     style: buildGraphBrowserStylesheet(),
-    // per-consult 图（cy）用 preset 布局：症状/证素/证型/药物天然分四列，坐标
-    // 是 computeLayout() 算好摆的。这张图没有那种天然分层——点开才逐步长大，
+    // per-consult 图（cy）用 preset 布局：症状/证素/病名证型/方剂/药材天然分层
+    // （药材是方剂的 compound 子节点），坐标是 computeLayout() 算好摆的。
+    // 这张图没有那种天然分层——点开才逐步长大，
     // 每次新增节点后都要重新摆位，cose 力导向布局适合这种"节点集合会变"的场景。
     layout: { name: "preset" },
     userZoomingEnabled: true,
@@ -1209,7 +1287,7 @@ async function growGraph(graph, { animate = true } = {}) {
   cy.elements().remove();
 
   const positions = computeLayout(graph.nodes, graph.edges);
-  const nodesByLayer = { 0: [], 1: [], 2: [], 3: [] };
+  const nodesByLayer = { 0: [], 1: [], 2: [], 3: [], 4: [] };
   for (const n of graph.nodes) nodesByLayer[n.data.layer].push(n);
 
   const myToken = ++growToken;
@@ -1260,14 +1338,17 @@ async function growGraph(graph, { animate = true } = {}) {
   };
 
   if (!animate) {
-    for (const layer of [0, 1, 2, 3]) nodesByLayer[layer].forEach(addNode);
+    // 顺序很重要：layer 3（方剂，compound 父节点）必须先加完，layer 4
+    // （药材，compound 子节点）才能加——cytoscape 的子节点靠 data.parent
+    // 引用父节点 id，父节点不存在时子节点加不上或渲染不出 compound 关系。
+    for (const layer of [0, 1, 2, 3, 4]) nodesByLayer[layer].forEach(addNode);
     addReadyEdges();
     cy.fit(undefined, 24);
     return;
   }
 
-  const STAGGER = { 0: 60, 1: 50, 2: 90, 3: 40 };
-  for (const layer of [0, 1, 2, 3]) {
+  const STAGGER = { 0: 60, 1: 50, 2: 90, 3: 60, 4: 20 };
+  for (const layer of [0, 1, 2, 3, 4]) {
     for (const n of nodesByLayer[layer]) {
       if (myToken !== growToken) return; // 被新一次生长取代，停掉旧循环
       const el = addNode(n);
@@ -1349,16 +1430,41 @@ function buildEvidenceIndex(data) {
       }
     }
 
-    for (const herb of (s3.herbs || []).slice(0, 6)) {
-      put(`herb::${r.physician}::${herb}`, {
-        title: `用药　${herb}`,
+    // M5：方剂(layer 3)/药材(layer 4) 都要建反查索引——层 3 从"用药"改成
+    // "方剂"之后不再有旧式 herb::{physician}::{herb} 这种节点，图上出现的
+    // 是每个候选方各一个 formula:: 节点、各自带自己的 herb:: 子节点，全部
+    // 候选方都建索引（不是只建 selected 那个），否则点未选中的候选方节点
+    // 侧栏是空的。
+    (s3.formula_candidates || []).forEach((cand, i) => {
+      put(`formula::${r.physician}::${cand.name}`, {
+        title: `${cand.name}　·　${r.physician_name}`,
         physician_name: r.physician_name,
         color: r.color,
-        formula: s3.formula,
-        treatment: s3.treatment_principle,
-        refs: (r.refs || []).filter((x) => (x.herbs || []).some((h) => h.includes(herb) || herb.includes(h))),
+        source: cand.source,
+        base_formula: cand.base_formula,
+        confidence: cand.confidence,
+        rationale: cand.rationale,
+        selected: i === s3.selected,
+        doses_count: cand.doses_count,
+        usage: cand.usage,
+        safety: cand.safety || null,
       });
-    }
+      for (const item of cand.herb_items || []) {
+        put(`herb::${r.physician}::${cand.name}::${item.name}`, {
+          title: `${item.name}　·　${cand.name}`,
+          physician_name: r.physician_name,
+          color: r.color,
+          formula: cand.name,
+          dose: item.dose,
+          dose_unit: item.dose_unit,
+          processing: item.processing,
+          decoction: item.decoction,
+          role: item.role,
+          function_in_formula: item.function_in_formula,
+          refs: (r.refs || []).filter((x) => (x.herbs || []).some((h) => h.includes(item.name) || item.name.includes(h))),
+        });
+      }
+    });
   }
 }
 
@@ -1371,6 +1477,57 @@ function evidenceSectionHtml(s) {
   }
   if (s.treatment) rows.push(`<div class="label">治法</div><div>${escapeHtml(s.treatment)}</div>`);
   if (s.formula) rows.push(`<div class="label">方剂</div><div>${escapeHtml(s.formula)}</div>`);
+
+  // M5：方剂节点的候选方元信息（source/confidence/rationale……）。只有
+  // formula:: 节点的 payload 才会带 source 字段，症状/证素/证型的 payload
+  // 里没有这个键，条件判断天然把两类节点分开，不用额外传节点类型标记。
+  if (s.source) {
+    const srcLabel = { classic: "经典方", modified: "加减方", composed: "自拟方" }[s.source] || s.source;
+    const metaParts = [
+      escapeHtml(srcLabel),
+      s.base_formula ? "原方：" + escapeHtml(s.base_formula) : "",
+      "置信度 " + escapeHtml(s.confidence || ""),
+      s.selected ? "★已选" : "",
+    ].filter(Boolean);
+    rows.push(`<div class="meta">${metaParts.join("　")}</div>`);
+  }
+  if (s.rationale) rows.push(`<div class="label">立方思路</div><div>${escapeHtml(s.rationale)}</div>`);
+  if (s.doses_count || s.usage) {
+    const usageParts = [
+      s.doses_count ? `${s.doses_count} 剂` : "",
+      s.usage ? escapeHtml(s.usage) : "",
+    ].filter(Boolean);
+    rows.push(`<div class="meta">${usageParts.join("　")}</div>`);
+  }
+  if (s.safety) {
+    const sf = s.safety;
+    const blocking = [];
+    if (sf.incompatible && sf.incompatible.length) {
+      blocking.push("配伍禁忌：" + sf.incompatible.map((p) => p.join("与")).join("；"));
+    }
+    if (sf.dose_violations && sf.dose_violations.length) {
+      blocking.push("剂量超限：" + sf.dose_violations.map((v) => `${v.herb} ${v.dose}${v.unit}`).join("；"));
+    }
+    const warn = [];
+    if (sf.thermal_warning) warn.push(sf.thermal_warning);
+    if (sf.decoction_missing && sf.decoction_missing.length) warn.push("煎法缺失：" + sf.decoction_missing.join("、"));
+    if (sf.toxic_herbs && sf.toxic_herbs.length) warn.push("含毒性药材：" + sf.toxic_herbs.join("、"));
+    if (blocking.length) rows.push(`<div class="label">⚠ 安全拦截</div><div class="meta">${escapeHtml(blocking.join("；"))}</div>`);
+    if (warn.length) rows.push(`<div class="label">安全提示</div><div class="meta">${escapeHtml(warn.join("；"))}</div>`);
+  }
+
+  // M5：药材节点的剂量/炮制/煎法/君臣佐使/方中作用。
+  if (s.dose != null || s.processing || s.decoction || s.role) {
+    const doseParts = [
+      s.dose != null ? `剂量 ${s.dose}${escapeHtml(s.dose_unit || "")}` : "",
+      s.processing ? "炮制：" + escapeHtml(s.processing) : "",
+      s.decoction ? "煎法：" + escapeHtml(s.decoction) : "",
+      s.role ? escapeHtml(s.role) + "药" : "",
+    ].filter(Boolean);
+    rows.push(`<div class="meta">${doseParts.join("　")}</div>`);
+  }
+  if (s.function_in_formula) rows.push(`<div class="label">方中作用</div><div>${escapeHtml(s.function_in_formula)}</div>`);
+
   if (s.reasoning) rows.push(`<div class="label">推理过程</div><div>${escapeHtml(s.reasoning)}</div>`);
   if (s.note) rows.push(`<div class="label">备注</div><div>${escapeHtml(s.note)}</div>`);
 

@@ -58,7 +58,8 @@ def _describe_edge(data: dict, source_label: str, target_label: str,
     return _run_node(js)
 
 
-# ---------- 四种节点类型（对应 to_graph() 的 layer 0-3）----------
+# ---------- 五种节点类型（对应 to_graph() 的 layer 0-4，M5 把原来的层 3
+# "用药" 拆成方剂(3)+药材(4) 两层）----------
 
 
 def test_symptom_node_shows_label_and_state():
@@ -87,19 +88,51 @@ def test_syndrome_node_shows_physician_name_from_pname_field():
     assert "证型" in out and "脾胃气虚" in out and "叶天士" in out
 
 
+def test_formula_node_shows_source_label_and_selected_and_safety_flags():
+    """M5：layer 3 从"用药"改成"方剂"，source 三档要翻成中文，selected/
+    safety_blocking 两个布尔标记要各自出一句人话，不是原样打印 true/false。"""
+    out = _describe_node({
+        "id": "formula::ye_tianshi::柴胡疏肝散", "label": "柴胡疏肝散", "layer": 3,
+        "phys": "ye_tianshi", "pname": "叶天士", "source": "classic",
+        "selected": True, "safety_blocking": False,
+    })
+    assert "方剂" in out and "柴胡疏肝散" in out and "叶天士" in out
+    assert "经典方" in out
+    assert "已选" in out
+    assert "安全拦截" not in out
+
+    out2 = _describe_node({
+        "id": "formula::ye_tianshi::柴胡疏肝散加减", "label": "柴胡疏肝散加减", "layer": 3,
+        "phys": "ye_tianshi", "pname": "叶天士", "source": "modified",
+        "selected": False, "safety_blocking": True,
+    })
+    assert "加减方" in out2
+    assert "已选" not in out2
+    assert "安全拦截" in out2
+
+
 def test_herb_node_falls_back_to_physician_names_map():
     """herb:: 节点的 data 里没有 pname（to_graph() 没存这份），必须靠前端自己
     从 PHYSICIAN_NAMES（renderConsultResult 里从 data.results 建的）查——
-    这条测试钉住这条回退路径，不是钉住"节点数据恰好带全了"这个巧合。"""
-    out = _describe_node({"id": "herb::wu_jutong::党参", "label": "党参", "layer": 3, "phys": "wu_jutong"},
-                         physician_names={"wu_jutong": "吴鞠通"})
-    assert "用药" in out and "党参" in out and "吴鞠通" in out
+    这条测试钉住这条回退路径，不是钉住"节点数据恰好带全了"这个巧合。
+    M5：id 从 herb::{phys}::{herb} 两段式变成 herb::{phys}::{方名}::{herb}
+    三段式（同一味药可能出现在多个候选方里，不带方名会撞节点），layer 3 的
+    "用药"变成 layer 4 的"药材"。"""
+    out = _describe_node(
+        {"id": "herb::wu_jutong::甘草泻心汤::党参", "label": "党参", "layer": 4,
+         "phys": "wu_jutong", "role": "臣", "dose": 9.0, "unit": "g"},
+        physician_names={"wu_jutong": "吴鞠通"},
+    )
+    assert "药材" in out and "党参" in out and "吴鞠通" in out
+    assert "臣药" in out
 
 
 def test_herb_node_without_physician_names_map_falls_back_to_raw_id():
     """PHYSICIAN_NAMES 还没建好（比如图还没渲染过就被 hover，理论上不会发生，
     但代码不能因为查不到就崩），退到显示医家 id 本身，好歹不是空白。"""
-    out = _describe_node({"id": "herb::wu_jutong::党参", "label": "党参", "layer": 3, "phys": "wu_jutong"})
+    out = _describe_node(
+        {"id": "herb::wu_jutong::甘草泻心汤::党参", "label": "党参", "layer": 4, "phys": "wu_jutong"}
+    )
     assert "wu_jutong" in out
 
 
