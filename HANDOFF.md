@@ -53,6 +53,8 @@
 | V1 评测汇总 | **已实现**（`eval/run_eval.py` + `eval/mcnemar.py` + `eval/mes/`），1 次真实 claude_cli 调用验证过全链路，见 SOURCES.md 第 23 条 | 对全量测试主诉真实跑一遍，产出正式的 `eval/report.md`；如果拿到了 V3 计划文档原文的 E1-E13 定义，按原文核对这一版自定义指标是否对得上 | 这边的"E1-E13"是按现有代码信号重新设计的，不是照抄原始编号（这一轮没拿到原文） |
 | 附属 quota.py/transition.py | **已实现**，6 条合成医案真实跑通全链路，见 SOURCES.md 第 24 条 | 对真实 `cases.json` 跑 `quota.py` 看是否达标；样本量达标后 `transition.py` 摆出的轨迹才有实际参考价值 | 同上，没有真实全量 `cases.json` |
 | SDT 全量评测 | 适配器 + 打分包装完成 | Test 50 条 × 两组 Solver | 400 次调用，成本与模型都不对 |
+| M2 剂量安全层重开循环 | **已实现**（`core/safety_output.py` 的 `assess_formula_safety` + `core/chain.py` 的重开循环），claude_cli 跑过 2-3 条主诉验证代码路径能跑通（冒烟，非回归） | `set -a && source .env && set +a && python -m core.chain`，对 10 条 `tests/queries.txt` 跑满，报出 blocking 次数 / 重开次数 / 重开后仍 blocking 次数 | claude_cli 不是 DeepSeek，这边跑出来的次数不可比（`manifest.comparability_warning` 机制就是标这个）；判据：blocking 不应为 0（10 条里至少几条会触发剂量或煎法警告），重开后仍 blocking 应远小于重开次数 |
+| M3 s3 prompt 格式遵从度 | **已实现**（`prompts/v1/s3_syndrome.yaml` 的病名/候选方/结构化药材约束），claude_cli 跑通 3 条主诉 × 2 位医家（6/6），全部满足「至少一个 classic」「confidence 不全 high」两条硬约束 | 同样 3 条（或全量）主诉在 DeepSeek 后端重跑一次，确认这两条格式约束不是 claude_cli 特有的巧合 | 格式遵从度理论上是模型无关的趋势指标，但目前只在一个后端上验证过；DeepSeek 可能更倾向把三个候选方都填 high，或者 role 大量留空，需要真实跑一次才能排除 |
 
 ---
 
