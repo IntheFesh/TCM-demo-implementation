@@ -2103,8 +2103,13 @@ function doctorSectionHtml(physician, mode) {
   if (mode !== "doctor") return "";
   const state = DOCTOR_STATE[physician];
   if (!state) return "";
+  // 免责声明文案只在 describeDisclaimer() 里写一份——这里跟页头那条横幅
+  // 共用同一个字符串来源，不各自硬编码一遍。收尾阶段核对 README「定位」
+  // 那节时发现这里曾经复制过一份，跟 describeDisclaimer() 各自维护，
+  // 改一处忘另一处的风险是真实存在的（CLAUDE.md「同一概念只能有一处
+  // 实现」，这次撞的是文案而不是逻辑，但道理一样），这里改成调用它。
   return `
-    <div class="doctor-disclaimer">医生模式：处方辅助工具。系统提供的方剂与剂量为建议，最终处方由执业医师审核、修改并签发，医师承担全部临床责任。所有导出操作均记录审计日志。</div>
+    <div class="doctor-disclaimer">${escapeHtml(describeDisclaimer("doctor"))}</div>
     <div class="label" style="margin-top:8px;">医生编辑处方——${escapeHtml(state.name)}</div>
     <div class="rx-formula-fields">
       <label>剂数　<input type="number" data-rx-phys="${physician}" data-rx-field="doses_count" value="${state.doses_count != null ? state.doses_count : ""}" style="width:50px" /></label>

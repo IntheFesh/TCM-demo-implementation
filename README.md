@@ -4,7 +4,7 @@
 **吴鞠通**（`wu_jutong`，《吴鞠通医案》）——的辨证思路，各自给出证型、治法、方药，并把
 两者并置对比、标出分歧。每条结论都必须引用它所依据的真实医案 id，用于防幻觉核查。
 
-> 患者 / 学生 / 研究者模式：教学与研究用途，非诊断工具。
+> 患者 / 学生 / 研究者模式：教学与研究用途，非诊断工具，不能替代执业医师。
 > 医生模式：处方辅助工具。系统提供的方剂与剂量为建议，最终处方由执业医师
 > 审核、修改并签发，医师承担全部临床责任。所有导出操作均记录审计日志。
 
@@ -620,3 +620,188 @@ LoRA_DIR）。
 - S1（症状标准化）全局只跑一次，两位医家共用结果，避免症状节点 id 对不上
 - 安全否决必须发生在 S2（证素推断）之前，被拦截的请求不产出任何方药
 - 所有 LLM 输出都用 pydantic 模型承接，防幻觉的关键约束（`min_length=1`）不要放松
+
+## 四种模式
+
+`POST /api/consult`、`POST /api/consult/stream` 请求体都可以带 `role`
+字段（`"patient" | "doctor" | "student" | "researcher"`，默认
+`"researcher"`）。跟 `retriever_mode` 一样是**逐请求参数，不是进程级
+设置**——同一个服务同时服务不同角色的请求，互不影响。
+
+字段裁剪**在服务端做**，不是前端拿到完整数据再选择性隐藏——patient
+角色拿到的响应体里 `formula_candidates` 这个键**根本不存在**，不是
+存在但为空；前端过滤等于把完整处方发到客户端再藏起来，打开浏览器
+devtools 照样能看到。
+
+| 字段 | patient | doctor | student | researcher |
+|---|---|---|---|---|
+| disease / syndrome | ✅ | ✅ | ✅ | ✅ |
+| triage（导诊） | ✅ | ✅ | — | — |
+| formula_candidates | ❌ | ✅ | ✅ | ✅ |
+| herb_items（含剂量） | ❌ | ✅ | ✅ | ✅ |
+| 食疗 / 中成药 | ✅（M9 前恒为空列表） | ✅（M9 前恒为空列表） | — | — |
+| reasoning | 通俗版 | 专业版 | 专业版 | 专业版 |
+| react_trace（ReAct 取证轨迹） | ❌ | ❌ | ✅ | ✅ |
+| refs（检索医案） | ❌ | ✅ | ✅ | ✅ |
+| divergence（分歧度） | ❌ | ❌ | ✅ | ✅ |
+| manifest（模型/prompt版本/耗时等技术元数据） | ❌ | ❌ | — | ✅ |
+| safety 详情 | 简化（布尔摘要，不含药名） | ✅ | ✅ | ✅ |
+| 六层图的方剂/药材层 | 不生成（不是生成后摘除） | 生成 | 生成 | 生成 |
+
+`urgency=high`（红旗症状）时，patient/doctor 两种角色**不返回任何用药
+相关字段**——食疗、中成药一并清空，这条闸门跟 `formula_candidates`
+是否存在无关，独立生效，不因为将来接了真实食疗数据源就被绕过。
+
+**patient**：只读，看得到证型/治法/导诊建议，看不到具体方药，`reasoning`
+是模型跟专业版一起生成的通俗语言版本（不是事后翻译）。
+
+**doctor**：完整信息（含具体方药），前端多一张**可编辑处方表**（见下面
+「处方安全」「审计」两节），可以改方、校验、导出——是这四种角色里唯一
+能产生"写入"这件事的模式。
+
+**student**：完整信息，前端额外做了三处教学优化：药材按君臣佐使分组
+显示（君药加粗）；点击任一症状节点高亮它到所有候选方的完整四步链路
+（症状→证素→病名证型→方剂，不下探到药材层——层3方剂是 compound
+父节点，框亮了药材自然看得见）；医家卡片的推理详情/ReAct 取证过程
+默认展开（researcher 模式默认折叠）。
+
+**researcher**（默认）：跟改造前的行为逐字节一致，包括 `manifest` 这类
+只对开发/评测有意义的技术元数据。
+
+## 处方安全
+
+`core/safety_output.py::assess_formula_safety(syndrome, herb_items)`
+是候选方安全检查**唯一的组装点**——五条规则都在这一个函数里跑，不是
+散在各处各查各的：
+
+| 规则 | 判据来源 | 分级 |
+|---|---|---|
+| 十八反十九畏配伍禁忌 | `check_incompatible` | 拦截级 |
+| 剂量超出常用上限 | `check_dose_limits`（`DOSE_LIMITS` 表） | 拦截级 |
+| 缺必要煎法（先煎/后下等） | `check_required_decoction`（`REQUIRED_DECOCTION` 表） | 警告级 |
+| 含毒性/大毒药材 | `check_toxic_herbs` | 警告级 |
+| 证型寒热方向与主方药性相悖 | `check_thermal_consistency` | 警告级 |
+
+**拦截级**（`FormulaSafety.blocking`，即"配伍禁忌"或"剂量超限"任一命中）
+会让 `core/chain.py` 里的 `run_physician` 重开一次方；**警告级**只提示
+不打回——寒热错杂证本来就寒热并用、毒性药材的常规用量本就贴着上限、
+漏标煎法不代表方子本身有问题，这三类逼模型重开只会把对的方子改坏。
+
+`DOSE_LIMITS`/`REQUIRED_DECOCTION`/毒性分层的数据来源方法论（WebSearch
+核实、非逐字核对原文 PDF 这层局限）如实记在 `core/safety_output.py`
+文件开头的文档字符串里，不重复贴一份到这里。
+
+`POST /api/prescription/validate`：纯规则、不调 LLM、毫秒级返回，独立于
+`/api/consult`——医生可能想校验一张手写/临时改动的方，不依赖任何问诊
+上下文。
+
+```
+POST /api/prescription/validate
+body: {herb_items: HerbItem[], syndrome: string, disease?: string}
+→ FormulaSafety 的字段 + 一个额外的 blocking 布尔（FormulaSafety.blocking
+  是 pydantic 的 @property，model_dump() 不带计算属性，接口这里手动补上，
+  避免调用方各自重新判断一遍"incompatible 或 dose_violations 非空就是
+  blocking"）
+```
+
+## 审计
+
+医生导出处方时（`POST /api/prescription/export`），无论方子有没有问题
+都会追加一条记录到 `data/audit.jsonl`（哈希链，不进版本控制——`.gitignore`
+的 `*.jsonl` 整体忽略规则已经会挡住它，运行时生成物不需要额外例外）。
+
+**为什么不用 SQLite**：审计日志的核心属性是防篡改。SQLite 默认给不了——
+任何人打开 db 文件改一行，改完看不出来。哈希链每条记录带前一条的哈希，
+改中间任何一条，后面全部对不上，一条命令就能校验出来。而且零依赖、
+纯文本可读，AutoDL 上就是普通文件写入，现在就能跑。
+
+`core/audit.py::AuditRecord` 字段：
+
+```python
+seq: int                 # 严格递增，从 1 开始
+timestamp: str            # ISO8601 UTC
+doctor_id: str
+patient_ref: str | None
+model_suggestion: dict    # 模型当初给的候选方（FormulaCandidate.model_dump()）
+final: dict                # 医生最终定的方
+diffs: list[str]          # 逐味药的人类可读差异，见下方例子
+safety_at_export: dict    # 导出那一刻服务端重新算出的 FormulaSafety（含 blocking）
+override_reason: str | None  # blocking 为真时医生坚持导出必须填的理由
+prev_hash: str             # 前一条记录的 sha256，第一条是 64 个 0
+hash: str                  # 本条记录（除 hash 外全部字段）的 sha256
+```
+
+`diffs` 按药名配对比较 `model_suggestion` 和 `final`（不按列表下标——
+医生中途插入/删除一味药会让下标错位），五类描述格式：
+
+```
+去 甘草                 # 原方有、定方没有
+加 海藻 15g              # 原方没有、定方有
+附子 10g→15g             # 剂量变了
+半夏 炮制 生→姜制         # 炮制变了
+附子 煎法 无→先煎         # 煎法变了
+```
+
+**安全判定服务端权威重算，不信任客户端传来的值**：`/api/prescription/export`
+收到的 `formula.safety`（如果客户端带了）完全不作数，服务端用
+`assess_formula_safety("", formula.herb_items)` 重新算一遍——跟 X2
+输出侧安全检查"不能让模型自己说安全"是同一条原则的延伸，这里是"不能让
+客户端自己说安全"（前端改一个布尔值不能绕过拦截）。`blocking` 为真且
+没有非空 `override_reason` 时拒绝导出（422，列出具体问题）；医生传了
+非空理由就放行，这条理由连同完整的 `safety_at_export` 一起写进审计
+记录——它是"医生明知有问题仍坚持导出"唯一的书面记录。
+
+并发写入用 `fcntl.flock(LOCK_EX)` 把"读最后一行取 prev_hash、算本条
+hash、追加写入"整段包进临界区，不能只锁写入那一步——两个医生同时导出，
+如果只锁写入，两边都可能在锁外先读到同一个 prev_hash，各自算出的哈希
+都"合法"，但链会在这里分叉。
+
+命令行手动校验一条链：
+
+```bash
+python -c "
+from core.audit import verify_audit_chain
+ok, problems = verify_audit_chain()
+print('完整' if ok else '不完整', problems)
+"
+```
+
+`verify_audit_chain` 分三个维度分别报问题（不是笼统一句"第 N 条有
+问题"）：hash 对不上（内容被改但没跟着重算哈希）、seq 不连续（丢了一条
+或插了一条不该在的）、prev_hash 跟上一条记录实际的 hash 对不上（链被
+剪断重接）——比较基准用文件里实际写的 hash，一条记录的问题只在它自己
+身上报一次，不会连累后面所有记录都被误判。
+
+```
+POST /api/prescription/export
+body: {formula: FormulaCandidate, doctor_id: string, patient_ref?: string,
+       model_suggestion: FormulaCandidate, override_reason?: string}
+→ 成功 {text: "药房格式文本", audit_id: "<seq>"}
+→ 422（blocking 且无 override_reason）{detail: {message, problems, safety}}
+```
+
+药房格式文本样例（`core/prescription.py::format_pharmacy_text`，中文
+药名按东亚宽字符显示宽度对齐，不是按字符数）：
+
+```
+瓜蒌薤白半夏汤加减                    7 剂
+  瓜蒌      15g
+  薤白       9g
+  半夏       9g   姜制  先煎
+用法：水煎服，每日1剂，分2次温服
+```
+
+## 定位
+
+> 患者 / 学生 / 研究者模式：教学与研究用途，非诊断工具，不能替代执业医师。
+> 医生模式：处方辅助工具。系统提供的方剂与剂量为建议，最终处方由执业医师
+> 审核、修改并签发，医师承担全部临床责任。所有导出操作均记录审计日志。
+
+跟文件顶部那句一字不差——这段文案**只有一处真正的来源**：
+`web/index.html::describeDisclaimer()`。前端有两个地方显示它，都是调用
+这一个函数、不是各自硬编码一份：页头的免责声明横幅（角色一切换就跟着
+换文案）、医生模式可编辑处方表顶部的紫色提示条。README 这里和 CLAUDE.md
+如果要跟着改，改的应该是 `describeDisclaimer()` 那一处，然后把新文案
+转录到这几个地方——不能先改 README、前端却没跟上（M8 报告里点名过的
+风险：审计/教学/研究这类免责表述，一处改一处忘，比代码逻辑不一致更容易
+被用户直接看到、也更容易造成误解）。
