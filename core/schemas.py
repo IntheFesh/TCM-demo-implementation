@@ -1,7 +1,9 @@
 """全项目共用的 pydantic 数据模型。离线抽取和在线推理链都从这里取模型，不裸用 dict。"""
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from core.herbs import split_western_drugs
 
 # ---------- 离线：医案结构化 ----------
 
@@ -272,20 +274,168 @@ class FollowupResult(BaseModel):
     reject_reason: str | None = None
 
 
-class S3Syndrome(BaseModel):
+class HerbItem(BaseModel):
+    """处方里的一味药。名字之外的字段都可能缺失（古籍医案常常不写剂量），
+    缺失一律 None，不要填默认值——"没写"和"写了 0"是两回事。
+
+    role 不做枚举以外的约束（比如"一个方最多一个君药"）：君臣佐使的分配是
+    模型自己判断的，这里只承接结果，不裁判它对不对——M7 的报告会把填充率
+    如实报出来，判断准不准是后续要看真实产出才能下的结论，不是 schema 该管的事。
+    """
+
+    name: str = Field(min_length=1)
+    dose: float | None = None
+    dose_unit: Literal["g", "钱", "两", "分", "枚", "片"] = "g"
+    processing: str | None = None  # 炮制：醋制/煅/蜜炙/生/炒/姜制/酒制
+    decoction: str | None = None  # 煎法：先煎/后下/包煎/烊化/冲服/另煎
+    role: Literal["君", "臣", "佐", "使"] | None = None
+    function_in_formula: str | None = None
+    dose_evidence: list[str] = Field(default_factory=list)
+
+
+class FormulaCandidate(BaseModel):
+    """一个候选方。三种来源的可信度不同，前端必须视觉区分（M6/M7）：
+      classic  —— 现有经典方，原方名照写
+      modified —— 在经典方基础上加减，必须能追溯到 base_formula
+      composed —— 根据药性药理自组方，没有"原方"这个概念
+
+    base_formula 的约束用 model_validator 强制而不是留给调用方记得填：
+    加减方不写原方就无法追溯改了什么，这条防线不能是"建议"。
+    """
+
+    name: str = Field(min_length=1)
+    source: Literal["classic", "modified", "composed"]
+    base_formula: str | None = None
+    confidence: Literal["high", "medium", "low"]
+    rationale: str = Field(min_length=1)
+    # min_length=1：一个"候选方"至少要有一味药，否则不构成方。
+    herb_items: list[HerbItem] = Field(min_length=1)
+    doses_count: int | None = None  # 剂数
+    usage: str | None = None  # 用法，如"水煎服，每日1剂，分2次温服"
+
+    @model_validator(mode="after")
+    def _check_base_formula(self) -> "FormulaCandidate":
+        if self.source == "modified":
+            if not self.base_formula:
+                raise ValueError(
+                    "source='modified'（加减方）必须填 base_formula——"
+                    "不写原方就无法追溯改了什么，这条约束不能省。"
+                )
+        elif self.base_formula:
+            raise ValueError(
+                f"source={self.source!r} 时 base_formula 必须为空："
+                "只有 modified（加减方）才有『原方』这个概念，classic/composed 硬填一个会误导。"
+            )
+        return self
+
+
+# 向后兼容合成用的占位符：只在"旧式调用只给了 herbs/formula/western_drugs、
+# 完全没给 formula_candidates"且连一味药都没给时才可能出现在 herb_items[0].name /
+# formula_candidates[0].name 里，_S3Base._derive_flat_fields 会把它从派生结果里
+# 过滤掉，好让 .herbs == [] / .formula is None 这两条旧默认值原样保留
+# （见 core/schemas.py 的 M1 迁移设计——不能让"没提供任何药材"被合成成一味假药，
+# 那会把 herb_jaccard 从 None 悄悄变成 0.0，一个没人要求过的行为变化）。
+_LEGACY_HERB_PLACEHOLDER = "（占位·未提供药材）"
+_LEGACY_FORMULA_PLACEHOLDER = "（占位·未提供方名）"
+
+
+class _S3Base(BaseModel):
+    """`S3Syndrome` 与 `S3SyndromeUnreferenced` 共享的字段与派生逻辑。
+
+    两个子类唯一的区别本该只在 cited_case_ids（一个必填、一个恒空的
+    property）——这个基类的存在就是不让这个"唯一的区别"之外的东西被复制
+    两份、以后改一边忘了改另一边（CLAUDE.md「同一概念只能有一处实现」，
+    这次撞的不是匹配逻辑，是 schema 定义本身）。
+
+    ## herbs / formula / western_drugs 为什么还在，为什么变成"派生"
+
+    这三个字段这一轮改造前是可以独立赋值的普通字段。保留它们**不是**为了兼容
+    调用方少写代码，是因为三个真实消费方到今天还在直接读它们：
+    herb_jaccard（分歧指标）、check_incompatible/check_thermal_consistency
+    （X2 输出侧安全）、前端证据链侧栏。逼这三处都改成读
+    `formula_candidates[selected].herb_items` 是这一轮不该碰的范围（M2/M5 才会
+    真的用上 herb_items 的 dose/role/decoction），所以让新旧两种形状共存，
+    但**只能有一份真相**：新形状（formula_candidates）永远是权威来源，旧形状
+    在构造完成后立即从它派生，调用方不用（也不能）让两者手动保持同步。
+
+    ## 两条 model_validator 各管一个方向
+
+    `_synthesize_formula_candidates_from_legacy_fields`（before）：输入侧没给
+    `formula_candidates` 时，从 `formula`/`herbs`/`western_drugs` 合成恰好一个
+    候选方——这不是"让旧代码继续绕过新约束"，是给 M1 之前所有已存在的构造点
+    （测试 fixture、CLI）一条不用逐个改写就能继续工作的迁移路径。真实 LLM 调用
+    在 M3 改完 prompt 前也会走这条路：模型仍按老 schema 吐 herbs/formula，
+    这里补一层，consult() 端到端行为在 M3 之前不变。
+
+    `_derive_flat_fields`（after）：不管 formula_candidates 是怎么来的（LLM
+    真输出的，还是上面合成的），一律从 `formula_candidates[selected]` 重新算出
+    `formula`/`herbs`/`western_drugs`，覆盖掉调用方可能传入的任何旧值——
+    "不要靠调用方记得同步"就是这条的字面意思。
+    """
+
+    disease: str | None = None  # 病名（M4 起才真正校验/匹配，这里先只是字段）
     syndrome: str
     reasoning: str
     treatment_principle: str
+    formula_candidates: list[FormulaCandidate] = Field(min_length=1, max_length=3)
+    selected: int = 0  # 默认选第几个候选方；下面的 after 校验器负责越界检查
+    # 以下三个保留，向后兼容，从 formula_candidates[selected] 派生——见类文档字符串
     formula: str | None = None
     herbs: list[str] = Field(default_factory=list)
     # 医家开方时也可能用西药（不只是医案原文里有），同 CaseStructured.western_drugs
     western_drugs: list[str] = Field(default_factory=list)
-    # min_length=1 同理：防幻觉的关键约束，不要改成可选。
-    cited_case_ids: list[str] = Field(min_length=1)
     note: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _synthesize_formula_candidates_from_legacy_fields(cls, data):
+        if not isinstance(data, dict) or "formula_candidates" in data:
+            # 后一个条件是"键存在"，不是"值非空"：显式传 formula_candidates=[]
+            # 必须让 pydantic 自己的 min_length=1 去拒绝它（这正是防幻觉约束要测的
+            # 那种输入），不能被这里的合成逻辑悄悄补上一个候选方，把校验绕过去。
+            # 前半个条件覆盖"根本不是 dict"（比如已构造好的实例）。
+            return data
+        herbs = list(data.get("herbs") or [])
+        western = list(data.get("western_drugs") or [])
+        names = herbs + western
+        herb_items = [{"name": n} for n in names] or [{"name": _LEGACY_HERB_PLACEHOLDER}]
+        data = dict(data)
+        data["formula_candidates"] = [{
+            "name": data.get("formula") or _LEGACY_FORMULA_PLACEHOLDER,
+            "source": "composed",
+            "confidence": "medium",
+            "rationale": "由旧式扁平字段（herbs/formula/western_drugs）自动合成，"
+                         "构造时未提供 formula_candidates。",
+            "herb_items": herb_items,
+        }]
+        data.setdefault("selected", 0)
+        return data
 
-class S3SyndromeUnreferenced(BaseModel):
+    @model_validator(mode="after")
+    def _derive_flat_fields(self) -> "_S3Base":
+        n = len(self.formula_candidates)
+        if not (0 <= self.selected < n):
+            raise ValueError(
+                f"selected={self.selected} 越界：formula_candidates 共 {n} 个，"
+                f"合法范围是 [0, {n - 1}]。"
+            )
+        cand = self.formula_candidates[self.selected]
+        # 过滤掉合成占位符，让"完全没给任何药材/方名"时 .herbs == [] / .formula
+        # is None 这两条旧默认值原样保留，见 _LEGACY_HERB_PLACEHOLDER 的注释。
+        names = [item.name for item in cand.herb_items if item.name != _LEGACY_HERB_PLACEHOLDER]
+        kept, moved = split_western_drugs(names)
+        self.formula = None if cand.name == _LEGACY_FORMULA_PLACEHOLDER else cand.name
+        self.herbs = kept
+        self.western_drugs = moved
+        return self
+
+
+class S3Syndrome(_S3Base):
+    # min_length=1：防幻觉的关键约束，不要改成可选。
+    cited_case_ids: list[str] = Field(min_length=1)
+
+
+class S3SyndromeUnreferenced(_S3Base):
     """检索不到任何相关医案（相似度全部低于阈值，或该医家没有医案）时用的 S3 schema。
 
     **没有 cited_case_ids 字段。** 这是 CLAUDE.md「某个新场景导致校验失败时，新建一个
@@ -293,15 +443,6 @@ class S3SyndromeUnreferenced(BaseModel):
     min_length=1 会逼模型编一个 id——要么必被判幻觉却照样出方，要么三次校验失败抛
     LLMError 让整个 consult 崩掉。S3Syndrome 本身一个字没动。
     """
-
-    syndrome: str
-    reasoning: str
-    treatment_principle: str
-    formula: str | None = None
-    herbs: list[str] = Field(default_factory=list)
-    # 跟 S3Syndrome 一起加：缺了它，检索为空这条路径前端会少一个键
-    western_drugs: list[str] = Field(default_factory=list)
-    note: str | None = None
 
     @property
     def cited_case_ids(self) -> list[str]:

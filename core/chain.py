@@ -97,9 +97,12 @@ RESIDUAL_THRESHOLD = 0.30
 
 
 # 药名归一挪到 core/herbs.py 了：core/safety_output.py 也要用它，留在这里会
-# 造成 chain ↔ safety_output 循环导入。这里只留本模块真正用到的两个名字。
+# 造成 chain ↔ safety_output 循环导入。这里只留本模块真正用到的一个名字。
+# split_western_drugs 曾经也在这里再导出（给 _split_western_into_s3 用），M1
+# 把西药拆分挪进 core.schemas._S3Base 的 model_validator 之后不再需要——
+# S3Syndrome/S3SyndromeUnreferenced 构造完成的那一刻，.herbs/.western_drugs
+# 就已经是拆好的，这里不用也不该再拆一次。
 normalize_herb = _herbs.normalize_herb
-split_western_drugs = _herbs.split_western_drugs
 
 
 def _format_case_line(case: CaseRecord) -> str:
@@ -184,20 +187,6 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
         pulse=s1.pulse or "未记",
     )
     return get_llm().generate(system=s2_system, user="", schema=S2Elements)
-
-
-def _split_western_into_s3(s3):
-    """S3 边界上把混进 herbs 的西药挑到 western_drugs。跟 S0 抽取那一侧用的是
-    同一个 core.herbs.split_western_drugs，不各写一套判断。
-
-    prompt 里也写了这条要求，但 prompt 是约束不是保证——模型照样可能把阿斯匹林
-    塞进 herbs，代码这一层必须兜住：混进去会污染 herb_jaccard，把跨学派分歧
-    系统性推高，而那个推高是假的（两位温病医家不可能开阿斯匹林）。
-    """
-    kept, moved = split_western_drugs(s3.herbs or [])
-    s3.herbs = kept
-    s3.western_drugs = list(dict.fromkeys((s3.western_drugs or []) + moved))
-    return s3
 
 
 def _search_cases(
@@ -335,7 +324,12 @@ def run_physician(
         # 没开 ReAct 时这是这位医家唯一一次要等的 LLM 调用；开了 ReAct 也要报——
         # 取证结束不代表马上有结果，S3 本身也要等一次真实调用。
         on_step("s3_start", {"physician": physician, "physician_name": physician_name})
-    s3 = _split_western_into_s3(get_llm().generate(system=s3_system, user="", schema=s3_schema))
+    # 混进 herbs 的西药（模型没照 prompt 的要求分开写）在 schema 构造时就已经被
+    # core.schemas._S3Base 的 model_validator 挑到 western_drugs 了，这里不用
+    # 再包一层 _split_western_into_s3——这一步以前是代码层面的兜底，现在兜底
+    # 挪进了 schema 本身，构造完成的这一刻 s3.herbs/s3.western_drugs 就已经是
+    # 拆好的（M1 之前这里对 herbs 混西药的拟合方式做了一次真实回归，见 SOURCES.md）。
+    s3 = get_llm().generate(system=s3_system, user="", schema=s3_schema)
 
     # X2 输出侧安全：十八反十九畏命中就把冲突写进 prompt 重开一次。
     # 只重开一次、不循环——循环会让 llm_calls 变成不可预测的数，
@@ -348,9 +342,7 @@ def run_physician(
             f"{format_conflicts(incompatible)}。请重新拟方避开这些配伍，"
             "其余要求不变。"
         )
-        s3 = _split_western_into_s3(
-            get_llm().generate(system=retry_system, user="", schema=s3_schema)
-        )
+        s3 = get_llm().generate(system=retry_system, user="", schema=s3_schema)
         revised = True
         # 重开之后再查一次：还有冲突就保留结果并如实标出来，不再重开。
         incompatible = check_incompatible(s3.herbs)
@@ -712,7 +704,8 @@ def consult(
     # 哪怕两者治法、方剂一字不差（实测 10 条主诉分歧率 9/9，指标无区分度）。
     # 改用药物集合的 Jaccard 距离作为主指标：用药是医家风格最实在的落点，
     # 而证型命名的差异很大程度上只是措辞。
-    # s3.herbs 在 S3 边界已经被 _split_western_into_s3 清过西药，这里不用再滤一次
+    # s3.herbs 在 S3Syndrome/S3SyndromeUnreferenced 构造完成的那一刻已经被
+    # core.schemas._S3Base 的 model_validator 清过西药，这里不用再滤一次
     # ——清洗只在那一处做，下游全都看到干净数据。
     herb_sets = [
         _herbs.normalized_herb_set(r["s3"].herbs)
