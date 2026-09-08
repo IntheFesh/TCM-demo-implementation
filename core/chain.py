@@ -335,7 +335,7 @@ def run_physician(
     # prompt 重开一次。只重开一次、不循环——循环会让 llm_calls 变成不可预测的数，
     # manifest 里那个调用数就没法用来算成本和比较配置了。
     for cand in s3.formula_candidates:
-        cand.safety = assess_formula_safety(s3.syndrome, cand)
+        cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
     selected_safety = s3.formula_candidates[s3.selected].safety
     revised = False
     if selected_safety.blocking:
@@ -346,7 +346,7 @@ def run_physician(
         )
         s3 = get_llm().generate(system=retry_system, user="", schema=s3_schema)
         for cand in s3.formula_candidates:
-            cand.safety = assess_formula_safety(s3.syndrome, cand)
+            cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
         revised = True
         # 重开之后再查一次：还有问题就保留结果并如实标出来，不再重开。
         selected_safety = s3.formula_candidates[s3.selected].safety

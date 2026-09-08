@@ -411,6 +411,14 @@ def test_empty_formula_safety_is_not_blocking():
 
 
 # ---------- assess_formula_safety：唯一组装点 ----------
+#
+# M8：assess_formula_safety 的第二个参数从 candidate: FormulaCandidate 改成
+# herb_items: list[HerbItem]（见 core/safety_output.py 里的文档字符串）——
+# 这个函数从来只读 candidate.herb_items，POST /api/prescription/validate
+# （M8 新增）手头只有 herb_items，没有 name/source/confidence/rationale
+# 这些字段，收窄参数类型比硬凑一个带假 rationale 的占位 FormulaCandidate
+# 更符合"禁止占位实现"。下面几条测试只改了调用参数（cand -> cand.herb_items），
+# 断言逻辑一个字都没动。
 
 
 def _candidate(herb_items):
@@ -426,7 +434,7 @@ def test_assess_formula_safety_runs_all_five_checks():
         HerbItem(name="海藻", dose=5, dose_unit="g"),
         HerbItem(name="附子", dose=20, dose_unit="g", decoction=None),
     ])
-    safety = assess_formula_safety("脾胃虚寒证", cand)
+    safety = assess_formula_safety("脾胃虚寒证", cand.herb_items)
     assert safety.incompatible == [("甘草", "海藻")]
     assert len(safety.dose_violations) == 1 and safety.dose_violations[0].herb == "附子"
     assert safety.decoction_missing == ["附子"]
@@ -442,7 +450,7 @@ def test_assess_formula_safety_excludes_western_drug_items():
         HerbItem(name="党参", dose=9, dose_unit="g"),
         HerbItem(name="西药阿斯匹林", dose=9999, dose_unit="g"),
     ])
-    safety = assess_formula_safety("脾胃气虚", cand)
+    safety = assess_formula_safety("脾胃气虚", cand.herb_items)
     assert safety.dose_violations == []
     assert safety.toxic_herbs == []
 
@@ -450,7 +458,7 @@ def test_assess_formula_safety_excludes_western_drug_items():
 def test_assess_formula_safety_clean_formula_has_no_warnings():
     cand = _candidate([HerbItem(name="党参", dose=15, dose_unit="g"),
                        HerbItem(name="白术", dose=10, dose_unit="g")])
-    safety = assess_formula_safety("脾胃气虚", cand)
+    safety = assess_formula_safety("脾胃气虚", cand.herb_items)
     assert safety.incompatible == [] and safety.dose_violations == []
     assert safety.decoction_missing == [] and safety.toxic_herbs == []
     assert safety.blocking is False

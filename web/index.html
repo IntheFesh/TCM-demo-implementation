@@ -292,6 +292,121 @@
     color: var(--muted, #666);
     margin: 4px 0 0;
   }
+
+  /* ---------- M8：医生模式可编辑处方表 ---------- */
+  .doctor-disclaimer {
+    background: var(--purple-bg);
+    border: 1px solid var(--purple-border);
+    color: var(--purple-text);
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 8px 0;
+    line-height: 1.6;
+  }
+  .rx-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 12.5px;
+  }
+  .rx-table th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--muted);
+    font-size: 11.5px;
+    padding: 3px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .rx-table td {
+    padding: 2px 3px;
+    vertical-align: middle;
+  }
+  .rx-table input[type="text"], .rx-table input[type="number"], .rx-table select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 4px 5px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--panel);
+    color: var(--text);
+  }
+  .rx-table input[type="number"] { width: 62px; }
+  .rx-del-btn {
+    background: none;
+    border: none;
+    color: var(--danger);
+    cursor: pointer;
+    font-size: 15px;
+    padding: 2px 6px;
+  }
+  .rx-add-btn {
+    margin-top: 4px;
+    background: none;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 12.5px;
+    padding: 5px 10px;
+  }
+  .rx-formula-fields {
+    display: flex;
+    gap: 14px;
+    margin: 6px 0;
+    font-size: 12.5px;
+    color: var(--muted);
+    align-items: center;
+  }
+  .rx-formula-fields input {
+    padding: 4px 6px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font-family: inherit;
+    font-size: 12.5px;
+  }
+  .rx-export-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 7px 16px;
+    font-size: 13px;
+    border-radius: 7px;
+    cursor: pointer;
+    margin-top: 6px;
+  }
+  .rx-override-box {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 6px;
+  }
+  .rx-override-box textarea {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 50px;
+    font-family: inherit;
+    font-size: 12.5px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    margin: 4px 0;
+  }
+  .rx-pharmacy-text {
+    white-space: pre;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    background: #f7f7f9;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-top: 8px;
+    overflow-x: auto;
+  }
+
   details {
     margin-top: 10px;
     border-top: 1px dashed var(--border);
@@ -504,7 +619,12 @@
 
 <header>
   <h1>名医辨证对照</h1>
-  <div class="disclaimer">教学与研究用途，非诊断工具，不能替代执业医师</div>
+  <!-- M8：定位表述分模式——患者/学生/研究者模式沿用原文案，医生模式换成
+       任务描述原文给的处方辅助工具表述（见 describeDisclaimer()）。这里的
+       初始文案是默认角色 researcher 对应的那句，JS 在 role-select 变化时
+       会原地替换，不是另起一块只在医生模式下才出现的提示——同一个位置，
+       内容跟着角色换，位置本身不该因为角色不同而消失或新增。 -->
+  <div class="disclaimer" id="disclaimer-text">教学与研究用途，非诊断工具，不能替代执业医师</div>
 </header>
 
 <div id="tab-bar">
@@ -541,15 +661,26 @@
         <option value="bm25">bm25（关键词）</option>
         <option value="graph">graph（证素索引）</option>
       </select>
-      <!-- M7：只放 researcher/student 两档——patient/doctor 后端（M6）已经支持，
-           但各自的专属界面（导诊横幅、可编辑处方表）分别是未排期工作和 M8 的
-           任务，这里先不摆一个选了却看不出差别的选项，等对应界面做出来再加。 -->
+      <!-- M7 只放了 researcher/student——patient 的专属界面（导诊横幅）仍是
+           未排期工作，这里还是不摆；doctor 的专属界面（可编辑处方表）M8 做了，
+           加回这个选项。 -->
       <label id="role-select-label" for="role-select">查看模式</label>
       <select id="role-select">
         <option value="researcher" selected>研究者（完整信息）</option>
         <option value="student">学生（教学展开）</option>
+        <option value="doctor">医生（可编辑处方）</option>
       </select>
       <button id="submit-btn">辨证</button>
+    </div>
+    <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
+         其余模式下这两个字段不出现——不是禁用置灰，是压根不摆出来，跟
+         patient/doctor 模式后端字段裁剪同一条"不该看到的东西不摆出来"的
+         精神，只是这里是前端表单层面的，不是安全边界。 -->
+    <div class="input-row" id="doctor-id-row" style="display:none;">
+      <label id="doctor-id-label" for="doctor-id-input">医生标识</label>
+      <input type="text" id="doctor-id-input" placeholder="例如：dr_ye（导出处方必填）" style="flex:1;padding:7px 8px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:12.5px;" />
+      <label id="patient-ref-label" for="patient-ref-input">患者标识（可选）</label>
+      <input type="text" id="patient-ref-input" placeholder="例如：门诊号/化名" style="flex:1;padding:7px 8px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:12.5px;" />
     </div>
     <div id="progress-log"></div>
     <div id="need-input-box">
@@ -1882,6 +2013,324 @@ function reactTraceDetailsHtml(rt, openAttr) {
   </details>`;
 }
 
+// ---------- M8：医生模式可编辑处方表 ----------
+//
+// DOCTOR_STATE：physician -> 这位医家当前的编辑状态。跟 EVIDENCE/lastGraph
+// 一样是"上一次问诊响应"派生出的运行时状态，每次新响应回来时重建
+// （initDoctorState），不是持久化的——医生编辑到一半切换到别的患者，
+// 之前编辑的内容本来就不该带过去。
+//
+// medical_suggestion（发给 /export 做 diff 基准的那份）在 initDoctorState
+// 时深拷贝一次锁死，之后医生怎么编辑 herb_items 都不会改到它——
+// compute_herb_diffs() 比的就是"模型当初给的" vs "医生最终定的"，如果
+// model_suggestion 也跟着编辑走，diff 永远是空的，审计就失去意义。
+let DOCTOR_STATE = {};
+
+function blankHerbItem() {
+  return { name: "", dose: null, dose_unit: "g", processing: null, decoction: null, role: null, function_in_formula: null };
+}
+
+function initDoctorState(results) {
+  DOCTOR_STATE = {};
+  for (const r of results) {
+    const s3 = r.s3;
+    const cand = (s3.formula_candidates && s3.formula_candidates.length)
+      ? s3.formula_candidates[s3.selected] : null;
+    if (!cand) continue; // patient 角色下 formula_candidates 整个不存在，医生模式不会走到这里，但兜底不崩
+    DOCTOR_STATE[r.physician] = {
+      syndrome: s3.syndrome,
+      disease: s3.disease || null,
+      name: cand.name,
+      source: cand.source,
+      base_formula: cand.base_formula,
+      confidence: cand.confidence,
+      rationale: cand.rationale,
+      doses_count: cand.doses_count,
+      usage: cand.usage,
+      herb_items: (cand.herb_items || []).map((h) => ({ ...h })),
+      model_suggestion: JSON.parse(JSON.stringify(cand)),
+      safety: null,
+      exportResult: null,
+      exportError: null,
+      pendingOverrideReason: null,
+    };
+  }
+}
+
+function rxRowHtml(physician, i, h) {
+  const doseUnits = ["g", "钱", "两", "分", "枚", "片"];
+  const unitOptions = doseUnits
+    .map((u) => `<option value="${u}" ${h.dose_unit === u ? "selected" : ""}>${u}</option>`)
+    .join("");
+  return `<tr>
+    <td><input type="text" data-rx-phys="${physician}" data-rx-idx="${i}" data-rx-field="name" value="${escapeHtml(h.name || "")}" /></td>
+    <td><input type="number" step="0.1" data-rx-phys="${physician}" data-rx-idx="${i}" data-rx-field="dose" value="${h.dose != null ? h.dose : ""}" /></td>
+    <td><select data-rx-phys="${physician}" data-rx-idx="${i}" data-rx-field="dose_unit">${unitOptions}</select></td>
+    <td><input type="text" data-rx-phys="${physician}" data-rx-idx="${i}" data-rx-field="processing" value="${escapeHtml(h.processing || "")}" /></td>
+    <td><input type="text" data-rx-phys="${physician}" data-rx-idx="${i}" data-rx-field="decoction" value="${escapeHtml(h.decoction || "")}" /></td>
+    <td><input type="text" data-rx-phys="${physician}" data-rx-idx="${i}" data-rx-field="function_in_formula" value="${escapeHtml(h.function_in_formula || "")}" /></td>
+    <td><button type="button" class="rx-del-btn" data-rx-del="${physician}" data-rx-idx="${i}" title="删除">×</button></td>
+  </tr>`;
+}
+
+// 跟 api/main.py::_safety_dict() 是同一份数据形状（FormulaSafety 的字段 +
+// blocking），这里只是把它渲染成人看的文字——判断"有没有问题"这件事本身
+// 不在前端重新做一遍，safety.blocking 和各个数组是否非空都是后端算好直接
+// 传过来的。
+function rxSafetyHtml(safety) {
+  if (!safety) return `<div style="font-size:12px;color:var(--muted);margin:4px 0;">尚未校验</div>`;
+  const blocks = [];
+  if (safety.incompatible && safety.incompatible.length) {
+    blocks.push(`<div class="safety-incompatible">⚠ 配伍禁忌：${safety.incompatible.map((p) => `${escapeHtml(p[0])} 反/畏 ${escapeHtml(p[1])}`).join("；")}</div>`);
+  }
+  if (safety.dose_violations && safety.dose_violations.length) {
+    blocks.push(`<div class="safety-incompatible">⚠ 剂量超限：${safety.dose_violations.map((v) => `${escapeHtml(v.herb)} ${v.dose}${escapeHtml(v.unit)}（上限 ${v.limit_g}g）`).join("；")}</div>`);
+  }
+  if (safety.thermal_warning) {
+    blocks.push(`<div class="safety-thermal">⚠ ${escapeHtml(safety.thermal_warning)}</div>`);
+  }
+  if (safety.decoction_missing && safety.decoction_missing.length) {
+    blocks.push(`<div class="safety-thermal">煎法缺失：${escapeHtml(safety.decoction_missing.join("、"))}</div>`);
+  }
+  if (safety.toxic_herbs && safety.toxic_herbs.length) {
+    blocks.push(`<div class="safety-thermal">含毒性药材：${escapeHtml(safety.toxic_herbs.join("、"))}</div>`);
+  }
+  if (!blocks.length) blocks.push(`<div style="font-size:12px;color:#2f7d4f;margin:4px 0;">✓ 未发现问题</div>`);
+  return blocks.join("");
+}
+
+function doctorSectionHtml(physician, mode) {
+  if (mode !== "doctor") return "";
+  const state = DOCTOR_STATE[physician];
+  if (!state) return "";
+  return `
+    <div class="doctor-disclaimer">医生模式：处方辅助工具。系统提供的方剂与剂量为建议，最终处方由执业医师审核、修改并签发，医师承担全部临床责任。所有导出操作均记录审计日志。</div>
+    <div class="label" style="margin-top:8px;">医生编辑处方——${escapeHtml(state.name)}</div>
+    <div class="rx-formula-fields">
+      <label>剂数　<input type="number" data-rx-phys="${physician}" data-rx-field="doses_count" value="${state.doses_count != null ? state.doses_count : ""}" style="width:50px" /></label>
+      <label>用法　<input type="text" data-rx-phys="${physician}" data-rx-field="usage" value="${escapeHtml(state.usage || "")}" style="width:220px" /></label>
+    </div>
+    <table class="rx-table">
+      <thead><tr><th>药名</th><th>剂量</th><th>单位</th><th>炮制</th><th>煎法</th><th>作用</th><th></th></tr></thead>
+      <tbody id="rx-table-body-${physician}">${state.herb_items.map((h, i) => rxRowHtml(physician, i, h)).join("")}</tbody>
+    </table>
+    <button type="button" class="rx-add-btn" data-rx-add="${physician}">+ 添加药味</button>
+    <div id="rx-safety-${physician}">${rxSafetyHtml(state.safety)}</div>
+    <button type="button" class="rx-export-btn" data-rx-export="${physician}">导出处方</button>
+    <div id="rx-export-panel-${physician}"></div>
+  `;
+}
+
+function renderDoctorTable(physician) {
+  const el = document.getElementById(`rx-table-body-${physician}`);
+  const state = DOCTOR_STATE[physician];
+  if (!el || !state) return;
+  el.innerHTML = state.herb_items.map((h, i) => rxRowHtml(physician, i, h)).join("");
+}
+
+function renderDoctorSafety(physician) {
+  const el = document.getElementById(`rx-safety-${physician}`);
+  const state = DOCTOR_STATE[physician];
+  if (!el || !state) return;
+  el.innerHTML = rxSafetyHtml(state.safety);
+}
+
+const RX_VALIDATE_TIMERS = {};
+
+// 每次编辑后调一次校验接口，但不是每敲一个字符就发一次请求——防抖
+// 400ms，跟用户打字节奏对齐，不会打字打到一半疯狂发请求。
+function scheduleValidate(physician) {
+  clearTimeout(RX_VALIDATE_TIMERS[physician]);
+  RX_VALIDATE_TIMERS[physician] = setTimeout(() => runValidate(physician), 400);
+}
+
+async function runValidate(physician) {
+  const state = DOCTOR_STATE[physician];
+  if (!state) return;
+  // 名字还没填的行（刚点了"+添加药味"、还没来得及输入）先过滤掉再送——
+  // 送一个空名字上去会撞 HerbItem 的 Field(min_length=1)，整个请求体
+  // 校验失败，会把已经填好的其他药材的校验结果也一起吞掉。
+  const herbItems = state.herb_items.filter((h) => (h.name || "").trim());
+  if (!herbItems.length) {
+    state.safety = null;
+    renderDoctorSafety(physician);
+    return;
+  }
+  try {
+    const resp = await fetch("/api/prescription/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ herb_items: herbItems, syndrome: state.syndrome, disease: state.disease }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    state.safety = await resp.json();
+  } catch (err) {
+    console.error("处方校验失败：", err);
+    state.safety = null;
+  }
+  renderDoctorSafety(physician);
+}
+
+function renderDoctorExportPanel(physician) {
+  const el = document.getElementById(`rx-export-panel-${physician}`);
+  const state = DOCTOR_STATE[physician];
+  if (!el || !state) return;
+
+  if (state.exportResult) {
+    el.innerHTML = `<div class="rx-pharmacy-text">${escapeHtml(state.exportResult.text)}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">审计编号：${escapeHtml(state.exportResult.audit_id)}</div>`;
+    return;
+  }
+  if (state.exportError) {
+    const message = state.exportError.message || "该方存在拦截级安全问题，拒绝导出。";
+    const problems = state.exportError.problems || null;
+    if (problems) {
+      // safety.blocking 为真：给出问题清单 + override_reason 输入框，
+      // 医生填了非空理由才能"坚持导出"——这条理由会进审计日志，是"明知
+      // 有问题仍坚持"唯一的书面记录，所以这里的文案要说清楚这一点，
+      // 不能只是一个不起眼的确认框。
+      el.innerHTML = `<div class="rx-override-box">
+        <div style="color:#8a4b12;font-weight:600;">⚠ ${escapeHtml(message)}</div>
+        ${problems.map((p) => `<div style="font-size:12.5px;margin-top:2px;">· ${escapeHtml(p)}</div>`).join("")}
+        <textarea id="rx-override-input-${physician}" placeholder="填写坚持导出的理由（必填，将原样记入审计日志，医师对该理由负责）"></textarea>
+        <button type="button" class="rx-export-btn" data-rx-confirm-export="${physician}">坚持导出</button>
+      </div>`;
+    } else {
+      el.innerHTML = `<div class="rx-override-box"><div style="color:#8a4b12;">⚠ ${escapeHtml(message)}</div></div>`;
+    }
+    return;
+  }
+  el.innerHTML = "";
+}
+
+async function runExport(physician) {
+  const state = DOCTOR_STATE[physician];
+  if (!state) return;
+  const doctorIdInput = document.getElementById("doctor-id-input");
+  const doctorId = (doctorIdInput ? doctorIdInput.value : "").trim();
+  if (!doctorId) {
+    state.exportError = { message: "请先在上方填写医生标识再导出处方。" };
+    state.exportResult = null;
+    renderDoctorExportPanel(physician);
+    return;
+  }
+  const patientRefInput = document.getElementById("patient-ref-input");
+  const patientRef = (patientRefInput ? patientRefInput.value : "").trim() || null;
+
+  const body = {
+    formula: {
+      name: state.name, source: state.source, base_formula: state.base_formula,
+      confidence: state.confidence, rationale: state.rationale,
+      herb_items: state.herb_items, doses_count: state.doses_count, usage: state.usage,
+    },
+    doctor_id: doctorId,
+    patient_ref: patientRef,
+    model_suggestion: state.model_suggestion,
+    override_reason: state.pendingOverrideReason || null,
+  };
+
+  try {
+    const resp = await fetch("/api/prescription/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (resp.status === 422) {
+      state.exportError = data.detail;
+      state.exportResult = null;
+    } else if (!resp.ok) {
+      state.exportError = { message: `导出失败（HTTP ${resp.status}）：${JSON.stringify(data)}` };
+      state.exportResult = null;
+    } else {
+      state.exportResult = data;
+      state.exportError = null;
+      state.pendingOverrideReason = null;
+    }
+  } catch (err) {
+    state.exportError = { message: `导出失败：${err.message || err}` };
+    state.exportResult = null;
+  }
+  renderDoctorExportPanel(physician);
+}
+
+// 事件委托绑在 #results 这个容器本身（每次响应回来只会替换它的子树，容器
+// 节点自己一直存在），不是每次重新渲染表格后逐个 input 重新 addEventListener
+// ——那样容易漏绑，而且用户正在打字的输入框如果整表重渲染会丢失光标位置，
+// 委托模式下"编辑单元格内容"根本不触发整表重渲染（见下面 input 分支只改
+// DOCTOR_STATE、不碰 DOM），只有加行/删行才会。
+document.getElementById("results").addEventListener("input", (e) => {
+  const t = e.target;
+  const phys = t.dataset.rxPhys;
+  if (!phys || !DOCTOR_STATE[phys]) return;
+  const field = t.dataset.rxField;
+  if (!field) return;
+  const idx = t.dataset.rxIdx;
+  if (idx !== undefined && idx !== "") {
+    const item = DOCTOR_STATE[phys].herb_items[Number(idx)];
+    if (!item) return;
+    item[field] = field === "dose" ? (t.value === "" ? null : Number(t.value)) : (t.value === "" ? null : t.value);
+  } else {
+    DOCTOR_STATE[phys][field] = field === "doses_count" ? (t.value === "" ? null : Number(t.value)) : (t.value === "" ? null : t.value);
+  }
+  scheduleValidate(phys);
+});
+
+document.getElementById("results").addEventListener("click", (e) => {
+  const addPhys = e.target.dataset.rxAdd;
+  if (addPhys) {
+    DOCTOR_STATE[addPhys].herb_items.push(blankHerbItem());
+    renderDoctorTable(addPhys);
+    return;
+  }
+  const delPhys = e.target.dataset.rxDel;
+  if (delPhys) {
+    DOCTOR_STATE[delPhys].herb_items.splice(Number(e.target.dataset.rxIdx), 1);
+    renderDoctorTable(delPhys);
+    scheduleValidate(delPhys);
+    return;
+  }
+  const exportPhys = e.target.dataset.rxExport;
+  if (exportPhys) {
+    DOCTOR_STATE[exportPhys].pendingOverrideReason = null;
+    runExport(exportPhys);
+    return;
+  }
+  const confirmPhys = e.target.dataset.rxConfirmExport;
+  if (confirmPhys) {
+    const textarea = document.getElementById(`rx-override-input-${confirmPhys}`);
+    DOCTOR_STATE[confirmPhys].pendingOverrideReason = textarea ? textarea.value : "";
+    runExport(confirmPhys);
+  }
+});
+
+// ---------- M8：定位表述分模式 + role-select 联动 ----------
+
+function describeDisclaimer(mode) {
+  if (mode === "doctor") {
+    return "医生模式：处方辅助工具。系统提供的方剂与剂量为建议，最终处方由执业医师" +
+      "审核、修改并签发，医师承担全部临床责任。所有导出操作均记录审计日志。";
+  }
+  return "教学与研究用途，非诊断工具，不能替代执业医师";
+}
+
+function updateDisclaimer() {
+  const el = document.getElementById("disclaimer-text");
+  if (el) el.textContent = describeDisclaimer(getSelectedRole());
+}
+
+function updateDoctorFieldsVisibility() {
+  const row = document.getElementById("doctor-id-row");
+  if (row) row.style.display = getSelectedRole() === "doctor" ? "flex" : "none";
+}
+
+document.getElementById("role-select").addEventListener("change", () => {
+  updateDisclaimer();
+  updateDoctorFieldsVisibility();
+});
+updateDisclaimer();
+updateDoctorFieldsVisibility();
+
 function cardHtml(result, mode = "researcher") {
   const color = PHYSICIAN_COLORS[result.physician] || "#333";
   const s3 = result.s3;
@@ -1931,6 +2380,7 @@ function cardHtml(result, mode = "researcher") {
       ${revisedHtml}
       ${noRefHtml}
       ${hallucinationHtml}
+      ${doctorSectionHtml(result.physician, mode)}
       <details ${openAttr}>
         <summary>推理过程与引用详情</summary>
         <div class="detail-block">
@@ -1986,6 +2436,7 @@ function getSelectedRole() {
 function resetSecondaryPanels() {
   lastGraph = null;
   EVIDENCE = {};
+  DOCTOR_STATE = {};
   closeEvidence();
   hideTooltip();
   for (const id of ["residual-note", "graph-note", "followup-note"]) {
@@ -2135,6 +2586,10 @@ function renderConsultResult(data) {
     note.style.display = "none";
   }
   renderDivergence(data.divergence);
+  // M8：医生模式的可编辑处方状态要在渲染卡片之前建好——cardHtml() 里的
+  // doctorSectionHtml() 读的是 DOCTOR_STATE，不是 data.results 本身
+  // （医生编辑的是自己的一份拷贝，不直接改问诊响应）。
+  initDoctorState(data.results);
   renderResults(data.results, getSelectedRole());
   renderFollowup(data.followup);
   renderGraph(data.graph);

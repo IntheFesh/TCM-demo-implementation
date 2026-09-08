@@ -19,11 +19,14 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from core.audit import append_audit
 from core.chain import consult, explained_symptoms
 from core.diseases import get_disease, triage_advice
 from core.herbs import is_western_drug, strip_dose_and_parens
 from core.physicians import PHYSICIANS
-from core.schemas import S1Normalize
+from core.prescription import compute_herb_diffs, format_pharmacy_text
+from core.safety_output import assess_formula_safety
+from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, S1Normalize
 from core.tools import GRAPH_PATH, get_graph_store
 from offline.graph_stats import compute_stats, lambda1_note
 
@@ -893,6 +896,105 @@ def assert_graph_edges_valid(graph: dict) -> None:
         parent = n["data"].get("parent")
         if parent is not None and parent not in node_ids:
             raise ValueError(f"节点的 parent 不存在：{n}")
+
+
+# ---------- M8：医生模式——处方校验 / 导出 / 审计 ----------
+
+
+class PrescriptionValidateRequest(BaseModel):
+    # 不设 min_length=1：可编辑处方表从空表开始，医生删到只剩 0 味药时
+    # 前端仍可能调一次校验（"每次编辑后调一次"）——0 味药本来就查不出十八反/
+    # 剂量超限，返回一个全空的 FormulaSafety 是诚实的结果，不该被 422 拒绝。
+    herb_items: list[HerbItem] = Field(default_factory=list)
+    syndrome: str = Field(min_length=1)
+    # disease 字段任务描述原文的 body 形状里给了，但 assess_formula_safety
+    # 五条规则（十八反/寒热/剂量/煎法/毒性）没有一条读病名——寒热一致性查的是
+    # 证型名里的关键词，不是病名。这里原样接住这个字段（跟请求契约保持一致，
+    # 医生端可能想传），但目前确实没有消费它，如实留着不裁掉，也不假装用了它。
+    disease: str | None = None
+
+
+def _safety_dict(safety: FormulaSafety) -> dict:
+    """FormulaSafety.blocking 是 @property（schemas.py 里定义），
+    model_dump() 不会带出计算属性——三处（/validate 响应、/export 拒绝时的
+    422 detail、写进审计记录的 safety_at_export）都要把 blocking 一起带上，
+    不然调用方（前端，或者以后读审计日志的人）得自己重新判断"incompatible
+    或 dose_violations 非空就是 blocking"，这条判断 core/safety_output.py
+    已经有唯一实现，不该被逼着在第二处（第三处、第四处……）重新写一遍
+    （CLAUDE.md「同一概念只能有一处实现」）。三处调用同一个函数，不是三处
+    各自拼一遍 {**safety.model_dump(), "blocking": ...}。"""
+    return {**safety.model_dump(), "blocking": safety.blocking}
+
+
+@app.post("/api/prescription/validate")
+def api_prescription_validate(req: PrescriptionValidateRequest) -> dict:
+    """纯规则校验，不调 LLM，毫秒级返回。独立于 /api/consult——医生可能在
+    完全不同的场景下想校验一张手写/临时改动的方（不是从某次问诊来的），
+    这条接口不依赖任何问诊上下文。"""
+    safety = assess_formula_safety(req.syndrome, req.herb_items)
+    return _safety_dict(safety)
+
+
+class PrescriptionExportRequest(BaseModel):
+    formula: FormulaCandidate
+    doctor_id: str = Field(min_length=1)
+    patient_ref: str | None = None
+    model_suggestion: FormulaCandidate
+    # 任务描述原文展示的 body 形状里没列这个字段，但紧接着那句"医生要坚持
+    # 导出，必须传 override_reason: str（非空）"没有别的地方能装这个值——
+    # 这里补上，属于把隐含在文字里的字段显式化，不是新加一条没来由的契约。
+    override_reason: str | None = None
+
+
+@app.post("/api/prescription/export")
+def api_prescription_export(req: PrescriptionExportRequest) -> dict:
+    """`formula.safety`（如果客户端带了）**不作数**——安全阻断的判定必须是
+    服务端权威计算的，不能信任客户端上报的安全结果，跟 X2 输出侧安全检查
+    "不能让模型自己说安全"是同一条原则，这里换成"不能让客户端自己说安全"。
+    重新算的时候 syndrome 传空字符串——`assess_formula_safety` 只有
+    thermal_warning（寒热警告，警告级，不影响 blocking）依赖 syndrome，
+    incompatible/dose_violations（两项拦截级判据）完全不看 syndrome，
+    空字符串不会让 blocking 的判定失真，只是这次重算不会产出寒热警告文案
+    （这条接口的请求体本来就没有 syndrome 可用，见 PrescriptionExportRequest
+    的字段选择）。
+
+    `safety.blocking` 为真且没有非空 `override_reason` 时拒绝导出（422，
+    列出具体问题）；医生传了非空 override_reason 就放行——这条理由连同
+    完整的 safety_at_export 一起写进审计记录，是"医生明知有问题仍坚持导出"
+    唯一的书面记录。
+    """
+    safety = assess_formula_safety("", req.formula.herb_items)
+    override_reason = (req.override_reason or "").strip()
+    if safety.blocking and not override_reason:
+        problems = []
+        if safety.incompatible:
+            problems.append("配伍禁忌：" + "、".join(f"{a}与{b}" for a, b in safety.incompatible))
+        if safety.dose_violations:
+            problems.append("剂量超限：" + "、".join(
+                f"{v.herb} {v.dose}{v.unit}（上限 {v.limit_g}g，{v.reason}）" for v in safety.dose_violations
+            ))
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "该方存在拦截级安全问题，拒绝导出。如需坚持导出，"
+                            "请传非空 override_reason 并对该理由负责。",
+                "problems": problems,
+                "safety": _safety_dict(safety),
+            },
+        )
+
+    diffs = compute_herb_diffs(req.model_suggestion, req.formula)
+    text = format_pharmacy_text(req.formula)
+    record = append_audit({
+        "doctor_id": req.doctor_id,
+        "patient_ref": req.patient_ref,
+        "model_suggestion": req.model_suggestion.model_dump(),
+        "final": req.formula.model_dump(),
+        "diffs": diffs,
+        "safety_at_export": _safety_dict(safety),
+        "override_reason": override_reason or None,
+    })
+    return {"text": text, "audit_id": str(record.seq)}
 
 
 # 静态文件挂在 /app，不要挂在根路径——否则会遮蔽上面的 API 路由。

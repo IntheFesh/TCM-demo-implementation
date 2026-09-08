@@ -23,7 +23,7 @@ M2 起五条规则、两个硬度档：
 from __future__ import annotations
 
 from core.herbs import is_western_drug, normalize_herb, strip_dose_and_parens
-from core.schemas import DoseViolation, FormulaCandidate, FormulaSafety, HerbItem
+from core.schemas import DoseViolation, FormulaSafety, HerbItem
 
 # ---------- 归一：把同一味药的各种写法归到禁忌表用的名字 ----------
 
@@ -492,8 +492,8 @@ def format_blocking_issues(safety: FormulaSafety) -> str:
     return "；".join(parts)
 
 
-def assess_formula_safety(syndrome: str, candidate: FormulaCandidate) -> FormulaSafety:
-    """给一个候选方跑全部 X2 输出侧安全检查，返回汇总结果。**唯一的组装点**——
+def assess_formula_safety(syndrome: str, herb_items: list[HerbItem]) -> FormulaSafety:
+    """给一组药材条目跑全部 X2 输出侧安全检查，返回汇总结果。**唯一的组装点**——
     run_physician 给每个候选方调一次这个函数，不是把 check_incompatible /
     check_thermal_consistency / check_dose_limits / check_required_decoction /
     check_toxic_herbs 五个检查散着调、自己攒结果，那样以后加第六个检查会有
@@ -504,8 +504,17 @@ def assess_formula_safety(syndrome: str, candidate: FormulaCandidate) -> Formula
     浪费），要么在极端情况下误判。跟 S3Syndrome.herbs（M1 派生字段）用的是
     同一条过滤规则（is_western_drug），两处必须一致——这是为什么这里也调
     core.herbs 的同一个判断，不另写一套字面匹配。
+
+    M8：参数从 `candidate: FormulaCandidate` 改成 `herb_items: list[HerbItem]`
+    ——这个函数从来只读 `candidate.herb_items` 一个字段，此前要求整个
+    FormulaCandidate 纯粹是因为调用方（core/chain.py）手头正好有一个。
+    POST /api/prescription/validate（M8 新增）只有 herb_items，没有
+    name/source/confidence/rationale 这些跟安全检查无关的字段——为了复用
+    这个函数硬凑一个带假 rationale 的占位 FormulaCandidate，比收窄参数
+    类型本身更违反"禁止占位实现"。调用方相应改成传 `cand.herb_items`，
+    不是新建一个第二套检查逻辑。
     """
-    kept_items = [item for item in candidate.herb_items if not is_western_drug(item.name)]
+    kept_items = [item for item in herb_items if not is_western_drug(item.name)]
     names = [item.name for item in kept_items]
     return FormulaSafety(
         incompatible=check_incompatible(names),
