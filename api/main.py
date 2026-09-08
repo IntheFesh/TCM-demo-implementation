@@ -531,6 +531,9 @@ def _serialize_result(r: dict) -> dict:
         # 检索为空时 s3 是 S3SyndromeUnreferenced，model_dump 里没有 cited_case_ids，
         # 前端按同一份契约读，这里补成空列表
         "s3": {**r["s3"].model_dump(), "cited_case_ids": list(r["s3"].cited_case_ids)},
+        # M4：规则算出来的病名候选（跟模型脱钩），前端可以摆出"模型判断 X，
+        # 规则倾向 Y"这种交叉校验，不是要替代模型的判断。
+        "disease_candidates": r.get("disease_candidates", []),
         "no_reference_cases": r.get("no_reference_cases", False),
         "refs": r["refs"],
         "hallucinated": r["hallucinated"],
@@ -617,9 +620,15 @@ def to_graph(s1: S1Normalize, results: list[dict], s2=None, residual: dict | Non
         physician = r["physician"]
         pname = r["physician_name"]
 
-        # layer 2 证型
+        # layer 2 病名·证型（M4）。node id 不变——仍是 syn::{physician}，只改
+        # label：id 是前端证据链侧栏 buildEvidenceIndex() 反查的键，改了就断链，
+        # 跟 M 药名剥剂量那次「label 剥、id 保原样」是同一条理由。disease 为
+        # None（病名判断不了，S3 prompt 允许留空）时退回只显示证型，不显示
+        # 一个悬空的"· 证型"。
         syn_id = f"syn::{physician}"
-        add_node(syn_id, label=r["s3"].syndrome, layer=2, phys=physician, pname=pname)
+        s3 = r["s3"]
+        label = f"{s3.disease} · {s3.syndrome}" if s3.disease else s3.syndrome
+        add_node(syn_id, label=label, layer=2, phys=physician, pname=pname)
 
         for hit in r["s2"].elements:
             elem_id = f"elem::{hit.element}"

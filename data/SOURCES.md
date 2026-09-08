@@ -813,3 +813,35 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     - 前端 `cardHtml` 里"幻觉引用"那条警告是整个卡片唯一没过 `escapeHtml` 就进
       innerHTML 的插值——恰恰因为它是"不可信输出"的警告，模型能把 `<img onerror>`
       塞进 `cited_case_ids`。
+27. **M4 · 病名层：`data/diseases.jsonl` 里两处跟任务描述原文对不上的地方，
+    核对时发现，不是漏填。**
+    - **"吐血"不是当前语料库的真实门类。** M4 任务描述原文把"吐血"列进
+      "现有语料的九个门类"，但 `offline/split_cases.py` 里叶天士/吴鞠通两位
+      医家的 `gates` 从来没有出现过"吐血"这个关键词，`data/SOURCES.md` 第 3
+      节的门类分布表（本文件上面）里也没有一次"吐血"。"吐血"只出现在两个
+      不代表真实医案覆盖的地方：`core/syndrome_norm.SYNONYMS` 表（那张表管
+      的是"这个词属于哪个证候门类"，不代表语料里真有这门类的案）、以及
+      `tests/queries.txt` 第 10 条（专门设计来触发 `check_safety` 安全否决的
+      测试主诉，压根不会走到 S3/病名匹配这一步）。所以 `diseases.jsonl` 里
+      吐血这一条的 `corpus_gate` 如实留空，"九个门类"实际只有八个在当前
+      语料库里有真实覆盖。
+    - **胸痹的 `location` 不能照抄任务描述原文给的示例。** 原文示例写的是
+      `["心", "胸"]`，但 `core/elements.py` 的 `LOCATIONS`（S2 证素推断能
+      产出的病位词表）里没有"胸"，只有"心"——留着"胸"不会报错（`Disease`
+      模型对 `location` 没做取值范围校验），但会让 `match_disease` 的病位
+      匹配永远命中不了这半个条目，安静地拉低胸痹的匹配分而不报任何错误。
+      `diseases.jsonl` 全部 15 条的 `location` 现在都收紧到只用
+      `core.elements.LOCATIONS` 里真实存在的词，用一条参数化测试
+      （`tests/test_diseases.py::test_every_disease_location_is_a_valid_element_location`）
+      钉住，防止以后加新病名时又抄一个表外词进来。
+    - 同一轮还发现：胸痹/心悸/眩晕/不寐/便血/咳嗽这六个心系病名是 M4 新增的
+      病名词表，当前语料库（叶天士/吴鞠通医案）范围是脾胃门，对它们零覆盖，
+      `corpus_gate` 如实留空——这是预期状态，不是缺陷，等心系医案（或
+      `data/patent_medicines.jsonl` 之类的新数据源）接入后才会有真覆盖。
+    - **路径也跟任务描述原文不一样：文件放在 `data/standard/diseases.jsonl`，
+      不是原文写的 `data/diseases.jsonl`。** 根源是 `.gitignore` 对 `*.jsonl`
+      整体忽略、只对 `data/standard/*.jsonl` 开了例外（`data/standard/
+      syndromes.jsonl` 就是这么处理的）——这份表跟 `syndromes.jsonl` 是同一类
+      "人工整理的静态参考表"，不是 `cases.json` 派生的生成物，理应走同一条
+      例外规则，而不是新开一条 `.gitignore` 例外。放在原路径的话这份文件会
+      静默进不了版本控制，问题要等下一次 clone 或 CI 才会暴露出来。

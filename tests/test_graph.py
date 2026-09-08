@@ -263,3 +263,38 @@ def test_frontend_evidence_index_key_matches_backend_herb_node_id():
         f"后端节点 id {backend_herb_ids} 在前端 EVIDENCE 索引 {frontend_keys} 里找不到——"
         "点击这个节点会打开空白侧栏"
     )
+
+
+# ---------- M4：layer 2 label 改成「病名 · 证型」，node id 不变 ----------
+
+
+def test_layer2_label_is_disease_dot_syndrome_when_disease_present():
+    s1 = S1Normalize(symptoms=["纳差", "乏力", "口苦"], tongue="淡红", pulse="细弱", unmapped=[])
+    results = _make_results()
+    results[0]["s3"].disease = "胃痛"
+    graph = to_graph(s1, results)
+    syn_node = next(n for n in graph["nodes"] if n["data"]["id"] == "syn::ye_tianshi")
+    assert syn_node["data"]["label"] == "胃痛 · 脾胃气虚"
+
+
+def test_layer2_label_falls_back_to_syndrome_when_disease_is_none():
+    # disease 字段允许留空（S3 prompt 明确说"判断不了就填 null，不要硬凑"），
+    # label 要退回只显示证型，不能拼出一个悬空的"None · 脾胃气虚"。
+    s1 = S1Normalize(symptoms=["纳差", "乏力", "口苦"], tongue="淡红", pulse="细弱", unmapped=[])
+    results = _make_results()
+    assert results[0]["s3"].disease is None  # 前提：_make_results() 没有设置 disease
+    graph = to_graph(s1, results)
+    syn_node = next(n for n in graph["nodes"] if n["data"]["id"] == "syn::ye_tianshi")
+    assert syn_node["data"]["label"] == "脾胃气虚"
+
+
+def test_layer2_node_id_unchanged_by_disease_label():
+    # id 是前端证据链侧栏反查的键，M4 只改 label、不能碰 id——跟 M 药名剥剂量
+    # 那次「label 剥、id 保原样」是同一条约束。
+    s1 = S1Normalize(symptoms=["纳差", "乏力", "口苦"], tongue="淡红", pulse="细弱", unmapped=[])
+    results = _make_results()
+    results[0]["s3"].disease = "胃痛"
+    results[1]["s3"].disease = "胃热"  # 表外病名，label 该照样拼（label 不做校验，note 才做）
+    graph = to_graph(s1, results)
+    node_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 2}
+    assert node_ids == {"syn::ye_tianshi", "syn::wu_jutong"}

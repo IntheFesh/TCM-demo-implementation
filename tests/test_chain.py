@@ -814,3 +814,95 @@ def test_divergence_epsilon_online_survives_corrupt_json(monkeypatch, tmp_path):
     monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
     monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
     assert chain.consult("纳差乏力")["divergence"]["epsilon_online"] is None
+
+
+# ---------- M4：病名层接进 S3 ----------
+
+
+def test_disease_candidates_present_and_scored_from_symptoms_not_from_model(monkeypatch):
+    """disease_candidates 是规则算出来的，跟模型填的 disease 字段脱钩——
+    即便模型一个病名都没填，disease_candidates 也该照样有值（只要症状/证素
+    能匹配上表里的病名）。"""
+    class GastralgiaS2LLM(FakeLLM):
+        # 基类 FakeLLM 的 S2Elements 分支写死返回 element="脾"，这里覆盖成
+        # "胃"——跟本测试传入的胃痛类症状对应，不然 match_disease 拿到的病位
+        # 证素跟症状文本对不上，断言会测到 FakeLLM 的默认值而不是真实行为。
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            if schema is S2Elements:
+                self.calls.append("S2Elements")
+                return S2Elements(
+                    elements=[
+                        ElementHit(
+                            element="胃", kind="location",
+                            supporting_symptoms=["胃脘胀痛"], confidence="high",
+                        )
+                    ],
+                    unexplained_symptoms=[],
+                )
+            return super().generate(system, user, schema, temperature, **kwargs)
+
+    s1 = S1Normalize(
+        symptoms=["胃脘胀痛", "嗳气泛酸", "情志不畅"], tongue="淡红", pulse="弦", unmapped=[]
+    )
+    s3_ye = S3Syndrome(
+        syndrome="肝胃不和证", reasoning="...", treatment_principle="疏肝和胃",
+        herbs=["柴胡"], cited_case_ids=["ye_tianshi-001"],
+    )  # 故意不填 disease
+    s3_wu = S3Syndrome(
+        syndrome="肝胃不和证", reasoning="...", treatment_principle="疏肝和胃",
+        herbs=["柴胡"], cited_case_ids=["wu_jutong-001"],
+    )
+    fake_llm = GastralgiaS2LLM({"叶天士": s3_ye, "吴鞠通": s3_wu}, s1=s1)
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    outcome = chain.consult("胃脘胀痛，嗳气泛酸，情志不畅")
+
+    for r in outcome["results"]:
+        assert r["s3"].disease is None
+        assert r["disease_candidates"], "症状明显指向胃痛，disease_candidates 不该是空的"
+        assert r["disease_candidates"][0][0] == "胃痛"
+
+
+def test_disease_not_in_table_gets_warning_in_note_not_rejected(monkeypatch):
+    """模型填的病名不在参考表（含别名）里时，只记 warning 到 note，不拒绝、
+    不影响其余字段——CLAUDE.md「追问...安全否决」管的是危重症状拦截，这里
+    是另一类判断：病名超出参考表不是安全问题，是"规则校验不了"。"""
+    s3_ye = S3Syndrome(
+        syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+        disease="这不是一个真实病名", herbs=["党参"], cited_case_ids=["ye_tianshi-001"],
+    )
+    s3_wu = S3Syndrome(
+        syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+        disease="胃痛",  # 表内病名，不该触发 warning
+        herbs=["党参"], cited_case_ids=["wu_jutong-001"],
+    )
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    outcome = chain.consult("纳差乏力")
+
+    assert outcome["rejected"] is False
+    ye = next(r for r in outcome["results"] if r["physician"] == "ye_tianshi")
+    wu = next(r for r in outcome["results"] if r["physician"] == "wu_jutong")
+    assert "这不是一个真实病名" in ye["s3"].note
+    assert "不在病名参考表" in ye["s3"].note
+    assert wu["s3"].note is None
+
+
+def test_disease_via_alias_does_not_get_warning(monkeypatch):
+    """模型填的是别名（比如"痞"而不是"痞满"）时不该被当成表外病名——
+    get_disease() 本身就支持别名查找，这里复用它，不另写一套判断。"""
+    s3 = S3Syndrome(
+        syndrome="脾虚气滞证", reasoning="...", treatment_principle="健脾理气",
+        disease="痞", herbs=["党参"], cited_case_ids=["ye_tianshi-001"],
+    )
+    fake_llm = FakeLLM({"叶天士": s3, "吴鞠通": s3})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    outcome = chain.consult("纳差乏力")
+
+    for r in outcome["results"]:
+        assert r["s3"].note is None

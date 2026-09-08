@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from core import herbs as _herbs
+from core.diseases import get_disease, match_disease
 from core.elements import LOCATIONS, NATURES
 from core.llm import get_llm, load_prompt, render
 from core.followup import (
@@ -358,11 +359,28 @@ def run_physician(
         ref_ids |= set(trace.retrieved_case_ids)
     hallucinated = [cid for cid in s3.cited_case_ids if cid not in ref_ids]
 
+    # M4：病名层。disease_candidates 是规则算出来的对照（跟模型脱钩，同样输入
+    # 永远同样输出），前端可以摆出"模型判断 X，规则倾向 Y"这种交叉校验。
+    # 只用病位证素（kind="location"）去匹配 Disease.location——nature 证素
+    # （气滞/血瘀……）不在 core.elements.LOCATIONS 词表里，传进去也匹配不上，
+    # 过滤掉更清楚地表达"这里比的是病位"，不是隐式依赖 match_disease 内部
+    # 会自动跳过不认识的词。
+    disease_candidates = match_disease(
+        s1.symptoms, [h.element for h in s2.elements if h.kind == "location"]
+    )
+    # 模型填的病名不在参考表里（含别名）时只记 warning，不拒绝——古籍病名可能
+    # 超出这 15 个，硬拒绝会丢信息（CLAUDE.md「防幻觉约束不许放松」管的是
+    # cited_case_ids 那类可验证事实，病名属于医家的专业判断，不是同一类约束）。
+    if s3.disease is not None and get_disease(s3.disease) is None:
+        warn = f"病名「{s3.disease}」不在病名参考表（含别名）里，未做规则校验。"
+        s3.note = f"{s3.note}；{warn}" if s3.note else warn
+
     return {
         "physician": physician,
         "physician_name": physician_name,
         "s2": s2,
         "s3": s3,
+        "disease_candidates": disease_candidates,
         "refs": refs,
         # True = 检索为空，这位医家的结论没有任何医案支撑；前端要明示，不能当成
         # "引用了 0 条"静默过去

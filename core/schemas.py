@@ -184,6 +184,37 @@ class S2Elements(BaseModel):
     unexplained_symptoms: list[str] = Field(default_factory=list)
 
 
+# ---------- 在线：病名层（M4） ----------
+
+
+class Disease(BaseModel):
+    """`data/standard/diseases.jsonl` 里的一条：中医内科病名参考表。M4 起给 S3 的
+    `disease` 字段做交叉校验（`core.diseases.match_disease`）、给图 layer2
+    拼 `病名 · 证型` label、给 M6 患者模式的导诊输出提供数据。
+
+    不是 LLM 输出 schema——这是人工整理的静态参考表，加载后不再做任何
+    生成式校验，`min_length=1` 只用在 `name` 上（防"表里混进一条空名称的
+    脏数据"，不是防模型幻觉，来源不同但约束该一样严）。
+
+    `triage_dept` / `triage_urgency` / `red_flags` 三个字段现在就要跟
+    `core.safety_output.DOSE_LIMITS` 一样的严格度：有出处、不确定就留 None
+    /空列表，不为了让表看起来完整而编一个等级——这三个字段虽然要到 M6
+    患者模式才真正用上，但它们是安全相关信息（导诊结果直接决定"要不要
+    建议立刻就医/叫救护车"），错误的严重度跟填错一味药的剂量上限是同一
+    量级，不能因为"暂时用不上"就放松核实标准。
+    """
+
+    name: str = Field(min_length=1)
+    aliases: list[str] = Field(default_factory=list)
+    location: list[str] = Field(default_factory=list)  # 病位，取值应落在 core.elements.LOCATIONS 内，否则 match_disease 的病位匹配永远命中不了
+    cardinal: list[str] = Field(default_factory=list)  # 主症关键词，match_disease 用来算命中数
+    common_syndromes: list[str] = Field(default_factory=list)
+    corpus_gate: list[str] = Field(default_factory=list)  # 语料库门类关键词，取 core.syndrome_norm 的 canonical 名；语料里没有对应医案的病名此项如实留空
+    triage_dept: str | None = None
+    triage_urgency: Literal["low", "medium", "high"] | None = None
+    red_flags: list[str] = Field(default_factory=list)
+
+
 # ---------- 在线：ReAct（G2） ----------
 
 
