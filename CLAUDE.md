@@ -77,6 +77,15 @@ tests/     pytest 用例与测试主诉
 `min_length=0`。如果某个新场景导致它校验失败，正确做法是**新建一个不含该
 字段的 schema**，不是放松原来的约束。这条如果被违反，整个防幻觉设计就废了。
 
+改动前后都要报一个准确数，数法定死：`grep -c "= Field(min_length=1" core/schemas.py`
+——只数真实字段声明，不数注释/文档字符串里提到这个词的行（`grep -c "min_length=1"`
+不带 `= Field(` 前缀会把后者也算进去，两种数法在这个文件里能差出 5 处以上，
+必须说明用的是哪一种，不能只报一个裸数字）。**基线：13 处（截至 `974c8c7`）。**
+M1 加了 5 处（`HerbItem.name`、`FormulaCandidate.name`/`rationale`/`herb_items`、
+`S3Syndrome`/`S3SyndromeUnreferenced` 共用基类的 `formula_candidates`），
+现在是 18 处——这个 18 是新数法数出来的新基线，跟这段被替换之前口头引用过的
+"18 处"（那其实是旧数法、旧文件的巧合重合）不是同一回事。
+
 ### 安全否决在 S2 之前
 
 危重症状的拦截必须发生在证素推断之前，不是在最后的 `note` 里提一句。
