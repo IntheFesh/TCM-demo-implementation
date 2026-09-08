@@ -2,6 +2,7 @@
 lifespan 预热、发给客户端的文字里不带项目绝对路径。全部 mock consult，不联网。"""
 import inspect
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -114,6 +115,28 @@ def test_health_is_async_so_it_never_queues_behind_the_threadpool():
     """同步端点跑在 anyio 线程池（默认 40 个槽）里；几十条并发问诊把槽占满时，
     同步的 /health 会跟着排队超时，编排器就会把一个活着的进程重启掉。"""
     assert inspect.iscoroutinefunction(api_main.health)
+
+
+def test_lifespan_stops_waiting_for_a_stuck_warmup_and_serves(monkeypatch):
+    """预热卡住（模型下载重试）时服务不能跟着卡：超过 WARMUP_TIMEOUT_SECONDS 就
+    先开始监听，/health 能答；预热线程留在后台。"""
+    gate = threading.Event()
+    started = threading.Event()
+
+    def stuck_warmup():
+        started.set()
+        gate.wait(timeout=10)
+
+    monkeypatch.setattr(api_main, "_warmup", stuck_warmup)
+    monkeypatch.setattr(api_main, "WARMUP_TIMEOUT_SECONDS", 0.2)
+    t0 = time.monotonic()
+    try:
+        with TestClient(api_main.app) as client:
+            assert started.is_set()
+            assert client.get("/health").json() == {"status": "ok"}
+        assert time.monotonic() - t0 < 5, "lifespan 没有在超时后放行"
+    finally:
+        gate.set()
 
 
 def test_lifespan_runs_warmup_exactly_once(monkeypatch):

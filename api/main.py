@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -55,13 +54,28 @@ def _warmup() -> None:
         print(f"[warmup] 检索器预热跳过：{e}", file=sys.stderr)
 
 
+# 预热最多等这么久，超过就先开始服务。真实冒烟里踩到的：有 cases.json 但连不上
+# huggingface 的机器，预热卡在模型下载的重试上，服务一分多钟都不监听端口，存活探针
+# 一直连不上——编排器会把它当成起不来。预热线程超时后不杀（也杀不了），在后台
+# 继续；首个问诊会在 _encode_lock 上等它，而 /health 这时已经能答。
+WARMUP_TIMEOUT_SECONDS = float(os.environ.get("WARMUP_TIMEOUT_SECONDS", "120"))
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """FastAPI 已把 on_event 标成 deprecated，改成 lifespan。预热是同步的
-    重 IO（加载模型、编码语料），丢进线程池跑而不是直接在事件循环上跑——
-    启动阶段本来也不对外服务，但直接阻塞循环会让 uvicorn 的信号处理一起卡住，
-    这段时间 Ctrl-C 都停不下来。"""
-    await run_in_threadpool(_warmup)
+    重 IO（加载模型、编码语料），放在自己的线程里而不是直接在事件循环上跑——
+    直接阻塞循环会让 uvicorn 的信号处理一起卡住，这段时间 Ctrl-C 都停不下来。
+    不走线程池：anyio 的 to_thread 默认等不到就取消不了，有超时也没法真的
+    "先开始服务"。"""
+    t = threading.Thread(target=_warmup, name="warmup", daemon=True)
+    t.start()
+    deadline = time.monotonic() + WARMUP_TIMEOUT_SECONDS
+    while t.is_alive() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    if t.is_alive():
+        print(f"[warmup] 预热 {WARMUP_TIMEOUT_SECONDS:.0f} 秒还没完成，先开始服务；"
+              "预热在后台继续，首个问诊会等它", file=sys.stderr)
     yield
 
 

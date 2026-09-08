@@ -64,7 +64,7 @@
 
 ```bash
 pip install -r requirements.txt
-pytest -q                      # 判据：802 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
+pytest -q                      # 判据：856 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
 python -c "import openai, os; print(bool(os.environ.get('LLM_API_KEY')))"
 ```
 
@@ -144,7 +144,7 @@ python -m core.chain            # 跑 tests/queries.txt 的 10 条
 - 幻觉例数应为 0（`cited_case_ids` 全部来自检索结果）
 - 分歧统计里主看 `herb_jaccard`，不要看 `same`（证型名字符串比对没有区分度，
   实测 9/9 全判为分歧，见 `SOURCES.md`）
-- 记下平均耗时——它决定 SSE 分步进度是不是必须的（预期三位医家 + ReAct 约 20 次
+- 记下平均耗时——它决定 SSE 分步进度是不是必须的（预期两位医家 + ReAct 约 20 次
   调用、P95 延迟约 70s，**基本可以确定是必须的**）
 
 ### 步骤 5：G3 追问端到端（真实 LLM）
@@ -291,3 +291,26 @@ python -m eval.run_eval --queries-path tests/queries.txt     # V1：评测汇总
 - 安全否决拦掉的记录数要跟分数一起报，否则读的人会以为是模型答错了。
 - `head_hints` 只在案首体例相同的书之间可比。
 - λ2 在只有两个学派、其中一个只有一位医家时仍然不是可信信号。
+
+---
+
+## 六、企业化整改一轮（2026-09）
+
+整个仓库跑了一遍复查（并发/安全/代码质量三路审计 + ruff + bandit + 覆盖率），
+结论和路线图在 `AUDIT.md`。改动全部有测试守着（802 → 856 条），下面只列
+接手的人要知道的行为变化：
+
+- **API 硬约束**：`complaint` 1–2000 字、`answer` ≤ 500 字（422）；并发问诊上限
+  `MAX_CONCURRENT_CONSULTS`（默认 4，满了 503 + Retry-After）；后台异常给客户端的
+  只有类型 + 错误编号，全文在服务端 stderr；对外文字不带项目绝对路径。
+- **SSE**：客户端断开后后台线程在下一次回调停下；`/answer` 只在有问题挂起时才收。
+- **启动**：预热最多等 `WARMUP_TIMEOUT_SECONDS`（默认 120）秒，超过先监听端口（真实冒烟里
+  连不上 huggingface 时预热卡了一分多钟，服务一直连不上）。
+- **冷启动并发**：`DenseRetriever` 半初始化窗口、四个惰性单例的双建、jieba 全局
+  词典的并发写，全部加锁修掉（`tests/test_concurrency_init.py`）。
+- **同一概念一处实现**：拒绝文案、"问的是危重症状而患者没否认"、ε 读取、
+  方→药物集合、症状文本匹配——各只剩一处（`tests/test_dedup_contracts.py` 钉住）。
+- **lint 基线**：`ruff check .` 零告警（`ruff.toml`），CI 在 `.github/workflows/ci.yml`
+  （沙箱里没法真跑 GitHub Actions，第一次 push 后看一眼）。
+- `EVAL_MODE` 开着时页面顶部有红色横幅；`NetworkXStore.add_node/add_edge` 对着
+  `core/graph/schema.py` 的词表校验类型，建图脚本手误会在建图时炸。

@@ -788,3 +788,28 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     异性，同一段代码换一条主诉、换一次真实调用，触没触发到某个分支完全
     可能不一样，不能因为一次没触发就怀疑代码，也不能因为一次触发了就
     以为验证已经"做完了"。
+
+26. **企业化整改一轮（2026-09）核实过的三个"各自测都对、放进同一条链才看出
+    矛盾"的实例，以及一个只在真实并发下才出现的 bug。** 这一轮是对整个仓库
+    的复查，不是新功能；发现记在这里是因为它们都是 CLAUDE.md 那几条约定的
+    反例，下次加东西时先对照。
+
+    - `DenseRetriever._load()` 先发布 `_model` 再花十几秒编码语料才发布
+      `_embeddings`，而 `_ensure_encoded()` 的锁外快路径只看 `_model`：两个冷
+      启动并发请求，后到的那个看到模型就位直接放行，`self._embeddings[i]` 拿到
+      None。服务里靠 startup 预热盖住了它，评测脚本和预热失败的机器盖不住。
+      修法是建好再一起发布、快路径改看最后发布的那个字段；测试用会卡住的假
+      `SentenceTransformer` 把窗口撑开，修之前必红。
+    - 拒绝辨证那句文案在 `core/safety.py`、`core/chain.py`（ReAct ask_user）、
+      `core/followup.py`（十问歌兜底）各拼了一份，逐字相同；「问的本身是危重
+      症状而患者没否认」这条判据在后两处各写一套，看的文本不同、否定语义也
+      不同（一边 `honor_negation=False` 一边 `True`）。合并进 `veto_message()`
+      与 `danger_confirmed_by_answer()`，两条追问路径都调它。
+    - `query_case_graph` 用裸的双向子串比症状文本，同模块的 `_match_graph_symptoms`
+      还会拆并列名——「饭后泛酸明显」查 s=「嗳气、泛酸」的三元组，一个查得到
+      一个查不到。抽成 `_symptom_text_matches()`，两边共用。
+    - `eval/run_eval.py` 里有一份跟 `core/chain.py` 逐字相同的 `_load_epsilon_online`；
+      ε 是分歧度的对照基准，读它的代码有两份等于对照基准有两份定义。
+    - 前端 `cardHtml` 里"幻觉引用"那条警告是整个卡片唯一没过 `escapeHtml` 就进
+      innerHTML 的插值——恰恰因为它是"不可信输出"的警告，模型能把 `<img onerror>`
+      塞进 `cited_case_ids`。

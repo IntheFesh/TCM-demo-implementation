@@ -35,8 +35,9 @@
 
 ## 数据与医家
 
-- `data/ye_tianshi/*.txt`：叶天士医案，出自《临证指南医案》，公有领域
-- `data/wu_jutong/*.txt`：吴鞠通医案，出自《吴鞠通医案》，公有领域
+- `data/ye_tianshi/*.json`：叶天士医案粗段，出自《临证指南医案》，公有领域
+- `data/wu_jutong/*.json`：吴鞠通医案粗段，出自《吴鞠通医案》，公有领域
+  （R1 的 `.txt` 已归档到 `data/_archive_r1_txt/`，抽取脚本只认 `.json`）
 - 医案来源与版权说明见 `data/SOURCES.md`
 - physician id 全部小写下划线：`ye_tianshi` / `wu_jutong`，不要用拼音以外的写法
 

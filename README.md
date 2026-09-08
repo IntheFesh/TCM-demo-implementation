@@ -90,7 +90,9 @@ cp .env.example .env
 | `CLAUDE_CLI_MODEL` / `CLAUDE_CLI_TIMEOUT` | `claude_cli` 模式下的模型名与超时，默认 `claude-sonnet-5` / 180 |
 | `USE_REACT` | `1` 打开 ReAct 取证（默认关，见「ReAct 取证模式」一节） |
 | `FAST_MODE` | `1` 同时降级三处：追问 0 轮、ReAct 步数上限降到 2、残差辨证整体关闭（默认关，见「追问」一节）。实测一次完整问诊 14 次调用 → 8 次 |
-| `EVAL_MODE` | `1` **只**让安全否决不中止链路（检查照跑、命中原因照记进 `safety_flag`），给评测量化"安全否决花了多少分"用。默认关，demo 的拦截红线不受影响；不要在对外演示的机器上打开 |
+| `EVAL_MODE` | `1` **只**让安全否决不中止链路（检查照跑、命中原因照记进 `safety_flag`），给评测量化"安全否决花了多少分"用。默认关，demo 的拦截红线不受影响；不要在对外演示的机器上打开——开着时页面顶部会有一条红色横幅提示，结果不会静默照常显示 |
+| `WARMUP_TIMEOUT_SECONDS` | 启动预热（加载 embedding 模型 + 编码语料）最多等这么久，默认 120；超过就先开始服务，预热在后台继续、首个问诊会等它。连不上 huggingface 的机器预热会卡在下载重试上，不设上限的话服务一分多钟都不监听端口 |
+| `MAX_CONCURRENT_CONSULTS` | 同时进行的问诊数上限（`/api/consult` 与 `/api/consult/stream` 合计），默认 4。满了立刻 503 + `Retry-After: 10`，不排队。这是部署侧的进程级设置，跟逐请求的 `retriever_mode` 不是一回事 |
 
 > **检索模式不是环境变量。** `RETRIEVER_MODE` 仍然存在（离线脚本/单机评测用），
 > 但 HTTP 请求要切模式请用请求体里的 `retriever_mode` 字段——环境变量是进程级的，
@@ -146,7 +148,8 @@ cp out/wu_jutong/*.json data/wu_jutong/
 mkdir -p data/zhang_xichun && cp out/zhang_xichun/*.json data/zhang_xichun/   # 下载了 584 才有
 ```
 
-跟目录里已有的 30+30 个 `.txt` 共存没有问题——下一步的抽取脚本只认 `.json`。
+`data/{physician}/` 下现在只有 `.json` 粗段（R1 的 `.txt` 已归档到 `data/_archive_r1_txt/`），
+下一步的抽取脚本只认 `.json`。
 
 **3.4 用 LLM 把粗段展开成结构化病人记录**：
 
@@ -215,7 +218,19 @@ run.sh          一键运行脚本
 | `POST` | `/api/consult/stream/{stream_id}/answer` | 回答流里 `need_input` 事件问出的追问，请求体 `{answer}` |
 | `GET` | `/api/graph` | 持久知识图谱（`data/graph.json` 的国标结构层），图谱浏览器页签用 |
 | `GET` | `/api/trajectories/{physician}` | 某位医家名下带复诊序列的病人证素轨迹 |
-| `GET` | `/health` | 存活探针 |
+| `GET` | `/health` | 存活探针（`async def`，不进线程池，问诊把线程池占满时它也能答） |
+
+**请求上限与错误契约**（企业化整改一轮加的硬约束）：
+
+- `complaint` 1–2000 字、`answer` ≤ 500 字，超出 422，一次 LLM 调用都不花（`api/main.py`
+  的 `MAX_COMPLAINT_CHARS` / `MAX_ANSWER_CHARS`）
+- 同时进行的问诊超过 `MAX_CONCURRENT_CONSULTS` → 503 + `Retry-After`
+- 后台线程里的未预期异常，客户端只拿到异常类型和一个错误编号（SSE 的 `error` 事件、
+  或 500），完整异常连同编号打在服务端 stderr；`retrieval_error` 和 503 的 `detail`
+  里不再带项目的绝对路径。模式名写错那类用户侧错误（400 / `error` 事件）文案原样给
+- `/answer` 只在**确实有一个问题在等回答**时才接（404 否则）：还没提问、已超时、已答过
+  都不收，上一问超时后迟到的答案不会漏给下一问
+- 客户端断开 SSE 连接后，后台线程在下一次回调就停下，不再花 LLM 调用
 
 **两条 consult 路径共用同一个序列化函数**（`api/main.py::_consult_response`），
 所以流式端点 `done` 事件的 data 跟非流式端点的响应体逐字段相同，前端一份渲染
@@ -515,13 +530,14 @@ python -m eval.sdt.run --sdt-dir $SDT --split Test --solver chain --out out/sdt_
 - `tests/queries.txt` 的 10 条测试主诉为本项目合成，非真实病例，**使用前应先经医学生
   审核**，确认表述符合中医临床描述习惯
 - 将来若接入现代出版的名老中医经验集，必须标 `copyright_status: copyrighted`，
-  且只能抽取事实性三元组、不得让原文进前端展示或训练集——`export_sft.py` 里的
-  过滤断言会自动拦截
+  且只能抽取事实性三元组、不得让原文进前端展示或训练集——`export_sft.py` 的
+  `filter_public_domain()` 会把它们排除在训练集之外，并把排除的条数和 id 打到 stderr
 
 ## 测试
 
 ```bash
-pytest
+pytest            # 856 条，秒级
+ruff check .      # lint 基线在 ruff.toml；CI（.github/workflows/ci.yml）两条都跑
 ```
 
 全部 pytest 用例都不需要网络（LLM、embedding 模型调用均用假后端 mock 掉），可以在没有

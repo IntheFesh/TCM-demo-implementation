@@ -1,3 +1,8 @@
+# 这里是**下限**，给开发环境用；生产部署要锁死版本：在验证过的环境里
+# `pip freeze > requirements.lock`，部署时 `pip install -r requirements.lock`。
+# 本轮（2026-09）在 Python 3.11 上验证过的一组：openai 3.6.0、pydantic 2.13.5、
+# fastapi 0.141.1、starlette 1.6.0、uvicorn 0.52.4、sentence-transformers 6.0.1、
+# numpy 2.4.6、networkx 3.6.1、rank-bm25 0.2.2、jieba 0.42.1、pytest 9.1.1。
 openai>=1.40
 pydantic>=2.7
 pyyaml>=6.0
