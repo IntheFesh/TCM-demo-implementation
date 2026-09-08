@@ -177,12 +177,19 @@ def test_read_sse_handles_multibyte_utf8_split_across_chunk_boundary():
 # ---------- 模块8：检索模式跟着请求走 ----------
 
 
-def _build_body(mode_value: str) -> dict:
+def _build_body(mode_value: str, role_value: str = "researcher") -> dict:
     """真实跑 index.html 里的 buildConsultRequestBody()，用一个只回答
-    #retriever-mode 的 document 桩喂给它。"""
+    #retriever-mode / #role-select 的 document 桩喂给它。role_value 默认
+    "researcher"——M7 之前的测试只关心 retriever_mode，这个默认值让那些
+    既有断言不用逐个改就能继续只盯 retriever_mode 那一个字段（role 这时
+    固定是 "researcher"，下面统一在期望值里带上）。"""
     js = f"""
     globalThis.document = {{
-      getElementById: (id) => (id === "retriever-mode" ? {{ value: {json.dumps(mode_value)} }} : null),
+      getElementById: (id) => {{
+        if (id === "retriever-mode") return {{ value: {json.dumps(mode_value)} }};
+        if (id === "role-select") return {{ value: {json.dumps(role_value)} }};
+        return null;
+      }},
     }};
     process.stdout.write(JSON.stringify(buildConsultRequestBody("纳差乏力")));
     """
@@ -190,10 +197,13 @@ def _build_body(mode_value: str) -> dict:
 
 
 def test_request_body_omits_retriever_mode_when_default_selected():
-    """选"默认"时整个字段都不带——不是传空字符串。空字符串不在
-    ALLOWED_MODES 里，传过去会被判成非法模式名直接 400。"""
+    """选"默认"时 retriever_mode 整个字段都不带——不是传空字符串。空字符串
+    不在 ALLOWED_MODES 里，传过去会被判成非法模式名直接 400。role 字段
+    是 M7 新加的，跟 retriever_mode 不是同一个契约：role-select 永远有个
+    合法选中值（不存在"用服务端默认，所以不传这个字段"的语义），所以
+    始终显式带上，这条断言只钉 retriever_mode 被省略，不要求 role 也被省略。"""
     body = _build_body("")
-    assert body == {"complaint": "纳差乏力"}
+    assert body == {"complaint": "纳差乏力", "role": "researcher"}
     assert "retriever_mode" not in body
 
 
@@ -204,13 +214,25 @@ def test_request_body_carries_the_selected_mode():
         assert body["complaint"] == "纳差乏力"
 
 
+def test_request_body_carries_the_selected_role():
+    """M7：role 跟 retriever_mode 一样逐请求带上，不落进程状态（同一条理由，
+    见 buildConsultRequestBody 里的注释）。"""
+    for role in ["researcher", "student"]:
+        body = _build_body("", role_value=role)
+        assert body["role"] == role
+        assert body["complaint"] == "纳差乏力"
+
+
 def test_request_body_survives_a_page_without_the_selector():
-    """选择框不存在时（比如将来某个精简页面）不该抛异常，退回默认行为。"""
+    """选择框（含 role-select）都不存在时（比如将来某个精简页面）不该抛异常，
+    role 退回代码里写死的默认值 "researcher"——跟 getSelectedRole() 的
+    `sel ? sel.value : "researcher"` 兜底是同一处逻辑，这里验证的就是这条
+    兜底真的生效，不是页面缺个选择框就直接抛异常把整个提交流程打断。"""
     js = """
     globalThis.document = { getElementById: () => null };
     process.stdout.write(JSON.stringify(buildConsultRequestBody("纳差")));
     """
-    assert json.loads(_run_node(js)) == {"complaint": "纳差"}
+    assert json.loads(_run_node(js)) == {"complaint": "纳差", "role": "researcher"}
 
 
 # ---------- 企业化整改：XSS 与 EVAL_MODE 横幅 ----------

@@ -57,12 +57,15 @@
   }
   #cy {
     width: 100%;
-    height: 460px;
+    /* M7：540（原 460）——方剂框内药材纵向堆叠的可用空间不够，视觉密度偏紧凑
+       （M5 报告标注、M7 一起调），配合 computeLayout() 里放宽的药材间距一起改，
+       两处任何一处单独改都解决不了问题：容器矮，间距再大也会被 cy.fit() 缩回去。 */
+    height: 540px;
     border-radius: 6px;
     background: #fbfbfd;
   }
   #cy-empty {
-    height: 460px;
+    height: 540px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -126,6 +129,18 @@
   }
   #retriever-mode-label { font-size: 12.5px; color: var(--muted); }
   #retriever-mode {
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 12.5px;
+    background: var(--panel);
+    color: var(--text);
+  }
+  /* M7：role 选择器，跟 retriever-mode 同一套视觉，不新起一套样式规则的理由
+     只是"这两个下拉框长得应该一样"，没有更深的耦合。 */
+  #role-select-label { font-size: 12.5px; color: var(--muted); }
+  #role-select {
     padding: 7px 8px;
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -226,6 +241,11 @@
     font-weight: 500;
     margin-right: 4px;
   }
+  /* M7：君臣佐使分组里"君药加粗"——不能复用 .field b（那是行首标签的样式，
+     颜色是灰的 var(--muted)），君药要的是正文本身加粗、颜色跟其余药材一致，
+     两种加粗的意图不同（一个是"这是个标签"，一个是"这味药更重要"），
+     所以另起一个类，不共用 .field b。 */
+  .herb-jun { font-weight: 700; }
   .hallucination-warning {
     background: #fdecea;
     border: 1px solid var(--danger);
@@ -521,6 +541,14 @@
         <option value="bm25">bm25（关键词）</option>
         <option value="graph">graph（证素索引）</option>
       </select>
+      <!-- M7：只放 researcher/student 两档——patient/doctor 后端（M6）已经支持，
+           但各自的专属界面（导诊横幅、可编辑处方表）分别是未排期工作和 M8 的
+           任务，这里先不摆一个选了却看不出差别的选项，等对应界面做出来再加。 -->
+      <label id="role-select-label" for="role-select">查看模式</label>
+      <select id="role-select">
+        <option value="researcher" selected>研究者（完整信息）</option>
+        <option value="student">学生（教学展开）</option>
+      </select>
       <button id="submit-btn">辨证</button>
     </div>
     <div id="progress-log"></div>
@@ -578,7 +606,17 @@ let PHYSICIAN_NAMES = {};
 // 父节点画，隔太远 cytoscape 算出来的方剂包围盒会变成横跨整个画布的细长条，
 // 不会像"一个方框里装着自己的药"。
 const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640, 4: 730 };
-const Y_MIN = 60, Y_MAX = 460;
+// M7：Y_MAX 从 460 提到 620——只调这一个数救不了拥挤（cy.fit() 最后会把全部
+// 内容按同一个缩放系数塞进 #cy 容器，光把逻辑坐标范围拉大、节点本身的像素
+// 尺寸不变的话，摆放间距和节点尺寸的"比例"没变，缩放后看起来还是一样挤）。
+// 真正起作用的是这个比例本身：药材间距（下面 HERB_GAP）从 16 提到 26，
+// 明显大于药材节点自身高度（字号 11 + 上下 padding 6，约 23 个逻辑单位），
+// 26 提供的间隙足够放开重叠；Y_MAX 一起加大只是给"医家带"之间、方剂与方剂
+// 之间腾出更多空间，配合 #cy 容器本身的高度（也在这轮从 460px 提到 540px）
+// 一起用，两处缺一处都解决不了 M5 报告标注的"药材纵向堆叠间距小"。
+const Y_MIN = 60, Y_MAX = 620;
+// 单味药材之间的目标纵向间距（逻辑单位，不是像素——最终经 cy.fit() 统一缩放）。
+const HERB_GAP = 26;
 
 let cy = null;
 
@@ -662,30 +700,72 @@ function computeLayout(nodes, edges) {
     });
   });
 
-  // layer 3 方剂：跟 layer 2 一样按医家分带排布。每个方剂算出 y 之后，
-  // 它下属的每味药材（layer 4）紧贴着这个 y 纵向小间距聚成一小簇——
-  // cytoscape compound 节点的包围盒是按子节点位置自动算出来的，子节点越贴近
-  // 父节点给定的位置，画出来的方剂框就越像"一个方框里装着自己的药"，
-  // 而不是横跨整个画布的细长条。
+  // layer 3 方剂：跟 layer 2 一样先按医家分带算出一个初始 y。每个方剂的
+  // 药材簇宽度（herbSpan）按"同一医家带内相邻候选方的间距"设上限——3 个
+  // 候选方紧挨着排，每个方能分到的纵向空间比只有 1 个候选方时更窄，原来
+  // 固定 90 的上限在候选方多、间距本来就小时仍然会撞（M5 报告标注的问题）。
   const bandCount = physOrder.length || 1;
   const bandHeight = (Y_MAX - Y_MIN - gap * (bandCount - 1)) / bandCount;
+  // 收集初始位置，先不写进 positions——下面还有一道"跨医家带"的碰撞检查，
+  // 同一医家带内部间距算得再准，也管不住"上一位医家最后一个候选方"跟
+  // "下一位医家第一个候选方"之间只隔着固定的 gap（40）这件事：两者的药材簇
+  // 只要分别比 gap 的一半还宽，照样会在带与带的接缝处撞上，这是本轮
+  // Playwright 真实截图才照出来的——JSON 结构测试测不出"两个方框画面上
+  // 是否互相压住"，只有真的渲染出来看像素位置才看得见（CLAUDE.md 那条
+  // "涉及图层结构变更要跑 Playwright"的教训在这里又应验了一次，虽然这次
+  // 没有改层结构，但同样是"数据对、布局算法的一个隐藏假设错了，只有真实
+  // 渲染能暴露"）。
+  const formulaLayout = [];
   physOrder.forEach((phys, bandIdx) => {
     const bandTop = Y_MIN + bandIdx * (bandHeight + gap);
     const items = formulaByPhys[phys] || [];
+    const formulaStep = items.length > 1 ? bandHeight / (items.length - 1) : bandHeight;
+    const maxHerbSpan = items.length > 1 ? formulaStep * 0.8 : bandHeight * 0.6;
     items.forEach((n, i) => {
       const y = items.length <= 1 ? bandTop + bandHeight / 2 : bandTop + (bandHeight * i) / (items.length - 1);
-      positions[n.data.id] = { x: LAYER_X[3], y };
-
       const herbs = herbsByFormula[n.data.id] || [];
-      const herbSpan = Math.min(90, 16 * Math.max(herbs.length - 1, 0));
-      herbs.forEach((h, hi) => {
-        const hy = herbs.length <= 1
-          ? y
-          : y - herbSpan / 2 + (herbSpan * hi) / (herbs.length - 1);
-        positions[h.data.id] = { x: LAYER_X[4], y: hy };
-      });
+      const herbSpan = Math.min(maxHerbSpan, HERB_GAP * Math.max(herbs.length - 1, 0));
+      formulaLayout.push({ id: n.data.id, y, herbSpan, herbs });
     });
   });
+
+  // 跨医家带的碰撞检查：按 y 从上到下排序后逐个检查相邻两个方剂的药材簇
+  // 是否留够间距（各自 herbSpan 的一半 + 一个固定安全边距），不够就把后一个
+  // （以及它之后所有已经排定的）整体下移，补齐差额——这是一次性的从上到下
+  // 扫描，不是反复迭代到收敛，因为"后面的推前面的"这种情况在这套从上到下的
+  // 排布里不会发生（每个方剂的初始 y 已经是它所在医家带内部合理排布的结果，
+  // 唯一可能不够的间距就是相邻两个的，处理完这一对，后面的对不会因为这次
+  // 调整而重新变得不够）。
+  // 这个安全边距不只是"两个方剂中心的间距"，还要盖住 compound 父节点自己的
+  // 渲染开销——node:parent 样式给了 14px padding（上下各一份）、"text-valign:
+  // top" 的方名标签还要再占一截高度、herbSpan 本身量的是"药材中心到中心"
+  // 不含药材节点自己的半个身位。60 是实测出来的：第一版用 20，Playwright
+  // 截图里两个相邻候选方的框依然会互相压住（见模块报告），说明"药材中心
+  // 间距够了"不等于"方框边缘不重叠"，20 只覆盖了 FORMULA_MARGIN 字面意思
+  // 那一层，没算 compound 框自己的额外开销，加到 60 之后截图确认不再重叠。
+  const FORMULA_MARGIN = 60;
+  formulaLayout.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < formulaLayout.length; i++) {
+    const prev = formulaLayout[i - 1];
+    const cur = formulaLayout[i];
+    const minGap = prev.herbSpan / 2 + cur.herbSpan / 2 + FORMULA_MARGIN;
+    const actualGap = cur.y - prev.y;
+    if (actualGap < minGap) cur.y = prev.y + minGap;
+  }
+
+  for (const f of formulaLayout) {
+    positions[f.id] = { x: LAYER_X[3], y: f.y };
+    // 下属的每味药材（layer 4）紧贴着（可能已经上移调整过的）f.y 纵向小间距
+    // 聚成一小簇——cytoscape compound 节点的包围盒是按子节点位置自动算出来
+    // 的，子节点越贴近父节点给定的位置，画出来的方剂框就越像"一个方框里
+    // 装着自己的药"，而不是横跨整个画布的细长条。
+    f.herbs.forEach((h, hi) => {
+      const hy = f.herbs.length <= 1
+        ? f.y
+        : f.y - f.herbSpan / 2 + (f.herbSpan * hi) / (f.herbs.length - 1);
+      positions[h.data.id] = { x: LAYER_X[4], y: hy };
+    });
+  }
 
   return positions;
 }
@@ -779,6 +859,12 @@ function buildStylesheet() {
         opacity: 0.85,
       },
     },
+    // M7：症状->方剂路径高亮用的淡化样式。放在样式表末尾（selector 顺序即
+    // 层叠顺序，医家配色规则在下面的循环里还会追加），这样 .gt-faded 的
+    // opacity 会盖过医家配色规则设的任何值——同一条"选中/拦截红框必须盖过
+    // 医家色"的道理（见下面 node[?selected] 的注释），淡化同样必须盖过颜色。
+    { selector: "node.gt-faded", style: { opacity: 0.15 } },
+    { selector: "edge.gt-faded", style: { opacity: 0.06 } },
   ];
   for (const [phys, color] of Object.entries(PHYSICIAN_COLORS)) {
     style.push({
@@ -872,7 +958,14 @@ function describeNodeTooltip(data) {
       if (data.role) parts.push(`${data.role}药`);
       if (data.dose != null) parts.push(`${data.dose}${data.unit || ""}`);
       if (data.decoction) parts.push(data.decoction);
-      return `<b>药材</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(parts.filter(Boolean).join("　"))}</div>`;
+      const metaLine = `<div class="tt-meta">${escapeHtml(parts.filter(Boolean).join("　"))}</div>`;
+      // M7：方中作用（function_in_formula）单独一行——跟上面那行不一样，
+      // 上面几项都是"一个词/一个数字"，用全角空格拼在一句里；这项是一整句
+      // 自由文本（比如"疏肝理气，为本方主药"），塞进同一行会跟前面的短词
+      // 混在一起看不清楚断句，单独一行更符合它本身的长度和语义。
+      const funcLine = data.function_in_formula
+        ? `<div class="tt-meta">${escapeHtml(data.function_in_formula)}</div>` : "";
+      return `<b>药材</b>　${escapeHtml(data.label)}${metaLine}${funcLine}`;
     }
     default:
       return escapeHtml(data.label || data.id || "");
@@ -927,6 +1020,72 @@ function hideTooltip(tooltipId = "graph-tooltip") {
   document.getElementById(tooltipId).classList.remove("show");
 }
 
+// ---------- M7：症状→方剂路径高亮 ----------
+//
+// 纯函数，只读 nodes/edges（跟 computeLayout 同一份数据形状），不碰 cy 实例——
+// 离线测试直接喂一份 graph JSON 断言返回的节点/边集合，不用起真实浏览器。
+//
+// "完整链路"而不是"直连"：起点症状只连着证素（层1），不会直接连到证型或
+// 方剂——如果只高亮 sym 节点的直接邻居，学生看到的还是"症状=证素"这一步，
+// 看不出这条证素牵动了哪些证型、哪些方剂。所以要顺着边一路往下游走，每一跳
+// 都把新到达的节点纳入"已高亮"集合再继续找下一跳的邻居，直到症状(0)->
+// 证素(1)->证型(2)->方剂(3) 四层全部走完（三跳）。
+//
+// 特意停在方剂（层3），不下探到药材（层4）：层4 药材是方剂内部的组成，不是
+// "症状牵动的下一个推理结论"，而且层3方剂本身是 compound 父节点，视觉上已经
+// 把它的药材整体框在一起了，框被高亮时药材跟着看得见，不需要再单独判它在不在
+// 路径上——四步链路的字面意思到"方剂"为止（对齐任务描述原文），不是五步。
+function computeHighlightPath(nodes, edges, startId) {
+  const highlighted = new Set([startId]);
+  let frontier = new Set([startId]);
+  for (let hop = 0; hop < 3; hop++) {
+    const next = new Set();
+    for (const e of edges) {
+      if (frontier.has(e.data.source) && !highlighted.has(e.data.target)) {
+        next.add(e.data.target);
+      }
+    }
+    for (const id of next) highlighted.add(id);
+    frontier = next;
+  }
+  const edgeIds = new Set();
+  for (const e of edges) {
+    if (highlighted.has(e.data.source) && highlighted.has(e.data.target)) {
+      edgeIds.add(`${e.data.source}::${e.data.target}`);
+    }
+  }
+  return { nodeIds: highlighted, edgeIds };
+}
+
+// 当前处于高亮状态的症状节点 id；null 表示没有高亮。用来实现"再点取消"——
+// 再点同一个症状节点时判出这是"关闭"而不是"换一个症状重新高亮"。
+let highlightedSymptomId = null;
+
+function applyPathHighlight(nodeIds, edgeIds) {
+  if (!cy) return;
+  cy.nodes().forEach((n) => n.toggleClass("gt-faded", !nodeIds.has(n.id())));
+  cy.edges().forEach((e) => {
+    const key = `${e.data("source")}::${e.data("target")}`;
+    e.toggleClass("gt-faded", !edgeIds.has(key));
+  });
+}
+
+function clearPathHighlight() {
+  if (cy) cy.elements().removeClass("gt-faded");
+  highlightedSymptomId = null;
+}
+
+function handleSymptomClick(nodeId) {
+  if (highlightedSymptomId === nodeId) {
+    clearPathHighlight();
+    return;
+  }
+  if (!lastGraph) return;
+  const { nodeIds, edgeIds } = computeHighlightPath(lastGraph.nodes, lastGraph.edges, nodeId);
+  applyPathHighlight(nodeIds, edgeIds);
+  highlightedSymptomId = nodeId;
+}
+
 function ensureCanvas() {
   // 画布只建一次。生长动画需要 cy.add() 往已有画布上分批追加元素，
   // 每次 destroy 重建就没有"增量"可言了。
@@ -940,9 +1099,19 @@ function ensureCanvas() {
     userPanningEnabled: true,
     boxSelectionEnabled: false,
   });
-  cy.on("tap", "node", (evt) => openEvidence(evt.target.id()));
+  cy.on("tap", "node", (evt) => {
+    const n = evt.target;
+    openEvidence(n.id());
+    // M7：只有症状节点（层0）触发路径高亮——点其他层级的节点应该只是照旧
+    // 打开证据侧栏，不应该顺带清空/改变当前的路径高亮状态（那样点一下证型
+    // 节点看侧栏，画面上的高亮却跟着消失，会很意外）。
+    if (Number(n.data("layer")) === 0) handleSymptomClick(n.id());
+  });
   cy.on("tap", (evt) => {
-    if (evt.target === cy) closeEvidence();
+    if (evt.target === cy) {
+      closeEvidence();
+      clearPathHighlight();
+    }
   });
   cy.on("mouseover", "node", (evt) => {
     showTooltip(describeNodeTooltip(evt.target.data()), evt.originalEvent.clientX, evt.originalEvent.clientY);
@@ -1285,6 +1454,11 @@ async function growGraph(graph, { animate = true } = {}) {
   // 配色随医家变化（physicians.py 是唯一源），每次重新应用样式表
   cy.style(buildStylesheet());
   cy.elements().remove();
+  // M7：新图跟旧图的节点 id 不一定还对得上（换了个主诉），上一次点开的高亮
+  // 状态没有意义了，清掉——不清的话 highlightedSymptomId 会残留一个新图里
+  // 可能根本不存在的 id，再点同名症状（如果凑巧还叫这个名）会被误判成
+  // "点第二下、取消"，其实用户是第一次点这张新图。
+  highlightedSymptomId = null;
 
   const positions = computeLayout(graph.nodes, graph.edges);
   const nodesByLayer = { 0: [], 1: [], 2: [], 3: [], 4: [] };
@@ -1635,7 +1809,80 @@ function refListHtml(refs) {
     .join("");
 }
 
-function cardHtml(result) {
+// ---------- M7：君臣佐使分组 ----------
+//
+// 纯函数：给一份 herb_items（core.schemas.HerbItem 的列表），按 role 分组，
+// 固定顺序 君/臣/佐/使，group 为空的角色不出现在返回结果里（没有臣药的方子
+// 不该显示一行空的"臣"）。role 为 null／不是这四个字之一的，一律归进
+// "未标注"组——不强行塞进某一档，模型没标注就是没标注，伪造一个猜测出来的
+// 君臣佐使比"照实说不知道"更误导人。
+function groupHerbsByRole(herbItems) {
+  const order = ["君", "臣", "佐", "使"];
+  const byRole = { 君: [], 臣: [], 佐: [], 使: [] };
+  const unlabeled = [];
+  for (const item of herbItems || []) {
+    if (item && order.includes(item.role)) byRole[item.role].push(item);
+    else unlabeled.push(item);
+  }
+  const groups = order.filter((r) => byRole[r].length).map((r) => ({ role: r, herbs: byRole[r] }));
+  if (unlabeled.length) groups.push({ role: "未标注", herbs: unlabeled });
+  return groups;
+}
+
+// 一味药的展示文本：名字 + 剂量（有就带上，古籍医案常常没写剂量，见
+// core.schemas.HerbItem 的文档字符串）。炮制信息放进括号里跟在后面，跟
+// evidenceSectionHtml 里"炮制：xxx"单独一行的详细展示是两个不同的场景——
+// 这里是卡片正文里一行多味药紧凑罗列，不适合每味药都占一整行。
+function herbItemLabel(item) {
+  const dose = item.dose != null ? `${item.dose}${item.dose_unit || ""}` : "";
+  const base = [item.name, dose].filter(Boolean).join(" ");
+  return item.processing ? `${base}（${item.processing}）` : base;
+}
+
+function herbGroupsHtml(cand) {
+  if (!cand || !cand.herb_items || !cand.herb_items.length) return "";
+  return groupHerbsByRole(cand.herb_items)
+    .map((g) => {
+      const text = g.herbs.map((h) => escapeHtml(herbItemLabel(h))).join("、");
+      const inner = g.role === "君" ? `<span class="herb-jun">${text}</span>` : text;
+      return `<div class="field"><b>${escapeHtml(g.role)}药</b>${inner}</div>`;
+    })
+    .join("");
+}
+
+// ---------- M7：卡片详情默认展开/折叠 ----------
+//
+// researcher 模式（默认）保持改造前的行为——推理过程/引用详情、ReAct 取证
+// 过程默认折叠，跟这一轮之前完全一样；student 模式默认展开，学生不用先点开
+// 才能看到完整推理链和取证过程，并排对照两位医家更直接。doctor/patient 目前
+// 没有专属界面（见 role-select 的注释），跟 researcher 一样按"默认折叠"处理
+// ——不是刻意把它们当 researcher 看待，只是还没有为它们设计过展开状态，
+// 折叠是更安全的缺省值。
+function defaultDetailsOpenForMode(mode) {
+  return mode === "student";
+}
+
+// ReAct 取证过程单独一个 <details>，不再嵌在"推理过程与引用详情"里面——
+// 这样它的默认展开状态能跟外层详情框分别控制（虽然这一轮两者的开合逻辑给的
+// 值相同，都是 defaultDetailsOpenForMode(mode)，但任务描述原文把"三医家默认
+// 展开"和"ReAct 默认显示"列成两条独立的验收项，说明它们在概念上是两个可以
+// 分别调节的开关，不是同一个东西的两次描述——现在拆开，以后要让两者展开
+// 状态不同（比如再增加一种模式）不用重新拆结构）。
+function reactTraceDetailsHtml(rt, openAttr) {
+  if (!rt || !rt.steps || !rt.steps.length) return "";
+  const steps = rt.steps
+    .map((st) => `<div>第${st.step}步 ${escapeHtml(st.action)}${st.note ? "（" + escapeHtml(st.note) + "）" : ""}：${escapeHtml((st.thought || "").slice(0, 100))}</div>`)
+    .join("");
+  const pending = rt.pending_question
+    ? `<div>追问患者：${escapeHtml(rt.pending_question)}${rt.pending_answer ? "　答：" + escapeHtml(rt.pending_answer) : "（未获回答）"}</div>`
+    : "";
+  return `<details ${openAttr}>
+    <summary>取证过程（ReAct，${escapeHtml(rt.terminated_by)}，${rt.llm_calls} 次调用）</summary>
+    <div class="detail-block">${steps}${pending}</div>
+  </details>`;
+}
+
+function cardHtml(result, mode = "researcher") {
   const color = PHYSICIAN_COLORS[result.physician] || "#333";
   const s3 = result.s3;
   const hallucinationHtml = result.hallucinated && result.hallucinated.length > 0
@@ -1658,12 +1905,18 @@ function cardHtml(result) {
   const noRefHtml = result.no_reference_cases
     ? `<div class="safety-thermal">⚠ 未检索到相关医案（相似度均低于阈值）：本结论没有医案支撑，仅供参考</div>`
     : "";
-  const rt = result.react_trace;
-  const reactHtml = rt && rt.steps && rt.steps.length
-    ? `<div class="label">取证过程（${escapeHtml(rt.terminated_by)}，${rt.llm_calls} 次调用）</div>` +
-      rt.steps.map((st) => `<div>第${st.step}步 ${escapeHtml(st.action)}${st.note ? "（" + escapeHtml(st.note) + "）" : ""}：${escapeHtml((st.thought || "").slice(0, 100))}</div>`).join("") +
-      (rt.pending_question ? `<div>追问患者：${escapeHtml(rt.pending_question)}${rt.pending_answer ? "　答：" + escapeHtml(rt.pending_answer) : "（未获回答）"}</div>` : "")
-    : "";
+  const openAttr = defaultDetailsOpenForMode(mode) ? "open" : "";
+  const reactHtml = reactTraceDetailsHtml(result.react_trace, openAttr);
+
+  // M7：君臣佐使分组显示——只有 formula_candidates 存在时才有 herb_items 可分组
+  // （patient 角色下这个字段被后端整个摘掉，见 api/main.py::_filter_s3_for_role，
+  // 这里退回旧的扁平"用药"一行，s3.herbs 在 patient 下同样是 undefined，
+  // 表现为"（无）"——不是本模块的显示 bug，是 M6 定的安全边界本该如此）。
+  const selectedCand = (s3.formula_candidates && s3.formula_candidates.length)
+    ? s3.formula_candidates[s3.selected] : null;
+  const herbsHtml = selectedCand
+    ? herbGroupsHtml(selectedCand)
+    : `<div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>`;
 
   return `
     <div class="card">
@@ -1671,14 +1924,14 @@ function cardHtml(result) {
       <div class="field"><b>证型</b>${escapeHtml(s3.syndrome)}</div>
       <div class="field"><b>治法</b>${escapeHtml(s3.treatment_principle)}</div>
       <div class="field"><b>方剂</b>${escapeHtml(s3.formula || "（未明确）")}</div>
-      <div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>
+      ${herbsHtml}
       ${westernHtml}
       ${incompatibleHtml}
       ${thermalHtml}
       ${revisedHtml}
       ${noRefHtml}
       ${hallucinationHtml}
-      <details>
+      <details ${openAttr}>
         <summary>推理过程与引用详情</summary>
         <div class="detail-block">
           <div class="label">推理过程</div>
@@ -1687,10 +1940,10 @@ function cardHtml(result) {
           <div>${escapeHtml((s3.cited_case_ids || []).join("、") || "（无）")}</div>
           <div class="label">检索结果与相似度</div>
           ${refListHtml(result.refs)}
-          ${reactHtml}
           ${s3.note ? `<div class="label">备注</div><div>${escapeHtml(s3.note)}</div>` : ""}
         </div>
       </details>
+      ${reactHtml}
     </div>
   `;
 }
@@ -1717,8 +1970,15 @@ function escapeHtml(str) {
     .replace(/'/g, "&#39;");
 }
 
-function renderResults(results) {
-  document.getElementById("results").innerHTML = results.map(cardHtml).join("");
+function renderResults(results, mode = "researcher") {
+  document.getElementById("results").innerHTML = results.map((r) => cardHtml(r, mode)).join("");
+}
+
+// role-select 的当前取值。跟 retriever-mode 一样"逐请求参数、不落进程状态"，
+// 这里只是读 DOM 当前值，不额外维护一份全局变量去跟 DOM 手动同步。
+function getSelectedRole() {
+  const sel = document.getElementById("role-select");
+  return sel ? sel.value : "researcher";
 }
 
 // 被拦截/信息不足的请求也要把上一次正常问诊留下的东西清掉：残差提示、页脚、
@@ -1799,6 +2059,11 @@ function buildConsultRequestBody(complaint) {
   const sel = document.getElementById("retriever-mode");
   const mode = sel ? sel.value : "";
   if (mode) body.retriever_mode = mode;
+  // M7：role 跟 retriever_mode 一样逐请求带上，不是进程级设置。这里始终显式
+  // 传（不像 retriever_mode 那样"空值就不传这个字段"），因为 role-select
+  // 永远有一个合法选中值（默认 researcher），没有"不传等于用服务端默认"这种
+  // 需要区分的场景。
+  body.role = getSelectedRole();
   return body;
 }
 
@@ -1870,7 +2135,7 @@ function renderConsultResult(data) {
     note.style.display = "none";
   }
   renderDivergence(data.divergence);
-  renderResults(data.results);
+  renderResults(data.results, getSelectedRole());
   renderFollowup(data.followup);
   renderGraph(data.graph);
 }

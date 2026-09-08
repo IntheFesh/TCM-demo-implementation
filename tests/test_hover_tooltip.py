@@ -136,6 +136,29 @@ def test_herb_node_without_physician_names_map_falls_back_to_raw_id():
     assert "wu_jutong" in out
 
 
+def test_herb_node_tooltip_includes_function_in_formula_when_present():
+    """M7：function_in_formula（这味药在方中的作用）加进药材节点的 tooltip——
+    to_graph() 早就把这个字段存进节点 data 了（M5 就有，见 api/main.py），
+    这一轮只是前端把它显示出来，没有改后端契约。"""
+    out = _describe_node(
+        {"id": "herb::wu_jutong::甘草泻心汤::党参", "label": "党参", "layer": 4,
+         "phys": "wu_jutong", "role": "臣", "dose": 9.0, "unit": "g",
+         "function_in_formula": "补中益气，防苦寒药伤脾"},
+        physician_names={"wu_jutong": "吴鞠通"},
+    )
+    assert "补中益气，防苦寒药伤脾" in out
+
+
+def test_herb_node_tooltip_omits_function_line_when_absent():
+    """没有这个字段（旧数据/模型没给）时不显示一行空的——不是显示"undefined"
+    或者一行空 <div>，而是这一段 HTML 干脆不出现。"""
+    out = _describe_node(
+        {"id": "herb::wu_jutong::甘草泻心汤::党参", "label": "党参", "layer": 4,
+         "phys": "wu_jutong", "role": "臣", "dose": 9.0, "unit": "g"},
+    )
+    assert out.count("tt-meta") == 1  # 只有原来那一行元信息，没有多出第二行空的
+
+
 def test_unknown_layer_falls_back_to_label_or_id():
     assert "神秘节点" in _describe_node({"id": "x::神秘节点", "label": "神秘节点", "layer": 99})
     assert "x::无标签" in _describe_node({"id": "x::无标签", "layer": 99})
