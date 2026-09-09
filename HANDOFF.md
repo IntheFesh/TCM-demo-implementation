@@ -66,7 +66,11 @@
 
 ```bash
 pip install -r requirements.txt
-pytest -q                      # 判据：856 条全绿，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
+pytest -q                      # 判据：全绿，无 failed，秒级跑完（新 clone 上 conftest 会自动建图，不用先跑步骤 3）
+                                # 不写死条数——跟第 33 行同一条原则，写死的数刚写完就可能过期
+                                # （这份清单最早写的时候是 856，M1-M8 那轮结束后已经涨到 1304，
+                                # 现在读到这行时大概率又不是这个数了）；条数本身不是判据，
+                                # "全绿、没有 failed"才是
 python -c "import openai, os; print(bool(os.environ.get('LLM_API_KEY')))"
 ```
 
@@ -299,7 +303,8 @@ python -m eval.run_eval --queries-path tests/queries.txt     # V1：评测汇总
 ## 六、企业化整改一轮（2026-09）
 
 整个仓库跑了一遍复查（并发/安全/代码质量三路审计 + ruff + bandit + 覆盖率），
-结论和路线图在 `AUDIT.md`。改动全部有测试守着（802 → 856 条），下面只列
+结论和路线图在 `AUDIT.md`。改动全部有测试守着（这一轮内测试条数单调上升——
+跟步骤 0 那行同一条原则，具体数字不写死，现查 `pytest --collect-only -q`），下面只列
 接手的人要知道的行为变化：
 
 - **API 硬约束**：`complaint` 1–2000 字、`answer` ≤ 500 字（422）；并发问诊上限
