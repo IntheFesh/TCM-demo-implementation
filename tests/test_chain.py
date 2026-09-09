@@ -9,6 +9,7 @@ from core.schemas import (
     S2Elements,
     S3Syndrome,
     S3SyndromeUnreferenced,
+    _S3Base,
 )
 
 
@@ -63,13 +64,52 @@ class FakeLLM:
                 ],
                 unexplained_symptoms=[],
             )
-        if schema is S3Syndrome:
-            # 依赖 system 提示词里包含医家姓名来区分两位医家的返回值
+        if issubclass(schema, _S3Base):
+            # S3Syndrome / S3SyndromeUnreferenced 是同一个 _S3Base 的两个子类，
+            # 只在 cited_case_ids 上有无区别（core/schemas.py::_S3Base 的文档
+            # 字符串）。chain.py 按该医家检索是否为空动态选 schema——只认
+            # S3Syndrome 会在"某位医家检索为空"这条真实会发生的路径上
+            # （min_score 卡掉全部结果，之前叶天士就出现过）把假 LLM 自己先
+            # 炸掉，而不是暴露产品代码的问题。依赖 system 提示词里包含医家
+            # 姓名来区分各位医家的返回值。
             for physician_name, s3 in self.s3_by_physician.items():
                 if physician_name in system:
-                    return s3
-            raise AssertionError("无法从 system 提示词判断当前医家")
+                    return _coerce_s3(s3, schema)
+            # 医家不在 s3_by_physician 里（比如注册表里新加的医家、这条测试
+            # 没显式配置过）：给个通用兜底响应，不是让整条测试因为"不认识
+            # 这个医家"而炸。这些测试大多守的是 SSE 事件序列，不是"每位医家
+            # 的内容对不对"。
+            return _coerce_s3(None, schema)
         raise AssertionError(f"未预期的 schema: {schema}")
+
+
+def _coerce_s3(s3: "_S3Base | None", schema):
+    """把预设的 S3 响应（或没有预设时的通用兜底内容）转成实际被请求的 schema。
+
+    两个 S3 schema 只在 cited_case_ids 上不同：S3Syndrome 必填，
+    S3SyndromeUnreferenced 没有这个字段。假 LLM 不能因为调用方按哪个 schema
+    准备了预设值，就在检索状态切换（有检索结果 <-> 检索为空）时把这条区别
+    弄反——那正是防幻觉约束要测的东西，弄反了测试会悄悄测出错误的结论
+    （比如检索为空却带上了 cited_case_ids，让"检索为空不该有引用"失效）。
+    """
+    if isinstance(s3, schema):
+        return s3
+    if s3 is not None:
+        data = s3.model_dump(exclude={"cited_case_ids"})
+    else:
+        data = {
+            "syndrome": "脾胃气虚",
+            "reasoning": "通用兜底响应（未在 s3_by_physician 中显式配置）",
+            "treatment_principle": "健脾益气",
+            "formula_candidates": [{
+                "name": "四君子汤", "source": "classic", "confidence": "medium",
+                "rationale": "兜底响应，供 SSE 事件序列等结构性测试使用，非真实医案推导。",
+                "herb_items": [{"name": "党参"}, {"name": "白术"}],
+            }],
+        }
+    if schema is S3Syndrome and not data.get("cited_case_ids"):
+        data["cited_case_ids"] = ["fallback-case-001"]
+    return schema(**data)
 
 
 class FakeRetriever(Retriever):
@@ -249,7 +289,10 @@ class ViolatingThenCleanLLM(FakeLLM):
         self.retry_prompts: list[str] = []
 
     def generate(self, system, user, schema, temperature=0.0, **kwargs):
-        if schema is S3Syndrome and "【安全问题】" in system:
+        # issubclass 而不是恒等比较：某位医家检索为空时 chain.py 重开也会用
+        # S3SyndromeUnreferenced（同一个 s3_schema 变量原样带进重开调用），
+        # 只认 S3Syndrome 会在这条路径上漏判、把重开当成普通调用处理。
+        if issubclass(schema, _S3Base) and "【安全问题】" in system:
             self.calls.append(schema.__name__)
             self.retry_prompts.append(system)
             for name, s3 in self.clean_by_physician.items():
@@ -380,7 +423,10 @@ class ReActFakeLLM(FakeLLM):
                 return ReActStep(thought="先看看证素对应哪些证候",
                                  action="query_graph", action_input={"node": "纳呆"})
             return ReActStep(thought="够了", action="finish")
-        if schema is S3Syndrome:
+        if issubclass(schema, _S3Base):
+            # 同样不能只认 S3Syndrome：某位医家检索为空时 S3 提示词走的是
+            # S3SyndromeUnreferenced，漏记会让"prompt 内容"这类断言对该医家
+            # 悄悄失去覆盖，而不是报错——比恒等比较直接崩溃更难发现。
             self.s3_systems.append(system)
         return super().generate(system, user, schema, temperature, **kwargs)
 

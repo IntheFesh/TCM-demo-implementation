@@ -8,9 +8,24 @@ consult() 会不会漏转发、会不会漏了某个自然边界不上报。
 不测 SSE 传输本身（那是 api/main.py 的事，走真实 uvicorn + curl -N 验证），
 这里只测"回调按什么顺序、带什么数据被调用"这个跟传输方式无关的契约。
 """
+import pytest
+
 from core import chain, react
 from core.schemas import S1Normalize, S3Syndrome
 from tests.test_chain import FakeLLM, FakeRetriever, ReActFakeLLM, _fake_cases
+
+
+@pytest.fixture(autouse=True)
+def _pin_two_physicians(monkeypatch):
+    """跟 tests/test_chain.py 的同名 fixture钉住同一件事，但这里必须单独声明一份：
+    autouse fixture 的作用域是它所在的模块，从 test_chain 导入 FakeLLM 等类不会
+    把那边的 autouse 一并带过来。这个文件里的用例把"两位医家各一段"写死在事件
+    序列的断言里（physician_start/physician_done 的名字列表、事件条数），注册表
+    增长到三位、四位不该让这些断言无缘无故变红——那不是这些用例要测的东西。"""
+    from core.physicians import PHYSICIANS as REG
+
+    two = {k: REG[k] for k in ("ye_tianshi", "wu_jutong")}
+    monkeypatch.setattr(chain, "PHYSICIANS", two)
 
 
 def _setup_two_physicians(monkeypatch):
@@ -141,3 +156,48 @@ def test_on_step_reports_residual_when_triggered(monkeypatch):
     # 共用的一步"，不该跟任何一位医家的进度绑在一起
     assert names.index("residual_done") < names.index("physician_start")
     assert names.index("s2_done") < names.index("residual_done")
+
+
+def test_on_step_emits_full_sequence_when_one_physician_has_empty_retrieval(monkeypatch):
+    """某位医家检索为空（真实场景：min_score 卡掉全部结果，叶天士出现过这种情况）时，
+    S3 改走 S3SyndromeUnreferenced，但那位医家的 SSE 事件序列不该因此缺一段——
+    physician_start / s3_start / physician_done 三个都要在。
+
+    这条不是新场景，是给"检索为空"这条路径补的事件完整性回归：这里注册张锡纯前
+    就曾经因为假 LLM 只认 S3Syndrome（恒等比较，见 tests/test_chain.py 的
+    issubclass(schema, _S3Base) 那处修复）而崩溃过——不是这些用例本来就测过的东西
+    没测出来，是这条路径以前根本没有真正走通过。不新增假医家、不碰
+    _fake_cases()：用已有的两位医家，只让其中一位的检索结果为空，跟真实会发生的
+    场景（阈值卡掉全部结果）保持同一种成因。
+    """
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="x", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"], herbs=["党参", "白术"])
+    s3_wu = S3Syndrome(syndrome="脾胃气虚", reasoning="x", treatment_principle="健脾益气",
+                       cited_case_ids=["wu_jutong-001"], herbs=["茯苓", "陈皮"])
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    # 只留叶天士的医案，吴鞠通检索为空
+    only_ye_cases = [c for c in _fake_cases() if c.physician == "ye_tianshi"]
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(only_ye_cases))
+
+    events = []
+    outcome = chain.consult("纳差乏力", on_step=lambda name, data: events.append((name, data)))
+
+    names = [e[0] for e in events]
+    assert names == [
+        "s1_done", "s2_done", "followup_done",
+        "physician_start", "s3_start", "physician_done",
+        "physician_start", "s3_start", "physician_done",
+    ]
+    phys_starts = [e[1]["physician"] for e in events if e[0] == "physician_start"]
+    phys_dones = [e[1]["physician"] for e in events if e[0] == "physician_done"]
+    assert phys_starts == ["ye_tianshi", "wu_jutong"]
+    assert phys_dones == ["ye_tianshi", "wu_jutong"]
+
+    # 确认吴鞠通那一支确实走的是检索为空这条路径，不是碰巧凑对了序列——
+    # 序列完整不能靠巧合证明，要靠"真的触发了这条路径"来证明
+    ye_result = next(r for r in outcome["results"] if r["physician"] == "ye_tianshi")
+    wu_result = next(r for r in outcome["results"] if r["physician"] == "wu_jutong")
+    assert ye_result["no_reference_cases"] is False
+    assert wu_result["no_reference_cases"] is True
+    assert wu_result["s3"].cited_case_ids == []
