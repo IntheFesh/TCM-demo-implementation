@@ -952,3 +952,48 @@ def test_disease_via_alias_does_not_get_warning(monkeypatch):
 
     for r in outcome["results"]:
         assert r["s3"].note is None
+
+
+# ---------- registry 增长回归：钉两位是权宜之计，不是终局 ----------
+
+def test_consult_runs_every_registered_physician_not_just_the_pinned_two(monkeypatch):
+    """_pin_two_physicians 这个 autouse fixture 让本文件其余测试不受 registry
+    增长影响，但代价是全项目没有一条测试真的对着"三位、四位医家"的真实注册表
+    跑过 consult()——只靠 pin 意味着"注册第三位医家后 chain.py 还正常"这件事
+    没有任何测试守着。这条故意用 monkeypatch 覆盖掉 autouse 的钉法，直接对着
+    core.physicians.PHYSICIANS 的真实内容跑，期望值也从它动态算，不写死
+    "叶天士/吴鞠通"这两个名字——这样 registry 涨到几位，这条测试都还在真的
+    验证 consult() 会不会漏跑或多跑某个医家，而不是永远只测两位那条老路径。"""
+    from core.physicians import PHYSICIANS as REAL_PHYSICIANS
+
+    assert len(REAL_PHYSICIANS) >= 2  # 这条测试的意义建立在"确实不止一位医家"上
+
+    s3_by_physician = {
+        info["name"]: S3Syndrome(
+            syndrome="脾胃气虚", reasoning="x", treatment_principle="健脾益气",
+            cited_case_ids=[f"{pid}-001"], herbs=["党参"],
+        )
+        for pid, info in REAL_PHYSICIANS.items()
+    }
+    fake_llm = FakeLLM(s3_by_physician)
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    # 覆盖掉 autouse 的两位钉死——这条测试就是要对着真实注册表跑
+    monkeypatch.setattr(chain, "PHYSICIANS", REAL_PHYSICIANS)
+    cases = [
+        CaseRecord(
+            case_id=f"{pid}-001", case_group_id=f"{pid}-001", physician=pid,
+            raw="原文", symptoms=["纳差"], tongue="淡红", pulse="细弱",
+            syndrome="脾胃气虚", herbs=["党参"],
+        )
+        for pid in REAL_PHYSICIANS
+    ]
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(cases))
+
+    outcome = chain.consult("纳差乏力")
+
+    # 每位注册医家都跑到了，顺序跟注册表一致，不多不少
+    assert [r["physician"] for r in outcome["results"]] == list(REAL_PHYSICIANS.keys())
+    assert len(outcome["results"]) == len(REAL_PHYSICIANS)
+    for r in outcome["results"]:
+        assert r["s3"].syndrome == "脾胃气虚"
+        assert r["no_reference_cases"] is False
