@@ -68,17 +68,37 @@ class CaseRecord(VisitStructured):
 
 # ---------- X3：医案三元组（S5 抽取，LLM 输出） ----------
 
+# 谓词受控词表。R2 --limit 5 试水暴露：不限定谓词时模型实际吐出 15 种以上
+# （起于/表现为/诊断为/脉象/病机为/病机/治法/治则/治以/方剂/用药/含/疗效/
+# 服药后/后……），其中「病机为」跟「病机」、「治法」「治则」「治以」互为同义词，
+# query_case_graph 的子串匹配对同义词无能为力——查「治以」查不到写成「治法」
+# 的那些行。原先的设计（见 R2 之前这段文档字符串的历史版本）刻意不限定成
+# 固定枚举，理由是"关系比证候-治法-方剂-药物这条链丰富得多"；R2 的真实抽取
+# 证明这个理由站不住：模型没有用这份自由去表达更丰富的关系，只是把同一个
+# 关系换着说法，外加把叙事/对话也塞进了谓词里（见下面 CaseTripleItem 的
+# "只抽本例患者" 那条）。收紧成六个固定谓词后，narrative 那类关系
+# （"认为"「用麻黄」"服此方后"）在 schema 层面直接不合法，不需要额外一层
+# 叙事过滤器。
+CaseTriplePredicate = Literal["提示", "属于", "治以", "用方", "含", "用药"]
+
 
 class CaseTripleItem(BaseModel):
     """S5（offline/extract_case_triples.py）从一诊原文里抽出的一条三元组。
     s/p/o 全部要求非空——防幻觉约束：抽不出完整的三元组就不该抽这一条，
     不能用空字符串占位凑数。
 
-    p（谓词）刻意不限定成固定枚举：医案原文里的关系比"证候-治法-方剂-药物"
-    这条链丰富得多（症状表现、病机归因、疗效反馈……），限定成小枚举会逼模型
-    把不属于任何枚举值的关系硬套进去，反而制造假三元组。core/tools.py 的
-    query_case_graph 也是按这个前提设计的：predicate 过滤用的是子串匹配，
-    不是枚举相等。
+    p（谓词）限定成 CaseTriplePredicate 六选一，schema 层用 Literal 强制、
+    不只是在 prompt 里写"请从这六个里选"——模型给了表外谓词就该让 pydantic
+    拒绝、走 core.llm 的重试（校验错误回灌），比抽完之后再清洗可靠：清洗
+    只能删，删不掉的话脏数据已经进了 data/case_triples.jsonl，Literal 校验
+    在数据落盘之前就拦住。
+
+    s/o 不做 Literal 约束（症状/病机/证型/治法/方名/药名是开放词表，没法枚举），
+    但**不能是指代词**（"此症""此病""本例""患者""病家"这类）——这类词在
+    941 条医案里字面相同、语义不同，挂进图谱会被当成同一个节点，把所有医案
+    的内容都连到它上面。这一条 schema 管不了（"此症"是合法的非空字符串），
+    prompt 里明确要求、extract_case_triples.py 里再做一层运行时黑名单兜底
+    （跟 source_span 的核验是同一个"prompt 说了不代表模型会听"的道理）。
 
     source_span 是这条三元组在原文里的出处片段，**必须能在传给模型的原文里
     逐字找到**——这一步不是 pydantic 能校验的（schema 只管字段非空，不知道
@@ -87,7 +107,7 @@ class CaseTripleItem(BaseModel):
     """
 
     s: str = Field(min_length=1)
-    p: str = Field(min_length=1)
+    p: CaseTriplePredicate
     o: str = Field(min_length=1)
     source_span: str = Field(min_length=1)
 
@@ -104,12 +124,15 @@ class CaseTripleRecord(BaseModel):
     """写进 data/case_triples.jsonl 的最终形态：CaseTripleItem 补上
     case_id/physician，字段名严格对齐 core/tools.py._load_case_triples() /
     query_case_graph() 已经在读的格式——那份代码是这个格式的第一个、也是
-    唯一的消费者，字段名改了它就读不到数据，不能各写各的。"""
+    唯一的消费者，字段名改了它就读不到数据，不能各写各的。
+
+    p 跟 CaseTripleItem 用同一个 CaseTriplePredicate，不是各自定义一份——
+    "谓词只能是这六个之一"是同一条约束，写两处以后改一处会漏。"""
 
     case_id: str
     physician: str
     s: str = Field(min_length=1)
-    p: str = Field(min_length=1)
+    p: CaseTriplePredicate
     o: str = Field(min_length=1)
     source_span: str = Field(min_length=1)
 

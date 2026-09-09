@@ -290,7 +290,11 @@ def query_graph(node: str, edge_type: str | None = None,
 
 class QueryCaseGraphInput(BaseModel):
     symptom: str | None = Field(default=None, description="按症状/实体文本匹配三元组的主语或宾语")
-    predicate: str | None = Field(default=None, description="只看这一类关系，如 表现为 / 治以 / 用药")
+    predicate: str | None = Field(
+        default=None,
+        description="只看这一类关系，如 提示 / 治以 / 用药（X3 受控词表六选一："
+                    "提示/属于/治以/用方/含/用药，见 core.schemas.CaseTriplePredicate）",
+    )
     physician: str | None = Field(default=None, description="只看这位医家的医案（ye_tianshi / wu_jutong）")
     case_id: str | None = Field(default=None, description="只看这条医案")
     limit: int = Field(default=20, ge=1, le=200)

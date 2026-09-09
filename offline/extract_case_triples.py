@@ -16,6 +16,12 @@ treatment_principle/formula/herbs 这几个字段虽然 S0 阶段已经抽过一
 查不到就整条三元组丢弃，不写进输出文件；丢了多少条要在统计里如实报出来，
 不能静默吞掉（吞了的话，"三元组文件的 source_span 都可核验"这句话就是假的）。
 
+**主语/宾语的指代词核验也在这里做，同样不在 schema 里。** "此症""患者"
+这类词是合法的非空字符串，pydantic 拦不住；核验逻辑跟 source_span 一样，
+抽取后立刻查，命中黑名单就丢弃、计入统计，不能静默吞。谓词受控词表（六选一）
+不一样——那条 schema 层能拦，见 core.schemas.CaseTriplePredicate，模型给了
+表外谓词会在 core.llm 的重试机制里被回灌校验错误，不需要这里再查一遍。
+
 用法：
     python -m offline.extract_case_triples
     python -m offline.extract_case_triples --dry-run --limit 5
@@ -33,22 +39,41 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASES_PATH = ROOT / "cases.json"
 DEFAULT_OUT_PATH = ROOT / "data" / "case_triples.jsonl"
 
+# R2 --limit 5 试水实测出现过的指代词（"此症""此病"），另外几个是同一类问题
+# 会出现的变体，一并列进来防患于未然。exact match（strip 后整串相等），不用
+# 子串匹配——"患者"是子串的话会连"患者自述"这种合法症状描述里的词一起拦掉，
+# 这里只拦"s 或 o 整个就是这个指代词"的情况。
+_REFERENTIAL_PLACEHOLDERS = frozenset({
+    "此症", "此病", "此证", "本例", "该患者", "该病人", "该症",
+    "患者", "病家", "病者", "病人", "其人",
+})
+
 
 def _source_text(case: CaseRecord) -> str | None:
-    """喂给模型、也是 source_span 核验基准的原文。优先诊次原文片段（跟"这一诊
-    具体证明了什么"颗粒度一致）；缺失时退到整段原文——仍然是这条医案的真实
-    文字，只是核验时可核对的范围更大。raw 也拿不到（不该发生，raw 是必填
-    字段）才返回 None，调用方据此跳过，不编造。"""
-    if case.raw_excerpt:
-        return case.raw_excerpt
-    return case.raw or None
+    """喂给模型、也是 source_span 核验基准的原文。**只用诊次原文片段
+    （raw_excerpt），不退回整段 raw。** raw 是同一病人所有诊次共享的整段
+    粗段——R2 --limit 5 试水实测过退回 raw 的后果：wu_jutong-0000 三诊共享
+    同一段 raw，三次都喂整段文本，模型三次读到同样的内容却抽出三套不一致的
+    三元组，p0-1 那次甚至混进了后面诊次才出现的方剂（麻黄附子甘草汤/桂枝汤/
+    五苓散）——这不是模型出错，是喂给它的原文本来就包含了它不该看到的内容。
+    raw_excerpt 覆盖率 97%（M1 那轮做的诊次级片段），缺失的 3% 直接跳过、
+    不编、不退化到 raw，调用方据此计入 stats 里的跳过数。"""
+    return case.raw_excerpt or None
 
 
-def extract_case(case: CaseRecord) -> tuple[list[CaseTripleRecord], int]:
-    """对一条医案调一次 S5，返回 (核验通过的三元组记录, 核验没过被丢弃的条数)。"""
+def _is_referential(text: str) -> bool:
+    return text.strip() in _REFERENTIAL_PLACEHOLDERS
+
+
+def extract_case(case: CaseRecord) -> tuple[list[CaseTripleRecord], dict[str, int]]:
+    """对一条医案调一次 S5，返回 (核验通过的三元组记录, 按丢弃原因分类的计数)。
+    两种丢弃原因分开计数而不是合并成一个数：source_span 找不到说明模型编了
+    出处，s/o 是指代词占位符说明模型没有把关系落到具体实体上——两类问题的
+    修法不一样（前者是抄写要更忠实，后者是要认出"这个词不是一个实体"），
+    分开报才看得出改 prompt 有没有真的改到点子上。"""
     text = _source_text(case)
     if text is None:
-        return [], 0
+        return [], {"span_not_found": 0, "referential": 0}
 
     prompt = load_prompt("s5_extract_triples")
     system = render(prompt["system"], raw_text=text)
@@ -57,23 +82,27 @@ def extract_case(case: CaseRecord) -> tuple[list[CaseTripleRecord], int]:
     )
 
     records = []
-    n_rejected = 0
+    rejected = {"span_not_found": 0, "referential": 0}
     for item in extraction.triples:
         if item.source_span not in text:
-            n_rejected += 1
+            rejected["span_not_found"] += 1
+            continue
+        if _is_referential(item.s) or _is_referential(item.o):
+            rejected["referential"] += 1
             continue
         records.append(CaseTripleRecord(
             case_id=case.case_id, physician=case.physician,
             s=item.s, p=item.p, o=item.o, source_span=item.source_span,
         ))
-    return records, n_rejected
+    return records, rejected
 
 
 def extract_all(cases: list[CaseRecord]) -> tuple[list[CaseTripleRecord], dict]:
     all_records: list[CaseTripleRecord] = []
     stats = {
         "cases": len(cases), "cases_no_text": 0, "cases_no_triples": 0,
-        "triples_extracted": 0, "triples_rejected_span_not_found": 0,
+        "triples_extracted": 0,
+        "triples_rejected_span_not_found": 0, "triples_rejected_referential": 0,
         "llm_calls": 0,
     }
     for case in cases:
@@ -81,9 +110,10 @@ def extract_all(cases: list[CaseRecord]) -> tuple[list[CaseTripleRecord], dict]:
         if text is None:
             stats["cases_no_text"] += 1
             continue
-        records, n_rejected = extract_case(case)
+        records, rejected = extract_case(case)
         stats["llm_calls"] += 1
-        stats["triples_rejected_span_not_found"] += n_rejected
+        stats["triples_rejected_span_not_found"] += rejected["span_not_found"]
+        stats["triples_rejected_referential"] += rejected["referential"]
         if not records:
             stats["cases_no_triples"] += 1
         stats["triples_extracted"] += len(records)
@@ -92,12 +122,14 @@ def extract_all(cases: list[CaseRecord]) -> tuple[list[CaseTripleRecord], dict]:
 
 
 def _estimate_call_count(cases_path: Path, limit: int | None) -> int:
+    """跟 _source_text 用同一条判据：只数有 raw_excerpt 的医案，不数只有 raw
+    的——不然 dry-run 报的调用数会比实际多跑的次数大，用来算成本会算高。"""
     if not cases_path.exists():
         return 0
     raw = json.loads(cases_path.read_text(encoding="utf-8"))
     if limit is not None:
         raw = raw[:limit]
-    return sum(1 for c in raw if c.get("raw_excerpt") or c.get("raw"))
+    return sum(1 for c in raw if c.get("raw_excerpt"))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -125,9 +157,10 @@ def main(argv: list[str] | None = None) -> None:
 
     records, stats = extract_all(cases)
 
-    print(f"读入 {stats['cases']} 条医案（{stats['cases_no_text']} 条无原文可用，已跳过）")
+    print(f"读入 {stats['cases']} 条医案（{stats['cases_no_text']} 条没有 raw_excerpt，已跳过，不退回整段 raw）")
     print(f"S5 调用 {stats['llm_calls']} 次，抽出 {stats['triples_extracted']} 条三元组通过核验，"
-          f"{stats['triples_rejected_span_not_found']} 条因 source_span 在原文里找不到被丢弃")
+          f"{stats['triples_rejected_span_not_found']} 条因 source_span 在原文里找不到被丢弃，"
+          f"{stats['triples_rejected_referential']} 条因主语/宾语是指代词占位符被丢弃")
     print(f"{stats['cases_no_triples']} 条医案调了模型但一条三元组都没抽出/全部核验未过")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
