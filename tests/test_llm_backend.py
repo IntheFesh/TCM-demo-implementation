@@ -5,7 +5,7 @@ import json
 import subprocess
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from core.llm import (
     ClaudeCLIBackend,
@@ -244,6 +244,34 @@ def test_generate_gives_up_after_three_attempts():
     assert "model=scripted" in msg
     assert "schema=Tiny" in msg
     assert "bad" in msg
+
+
+def test_generate_gives_up_preserves_exception_chain():
+    """__cause__ 要能拿到真实的底层异常，不是只能从格式化好的字符串里猜。
+    调用方（比如 X3 批量抽取）按失败原因分布做统计时，
+    type(err.__cause__).__name__ 是结构化信号，解析"最后错误={...}"
+    这句拼出来的文本反而脆弱——错误信息格式一变解析就错。"""
+    b = ScriptedBackend(['{"bad":1}', '{"bad":2}', '{"bad":3}'])
+    with pytest.raises(LLMError) as ei:
+        b.generate("sys", "usr", Tiny)
+    assert ei.value.__cause__ is not None
+    assert isinstance(ei.value.__cause__, ValidationError)
+
+
+def test_transport_error_llm_error_also_preserves_cause():
+    """传输类错误（超时/连接断）耗尽重试后同样要能拿到底层异常类型，
+    不止是校验错误这一条路径。"""
+    class AlwaysTimesOut(LLMBackend):
+        def model_name(self): return "m"
+        def backend_id(self): return "t"
+        def _complete(self, messages, temperature, **kw):
+            raise TimeoutError("超时")
+
+    b = AlwaysTimesOut()
+    b.RETRY_BACKOFF_SECONDS = (0.0, 0.0)
+    with pytest.raises(LLMError) as ei:
+        b.generate(system="s", user="u", schema=Tiny)
+    assert isinstance(ei.value.__cause__, TimeoutError)
 
 
 def test_generate_injects_schema_into_system():

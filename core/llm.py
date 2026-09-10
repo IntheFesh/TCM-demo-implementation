@@ -241,12 +241,17 @@ class LLMBackend(ABC):
                         }
                     )
 
+        # from last_error 保留异常链：调用方（比如 X3 批量抽取）要按失败原因
+        # 分布做统计时，靠字符串里的"最后错误={last_error}"去解析文本很脆弱
+        # （错误信息格式一变就解析错）。__cause__ 是结构化的，
+        # type(err.__cause__).__name__ 直接给出真实的异常类型
+        # （TimeoutError/RateLimitError/ValidationError……），不用猜。
         raise LLMError(
             f"LLM 调用在 {self.MAX_ATTEMPTS} 次尝试后仍失败。"
             f"backend={self.backend_id()}, model={self.model_name()}, "
             f"schema={schema.__name__}, 最后错误={last_error}, "
             f"最后原始返回前 500 字={last_raw[:500]!r}"
-        )
+        ) from last_error
 
 
 class OpenAICompatBackend(LLMBackend):
