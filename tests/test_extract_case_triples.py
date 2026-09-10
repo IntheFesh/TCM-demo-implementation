@@ -4,10 +4,14 @@
 这里要覆盖的核心逻辑有三层防幻觉核验，pydantic schema 都管不了，是
 extract_case_triples.py 自己做的：
   1. source_span 的逐字核验（这个模块最初存在的理由）
-  2. s/o 不能是"此症""患者"这类指代词占位符（R2 --limit 5 试水暴露）
+  2. s/o 不能是"此症""患者"这类指代词占位符（R2 第一轮 --limit 5 试水暴露）
   3. 只用 raw_excerpt 核验/喂给模型，raw_excerpt 缺失就跳过、不退回整段 raw
-     （R2 试水暴露：退回 raw 会让同一病人的多次诊次读到同一段文本、抽出
+     （同一轮试水暴露：退回 raw 会让同一病人的多次诊次读到同一段文本、抽出
      不一致甚至跨诊次的内容）
+以及第四层——不是"内容有问题"，是"根本没读完"：
+  4. 输出被截断（LLMTruncatedError）时跳过这条医案，不重试、不崩批
+     （R2 全量跑第一条医案就崩暴露：一张九味药的方子，九条「含」关系的
+     source_span 全部重复抄整张方子，约 1800 字纯重复撞上 max_tokens）
 谓词的六选一（core.schemas.CaseTriplePredicate）是 schema 层拦的，pydantic
 自己会报错，不需要这里再测——CaseTripleItem 的构造失败已经是 pydantic 的
 标准行为，这里只补一条确认 Literal 真的生效了。
@@ -17,6 +21,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from core.llm import LLMTruncatedError
 from core.schemas import CaseRecord, CaseTripleExtraction, CaseTripleItem
 from offline import extract_case_triples as ect
 
@@ -36,11 +41,25 @@ class FakeLLM:
     def __init__(self, result: CaseTripleExtraction):
         self.result = result
         self.calls = 0
+        self.kwargs_seen: list[dict] = []
 
     def generate(self, system, user, schema, temperature=0.0, **kwargs):
         self.calls += 1
+        self.kwargs_seen.append(kwargs)
         assert schema is CaseTripleExtraction
         return self.result
+
+
+class TruncatingFakeLLM:
+    """模拟输出被截断：generate() 直接抛 LLMTruncatedError，就像真实后端
+    在 JSON 于 max_tokens 处被砍断时会做的那样。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def generate(self, system, user, schema, temperature=0.0, **kwargs):
+        self.calls += 1
+        raise LLMTruncatedError("疑似输出在 max_tokens 上限处被截断（测试用假错误）")
 
 
 # 默认值改用受控词表里的"提示"（症状→病机），s/o 都是具体实体，不再用
@@ -58,8 +77,9 @@ def test_valid_source_span_survives(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[_item()]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert rejected == {"span_not_found": 0, "referential": 0}
+    assert truncated is False
     assert len(records) == 1
     assert records[0].s == "脘痛" and records[0].o == "肝木犯胃"
     assert records[0].case_id == "ye_tianshi-1"
@@ -76,8 +96,9 @@ def test_source_span_not_in_text_is_rejected(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[bad, good]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert rejected == {"span_not_found": 1, "referential": 0}
+    assert truncated is False
     assert len(records) == 1
     assert records[0].s == "脘痛"
 
@@ -92,8 +113,9 @@ def test_referential_subject_is_rejected(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[bad, good]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert rejected == {"span_not_found": 0, "referential": 1}
+    assert truncated is False
     assert len(records) == 1
     assert records[0].s == "脘痛"
 
@@ -106,8 +128,9 @@ def test_referential_object_is_rejected(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[bad]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert rejected == {"span_not_found": 0, "referential": 1}
+    assert truncated is False
     assert records == []
 
 
@@ -120,8 +143,9 @@ def test_referential_check_is_exact_match_not_substring(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[ok]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert rejected == {"span_not_found": 0, "referential": 0}
+    assert truncated is False
     assert len(records) == 1
 
 
@@ -130,9 +154,10 @@ def test_empty_extraction_is_not_an_error(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert records == []
     assert rejected == {"span_not_found": 0, "referential": 0}
+    assert truncated is False
 
 
 def test_source_span_checked_against_excerpt_raw_never_consulted(monkeypatch):
@@ -143,14 +168,16 @@ def test_source_span_checked_against_excerpt_raw_never_consulted(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[_item(source_span="这一诊的片段")]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert rejected == {"span_not_found": 0, "referential": 0}
+    assert truncated is False
     assert len(records) == 1
 
     fake2 = FakeLLM(CaseTripleExtraction(triples=[_item(source_span="整段原文，另有别的诊次内容")]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake2)
-    records2, rejected2 = ect.extract_case(case)
+    records2, rejected2, truncated2 = ect.extract_case(case)
     assert rejected2 == {"span_not_found": 1, "referential": 0}
+    assert truncated2 is False
     assert records2 == []
 
 
@@ -161,9 +188,10 @@ def test_no_source_text_returns_empty_without_calling_llm(monkeypatch):
     fake = FakeLLM(CaseTripleExtraction(triples=[_item()]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert records == []
     assert rejected == {"span_not_found": 0, "referential": 0}
+    assert truncated is False
     assert fake.calls == 0  # 没有原文可核验，不该白烧一次调用
 
 
@@ -179,10 +207,41 @@ def test_missing_raw_excerpt_is_skipped_even_though_raw_has_real_content(monkeyp
     fake = FakeLLM(CaseTripleExtraction(triples=[_item()]))
     monkeypatch.setattr(ect, "get_llm", lambda: fake)
 
-    records, rejected = ect.extract_case(case)
+    records, rejected, truncated = ect.extract_case(case)
     assert records == []
     assert rejected == {"span_not_found": 0, "referential": 0}
+    assert truncated is False
     assert fake.calls == 0  # 没有 raw_excerpt，不该拿 raw 顶上去调用
+
+
+def test_extract_case_passes_higher_max_tokens_than_the_backend_default(monkeypatch):
+    """R2 全量跑第一条医案就崩：一张九味药的方子，九条「含」关系的
+    source_span 各自重抄一遍整张方子，约 1800 字纯重复撞上默认的 8192。
+    S5 这一处调用要显式传更大的 max_tokens，不是让它落到后端默认值。"""
+    case = _case()
+    fake = FakeLLM(CaseTripleExtraction(triples=[_item()]))
+    monkeypatch.setattr(ect, "get_llm", lambda: fake)
+
+    ect.extract_case(case)
+    assert fake.kwargs_seen[0]["max_tokens"] == ect.S5_MAX_TOKENS
+    assert ect.S5_MAX_TOKENS > 8192  # 明确大于后端默认值，不是凑巧等于
+
+
+def test_truncated_output_is_skipped_not_retried_or_raised(monkeypatch):
+    """R2 全量跑第一条医案就崩的直接根因：LLMTruncatedError 一路往上抛，
+    整批全量跑崩掉。现在这里要捕获它，返回空结果 + truncated=True，让
+    调用方（extract_all）跳过这条医案继续跑下一条，而不是让一条医案
+    的输出格式问题拖垮整批。"""
+    case = _case()
+    fake = TruncatingFakeLLM()
+    monkeypatch.setattr(ect, "get_llm", lambda: fake)
+
+    records, rejected, truncated = ect.extract_case(case)
+    assert records == []
+    assert rejected == {"span_not_found": 0, "referential": 0}
+    assert truncated is True
+    assert fake.calls == 1  # 截断不重试——core.llm 的 generate() 已经不重试了，
+    # 这里额外确认 extract_case 自己也没有再包一层重试
 
 
 # ---------- extract_all：统计聚合 ----------
@@ -220,6 +279,33 @@ def test_extract_all_reports_referential_rejections_separately(monkeypatch):
     assert stats["triples_rejected_span_not_found"] == 1
     assert stats["triples_extracted"] == 1
     assert len(records) == 1
+
+
+def test_extract_all_skips_truncated_case_and_keeps_running(monkeypatch):
+    """这是这次修复最核心的行为：一条医案输出被截断，不该让整批 extract_all
+    崩掉——统计里要能看出"跳过了几条"，其余医案照常处理。用两条医案模拟：
+    第一条截断，第二条正常，确认第二条真的被处理了（不是提前 return）。"""
+    truncated_case = _case(case_id="a", case_group_id="a")
+    ok_case = _case(case_id="b", case_group_id="b")
+
+    class MixedFakeLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise LLMTruncatedError("第一条截断（测试用假错误）")
+            return CaseTripleExtraction(triples=[_item()])
+
+    fake = MixedFakeLLM()
+    monkeypatch.setattr(ect, "get_llm", lambda: fake)
+
+    records, stats = ect.extract_all([truncated_case, ok_case])
+    assert stats["cases_truncated"] == 1
+    assert stats["llm_calls"] == 2  # 两条都真的调用了一次，截断的那次也算
+    assert len(records) == 1  # 第二条正常产出的那一条
+    assert records[0].case_id == "b"
 
 
 # ---------- CLI ----------
@@ -275,6 +361,20 @@ def test_main_writes_jsonl_in_established_format(tmp_path, monkeypatch):
     row = json.loads(line)
     assert set(row) == {"case_id", "physician", "s", "p", "o", "source_span"}
     assert row["s"] == "脘痛" and row["p"] == "提示" and row["o"] == "肝木犯胃"
+
+
+def test_main_warns_about_truncated_cases(tmp_path, monkeypatch, capsys):
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(json.dumps([
+        {"case_id": "a", "case_group_id": "a", "physician": "ye_tianshi",
+         "raw": "x", "raw_excerpt": "脘痛不食，脉弦，此肝木犯胃，治以疏肝和胃。"},
+    ]), encoding="utf-8")
+
+    monkeypatch.setattr(ect, "get_llm", lambda: TruncatingFakeLLM())
+    ect.main(["--cases-path", str(cases_path), "--out", str(tmp_path / "out.jsonl")])
+    out = capsys.readouterr().out
+    assert "截断" in out
+    assert "1 条医案" in out
 
 
 def test_main_raises_clear_error_when_cases_json_missing(tmp_path):

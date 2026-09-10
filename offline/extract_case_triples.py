@@ -32,12 +32,20 @@ import argparse
 import json
 from pathlib import Path
 
-from core.llm import get_llm, load_prompt, render
+from core.llm import LLMTruncatedError, get_llm, load_prompt, render
 from core.schemas import CaseRecord, CaseTripleExtraction, CaseTripleRecord
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASES_PATH = ROOT / "cases.json"
 DEFAULT_OUT_PATH = ROOT / "data" / "case_triples.jsonl"
+
+# 默认 8192 在真实数据上撞过：一张九味药的方子，九条「含」关系的 source_span
+# 如果模型把整张方子重抄一遍（约 200 字 × 9 ≈ 1800 字纯重复），很容易顶到默认
+# 上限被截断。prompts/v1/s5_extract_triples.yaml 已经加了"含关系的 source_span
+# 只抄那一味药"的指令（治本，从源头减少重复输出）；这里把上限翻倍是兜底
+# （治标）——两条都要：只靠 prompt 指令不能保证模型 100% 遵守，只提高上限
+# 不能省掉本来就不该有的重复内容浪费的 token。
+S5_MAX_TOKENS = 16384
 
 # R2 --limit 5 试水实测出现过的指代词（"此症""此病"），另外几个是同一类问题
 # 会出现的变体，一并列进来防患于未然。exact match（strip 后整串相等），不用
@@ -65,21 +73,36 @@ def _is_referential(text: str) -> bool:
     return text.strip() in _REFERENTIAL_PLACEHOLDERS
 
 
-def extract_case(case: CaseRecord) -> tuple[list[CaseTripleRecord], dict[str, int]]:
-    """对一条医案调一次 S5，返回 (核验通过的三元组记录, 按丢弃原因分类的计数)。
+def extract_case(
+    case: CaseRecord,
+) -> tuple[list[CaseTripleRecord], dict[str, int], bool]:
+    """对一条医案调一次 S5，返回 (核验通过的三元组记录, 按丢弃原因分类的计数,
+    是否因输出被截断而跳过这条医案)。
+
     两种丢弃原因分开计数而不是合并成一个数：source_span 找不到说明模型编了
     出处，s/o 是指代词占位符说明模型没有把关系落到具体实体上——两类问题的
     修法不一样（前者是抄写要更忠实，后者是要认出"这个词不是一个实体"），
-    分开报才看得出改 prompt 有没有真的改到点子上。"""
+    分开报才看得出改 prompt 有没有真的改到点子上。
+
+    截断（LLMTruncatedError）是第三种失败模式，跟前两种不是一回事：前两种
+    是模型正常返回、内容有问题；截断是模型的输出在 max_tokens 处被砍断，
+    根本没有完整内容可核验。重试没有意义——同样的输入会在同一处再次被
+    截断——所以这里直接捕获，返回空结果加截断标记，让调用方跳过这条医案、
+    计入统计，而不是让 LLMError 一路往上抛把整批全量跑崩掉（全量跑第一条
+    医案就崩是实测踩过的真实后果）。"""
     text = _source_text(case)
     if text is None:
-        return [], {"span_not_found": 0, "referential": 0}
+        return [], {"span_not_found": 0, "referential": 0}, False
 
     prompt = load_prompt("s5_extract_triples")
     system = render(prompt["system"], raw_text=text)
-    extraction = get_llm().generate(
-        system=system, user="", schema=CaseTripleExtraction
-    )
+    try:
+        extraction = get_llm().generate(
+            system=system, user="", schema=CaseTripleExtraction,
+            max_tokens=S5_MAX_TOKENS,
+        )
+    except LLMTruncatedError:
+        return [], {"span_not_found": 0, "referential": 0}, True
 
     records = []
     rejected = {"span_not_found": 0, "referential": 0}
@@ -94,13 +117,14 @@ def extract_case(case: CaseRecord) -> tuple[list[CaseTripleRecord], dict[str, in
             case_id=case.case_id, physician=case.physician,
             s=item.s, p=item.p, o=item.o, source_span=item.source_span,
         ))
-    return records, rejected
+    return records, rejected, False
 
 
 def extract_all(cases: list[CaseRecord]) -> tuple[list[CaseTripleRecord], dict]:
     all_records: list[CaseTripleRecord] = []
     stats = {
         "cases": len(cases), "cases_no_text": 0, "cases_no_triples": 0,
+        "cases_truncated": 0,
         "triples_extracted": 0,
         "triples_rejected_span_not_found": 0, "triples_rejected_referential": 0,
         "llm_calls": 0,
@@ -110,8 +134,11 @@ def extract_all(cases: list[CaseRecord]) -> tuple[list[CaseTripleRecord], dict]:
         if text is None:
             stats["cases_no_text"] += 1
             continue
-        records, rejected = extract_case(case)
-        stats["llm_calls"] += 1
+        records, rejected, truncated = extract_case(case)
+        stats["llm_calls"] += 1  # 截断也是真的调用了一次，要计进去
+        if truncated:
+            stats["cases_truncated"] += 1
+            continue
         stats["triples_rejected_span_not_found"] += rejected["span_not_found"]
         stats["triples_rejected_referential"] += rejected["referential"]
         if not records:
@@ -162,6 +189,9 @@ def main(argv: list[str] | None = None) -> None:
           f"{stats['triples_rejected_span_not_found']} 条因 source_span 在原文里找不到被丢弃，"
           f"{stats['triples_rejected_referential']} 条因主语/宾语是指代词占位符被丢弃")
     print(f"{stats['cases_no_triples']} 条医案调了模型但一条三元组都没抽出/全部核验未过")
+    if stats["cases_truncated"]:
+        print(f"警告：{stats['cases_truncated']} 条医案的输出疑似被截断（撞 max_tokens={S5_MAX_TOKENS}），"
+              "已跳过、不写入任何三元组——不是重试三次以后才放弃，是探测到截断就直接跳过。")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:

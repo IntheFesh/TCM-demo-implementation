@@ -52,7 +52,13 @@ system: |
     抄错等于凭空生成，事后会被逐字核验，核验不过的三元组会被整条丢弃。
   - 一条 source_span 可以支持多条三元组（比如"脘痛不食，脉弦，此肝木犯胃，
     治以疏肝和胃"这一句，既能证明"脘痛 提示 肝木犯胃"，也能证明"肝木犯胃
-    属于 肝胃不和证"）。
+    属于 肝胃不和证"）。**但反过来，"含"关系（方名 → 药物）的每一条 source_span
+    只需要包含该药那一小段，不要把整张方子抄进来。** 比如方子是"瓜蒌薤白半夏汤，
+    栝蒌二钱，薤白三钱，半夏五钱"，抽三条"含"关系时，"含 栝蒌"的 source_span
+    是"栝蒌二钱"，不是"栝蒌二钱，薤白三钱，半夏五钱"整串重抄一遍——一张方子
+    有几味药，就不要把方子原文重复抄那么多遍。这条不只是省字数：source_span
+    要能告诉人"这一味药的依据具体是原文哪几个字"，九条"含"关系如果 source_span
+    完全一样，等于没有指出是哪一味药的出处。
   - 原文信息不够、抽不出任何三元组时，triples 输出空列表，不要为了"有产出"
     而编造关系。
   - 不要抽取"这一诊没有提到"的信息——即使你知道这个证型/方剂通常还有别的
@@ -67,6 +73,11 @@ notes: "喂给 core.schemas.CaseTripleExtraction；由 offline/extract_case_trip
   每条 CaseTripleItem 补上 case_id/physician 后展开成一条 data/case_triples.jsonl 记录，
   格式跟 core/tools.py 的 query_case_graph() 已经在读的 {case_id, physician, s, p, o,
   source_span} 严格对齐（那份代码是先写的，这份 prompt 要迁就它，不能反过来）。
-  谓词的六个固定值、指代词黑名单、叙事排除，这三条是 R2 --limit 5 试水发现的问题
-  之后加的（此前没有这三条约束）——见 core.schemas.CaseTriplePredicate 的文档字符串
-  和 offline/extract_case_triples.py 的 _REFERENTIAL_PLACEHOLDERS。"
+  谓词的六个固定值、指代词黑名单、叙事排除，这三条是 R2 第一轮 --limit 5 试水
+  发现的问题之后加的——见 core.schemas.CaseTriplePredicate 的文档字符串和
+  offline/extract_case_triples.py 的 _REFERENTIAL_PLACEHOLDERS。「含」关系
+  source_span 不许整张方子重抄，是第二轮全量首条医案就崩溃后加的：一张九味药
+  的方子产出九条「含」三元组、每条都把整张方子（带剂量、带换行）重抄一遍，
+  约 1800 字纯重复，撞上 max_tokens=8192（EOF 截断）——见 core.llm 的
+  LLMTruncatedError 和 offline/extract_case_triples.py 传的 max_tokens=16384
+  （治标：把上限提高；这条 prompt 约束是治本：从源头减少重复输出）。"

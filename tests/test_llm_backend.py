@@ -11,8 +11,10 @@ from core.llm import (
     ClaudeCLIBackend,
     LLMBackend,
     LLMError,
+    LLMTruncatedError,
     OpenAICompatBackend,
     VLLMBackend,
+    _looks_like_truncated_json,
     get_backend,
     get_llm,
     reset_llm_singleton,
@@ -31,6 +33,7 @@ class ScriptedBackend(LLMBackend):
     def __init__(self, raws: list[str]):
         self.raws = raws
         self.calls: list[list[dict]] = []
+        self.kwargs_seen: list[dict] = []
 
     def model_name(self) -> str:
         return "scripted"
@@ -41,6 +44,7 @@ class ScriptedBackend(LLMBackend):
     def _complete(self, messages, temperature, **kwargs) -> str:
         # 深拷一份：generate 会往同一个 list 里 append，不拷的话历史会被后续修改覆盖
         self.calls.append([dict(m) for m in messages])
+        self.kwargs_seen.append(dict(kwargs))
         return self.raws[len(self.calls) - 1]
 
 
@@ -537,3 +541,154 @@ def test_validation_errors_retry_immediately_without_backoff():
     b.RETRY_BACKOFF_SECONDS = (1.0, 2.0)
     assert b.generate(system="s", user="u", schema=Tiny).note == "x"
     assert sleeps == []
+
+
+# ---------- max_tokens：显式参数，不塞进 **kwargs ----------
+
+
+def test_generate_passes_max_tokens_to_complete():
+    b = ScriptedBackend(['{"ok":true,"note":"n"}'])
+    b.generate(system="s", user="u", schema=Tiny, max_tokens=16384)
+    assert b.kwargs_seen[0]["max_tokens"] == 16384
+
+
+def test_generate_defaults_max_tokens_to_none():
+    """不传就是 None，各后端自己决定默认值（OpenAICompatBackend 落到环境变量，
+    ClaudeCLIBackend 忽略）——generate() 本身不该替后端猜一个数字。"""
+    b = ScriptedBackend(['{"ok":true,"note":"n"}'])
+    b.generate(system="s", user="u", schema=Tiny)
+    assert b.kwargs_seen[0]["max_tokens"] is None
+
+
+def test_openai_backend_max_tokens_overrides_env_var(monkeypatch):
+    """显式传的 max_tokens 要真的传到 SDK 调用里，不是只存在签名上没用上。"""
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kw):
+            captured.update(kw)
+
+            class R:
+                choices = [type("C", (), {"message": type("M", (), {"content": '{"ok":true,"note":"n"}'})()})]
+            return R()
+
+    class FakeClient:
+        class chat:
+            completions = FakeCompletions()
+
+    monkeypatch.setenv("LLM_MAX_TOKENS", "8192")
+    b = OpenAICompatBackend()
+    b._client = FakeClient()
+    b._complete([{"role": "user", "content": "x"}], 0.0, max_tokens=16384)
+    assert captured["max_tokens"] == 16384
+
+
+def test_openai_backend_max_tokens_falls_back_to_env_var_when_not_passed(monkeypatch):
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kw):
+            captured.update(kw)
+
+            class R:
+                choices = [type("C", (), {"message": type("M", (), {"content": '{"ok":true,"note":"n"}'})()})]
+            return R()
+
+    class FakeClient:
+        class chat:
+            completions = FakeCompletions()
+
+    monkeypatch.setenv("LLM_MAX_TOKENS", "12000")
+    b = OpenAICompatBackend()
+    b._client = FakeClient()
+    b._complete([{"role": "user", "content": "x"}], 0.0)
+    assert captured["max_tokens"] == 12000
+
+
+def test_claude_cli_complete_accepts_and_ignores_max_tokens(monkeypatch):
+    """CLI 没有对应开关（build_command 里确认过没有 token 上限参数），传了也不该
+    报错——截断风险交给 generate() 里的 EOF 检测兜底，不是这里的事。"""
+    payload = json.dumps({"is_error": False, "result": '{"ok":true,"note":"从 CLI 来"}'})
+    monkeypatch.setattr(subprocess, "run", _fake_run_factory(0, stdout=payload))
+    out = ClaudeCLIBackend()._complete(
+        [{"role": "user", "content": "x"}], 0.0, max_tokens=16384
+    )
+    assert out == '{"ok":true,"note":"从 CLI 来"}'
+
+
+# ---------- 输出被截断（撞 max_tokens）：直接失败，不当格式错误重试 ----------
+
+
+def _truncated_json_for(schema) -> str:
+    """构造一个在字符串字段中途被切断的 JSON，模拟真实撞 max_tokens 的输出。"""
+    return '{"ok": true, "note": "这段话说到一半被砍掉了，后面还有内容但是没'
+
+
+def test_looks_like_truncated_json_detects_eof_at_end_of_text():
+    from pydantic import ValidationError
+
+    text = _truncated_json_for(Tiny)
+    try:
+        Tiny.model_validate_json(text)
+        raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, text) is True
+
+
+def test_looks_like_truncated_json_does_not_flag_mid_text_syntax_errors():
+    """缺逗号这类语法错误报在文本中间，不是"读到末尾断了"，不该被当成截断——
+    这类错误重试有意义（模型只是格式没对），误判成截断会让本该能修好的输出
+    白白被跳过。"""
+    from pydantic import ValidationError
+
+    text = '{"ok": true "note": "缺个逗号"}'
+    try:
+        Tiny.model_validate_json(text)
+        raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, text) is False
+
+
+def test_looks_like_truncated_json_handles_multiline_output():
+    """模型有时会把 JSON 打印成多行（缩进/换行），"末尾"要按最后一行算，
+    不能直接拿 len(text) 跟 pydantic 报的 column 比——column 是行内位置，
+    多行时那样比较会永远比不上，把真截断当成不是截断。"""
+    from pydantic import ValidationError
+
+    text = '{\n  "ok": true,\n  "note": "这一行被砍断了没有闭合引号'
+    try:
+        Tiny.model_validate_json(text)
+        raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, text) is True
+
+
+def test_looks_like_truncated_json_ignores_non_json_invalid_errors():
+    """字段类型错（不是 JSON 语法错）走的是另一条 pydantic 错误类型，
+    不该被这个只管"JSON 本身解析失败"的判断函数误伤。"""
+    from pydantic import ValidationError
+
+    try:
+        Tiny.model_validate_json('{"ok": "不是布尔值", "note": "x"}')
+        raise AssertionError("这段构造的输入应该校验失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, '{"ok": "不是布尔值", "note": "x"}') is False
+
+
+def test_generate_raises_truncated_error_without_retrying():
+    """截断了就直接失败，不重试三次——同样的输入会在同一处再次被截断，
+    重试是白烧调用。这条用真实会撞到的场景构造：只给一次截断响应，
+    如果代码还在重试就会 IndexError（脚本只有一条）而不是我们要的
+    LLMTruncatedError，能确认"真的只调用了一次"。"""
+    b = ScriptedBackend([_truncated_json_for(Tiny)])
+    with pytest.raises(LLMTruncatedError) as ei:
+        b.generate(system="s", user="u", schema=Tiny)
+    assert len(b.calls) == 1  # 没有重试
+    msg = str(ei.value)
+    assert "截断" in msg
+    assert "backend=scripted" in msg
+
+
+def test_generate_truncated_error_is_also_an_llm_error():
+    """子类关系：广义捕获 LLMError 的既有调用方不用为了这条改代码。"""
+    assert issubclass(LLMTruncatedError, LLMError)

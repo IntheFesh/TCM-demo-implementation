@@ -63,6 +63,51 @@ class LLMError(RuntimeError):
     """LLM 调用在重试耗尽后仍失败时抛出，携带足够定位问题的上下文。"""
 
 
+class LLMTruncatedError(LLMError):
+    """输出疑似在 max_tokens 上限处被截断，不是普通的格式错误。
+
+    LLMError 的子类——原来广义捕获 LLMError 的调用方不用改；需要单独处理
+    "截断"这一种失败（比如跳过这条输入而不是让整批崩掉）的调用方可以单独
+    catch 这个子类。是不是截断由 core.llm 的 generate() 在 JSON 解析失败时判断，
+    不是各调用方各猜一遍。
+    """
+
+
+_JSON_EOF_RE = re.compile(r"EOF while parsing.*line (\d+) column (\d+)")
+
+
+def _looks_like_truncated_json(error: Exception, text: str) -> bool:
+    """区分"输出被截断"和"随便一种 JSON 语法错误"。
+
+    EOF 类错误（pydantic 报 "EOF while parsing ... at line L column C"）只会在
+    解析器真的走到输入末尾、结构还没闭合时出现——按定义就发生在文本末尾，
+    不需要额外猜"离末尾多近"；这里仍然核对一遍 (L, C) 落在 text 的最后一行、
+    且离行尾很近，是防御性的双重确认，不是主判据。
+    普通语法错误（缺逗号、多引号）报在文本中间，那种值得重试——模型只是
+    格式没对，回灌错误信息有机会修正；截断类错误重试没有意义，同样的输入
+    会在同一处再次被截断，三次重试只是白烧三次调用。
+    不看 max_tokens 数字本身：token 数和字符数的换算在中文文本上不可靠，
+    "解析失败的位置是不是文本末尾"是更直接、不需要猜换算比例的信号。
+    """
+    errors = getattr(error, "errors", None)
+    if not callable(errors):
+        return False
+    lines = text.split("\n")
+    for e in error.errors():
+        if e.get("type") != "json_invalid":
+            continue
+        msg = e.get("ctx", {}).get("error", "")
+        m = _JSON_EOF_RE.search(msg)
+        if not m:
+            continue
+        line_no, col = int(m.group(1)), int(m.group(2))
+        if line_no != len(lines):
+            continue  # 报错行不是最后一行，不是"读到末尾断了"这种情况
+        if len(lines[line_no - 1]) - col <= 5:  # 留几个字符余量
+            return True
+    return False
+
+
 class LLMBackend(ABC):
     """后端基类。**重试/校验/错误回灌只在这里实现一份**，子类只实现 `_complete`
     这个"单次原始调用"。
@@ -81,9 +126,17 @@ class LLMBackend(ABC):
     _sleep = staticmethod(time.sleep)  # 留个缝给测试换掉，不真睡
 
     @abstractmethod
-    def _complete(self, messages: list[dict], temperature: float, **kwargs) -> str:
+    def _complete(
+        self, messages: list[dict], temperature: float,
+        max_tokens: int | None = None, **kwargs,
+    ) -> str:
         """单次原始调用：给定 [{"role", "content"}] 返回模型原始文本。
-        不做 schema 校验、不重试——那些由 generate() 统一负责。"""
+        不做 schema 校验、不重试——那些由 generate() 统一负责。
+
+        max_tokens 是显式参数不是塞进 **kwargs：OpenAICompatBackend 原来
+        自己读环境变量算这个值，如果调用方也通过 kwargs 传一份同名参数，
+        会在传给 SDK 时撞上"重复关键字参数"。None 表示"用这个后端自己的
+        默认值"（不是"不设上限"——CLI 后端本来就没有这个旋钮）。"""
         raise NotImplementedError
 
     @abstractmethod
@@ -112,6 +165,7 @@ class LLMBackend(ABC):
         user: str,
         schema: type[T],
         temperature: float = 0.0,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> T:
         """给定 system/user 提示与目标 pydantic 模型，返回校验通过的模型实例。
@@ -119,6 +173,12 @@ class LLMBackend(ABC):
         重试语义：首次 + 最多 2 次重试；第 2 次起把上次的原始返回和 pydantic
         校验错误一起回灌，要求模型修正。实测这一步是必要的——换模型时字段名
         猜错（比如把 element 写成 name）靠这一轮就能纠正。
+
+        max_tokens 不传就用各后端自己的默认值（OpenAICompatBackend 读
+        LLM_MAX_TOKENS 环境变量，默认 8192）。**不要全局调高默认值**：
+        S1/S2/S3 用不到那么多 token，调高只会让真正失控的输出更晚才被
+        发现；某个 prompt 确实需要更大上限（比如 S5 一张方子的「含」关系
+        会重复带出 source_span，实测容易顶到 8192），在那一处调用点单独传。
         """
         # 字段名那一句是实测来的：裸 prompt（不注入 schema）下模型 3/3 把
         # ElementHit.element 写成 name。注入 schema 后 3/3 一次过，所以这句是
@@ -141,7 +201,7 @@ class LLMBackend(ABC):
         last_raw = ""
         for attempt in range(self.MAX_ATTEMPTS):
             try:
-                raw = self._complete(messages, temperature, **kwargs)
+                raw = self._complete(messages, temperature, max_tokens=max_tokens, **kwargs)
             except Exception as e:  # noqa: BLE001 - 传输类错误：超时/非零退出/API 异常
                 # 这一类没有"上一次输出"可回灌——回灌上一轮的陈旧 raw 或空串只会让
                 # 模型收到文不对题的纠错指令。原样重试，但重试前先退避一下。
@@ -151,10 +211,23 @@ class LLMBackend(ABC):
                     self._sleep(backoff[min(attempt, len(backoff) - 1)])
                 continue
             last_raw = raw
+            stripped = strip_code_fence(raw)
             try:
-                return schema.model_validate_json(strip_code_fence(raw))
+                return schema.model_validate_json(stripped)
             except Exception as e:  # noqa: BLE001 - 校验错误：把原始输出和错误一起回灌
                 last_error = e
+                # 输出被截断（撞 max_tokens）跟"格式错了"是两类问题：格式错误
+                # 回灌错误信息重试有意义，截断重试没有意义——同样的输入会在
+                # 同一处再次被截断，三次重试只是白烧三次调用。直接失败，
+                # 让调用方（比如 X3 批量抽取）决定要不要跳过这条输入。
+                if _looks_like_truncated_json(e, stripped):
+                    raise LLMTruncatedError(
+                        f"疑似输出在 max_tokens 上限处被截断（JSON 在文本末尾附近"
+                        f"解析失败，不是格式错误，不会重试）。backend={self.backend_id()}, "
+                        f"model={self.model_name()}, schema={schema.__name__}, "
+                        f"原始返回长度={len(stripped)} 字符, max_tokens={max_tokens}, "
+                        f"原始错误={e}"
+                    ) from e
                 if attempt < self.MAX_ATTEMPTS - 1:
                     messages.append({"role": "assistant", "content": last_raw})
                     messages.append(
@@ -205,15 +278,24 @@ class OpenAICompatBackend(LLMBackend):
     def backend_id(self) -> str:
         return "api"
 
-    def _complete(self, messages: list[dict], temperature: float, **kwargs) -> str:
+    def _complete(
+        self, messages: list[dict], temperature: float,
+        max_tokens: int | None = None, **kwargs,
+    ) -> str:
         resp = self.client.chat.completions.create(
             model=self.model_name(),
             messages=messages,
             temperature=temperature,
             response_format={"type": "json_object"},
             # DeepSeek 默认输出上限 4096 token：S0 抽多病人粗段的 JSON 会被截断，
-            # 截断的 JSON 回灌重试也只会以同样方式再截断三次。显式给到模型上限。
-            max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "8192")),
+            # 截断的 JSON 回灌重试也只会以同样方式再截断三次。默认给到 8192；
+            # 调用方（generate() 的 max_tokens 参数）能覆盖这个默认值——
+            # 不是全局调高，是某个 prompt 明确知道自己需要更大上限时单独传
+            # （比如 S5 一张方子的多条「含」关系）。
+            max_tokens=(
+                max_tokens if max_tokens is not None
+                else int(os.environ.get("LLM_MAX_TOKENS", "8192"))
+            ),
             **kwargs,
         )
         return resp.choices[0].message.content or ""
@@ -303,10 +385,16 @@ class ClaudeCLIBackend(LLMBackend):
                 parts.append(content)
         return "\n\n".join(parts)
 
-    def _complete(self, messages: list[dict], temperature: float, **kwargs) -> str:
+    def _complete(
+        self, messages: list[dict], temperature: float,
+        max_tokens: int | None = None, **kwargs,
+    ) -> str:
         # temperature：CLI 没有对应开关，这里如实忽略而不是假装设置了。
         # 影响：claude_cli 后端下 temperature=0 的"可复现"承诺不成立，
         # 所以它更不能用来测 ε（噪声地板）——ε 本来就是在测抖动。
+        # max_tokens 同样忽略：`claude -p` 没有对应的输出长度上限开关
+        # （`claude -p --help` 确认过），CLI 是完整 agent 会话不是裸 completion，
+        # 截断风险由 generate() 里的 EOF 检测兜底，不是这里能设一个数解决的。
         prompt = self.flatten_messages(messages)
         proc = subprocess.run(
             self.build_command(),
