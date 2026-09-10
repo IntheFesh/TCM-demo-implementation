@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 from typing import Callable
 
+from core.diseases import match_disease
 from core.safety import check_safety, danger_confirmed_by_answer, mentions_danger, veto_message
 from core.schemas import FollowupResult, HistoryItem
 from core.tools import question_candidates
@@ -98,6 +99,30 @@ def run_followup(
     if ask_fn is None:
         return FollowupResult(stopped_by="no_answer")
 
+    # 病名收窄候选池（见 core.tools._scope_by_disease）：R2 教材扩表后
+    # syndrome_posterior/question_candidates 默认在全量候选（不分病种混在一起）
+    # 上算后验，两个问题会一起冒出来——(1) 单条追问答案在几百个候选上归一化，
+    # movement 小到接近浮点噪声；(2) 更要命的是，Category 2 那条"安全相关症状
+    # 保证进候选"的修复实测会被这个放大：不分病种时，候选posterior 混进了跟
+    # 当前主诉毫不相关的病种（比如患者主诉两胁胀满，候选里却混进了"中风脱证"
+    # 这类跟脾胃门完全不沾边的证候），会让"不省人事""突然昏厥"这类安全关键词
+    # 对当前全量候选也拥有真实的（非零的）区分度，从而被 Category 2 的机制
+    # 正当地选中、排到最前面——问出一堆跟患者主诉毫不相关的危重症状问题，
+    # 三轮追问预算问不到一句真正该问的诊断问题。用 match_disease（M4 现成的
+    # 规则打分，不新建一套判断）先估一个最可能的病名，把候选收窄到同一病名下，
+    # 从源头上让"跟当前主诉无关的安全词条"不再进入候选池，而不是在选出来
+    # 之后再想办法过滤——诊断相关性判断本来就该在候选池这一层做，不是在
+    # "这个候选该不该被安全机制优先"这层做。
+    #
+    # 取分数最高的一个；一条都没匹配上（罕见，比如主诉极简短）时 disease_hint
+    # 是 None，question_candidates/syndrome_posterior 都认这个值为"不收窄"，
+    # 退回改造前的全量候选行为，不是报错。
+    try:
+        disease_matches = match_disease(symptoms, elements)
+    except FileNotFoundError:
+        disease_matches = []
+    disease_hint = disease_matches[0][0] if disease_matches else None
+
     history: list[HistoryItem] = []
     asserted: list[str] = []
     denied: list[str] = []
@@ -107,12 +132,20 @@ def run_followup(
         candidates = question_candidates(
             elements, k=1, known_symptoms=symptoms, asked=asked,
             physician=physician, asserted_symptoms=asserted, denied_symptoms=denied,
+            disease_hint=disease_hint,
         )
         if not candidates:
             return _result(history, asserted, denied, "no_candidate")
         top = candidates[0]
         ig = top.get("information_gain")
-        if ig is not None and ig < MIN_USEFUL_IG:
+        # 安全相关的候选不受这道收敛门槛约束：core/tools.py::question_candidates
+        # 保证它们排到最前面时可以带着很低甚至趋零的信息增益（它们回答的是"要不要
+        # 转诊"，不是"能不能帮图区分当前候选证候"，两者本就可能不相关）。这里如果
+        # 照常按 ig < MIN_USEFUL_IG 判"已收敛"，会把一个被刻意提到最前面、专门
+        # 要问的危重症状问题在问都没问的情况下直接判定为"不用问了"，
+        # 生产链路固定 k=1，top 就是唯一会被消费的候选——判错这一条等于
+        # 安全相关症状保证进候选那条修复白做了。
+        if not top.get("safety_relevant") and ig is not None and ig < MIN_USEFUL_IG:
             return _result(history, asserted, denied, "converged")
 
         answer = ask_fn(top["question"])

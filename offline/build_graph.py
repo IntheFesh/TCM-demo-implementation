@@ -88,6 +88,11 @@ def build_graph(defs: list[SyndromeDefinition]) -> NetworkXStore:
             is_category=d.is_category,
             definition=d.definition,
             tongue_pulse=d.tongue_pulse,
+            # R2：证候扩表暴露的候选池摊薄问题的解法——见
+            # core.tools.syndrome_posterior 的 disease_hint 参数。手工的 17 条
+            # 没有 disease，取 None；下游按 None 分组就是"不属于任何 disease_hint
+            # 收窄范围"，不会被误收窄掉。
+            disease=d.disease,
         )
 
         if d.parent:

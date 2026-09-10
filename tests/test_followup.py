@@ -13,7 +13,7 @@ from core.followup import (
     parse_answer,
     run_followup,
 )
-from core.tools import syndrome_posterior
+from core.tools import is_safety_relevant, syndrome_posterior
 from eval.patient_sim import ScriptedPatient
 
 ELEMENTS = ["胃", "肝", "气滞"]
@@ -119,12 +119,22 @@ def test_fast_mode_skips_everything(monkeypatch):
 
 def test_converged_stops_before_max_rounds(monkeypatch):
     """收敛退出和问满轮次要分开记：前者说明追问设计有效，后者说明轮次上限
-    卡住了它，混成一个就没法调 MAX_ASK_ROUNDS。"""
-    monkeypatch.setattr(fu, "MIN_USEFUL_IG", 99.0)  # 任何问题都达不到
+    卡住了它，混成一个就没法调 MAX_ASK_ROUNDS。
+
+    R2 教材扩表前这里是 0 轮就收敛：候选池里没有安全相关症状，MIN_USEFUL_IG
+    一设到 99 每个问题都立刻不合格。扩表后候选池里出现了合法的安全相关症状
+    （ELEMENTS=["胃","肝","气滞"] 下能匹配到胃热壅盛证的吐血——这是原始 17 条
+    手工条目之一，disease_hint 收窄也不会把它排除，见 core.tools._scope_by_disease）。
+    Category 2 的修复保证这条症状不管诊断信息增益多低都会被问一次
+    （core/followup.py 里"安全相关候选不受 MIN_USEFUL_IG 收敛门槛约束"那段
+    说明），问完之后再收敛——所以"收敛"仍然成立，只是不再是 0 轮，而是恰好
+    1 轮（安全screening 用掉的那一轮）。"""
+    monkeypatch.setattr(fu, "MIN_USEFUL_IG", 99.0)  # 任何非安全问题都达不到
     patient = ScriptedPatient(present=[], absent=[])
     r = run_followup(SYMPTOMS, ELEMENTS, patient)
     assert r.stopped_by == "converged"
-    assert r.rounds == 0
+    assert r.rounds == 1
+    assert is_safety_relevant(r.history[0].symptom)
 
 
 def test_min_useful_ig_is_a_small_positive_threshold():
@@ -167,6 +177,23 @@ def test_denial_shifts_the_posterior():
     after = syndrome_posterior(e, denied_symptoms=["口干或口苦"])
     assert after["SP-03"] < before["SP-03"]      # 脾胃湿热：口干或口苦是主症
     assert after["SP-09"] > before["SP-09"]      # 胃阴虚：不以它为主症
+
+
+def test_denial_moves_top1_probability_by_more_than_five_percent():
+    """R2 教材扩表把候选证候池从 17 撑到几百条之后，钉住"追问真的有用"这条
+    验收标准：同一组证素，追问一个高信息量症状前后，top-1 证候的概率变化
+    幅度必须 > 5%——不能是小数点第 15 位才有差异的浮点噪声量级（float64
+    epsilon 约 2.2e-16，这正是本轮修复要防止退化成的样子）。"""
+    e = ["胃", "阴虚", "津伤", "热"]
+    before = syndrome_posterior(e)
+    top1_code = max(before, key=before.get)
+    after = syndrome_posterior(e, denied_symptoms=["口干或口苦"])
+    p0, p1 = before[top1_code], after[top1_code]
+    relative_change = abs(p1 - p0) / p0
+    assert relative_change > 0.05, (
+        f"{top1_code} 的概率 {p0} -> {p1}，相对变化 {relative_change:.2%}，"
+        "追问一轮答案对后验几乎没有影响"
+    )
 
 
 def test_assertion_and_denial_move_in_opposite_directions():

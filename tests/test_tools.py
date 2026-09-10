@@ -117,8 +117,15 @@ def test_query_graph_missing_node_returns_empty():
 
 def test_query_graph_missing_node_suggests_near_matches():
     """实测：真实模型查「口苦」查不到就放弃了，而图里有「口干或口苦」。
-    只回一句"没有这个节点"会把它逼进死胡同，必须给出可以重查的近似名。"""
-    out = query_graph("口苦")
+    只回一句"没有这个节点"会把它逼进死胡同，必须给出可以重查的近似名。
+
+    这里故意不直接用"口苦"当 query：R2 教材扩表后「口苦」本身已经是图里
+    一个独立的标准症状节点（教材原文把它拆成了单字症状，不再只藏在
+    「口干或口苦」这个并列名里），"口苦"精确查得到，测不出 near_matches
+    这条兜底路径。换成patient口语里常见的带垫词写法（"总是觉得口苦"）——
+    这种口语化整句几乎不可能精确等于某个标准症状名，但仍然按片段包含
+    「口苦」，能稳定触发同一条近似匹配逻辑，不会随词表继续扩表又被撞穿。"""
+    out = query_graph("总是觉得口苦")
     assert out["found"] is False
     assert "口干或口苦" in out["near_matches"]
     assert "near_matches" in out["note"]
@@ -276,15 +283,24 @@ def test_lookup_standard_by_code_and_name():
 
 
 def test_lookup_standard_partial_unique_match():
-    out = lookup_standard("胃阴虚")
+    # 原来用"胃阴虚"举例：R2 教材扩表后同时有 SP-09「胃阴虚证」和 TB-285
+    # 「脾胃阴虚证」都含这个子串，partial match 不再唯一，这个例子测的东西
+    # 变了（从"唯一部分匹配成功"变成"歧义"）。换成"脾虚气滞"——这是原始
+    # 17 条手工条目之一（SP-02），词表继续扩表也不太可能长出另一个包含
+    # 这四个字的证候名。
+    out = lookup_standard("脾虚气滞")
     assert out["found"] is True
-    assert out["definition"]["name"] == "胃阴虚证"
+    assert out["definition"]["name"] == "脾虚气滞证"
 
 
 def test_lookup_standard_not_found_lists_candidates():
+    # 候选数不写死：R2 教材扩表把 17 条撑到几百条，下次再扩到 1475 条这里又会
+    # 崩——改成从同一份数据源动态取数（跟 _pin_two_physicians 那次同类问题
+    # 同一种修法：测试不能跟词表规模耦合）。
+    expected_total = len(tools._load_standard())
     out = lookup_standard("完全不存在的证")
     assert out["found"] is False
-    assert len(out["candidates"]) == 17
+    assert len(out["candidates"]) == expected_total
     # 结构化对象，不是拼好的 "SP-01 肝胃不和证" 字符串——实测真实模型拿到拼好的
     # 字符串会把整串当 query 传回来，然后查不到，白烧一步。
     assert out["candidates"][0] == {"code": "SP-01", "name": "肝胃不和证"}
@@ -300,10 +316,14 @@ def test_lookup_standard_accepts_code_plus_name(q):
 # ---------- check_residual ----------
 
 def test_check_residual_splits_explained_and_unexplained():
-    # 大便干结 出自胃阴虚证，指向 胃/阴虚；已知证素里两个都没有，所以未被解释
-    out = check_residual(["两胁胀满", "大便干结"], ["肝", "气滞"])
+    # 原来用"大便干结"举例（指向 胃/阴虚，已知证素里没有，故未被解释）：
+    # R2 教材扩表后图里多了一个独立节点"大便干"，恰好是"大便干结"的字面
+    # 前缀，片段匹配器会把两者的 indicates 目标都算进来，"大便干"那条边
+    # 意外指向了肝/气滞，"大便干结"就被误判成已解释。换成"手足心热"——
+    # 单一匹配、只指向 胃/阴虚，不跟肝/气滞沾边，不受这种子串碰撞影响。
+    out = check_residual(["两胁胀满", "手足心热"], ["肝", "气滞"])
     assert out["explained"] == ["两胁胀满"]
-    assert out["unexplained"] == ["大便干结"]
+    assert out["unexplained"] == ["手足心热"]
     assert out["coverage"] == 0.5
 
 
@@ -649,10 +669,13 @@ def test_query_case_graph_skips_non_object_rows_and_rows_without_source_span(tmp
 
 
 def test_query_graph_resolves_unique_partial_syndrome_name():
-    """lookup_standard 认「胃阴虚」→「胃阴虚证」，query_graph 也必须认，
-    否则同一个词两个工具给出相反答案（CLAUDE.md 第三次撞墙）。"""
-    assert query_graph("胃阴虚")["found"] is True
-    assert query_graph("胃阴虚")["name"] == "胃阴虚证"
+    """lookup_standard 认「脾虚气滞」→「脾虚气滞证」，query_graph 也必须认，
+    否则同一个词两个工具给出相反答案（CLAUDE.md 第三次撞墙）。
+
+    跟上面 test_lookup_standard_partial_unique_match 用同一个替换理由：
+    "胃阴虚"在 R2 扩表后不再唯一部分匹配（同时命中"胃阴虚证"和"脾胃阴虚证"）。"""
+    assert query_graph("脾虚气滞")["found"] is True
+    assert query_graph("脾虚气滞")["name"] == "脾虚气滞证"
 
 
 def test_generic_fragments_do_not_match_everything():
@@ -669,3 +692,53 @@ def test_posterior_and_candidates_use_the_same_physician_weights():
     a = syndrome_posterior(["胃", "肝"], physician="ye_tianshi")
     b = syndrome_posterior(["胃", "肝"], physician="wu_jutong")
     assert set(a) == set(b)  # λ1≡0 时两者数值相同；这里钉的是参数能传进去且不崩
+
+
+# ---------- disease_hint 收窄候选池（core.tools._scope_by_disease） ----------
+
+
+def test_scope_by_disease_no_hint_returns_full_index():
+    index = {"A": {"disease": None}, "B": {"disease": "胃痛"}, "C": {"disease": "痞满"}}
+    assert tools._scope_by_disease(index, None) == index
+
+
+def test_scope_by_disease_keeps_untagged_and_matching_drops_other_diseases():
+    """未标 disease 的条目（手工原始 17 条）不管 disease_hint 是什么都要保留；
+    标了病名的条目只有跟 disease_hint 一致才留，标了别的病名的要被排除。"""
+    index = {
+        "untagged": {"disease": None},
+        "same_disease": {"disease": "胃痛"},
+        "other_disease": {"disease": "痞满"},
+        "pad1": {"disease": None},
+        "pad2": {"disease": None},
+    }
+    scoped = tools._scope_by_disease(index, "胃痛")
+    assert set(scoped) == {"untagged", "same_disease", "pad1", "pad2"}
+    assert "other_disease" not in scoped
+
+
+def test_scope_by_disease_falls_back_to_full_pool_when_too_few_candidates():
+    """病名判断本身可能错（match_disease 是规则打分，不是精确诊断）；收窄后
+    候选不足 3 条时，把真正的证候排除在外的代价比候选池大更严重，宁可退回
+    全量。"""
+    index = {"A": {"disease": "胃痛"}, "B": {"disease": "痞满"}}
+    assert tools._scope_by_disease(index, "胃痛") == index  # 命中的只有 1 条，< 3，退回全量
+
+
+def test_syndrome_posterior_and_question_candidates_share_disease_scoping():
+    """两处必须用同一份收窄后的候选池，否则"这个问题预期得到多少 bit"（在收窄
+    候选池上算）和"答完后验变成什么"（如果没收窄，在全量候选池上算）就不是
+    同一个假设空间下的数字（core/tools.py:749 附近的说明）。"""
+    elements = ["胃", "阴虚", "津伤", "热"]
+    disease_hint = "胃痛"
+    posterior = syndrome_posterior(elements, disease_hint=disease_hint)
+    candidates = question_candidates(elements, k=20, disease_hint=disease_hint)
+    index = tools._syndrome_index(tools.get_graph_store())
+    scoped = tools._scope_by_disease(index, disease_hint)
+    assert set(posterior) == set(scoped)
+    # question_candidates 里出现的 if_yes_top/if_no_top 也只能来自这同一份候选池
+    for c in candidates:
+        if c["source"] != "graph_ig":
+            continue
+        assert c["if_yes_top"] in {info["name"] for info in scoped.values()}
+        assert c["if_no_top"] in {info["name"] for info in scoped.values()}

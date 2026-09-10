@@ -11,7 +11,7 @@ import pytest
 from core import chain, react
 from core.followup import fast_mode_enabled
 from core.schemas import ReActStep, S3Syndrome
-from tests.test_chain import FakeRetriever, ReActFakeLLM, _fake_cases
+from tests.test_chain import FakeRetriever, ReActFakeLLM, _affirm_unless_dangerous, _fake_cases
 
 
 @pytest.fixture(autouse=True)
@@ -137,7 +137,11 @@ def _consult_calls(monkeypatch, **env):
     monkeypatch.setattr(chain, "get_llm", lambda: fake)
     monkeypatch.setattr(react, "get_llm", lambda: fake)
     monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
-    outcome = chain.consult("纳差乏力", use_react=True, ask_fn=lambda q: "有")
+    # 不能无脑答"有"：R2 扩表后 Category 2 的修复保证候选池里第一条未问过的
+    # 安全相关症状一定会被问到，答"有"会被 check_safety 真实拦截、consult 提前
+    # 终止，测不到这条测试真正要测的 ReAct 步数/S2 重跑次数。见
+    # tests/test_chain.py::_affirm_unless_dangerous 的说明。
+    outcome = chain.consult("纳差乏力", use_react=True, ask_fn=_affirm_unless_dangerous)
     return outcome, fake
 
 

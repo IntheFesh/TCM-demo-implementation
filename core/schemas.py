@@ -168,6 +168,14 @@ class SyndromeDefinition(BaseModel):
     cardinal_symptoms: list[str] = Field(default_factory=list)  # 主症
     secondary_symptoms: list[str] = Field(default_factory=list)  # 次症
     tongue_pulse: str | None = None
+    # 这条证候是在哪个病名下定义的（比如"胃痛"门下的"脾胃虚寒证"）。R2 教材
+    # 扩表之前没有这个字段——17 条手工条目都不绑病名，候选池小，先辨病再辨证
+    # 收窄不了太多也不需要收窄。教材来源的条目一律带这个字段：同一个证候名
+    # （比如"脾胃虚寒证"）在不同病名下的具体表现不完全一样，各自是独立的
+    # (disease, syndrome) 组合，不去重合并——合并会丢掉"这条是哪个病下辨出来
+    # 的"这个信息，而这正是 core.tools.syndrome_posterior 的 disease_hint
+    # 要用来收窄候选池的锚点。旧的 17 条留 None，不倒填一个猜的病名。
+    disease: str | None = None
     source: Literal[
         "gb_standard",
         "official_consensus",
@@ -175,6 +183,14 @@ class SyndromeDefinition(BaseModel):
         "journal",
         "secondary_verified",
         "manual",
+        # 十四五规划教材（《中医内科学》等）。规则脚本从教材原文的"临床表现/
+        # 证机概要"四元组抽取，零 LLM 调用——见
+        # offline/build_syndrome_textbook.py。教材是公开出版、经同行评审的
+        # 权威教学材料，可信度介于 journal 和 secondary_verified 之间，但
+        # 这批条目目前没有交叉确认（只有教材这一个来源），不能标
+        # secondary_verified（那档要求"内容与另一独立来源交叉确认一致"），
+        # 所以单独开一档，不跟 secondary_verified 混在一起。
+        "textbook",
     ]
     # ICD-11（含 WHO 传统医学模块 TM2）编码。目前唯一能做跨术语体系映射的锚点，
     # 只有极少数条目的来源本身给出了这个编码，绝大多数留空——不要为了填满这个

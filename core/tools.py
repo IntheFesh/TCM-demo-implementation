@@ -683,8 +683,10 @@ def _entropy(probs) -> float:
 
 
 def _syndrome_index(store: NetworkXStore) -> dict[str, dict]:
-    """证候 code -> {name, elements}。类目词排除：国标明确写了类目词不适用于
-    临床诊断，把它放进假设空间会让信息增益去区分一个不能作为结论的东西。"""
+    """证候 code -> {name, elements, disease}。类目词排除：国标明确写了类目词
+    不适用于临床诊断，把它放进假设空间会让信息增益去区分一个不能作为结论的
+    东西。disease 是 R2 教材扩表时补的字段（手工的 17 条没有，是 None）——
+    syndrome_posterior 的 disease_hint 用它收窄候选池。"""
     out: dict[str, dict] = {}
     for syn_id in store.find_nodes("syndrome"):
         attrs = store.get_node(syn_id) or {}
@@ -699,6 +701,7 @@ def _syndrome_index(store: NetworkXStore) -> dict[str, dict]:
             "id": syn_id,
             "name": attrs.get("name") or syn_id,
             "elements": elements,
+            "disease": attrs.get("disease"),
         }
     return out
 
@@ -729,12 +732,41 @@ def _p_symptom_given_syndrome(weights_by_code: dict[str, float], code: str) -> f
     return min(max(weights_by_code.get(code, P_UNLISTED), P_UNLISTED), P_MAX)
 
 
+def _scope_by_disease(index: dict[str, dict], disease_hint: str | None) -> dict[str, dict]:
+    """按病名收窄候选池——R2 教材扩表把候选证候从 17 条撑到 200+ 条后，
+    单条追问答案在全量候选上归一化，movement 会小到跟浮点噪声（float64
+    相对精度约 2e-16）同量级，两个候选谁大谁小可能已经是舍入误差在决定，
+    不是真的没有区分度（见追问链路那轮修复报告的根因验证）。先按病名收窄
+    到同一病名下的证候（通常几条到十几条），再在这个小得多的空间里归一化，
+    是"先辨病再辨证"在数学上的落地——不是为了让数字好看设的技巧。
+
+    未标 disease 的条目（手工的原始 17 条）**总是保留**，不管有没有给
+    disease_hint、给的是哪个病名：它们是这个项目里核验最严格的一批条目
+    （K1 那轮 7 个独立来源交叉确认），不能因为没打病名标签就被病名收窄
+    误伤掉；只排除"标了病名、但标的是另一个病名"的条目。
+
+    收窄后 < 3 条就退回未收窄的 index——病名判断本身可能错（match_disease
+    是规则打分，不是精确诊断），候选池小于 3 条时"病名判错了"的代价
+    （把真正的证候排除在候选外）比"候选池大导致精度低"更严重，宁可退回
+    全量也不要在一个几乎没有选择余地的假候选池里瞎猜。"""
+    if not disease_hint:
+        return index
+    scoped = {
+        code: info for code, info in index.items()
+        if info["disease"] is None or info["disease"] == disease_hint
+    }
+    if len(scoped) < 3:
+        return index
+    return scoped
+
+
 def syndrome_posterior(
     current_elements: list[str],
     store: NetworkXStore | None = None,
     asserted_symptoms: list[str] | None = None,
     denied_symptoms: list[str] | None = None,
     physician: str | None = None,
+    disease_hint: str | None = None,
 ) -> dict[str, float]:
     """P(证候 | 已知证素, 追问答案)。证素为空时退化为均匀先验——那是合理的初始
     状态（还没问出任何东西），不是错误。
@@ -747,6 +779,10 @@ def syndrome_posterior(
     用的似然跟信息增益那套完全一致（同一组常数、同样的钳位），所以「问这个问题
     预期能得到多少 bit」和「答完之后后验变成什么」在数学上是自洽的——两处各写
     一套的话，IG 排出来的最优问题答完可能并不最优。
+
+    disease_hint 见 _scope_by_disease 的文档字符串——收窄逻辑单独抽出一个
+    函数，因为 question_candidates 算 IG 时也要用同一份候选池，不能两处
+    各写一套收窄规则。
     """
     store = store or get_graph_store()
     if store is None:
@@ -754,6 +790,7 @@ def syndrome_posterior(
     index = _syndrome_index(store)
     if not index:
         return {}
+    index = _scope_by_disease(index, disease_hint)
     current = set(current_elements or [])
     # 权重按同一位医家取——question_candidates 的似然也按这位医家取，两处不一致
     # 的话「问这个问题预期得到多少 bit」和「答完后验变成什么」就不再自洽。
@@ -811,8 +848,15 @@ def question_candidates(
     physician: str | None = None,
     asserted_symptoms: list[str] | None = None,
     denied_symptoms: list[str] | None = None,
+    disease_hint: str | None = None,
 ) -> list[dict]:
     """按信息增益给出接下来最该问的 k 个问题，算不出来时退到十问歌固定顺序。
+
+    disease_hint 原样传给 syndrome_posterior（见 core.tools._scope_by_disease）
+    ——这里和 syndrome_posterior 必须用同一份候选池，不能这边收窄了那边没收窄：
+    那样"问这个问题预期得到多少 bit"（在收窄后的候选池上算）和"答完后验变成
+    什么"（如果没收窄，在全量候选池上算）就不是同一个假设空间下的数字，IG
+    排出来的最优问题就不再对应真实会发生的后验更新。
 
     **退到十问歌的触发条件（穷举，5 条）：**
       1. 图谱不可用——data/graph.json 不存在或加载失败。
@@ -833,6 +877,10 @@ def question_candidates(
     `asserted_symptoms` / `denied_symptoms` 是追问已经问出来的肯定/否定回答：
     两者都进后验（见 syndrome_posterior），也都从候选池里去掉——问过的问题不该
     再问第二遍，无论答案是有还是没有。
+
+    **安全相关症状（吐血/便血/黑便/意识改变……）保证进入返回列表，不参与 IG
+    排名竞争、也不吃 MIN_INFORMATION_GAIN 这道门槛。** 判据是 is_safety_relevant
+    （复用 core/safety.py 的表）。理由和取舍见下面挑选阶段的代码注释。
     """
     store = store or get_graph_store()
     asked_set = set(asked or [])
@@ -843,7 +891,7 @@ def question_candidates(
     posterior = syndrome_posterior(
         current_elements, store,
         asserted_symptoms=asserted_symptoms, denied_symptoms=denied_symptoms,
-        physician=physician,
+        physician=physician, disease_hint=disease_hint,
     )
     symptom_weights = _symptom_index(store, physician)
     if not posterior or not symptom_weights:
@@ -890,6 +938,14 @@ def question_candidates(
         post_yes = {c: posterior[c] * p_yes_given[c] / p_yes for c in posterior}
         post_no = {c: posterior[c] * (1 - p_yes_given[c]) / p_no for c in posterior}
         ig = prior_entropy - p_yes * _entropy(post_yes.values()) - p_no * _entropy(post_no.values())
+        # 这道 MIN_INFORMATION_GAIN 门槛对安全相关症状也照样生效，不单独放宽——
+        # 见下面挑选阶段那段注释：放宽到"不管跟当前证候有没有关系，图里存在就必问"
+        # 试过，会把追问的三轮预算全耗在跟当前主诉毫不相关的危重症状排查上
+        # （实测：主诉"两胁胀满"、证素范围胃/肝/气滞时，"不省人事""突然昏厥"这类
+        # 跟脾胃门八竿子打不着的安全词条也会被塞进候选，三轮问完一条本该问的
+        # 「两胁胀满」都没问上）。这里保留的约束只是"图区分得开当前候选证候"，
+        # 危重症状只要对当前证素范围有哪怕很小的区分度就够格，不要求它赢得
+        # IG 排名。
         if ig <= MIN_INFORMATION_GAIN:
             continue
         top_yes = max(post_yes, key=post_yes.get)
@@ -920,4 +976,34 @@ def question_candidates(
 
     # 同分时按症状名排序，保证同样输入给出同样顺序（可测、可复现）
     scored.sort(key=lambda d: (-d["information_gain"], d["symptom"]))
-    return scored[:k]
+
+    # 安全相关症状不参与 IG 排名竞争。R2 教材扩表把症状候选池从 93 撑到 1282 个
+    # 之后，吐血/便血/黑便这类危重症状即使跟当前证候确实相关（清得过上面那道
+    # MIN_INFORMATION_GAIN 门槛），排名也很容易被成百上千个普通症状挤到 k 名
+    # 开外——生产链路（core/followup.py::run_followup）固定 k=1、只取
+    # candidates[0]，挤不进 top-k 就等于问不到，safety_relevant=True 那条
+    # "答了要不要先过 check_safety" 的判断压根拿不到数据，G3 追问是安全否决层
+    # 后门这条约束（CLAUDE.md 改造期约定）就从这里被绕过去了。
+    #
+    # 做法：先按 IG 正常排序、正常截到 k 条；如果这 k 条里一条安全相关的都没有，
+    # 就把（已经清过 MIN_INFORMATION_GAIN 门槛的）安全候选里 IG 最高的那个换到
+    # 最前面，顶替掉原本排名最后的一条，长度仍是 k。选择"固定占最前面的一个
+    # 位置"而不是"占 k 个位置之外的额外名额"：后一种做法在 k=1 的生产调用下
+    # 形同虚设——多出来的名额永远不会被读到，等于没修。
+    #
+    # 但只在**这轮追问会话里还一条安全相关症状都没问过**时才这样强行插队——
+    # `asked` 传进来的是本次会话已经问过的症状。原始 17 条手工条目里有的证候
+    # （比如胃热壅盛证）本身就正当地带吐血/便血/黑便好几个安全相关主症，不加
+    # 这道"问过一条就不再抢跑"的限制，会把这些症状一个接一个地排到队首，
+    # 追问 3 轮的预算会被同一个安全门类的不同措辞耗光，真正该问的鉴别诊断
+    # 问题一个都问不上（实测：主诉两胁胀满时命中过这个情况）。只保证"至少有
+    # 机会问到一条"，不保证"问到所有能问的"——后者对这个 demo 的追问轮次预算
+    # 不现实，前者已经能把 G3 的安全后门链路接通。
+    already_asked_safety = any(is_safety_relevant(a) for a in asked_set)
+    top_k = scored[:k]
+    if not already_asked_safety and not any(c["safety_relevant"] for c in top_k):
+        safety_candidates = [c for c in scored if c["safety_relevant"]]
+        if safety_candidates:
+            promoted = safety_candidates[0]
+            top_k = [promoted] + top_k[: max(0, k - 1)]
+    return top_k

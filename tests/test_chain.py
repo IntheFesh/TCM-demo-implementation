@@ -520,6 +520,23 @@ def test_consult_without_ask_channel_is_unchanged(monkeypatch):
     assert all("追问结果" not in s for s in fake_llm.s3_systems)
 
 
+def _affirm_unless_dangerous(question: str) -> str:
+    """测试用的"通情达理"患者：什么都说"有"，除非问的是危重症状。
+
+    R2 教材扩表后 Category 2 的修复保证候选池里第一条未问过的安全相关症状
+    一定会被问到（core/tools.py::question_candidates），跟诊断信息增益无关。
+    这份 fixture 下面几条测试要验证的是"新症状怎么并回 S2"这条跟安全无关的
+    路径——如果对安全相关问题也机械地答"有"，会在第一轮就真触发
+    check_safety/danger_confirmed_by_answer 而提前终止整个 consult（这是
+    正确行为，不是 bug：真答"有便血"就该被拦），但会让这几条测试测不到它们
+    本来要测的东西。用 mentions_danger 识别"这一句问的是不是危重症状"
+    （core/safety.py 现成的判据，不是新写一套），对危重症状照实答"没有"，
+    其余一律"有"。"""
+    from core.safety import mentions_danger
+
+    return "没有" if mentions_danger(question) else "有"
+
+
 def test_followup_costs_one_extra_s2_no_matter_how_many_rounds(monkeypatch):
     """追问每轮 0 次 LLM 调用（规则解析 + 图上贝叶斯更新），只在问出了新症状之后
     整体重跑一次 S2。按轮收费的话这个 demo 就没法用了（G2 实测每次调用 4-8s）。
@@ -529,7 +546,7 @@ def test_followup_costs_one_extra_s2_no_matter_how_many_rounds(monkeypatch):
     没被 FakeLLM 的证素解释）。轮数变多时这个数不许跟着涨。
     """
     fake_llm = _followup_setup(monkeypatch)
-    outcome = chain.consult("纳差乏力", ask_fn=lambda q: "有")
+    outcome = chain.consult("纳差乏力", ask_fn=_affirm_unless_dangerous)
     assert outcome["followup"].rounds >= 2
     assert fake_llm.calls.count("S2Elements") == 3
     assert fake_llm.calls.count("S1Normalize") == 1, "S1 仍然全局只跑一次"
@@ -539,7 +556,8 @@ def test_followup_costs_one_extra_s2_no_matter_how_many_rounds(monkeypatch):
 
 def test_asserted_symptoms_are_merged_into_the_symptom_list(monkeypatch):
     _followup_setup(monkeypatch)
-    outcome = chain.consult("纳差乏力", ask_fn=lambda q: "有")
+    outcome = chain.consult("纳差乏力", ask_fn=_affirm_unless_dangerous)
+    assert outcome["followup"].asserted, "全答有没有一条断言，这条测试就测不到并入这一步了"
     for s in outcome["followup"].asserted:
         assert s in outcome["s1"].symptoms
 
