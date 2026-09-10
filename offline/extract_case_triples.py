@@ -31,9 +31,18 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Callable
 
 from core.llm import LLMTruncatedError, get_llm, load_prompt, render
 from core.schemas import CaseRecord, CaseTripleExtraction, CaseTripleRecord
+
+# 每处理完这么多条医案报一次进度。941 条要跑十几分钟，中途崩了不知道跑到
+# 哪——这不是猜的，是真实踩过的坑（这次修的截断问题就是从"跑到第 1 条就
+# 没输出"这个状态排查出来的）。50 条一报是"够密集看出卡在哪、又不会把
+# 输出刷屏"之间的折中，不是精确调过的数字。
+PROGRESS_EVERY = 50
+
+OnProgress = Callable[[int, int, dict], None]
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASES_PATH = ROOT / "cases.json"
@@ -120,31 +129,42 @@ def extract_case(
     return records, rejected, False
 
 
-def extract_all(cases: list[CaseRecord]) -> tuple[list[CaseTripleRecord], dict]:
+def extract_all(
+    cases: list[CaseRecord], on_progress: OnProgress | None = None,
+) -> tuple[list[CaseTripleRecord], dict]:
+    """on_progress(已处理条数, 总条数, 当前 stats 快照) 每处理完
+    PROGRESS_EVERY 条医案调一次，外加处理完最后一条时必调一次（不满
+    PROGRESS_EVERY 的尾巴不会被吃掉）。这里不直接 print——这个函数是
+    "给什么输入、产出什么结果"的纯处理逻辑，输出去哪交给调用方决定，
+    跟 core/chain.py 的 on_step 是同一个模式（那边是 SSE 分步事件，这边是
+    批处理进度，机制一样：回调而不是硬编码某个具体的输出channel）。"""
     all_records: list[CaseTripleRecord] = []
+    total = len(cases)
     stats = {
-        "cases": len(cases), "cases_no_text": 0, "cases_no_triples": 0,
+        "cases": total, "cases_no_text": 0, "cases_no_triples": 0,
         "cases_truncated": 0,
         "triples_extracted": 0,
         "triples_rejected_span_not_found": 0, "triples_rejected_referential": 0,
         "llm_calls": 0,
     }
-    for case in cases:
+    for i, case in enumerate(cases, start=1):
         text = _source_text(case)
         if text is None:
             stats["cases_no_text"] += 1
-            continue
-        records, rejected, truncated = extract_case(case)
-        stats["llm_calls"] += 1  # 截断也是真的调用了一次，要计进去
-        if truncated:
-            stats["cases_truncated"] += 1
-            continue
-        stats["triples_rejected_span_not_found"] += rejected["span_not_found"]
-        stats["triples_rejected_referential"] += rejected["referential"]
-        if not records:
-            stats["cases_no_triples"] += 1
-        stats["triples_extracted"] += len(records)
-        all_records.extend(records)
+        else:
+            records, rejected, truncated = extract_case(case)
+            stats["llm_calls"] += 1  # 截断也是真的调用了一次，要计进去
+            if truncated:
+                stats["cases_truncated"] += 1
+            else:
+                stats["triples_rejected_span_not_found"] += rejected["span_not_found"]
+                stats["triples_rejected_referential"] += rejected["referential"]
+                if not records:
+                    stats["cases_no_triples"] += 1
+                stats["triples_extracted"] += len(records)
+                all_records.extend(records)
+        if on_progress is not None and (i % PROGRESS_EVERY == 0 or i == total):
+            on_progress(i, total, dict(stats))
     return all_records, stats
 
 
@@ -182,7 +202,12 @@ def main(argv: list[str] | None = None) -> None:
         raw = raw[: args.limit]
     cases = [CaseRecord.model_validate(r) for r in raw]
 
-    records, stats = extract_all(cases)
+    def _print_progress(done: int, total: int, snapshot: dict) -> None:
+        print(f"进度 {done}/{total}：抽出 {snapshot['triples_extracted']} 条三元组，"
+              f"跳过 {snapshot['cases_no_text']} 条无 excerpt，"
+              f"{snapshot['cases_truncated']} 条疑似截断")
+
+    records, stats = extract_all(cases, on_progress=_print_progress)
 
     print(f"读入 {stats['cases']} 条医案（{stats['cases_no_text']} 条没有 raw_excerpt，已跳过，不退回整段 raw）")
     print(f"S5 调用 {stats['llm_calls']} 次，抽出 {stats['triples_extracted']} 条三元组通过核验，"

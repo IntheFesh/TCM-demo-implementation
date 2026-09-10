@@ -308,6 +308,75 @@ def test_extract_all_skips_truncated_case_and_keeps_running(monkeypatch):
     assert records[0].case_id == "b"
 
 
+# ---------- extract_all：进度回调 ----------
+
+
+def test_on_progress_fires_every_n_cases_and_at_the_end(monkeypatch):
+    """941 条要跑十几分钟，中途崩了要知道跑到哪——这条钉住"每 PROGRESS_EVERY
+    条报一次，外加处理完最后一条必报一次"这个节奏，不满一个整数倍的尾巴
+    不能被吃掉（比如 130 条：报在 50、100、130，不是只报 50、100 然后
+    静默结束）。"""
+    fake = FakeLLM(CaseTripleExtraction(triples=[]))
+    monkeypatch.setattr(ect, "get_llm", lambda: fake)
+    cases = [_case(case_id=str(i), case_group_id=str(i)) for i in range(130)]
+
+    calls = []
+    ect.extract_all(cases, on_progress=lambda done, total, stats: calls.append((done, total)))
+
+    assert calls == [(50, 130), (100, 130), (130, 130)]
+
+
+def test_on_progress_not_called_when_omitted(monkeypatch):
+    """默认不传就是 None，不该强迫所有调用方（包括现有测试）都提供一个回调。"""
+    fake = FakeLLM(CaseTripleExtraction(triples=[]))
+    monkeypatch.setattr(ect, "get_llm", lambda: fake)
+    # 不传 on_progress，只要不抛异常就说明默认值处理对了
+    ect.extract_all([_case()])
+
+
+def test_on_progress_receives_a_snapshot_not_a_live_reference(monkeypatch):
+    """传给回调的 stats 必须是那一刻的快照，不能是后续还会被原地修改的同一个
+    dict——不然回调里存下来的"第 50 条时的统计"会被第 51-100 条的处理悄悄
+    改掉，等回调真正使用这个值时（比如打印或写日志）已经不是当时的数字了。"""
+    fake = FakeLLM(CaseTripleExtraction(triples=[_item()]))
+    monkeypatch.setattr(ect, "get_llm", lambda: fake)
+    cases = [_case(case_id=str(i), case_group_id=str(i)) for i in range(60)]
+
+    snapshots = []
+    ect.extract_all(cases, on_progress=lambda done, total, stats: snapshots.append(stats))
+
+    assert snapshots[0]["triples_extracted"] == 50  # 第 50 条时已抽出 50 条
+    assert snapshots[1]["triples_extracted"] == 60  # 第 60 条时已抽出 60 条
+    # 第一份快照没有被第二次回调时的处理悄悄改成 60
+    assert snapshots[0]["triples_extracted"] == 50
+
+
+def test_on_progress_snapshot_reflects_truncated_and_skipped_counts(monkeypatch):
+    cases = [_case(case_id=str(i), case_group_id=str(i)) for i in range(3)]
+    cases[1] = _case(case_id="1", case_group_id="1", raw="有内容", raw_excerpt=None)
+
+    class MixedFakeLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise LLMTruncatedError("测试用假错误")
+            return CaseTripleExtraction(triples=[_item()])
+
+    fake = MixedFakeLLM()  # 同一个实例贯穿多次调用——lambda 里现建会让 calls
+    # 计数器每次都从 0 开始，两次调用各自都撞上 self.calls == 1 的截断分支
+    monkeypatch.setattr(ect, "get_llm", lambda: fake)
+    snapshots = []
+    ect.extract_all(cases, on_progress=lambda done, total, stats: snapshots.append(stats))
+
+    final = snapshots[-1]
+    assert final["cases_truncated"] == 1
+    assert final["cases_no_text"] == 1
+    assert final["triples_extracted"] == 1
+
+
 # ---------- CLI ----------
 
 
@@ -375,6 +444,25 @@ def test_main_warns_about_truncated_cases(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "截断" in out
     assert "1 条医案" in out
+
+
+def test_main_prints_progress_for_a_batch_crossing_the_report_boundary(tmp_path, monkeypatch, capsys):
+    """941 条这种长跑批次最需要的就是这行输出——这里用 PROGRESS_EVERY + 1 条
+    医案确认真的打了两次进度（一次在整数倍处、一次是收尾），不是只在全部
+    跑完后才输出一次汇总。"""
+    n = ect.PROGRESS_EVERY + 1
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(json.dumps([
+        {"case_id": str(i), "case_group_id": str(i), "physician": "ye_tianshi",
+         "raw": "x", "raw_excerpt": "脘痛不食，脉弦，此肝木犯胃，治以疏肝和胃。"}
+        for i in range(n)
+    ]), encoding="utf-8")
+
+    monkeypatch.setattr(ect, "get_llm", lambda: FakeLLM(CaseTripleExtraction(triples=[])))
+    ect.main(["--cases-path", str(cases_path), "--out", str(tmp_path / "out.jsonl")])
+    out = capsys.readouterr().out
+    assert f"进度 {ect.PROGRESS_EVERY}/{n}" in out
+    assert f"进度 {n}/{n}" in out
 
 
 def test_main_raises_clear_error_when_cases_json_missing(tmp_path):
