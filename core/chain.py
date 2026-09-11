@@ -48,14 +48,28 @@ from core.schemas import (
 EPSILON_PATH = Path(__file__).resolve().parent.parent / "eval" / "epsilon.json"
 
 
-def load_epsilon_online() -> float | None:
+def load_epsilon_online_detail() -> dict | None:
+    """跟 load_epsilon_online 读的是同一份文件——文件读取/解析只在这里做一次，
+    load_epsilon_online 是对它取 .mean 的薄封装，不是另一份独立实现
+    （tests/test_dedup_contracts.py::test_epsilon_loader_is_defined_only_in_chain
+    钉住"ε 的加载器只能在 core/chain.py 里"这条约束）。
+
+    E3/E4 消融（eval/run_eval.py）要按 (主诉, 医家) 配对去比噪声地板，
+    单独一个 mean 标量不够用——这里把完整的 epsilon_online 子对象
+    （含 per_query/by_physician）交出去，调用方自己从里面挑要用的字段。
+    """
     if not EPSILON_PATH.exists():
         return None
     try:
         data = json.loads(EPSILON_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return (data.get("epsilon_online") or {}).get("mean")
+    return data.get("epsilon_online")
+
+
+def load_epsilon_online() -> float | None:
+    detail = load_epsilon_online_detail()
+    return detail.get("mean") if detail else None
 
 
 class SafetyVeto(Exception):
@@ -220,6 +234,26 @@ def _search_cases(
         raise RetrievalUnavailable(retriever_mode or "hybrid", str(e)) from e
 
 
+# E3/E4 消融（eval/run_eval.py）用的三种取值：
+#   own     —— 改造前的默认行为，检索这位医家自己的医案库
+#   swapped —— 检索另一位医家的医案库（见 _swap_physician_id），但仍然以这位
+#              医家的口吻/prompt 出方——检验"换掉参考医案，结论会不会跟着变"
+#   none    —— 不检索任何参考医案（等价于该医家检索为空时的既有路径，
+#              S3SyndromeUnreferenced 接管）——检验"有没有参考医案，结论会不会变"
+ALLOWED_REFS_MODES = {"own", "swapped", "none"}
+
+
+def _swap_physician_id(physician: str) -> str:
+    """按 PHYSICIANS 的登记顺序做一个环形轮换，取"下一位"医家的 id。
+    只有 2 位医家时这就是"对方"；3 位及以上时是真正的环（叶→吴→张→叶……）。
+    不写死"三位医家"这个数字——PHYSICIANS 目前还是 2 位，张锡纯加入后
+    这里不用改一行代码就能自动变成三向轮换（E3/E4 消融同理，见
+    eval/run_eval.py 的 collect_refs_mode_pair）。"""
+    ids = list(PHYSICIANS)
+    idx = ids.index(physician)
+    return ids[(idx + 1) % len(ids)]
+
+
 def run_physician(
     s1: S1Normalize,
     s2: S2Elements,
@@ -228,6 +262,7 @@ def run_physician(
     use_react: bool = False,
     followup: FollowupResult | None = None,
     ask_fn: AskFn | None = None,
+    refs_mode: str = "own",
     bypass_safety: bool = False,
     on_step: StepFn | None = None,
     retriever_mode: str | None = None,
@@ -239,15 +274,27 @@ def run_physician(
     RETRIEVER_MODE 那个环境变量是进程级的，两个并发请求各选一种模式会互相
     污染（跟 safety_bypassed() 拒绝"接到环境变量"是同一条理由）。不传就完全
     走改造前的老路——连 mode 关键字都不传给 search()，行为逐字节一致。
+
+    refs_mode 见模块里 ALLOWED_REFS_MODES 上面那段注释。默认 "own"，
+    行为、调用参数跟改造前逐字节一致——不传就是没有这个开关时的老路。
     """
+    if refs_mode not in ALLOWED_REFS_MODES:
+        raise ValueError(f"未知的 refs_mode={refs_mode!r}，目前支持 {sorted(ALLOWED_REFS_MODES)}")
+
     symptoms_text = "；".join(s1.symptoms)
     # ReAct 追问命中危重症状时，demo 模式抛 SafetyVeto 中止；EVAL_MODE 下不中止，
     # 把本该拦截的原因经由返回值带回 consult()（异常没抛，只能走返回值这条路）。
     react_safety_flag: str | None = None
 
-    # 检索该医家 top-3 医案
+    # 检索该医家 top-3 医案。refs_mode="none" 时连检索都不做（不是查出来再扔掉）
+    # ——E4 要测的是"完全没有参考医案"这个条件，真的不检索比检索了再清空更贴近
+    # 这个条件本身，也省一次不会被用到的检索调用。
     query = f"{symptoms_text}。舌{s1.tongue or '未记'}，脉{s1.pulse or '未记'}"
-    hits = _search_cases(query, physician, s2, retriever_mode)
+    if refs_mode == "none":
+        hits = []
+    else:
+        search_physician = physician if refs_mode == "own" else _swap_physician_id(physician)
+        hits = _search_cases(query, search_physician, s2, retriever_mode)
     # 一条相关医案都没有时换用不含 cited_case_ids 的 schema（见 S3SyndromeUnreferenced
     # 的文档字符串）。不是放松 min_length=1，是这个场景下根本没有可引用的东西。
     s3_schema = S3Syndrome if hits else S3SyndromeUnreferenced
@@ -382,6 +429,10 @@ def run_physician(
         "s3": s3,
         "disease_candidates": disease_candidates,
         "refs": refs,
+        # E3/E4 消融要按 (主诉, 医家) 配对比较不同 refs_mode 的结果；结果自带
+        # 这个字段，eval/run_eval.py 的收集代码不用另外在外层记一份"这条是哪个
+        # 模式跑出来的"，也避免两边状态不同步。
+        "refs_mode": refs_mode,
         # True = 检索为空，这位医家的结论没有任何医案支撑；前端要明示，不能当成
         # "引用了 0 条"静默过去
         "no_reference_cases": not hits,
@@ -485,9 +536,16 @@ def consult(
     eval_mode: bool | None = None,
     on_step: StepFn | None = None,
     retriever_mode: str | None = None,
+    refs_mode: str = "own",
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
+
+    refs_mode 是**逐请求**的参考医案取用方式（own/swapped/none，见
+    run_physician 上面 ALLOWED_REFS_MODES 那段注释），只在调用栈里传、
+    不接环境变量——跟 retriever_mode 是同一条理由。默认 "own"，行为跟改造前
+    逐字节一致。E3/E4 消融（eval/run_eval.py）用它来检验参考医案对结论的
+    真实影响。
 
     ask_fn 是追问的提问渠道（真人命令行、患者模拟器、前端各传各的）。不传就
     不追问——没有提问渠道时静默跳过是对的，不是错误。
@@ -528,6 +586,13 @@ def consult(
         # 复用，不另抄一份字符串列表——抄一份的话加新模式时必然漏改一处。
         raise ValueError(
             f"未知的 retriever_mode={retriever_mode!r}，目前支持 {sorted(ALLOWED_MODES)}"
+        )
+    if refs_mode not in ALLOWED_REFS_MODES:
+        # 同样立刻抛，不等到第一位医家开始检索才失败——run_physician 里也会查
+        # 一次（它可以被单独调用，不能假设调用方永远经过 consult 这道校验），
+        # 这里提前查是为了避免 S1/S2 两次调用白花。
+        raise ValueError(
+            f"未知的 refs_mode={refs_mode!r}，目前支持 {sorted(ALLOWED_REFS_MODES)}"
         )
 
     if use_react is None:
@@ -665,7 +730,7 @@ def consult(
             r = run_physician(
                 s1, s2, physician, info["name"], use_react=use_react,
                 followup=followup, ask_fn=ask_fn, bypass_safety=bypass, on_step=on_step,
-                retriever_mode=retriever_mode,
+                retriever_mode=retriever_mode, refs_mode=refs_mode,
             )
             results.append(r)
             emit("physician_done", physician=physician, physician_name=info["name"],
