@@ -177,6 +177,18 @@ def test_bm25_ranking_has_no_min_score_parameter():
     assert "min_score" not in sig.parameters
 
 
+def test_graph_ranking_has_no_min_score_parameter():
+    """跟上面 bm25 那条镜像的测试（P0-13 独立审计发现的覆盖缺口）：
+    _graph_ranking 同样不接受 min_score，之前只在注释/文档字符串里提过，
+    没有独立断言过。K3b 的 _graph_ranking 文档字符串已经说明了理由——
+    证素集合通常只有两三个元素，Jaccard 相似度哪怕只共享一个证素也能到
+    0.3-0.5，套用为稠密分校准的阈值会把这条信号基本过滤没。"""
+    import inspect
+
+    sig = inspect.signature(HybridRetriever._graph_ranking)
+    assert "min_score" not in sig.parameters
+
+
 # ---------- P0-6：BM25 语料复用 DenseRetriever 过滤/编码过的 _case_texts ----------
 
 

@@ -388,16 +388,32 @@ def test_apply_cutoff_does_not_apply_to_hybrid_or_bm25_or_default(mode):
 
 
 def test_apply_cutoff_hybrid_does_not_cut_bm25_found_low_dense_item():
-    """P0-13 自查清单第 5 条要求的那条测试：hybrid 模式下，一条 BM25 引入
-    的低 dense 分候选（跟 top-1 的高 dense 分候选分差很大，但两条低 dense
-    分候选之间分差很小）不该被误判成"没有区分度"而被砍到只剩 1 条。"""
-    # top-1 是 dense 强势候选（0.85），后两条是 bm25 找到的、dense 分都很低
-    # 且彼此接近（0.55/0.53，分差 0.02 < margin）——如果误套用这条判据，
-    # 会把这两条里的一条砍掉，恰恰是 K3a 引入 BM25 想保留的那类结果。
-    hits = _hits(0.85, 0.55, 0.53)
+    """P0-13 自查清单第 5 条要求的那条测试：hybrid 模式下，三条候选彼此的
+    dense 分都很低、很接近（0.02 < margin），但它们在真正的排序依据（RRF
+    融合分）上可能分得很开——dense 分凑巧聚在一起不代表"排序没有区分度"，
+    只代表它们都不是 dense 那一路的强项（真实排名是靠 BM25/graph 分出来的）。
+
+    **这条测试第一版是空验证**（独立审计发现的）：原来用 (0.85, 0.55, 0.53)，
+    top-1 和 bottom 的分差是 0.32，早就超过 margin=0.03，不管 mode 参数
+    是什么、甚至不管有没有 P0-13 这条 mode 限制，triggered 恒为 False——
+    测的根本不是 mode 限制在起作用，去掉限制这条测试照样绿。这一版换成
+    分差本身就 < margin 的三条（0.55/0.54/0.53，分差 0.02），这样如果
+    mode="hybrid" 时这条限制不生效（退回旧的、不分 mode 的判据），
+    triggered 会变成 True、只剩 1 条——用这个可验证的差异证明限制确实
+    在起作用，不是巧合地绿。"""
+    hits = _hits(0.55, 0.54, 0.53)  # 分差 0.02 < LOW_DISCRIMINATION_MARGIN=0.03
     result, triggered = apply_low_discrimination_cutoff(hits, mode="hybrid", enabled=True)
     assert triggered is False
     assert result == hits
     assert len(result) == 3
+
+    # 对照：同样的分数在 dense 模式下（这条判据成立的场景）应该真的触发——
+    # 证明上面 hybrid 的"不触发"不是因为这组分数本身永远不触发，
+    # 而是 mode="hybrid" 这个限制真的挡住了它。
+    contrast_result, contrast_triggered = apply_low_discrimination_cutoff(
+        hits, mode="dense", enabled=True
+    )
+    assert contrast_triggered is True
+    assert len(contrast_result) == 1
 
 

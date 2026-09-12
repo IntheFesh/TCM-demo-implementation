@@ -275,6 +275,45 @@ def test_search_cases_without_corpus_is_unavailable_not_crash(monkeypatch):
     assert "cases.json" in out["note"]
 
 
+def test_search_cases_description_warns_score_is_dense_only():
+    """P0-13 独立审计发现的真实问题：search_cases 返回给模型的 score 字段
+    是稠密相似度（core/retrieval.py::_case_to_text 那一路），不是最终排序
+    依据——hybrid 模式下一条医案可能因为 BM25 精确匹配关键词而排到前面，
+    score 却很低（0.5-0.6）。ReAct 的 observation 是这个返回值原样
+    json.dumps 进 S3 prompt（core/react.py::_observation_text），模型
+    看得到这个数字，没有任何提示告诉它"score 低不代表不相关"，容易被
+    误导成"这条不相关"而漏掉一条真实有用的先例。工具描述要把这句话
+    说清楚——这是成本最低的修法：不改返回值形状（不引入新字段、不改
+    既有测试断言），只改模型读到的说明文字。"""
+    manifest = {m["name"]: m for m in tools_manifest()}
+    description = manifest["search_cases"]["description"]
+    assert "score" in description
+    assert "不代表" in description or "不是最终排序依据" in description
+
+
+def test_search_cases_does_not_waste_an_adaptive_min_score_probe(monkeypatch):
+    """P0-13 独立审计发现的测试缺口：search_cases 从不显式传 mode 给
+    adaptive_min_score/retriever.search()（core/tools.py 里这两次调用都
+    没有 mode 关键字），这跟 core/chain.py::_search_cases 默认路径同理，
+    该跳过探测——但之前没有测试钉住这一点。"""
+    import core.retrieval as retrieval
+
+    class _CountingRetriever(retrieval.Retriever):
+        def __init__(self):
+            self.call_count = 0
+
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            self.call_count += 1
+            return []
+
+    r = _CountingRetriever()
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: r)
+
+    run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
+
+    assert r.call_count == 1, "不该多出一次探测调用——search_cases 从不请求 dense 模式"
+
+
 # ---------- lookup_standard ----------
 
 def test_lookup_standard_by_code_and_name():
