@@ -133,6 +133,37 @@ def test_main_returns_one_when_retriever_unavailable(monkeypatch, capsys):
     assert "cases.json" in err
 
 
+def test_main_prints_rank_and_rrf_breakdown_when_not_hit(monkeypatch, capsys):
+    """P0-13 续：光看"进没进 top-3"看不出 RRF 把目标压到第几名、又是被谁
+    挤下去的——这条测试钉住排名分解这个功能本身（dense/bm25 各自的精确
+    排名和分数，加上用 RRF_K 手算的融合分，以及排在目标前面那几条的
+    同款分解）。"""
+    retriever = _FixedRankingRetriever({
+        "dense": ["A", "B", "C", "target"],
+        "bm25": ["target", "x", "y", "z"],
+        "hybrid": ["A", "B", "C", "target"],
+    })
+    _install(monkeypatch, retriever)
+
+    code = vhf.main(["--physician", "ye_tianshi", "--expect-case-id", "target"])
+    captured = capsys.readouterr()
+    out = captured.out
+
+    assert code == 1
+    assert "关键医案排名分解" in out
+    assert "target ★  dense #4" in out
+    assert "bm25 #1" in out
+    assert "RRF=0.03202" in out  # 1/(60+4) + 1/(60+1)，手算验证过
+    # hybrid 排在目标前面的 3 条（A/B/C）都要出现在分解里，各自的 dense 排名
+    assert "A  dense #1" in out
+    assert "B  dense #2" in out
+    assert "C  dense #3" in out
+    # A/B/C 不在 bm25 榜单里（本测试的合成数据没给），分解要老实说"未命中"，
+    # 不能编一个假排名出来
+    assert "bm25 未命中" in out
+    assert "RRF=N/A" in out
+
+
 def test_main_accepts_custom_top_n(monkeypatch, capsys):
     retriever = _FixedRankingRetriever({
         "dense": ["a", "b", "c", "d", "e"],

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from core import retrieval_hybrid as rh
-from core.retrieval_hybrid import ALLOWED_MODES, HybridRetriever, _rrf_fuse
+from core.retrieval_hybrid import ALLOWED_MODES, HybridRetriever, _apply_bm25_floor, _rrf_fuse
 from core.schemas import CaseRecord
 
 
@@ -600,3 +600,184 @@ def test_search_empty_physician_returns_empty_without_touching_model(tmp_path):
 
 def test_allowed_modes_includes_graph():
     assert ALLOWED_MODES == {"dense", "bm25", "graph", "hybrid"}
+
+
+# ---------- P0-13 续：RRF 把强 bm25 信号压到 top-N 之外，bm25 保底修复 ----------
+#
+# 上面 test_fusion_admits_bm25_only_match_that_fails_the_dense_threshold 修的是
+# "进不进候选池"；这里修的是"进了候选池、RRF 排完名之后排第几"——AutoDL 真实
+# 语料复现：目标医案 dense 排名 100 开外、bm25 排第 2，进了候选池但被 RRF 压到
+# 第 31 名。见 core/retrieval_hybrid.py 里 BM25_FLOOR_N 的注释，三个修法的
+# 算法比较用的就是这条测试的数字。
+
+
+def test_apply_bm25_floor_promotes_bm25_top_n_ahead_of_everything_else():
+    fused = [(10, 0.9), (11, 0.8), (12, 0.02), (13, 0.01)]  # RRF 融合序，12/13 排最后
+    bm25_ranking = [(12, 99.0), (13, 90.0), (10, 1.0), (11, 0.5)]  # bm25 里 12/13 才是前两名
+    promoted = _apply_bm25_floor(fused, bm25_ranking, floor_n=2)
+    assert [i for i, _ in promoted[:2]] == [12, 13]  # 保底的两条被提到最前面
+    assert [i for i, _ in promoted[2:]] == [10, 11]  # 组内顺序仍按 fused 分，不是打乱成 bm25 分排序
+
+
+def test_apply_bm25_floor_zero_is_no_op():
+    fused = [(1, 0.9), (2, 0.1)]
+    bm25_ranking = [(2, 5.0), (1, 1.0)]
+    assert _apply_bm25_floor(fused, bm25_ranking, floor_n=0) == fused
+
+
+def test_apply_bm25_floor_does_not_duplicate_items_already_high_in_fused():
+    """保底集合跟 fused 前几名重叠时不该出现重复条目。"""
+    fused = [(1, 0.9), (2, 0.5), (3, 0.1)]
+    bm25_ranking = [(1, 9.0), (2, 1.0), (3, 0.5)]  # 1 本来就是 bm25 第一，也是 fused 第一
+    promoted = _apply_bm25_floor(fused, bm25_ranking, floor_n=1)
+    assert [i for i, _ in promoted] == [1, 2, 3]  # 没有重复，顺序不变
+
+
+def _filler_pool(n, physician="ye_tianshi", prefix="filler"):
+    return [_case(f"{prefix}{i}", physician, ["占位"]) for i in range(n)]
+
+
+def test_bm25_floor_rescues_target_that_rrf_ranks_below_top_n(tmp_path, monkeypatch):
+    """精确复现 AutoDL 实测的失败场景：目标医案 dense 排名 100（全库倒数）、
+    bm25 排第 2（全库唯一精确命中），对手 A/B/C 分别是 dense 第 1/2/3 名、
+    bm25 第 50/60/80 名——跟 core/retrieval_hybrid.py 里 BM25_FLOOR_N 那段
+    注释算的是同一组数字。用 monkeypatch 直接注入这组排名（不依赖真实
+    embedding/BM25 恰好算出这几个名次，那样没法稳定复现），确认 bm25 保底
+    修复后目标能进 hybrid 的 top-3。
+
+    这条测试在 BM25_FLOOR_N 引入前必须是红的——见下面
+    test_bm25_floor_disabled_reproduces_the_original_failure，把 floor_n
+    强制夹成 0 后同样的场景确实未命中，证明这条测试真的钉住了这次修复，
+    不是数据凑巧一开始就是绿的（P0-13 自查清单第 10 条同款要求）。"""
+    target_idx, a_idx, b_idx, c_idx = 0, 1, 2, 3
+    cases = [
+        _case("target", "ye_tianshi", ["占位"]),
+        _case("A", "ye_tianshi", ["占位"]),
+        _case("B", "ye_tianshi", ["占位"]),
+        _case("C", "ye_tianshi", ["占位"]),
+        *_filler_pool(96),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+
+    filler_idxs = list(range(4, 100))  # 96 个 filler，idx 4~99
+
+    # dense 排名：A/B/C 第 1/2/3，96 个 filler 占第 4~99 名，目标垫底第 100。
+    dense_ranking = [(a_idx, 0.99), (b_idx, 0.98), (c_idx, 0.97)]
+    dense_ranking += [(i, 0.5) for i in filler_idxs]
+    dense_ranking.append((target_idx, 0.01))
+    assert len(dense_ranking) == 100
+
+    # bm25 排名：目标第 2 名，A/B/C 第 50/60/80 名，其余名次用 filler 填满，
+    # 保证"第 X 名"是真实名次，不是凑出来的近似值。filler 消费顺序跟上面
+    # dense 那段反过来（reversed）——避免同一个 filler 在两路都排前面，
+    # 那样会让它跟 A/B/C 抢 fused 前几名，稀释了这条测试要验证的东西。
+    bm25_fillers = iter(reversed(filler_idxs))
+
+    def take(n):
+        return [next(bm25_fillers) for _ in range(n)]
+
+    bm25_ranking = [(i, 10.0) for i in take(1)]        # 第 1 名：filler
+    bm25_ranking.append((target_idx, 9.9))              # 第 2 名：目标
+    bm25_ranking += [(i, 5.0) for i in take(47)]         # 第 3~49 名
+    bm25_ranking.append((a_idx, 2.0))                    # 第 50 名：A
+    bm25_ranking += [(i, 1.9) for i in take(9)]           # 第 51~59 名
+    bm25_ranking.append((b_idx, 1.5))                     # 第 60 名：B
+    bm25_ranking += [(i, 1.4) for i in take(19)]           # 第 61~79 名
+    bm25_ranking.append((c_idx, 1.0))                      # 第 80 名：C
+    bm25_ranking += [(i, 0.5) for i in take(20)]            # 第 81~100 名
+    assert len(bm25_ranking) == 100
+    assert next(bm25_fillers, None) is None  # 恰好用完 96 个 filler，没多也没少
+
+    monkeypatch.setattr(retriever, "_dense_ranking",
+                         lambda query, idxs, min_score: dense_ranking)
+    monkeypatch.setattr(retriever, "_bm25_ranking",
+                         lambda query, idxs: bm25_ranking)
+
+    hits = retriever.search("q", "ye_tianshi", k=3, mode="hybrid")
+    hit_ids = {c.case_id for c, _ in hits}
+    assert "target" in hit_ids, (
+        "目标 dense#100/bm25#2，RRF_K=60 下融合分排在 A/B/C 之后（算法见 "
+        "core/retrieval_hybrid.py 的 BM25_FLOOR_N 注释）——bm25 保底（N=2）"
+        "应该把它强制留在 top-3 里，不管 RRF 怎么排"
+    )
+
+
+def test_bm25_floor_disabled_reproduces_the_original_failure(tmp_path, monkeypatch):
+    """跟上面那条同一组数据，把 floor_n 强制夹成 0——证明上面那条测试是真的
+    在测 bm25 保底这个机制，不是巧合地一开始就是绿的。"""
+    target_idx, a_idx, b_idx, c_idx = 0, 1, 2, 3
+    cases = [
+        _case("target", "ye_tianshi", ["占位"]),
+        _case("A", "ye_tianshi", ["占位"]),
+        _case("B", "ye_tianshi", ["占位"]),
+        _case("C", "ye_tianshi", ["占位"]),
+        *_filler_pool(96),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+
+    filler_idxs = list(range(4, 100))
+    dense_ranking = [(a_idx, 0.99), (b_idx, 0.98), (c_idx, 0.97)]
+    dense_ranking += [(i, 0.5) for i in filler_idxs]
+    dense_ranking.append((target_idx, 0.01))
+
+    bm25_fillers = iter(reversed(filler_idxs))
+
+    def take(n):
+        return [next(bm25_fillers) for _ in range(n)]
+
+    bm25_ranking = [(i, 10.0) for i in take(1)]
+    bm25_ranking.append((target_idx, 9.9))
+    bm25_ranking += [(i, 5.0) for i in take(47)]
+    bm25_ranking.append((a_idx, 2.0))
+    bm25_ranking += [(i, 1.9) for i in take(9)]
+    bm25_ranking.append((b_idx, 1.5))
+    bm25_ranking += [(i, 1.4) for i in take(19)]
+    bm25_ranking.append((c_idx, 1.0))
+    bm25_ranking += [(i, 0.5) for i in take(20)]
+
+    monkeypatch.setattr(retriever, "_dense_ranking",
+                         lambda query, idxs, min_score: dense_ranking)
+    monkeypatch.setattr(retriever, "_bm25_ranking",
+                         lambda query, idxs: bm25_ranking)
+    monkeypatch.setattr(rh, "BM25_FLOOR_N", 0)
+
+    hits = retriever.search("q", "ye_tianshi", k=3, mode="hybrid")
+    hit_ids = {c.case_id for c, _ in hits}
+    assert "target" not in hit_ids, (
+        "没有保底时，目标应该还是原来那个失败场景——RRF 分排在 A/B/C 之后，"
+        "进不了 top-3。如果这条测试也是绿的，说明上面那条测试的绿不是保底"
+        "机制带来的，是数据本身凑巧"
+    )
+
+
+def test_hybrid_floor_leaves_room_for_pure_rrf_when_k_is_small(tmp_path, monkeypatch):
+    """floor_n 会被夹到 min(BM25_FLOOR_N, k-1)——k 很小时不能让保底吃掉全部
+    名额，否则那次调用 hybrid 的结果集合跟纯 bm25 的 top-N 完全一样，E8
+    消融就失去意义了（见 core/retrieval_hybrid.py 里 BM25_FLOOR_N 注释）。"""
+    cases = [
+        _case("X_bm25_top", "ye_tianshi", ["占位"]),
+        _case("Y_bm25_second", "ye_tianshi", ["占位"]),
+        _case("Z_dense_top_bm25_worst", "ye_tianshi", ["占位"]),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+    # dense：Z 第一，X 第二，Y 第三。bm25：X 第一，Y 第二，Z 垫底。
+    # RRF_K=60 手算：X=1/62+1/61=0.032522，Z=1/61+1/63=0.032266，
+    # Y=1/63+1/62=0.032002——纯 RRF 排名是 X > Z > Y，Z 本来就该赢 Y。
+    monkeypatch.setattr(retriever, "_dense_ranking",
+                         lambda query, idxs, min_score: [(2, 0.99), (0, 0.5), (1, 0.4)])
+    monkeypatch.setattr(retriever, "_bm25_ranking",
+                         lambda query, idxs: [(0, 9.0), (1, 8.0), (2, 0.1)])
+
+    hits = retriever.search("q", "ye_tianshi", k=2, mode="hybrid")
+    hit_ids = {c.case_id for c, _ in hits}
+
+    assert hit_ids == {"X_bm25_top", "Z_dense_top_bm25_worst"}, (
+        "k=2 时保底应该被夹到 floor_n=min(2, k-1)=1——只强制留 bm25 第一名 "
+        "1 个名额，剩下 1 个名额留给纯 RRF 排名，让 Z（RRF 分比 Y 高但 "
+        "bm25 排最后）顶掉 Y（bm25 第二但 RRF 分更低）。如果保底不夹这个 "
+        "上限，k=2 时 hybrid 会退化成跟 bm25 的 top-2 完全一样（X, Y），"
+        "Z 这条纯 RRF 的贡献就被抹掉了"
+    )

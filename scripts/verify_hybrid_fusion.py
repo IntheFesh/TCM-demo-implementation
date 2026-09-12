@@ -14,6 +14,13 @@ python -c。
 
 退出码：期望的 case_id 出现在 hybrid 模式 top-3 里 -> 0；没出现 -> 1
 （能直接接进 CI 或 shell 里的 `&&` 判断）。
+
+未命中时会额外打印目标医案在 dense/bm25 两路的精确排名和分数，以及用
+RRF_K 手算出的融合分、跟排在它前面那几条的同款分解——只看"进没进
+top-3"看不出 RRF 融合本身把它压到第几名、又是被谁挤下去的（P0-13 续，
+真实案例：目标 dense 排名 100 开外、bm25 排第 2，进了候选池但被 RRF
+压到第 31 名）。这个分解本身是脚本的交付物：下次再遇到"某条该进没进"
+的问题，一条命令就能看到分解，不用现写 python -c。
 """
 from __future__ import annotations
 
@@ -36,26 +43,70 @@ DEFAULT_QUERY = "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅
 DEFAULT_PHYSICIAN = "ye_tianshi"
 DEFAULT_EXPECT_CASE_ID = "ye_tianshi-0030-p0-0"
 
-# top-3 之外再探一次更宽的排名，给"没命中"的诊断信息——跟 P0-13 报告里
-# "这条不在 top-50 里"是同一种诊断方式，不是脚本必须要求的行为，只是让
-# 排查更快。
-DIAGNOSTIC_RANK_DEPTH = 50
+# 排名分解要看清楚目标真实排第几、是被谁挤下去的，不能只探测到某个固定
+# 深度就停——用一个远超任何医家医案总数的 k 顶格查，等价于拿到整份排名，
+# 不用再猜"是不是恰好卡在探测深度外面"这种半信息。search() 内部只会
+# min(k, 候选总数) 截断，传大 k 不会报错也不会因为语料变大就要跟着调。
+FULL_RANK_K = 100_000
+
+# 排名分解只展示排在目标前面的前几条，不是全部——真实案例目标排第 31，
+# 前面 30 条全打出来是噪音，不是诊断。
+BREAKDOWN_CAP = 10
 
 MODES = ["dense", "bm25", "hybrid"]
 
 
-def _rank_and_top(retriever, query: str, physician: str, mode: str, expect_case_id: str,
-                   top_n: int, depth: int) -> tuple[list[tuple[str, float]], int | None]:
-    """返回 (top_n 条 (case_id, score)，expect_case_id 在更宽的 depth 名单里的排名
-    （1-based；不在里面则 None））。"""
-    wide = retriever.search(query, physician, k=depth, mode=mode)
-    top = [(c.case_id, score) for c, score in wide[:top_n]]
-    rank = None
-    for i, (case, _score) in enumerate(wide, start=1):
-        if case.case_id == expect_case_id:
-            rank = i
-            break
-    return top, rank
+def _rank_of(
+    ranking: list[tuple[object, float]], case_id: str
+) -> tuple[int | None, float | None]:
+    """在按分数降序的 (case, score) 列表里找 case_id 的 (1-based 排名, 分数)；
+    不在里面则 (None, None)。"""
+    for i, (case, score) in enumerate(ranking, start=1):
+        if case.case_id == case_id:
+            return i, score
+    return None, None
+
+
+def _print_breakdown(
+    rankings: dict[str, list[tuple[object, float]]],
+    expect_case_id: str,
+) -> None:
+    """打印目标医案在 dense/bm25 两路的精确排名和分数，加上用 RRF_K 手算的
+    融合分，以及排在它前面那几条的同款分解——这是排查"RRF 把它排到第几"
+    这类问题要看的东西，不是"进没进 top-3"这一句话能回答的。"""
+    from core.retrieval_hybrid import RRF_K
+
+    def _rrf_score(case_id: str) -> float | None:
+        d_rank, _ = _rank_of(rankings["dense"], case_id)
+        b_rank, _ = _rank_of(rankings["bm25"], case_id)
+        if d_rank is None or b_rank is None:
+            return None
+        return 1.0 / (RRF_K + d_rank) + 1.0 / (RRF_K + b_rank)
+
+    def _row(case_id: str, mark: str = "") -> None:
+        d_rank, d_score = _rank_of(rankings["dense"], case_id)
+        b_rank, b_score = _rank_of(rankings["bm25"], case_id)
+        rrf = _rrf_score(case_id)
+        d_part = f"dense #{d_rank} ({d_score:.3f})" if d_rank is not None else "dense 未命中"
+        b_part = f"bm25 #{b_rank} ({b_score:.3f})" if b_rank is not None else "bm25 未命中"
+        rrf_part = f"RRF={rrf:.5f}" if rrf is not None else "RRF=N/A"
+        print(f"  {case_id}{mark}  {d_part}  {b_part}  {rrf_part}")
+
+    hybrid_rank, _ = _rank_of(rankings["hybrid"], expect_case_id)
+
+    print(f"关键医案排名分解（dense 排名 / bm25 排名 -> RRF 分，RRF_K={RRF_K}）：")
+    _row(expect_case_id, mark=" ★")
+
+    if hybrid_rank is not None and hybrid_rank > 1:
+        n_ahead = min(hybrid_rank - 1, BREAKDOWN_CAP)
+        omitted = hybrid_rank - 1 - n_ahead
+        print(f"  ------ hybrid 排在它前面的 {n_ahead} 条"
+              f"（共 {hybrid_rank - 1} 条{f'，只列前 {n_ahead} 条' if omitted > 0 else ''}）------")
+        for case, _score in rankings["hybrid"][:n_ahead]:
+            _row(case.case_id)
+    elif hybrid_rank is None:
+        print("  （hybrid 排名里完全没找到这条医案——不是排名靠后，是真的没进候选池）")
+    print()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,27 +133,27 @@ def main(argv: list[str] | None = None) -> int:
     print(f"期望命中：{args.expect_case_id}")
     print()
 
-    results: dict[str, tuple[list[tuple[str, float]], int | None]] = {}
+    rankings: dict[str, list[tuple[object, float]]] = {}
     for mode in MODES:
-        top, rank = _rank_and_top(
-            retriever, args.query, args.physician, mode, args.expect_case_id,
-            args.top_n, DIAGNOSTIC_RANK_DEPTH,
-        )
-        results[mode] = (top, rank)
+        wide = retriever.search(args.query, args.physician, k=FULL_RANK_K, mode=mode)
+        rankings[mode] = wide
+        total = len(wide)
+        rank, _score = _rank_of(wide, args.expect_case_id)
+
         print(f"[{mode}] top-{args.top_n}：")
-        for case_id, score in top:
-            mark = " ★" if case_id == args.expect_case_id else ""
-            print(f"  {score:.3f}  {case_id}{mark}")
-        if not any(case_id == args.expect_case_id for case_id, _ in top):
+        for case, score in wide[: args.top_n]:
+            mark = " ★" if case.case_id == args.expect_case_id else ""
+            print(f"  {score:.3f}  {case.case_id}{mark}")
+        if rank is None or rank > args.top_n:
             if rank is not None:
                 print(f"  （{args.expect_case_id} 未进 top-{args.top_n}，"
-                      f"在前 {DIAGNOSTIC_RANK_DEPTH} 里排第 {rank} 名）")
+                      f"在前 {total} 里排第 {rank} 名）")
             else:
-                print(f"  （{args.expect_case_id} 不在前 {DIAGNOSTIC_RANK_DEPTH} 里）")
+                print(f"  （{args.expect_case_id} 不在前 {total} 里）")
         print()
 
-    hybrid_top, _ = results["hybrid"]
-    hit = any(case_id == args.expect_case_id for case_id, _ in hybrid_top)
+    hybrid_rank, _ = _rank_of(rankings["hybrid"], args.expect_case_id)
+    hit = hybrid_rank is not None and hybrid_rank <= args.top_n
 
     print("=" * 60)
     if hit:
@@ -113,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         # 退出码之外还要有一行肉眼可读的失败原因不依赖 stdout 是否被留下来。
         print(f"✗ 未命中，本次修复未生效：{args.expect_case_id} 没有出现在 "
               f"hybrid 模式 top-{args.top_n} 里。", file=sys.stderr)
+        print()
+        _print_breakdown(rankings, args.expect_case_id)
     return 0 if hit else 1
 
 

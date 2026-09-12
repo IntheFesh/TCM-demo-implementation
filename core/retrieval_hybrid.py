@@ -65,6 +65,66 @@ def _rrf_fuse(
     return sorted(scores.items(), key=lambda kv: -kv[1])
 
 
+# ---------------------------------------------------------------------------
+# P0-13 续：AutoDL 真实语料复现——「情志不畅」这条主诉，全库唯一精确命中
+# "情志诱因"的医案（ye_tianshi-0030-p0-0）dense 排名 100 开外、bm25 排第 2。
+# 上面这段"融合准入不设单路阈值"的修复（P0-13）已经生效：这条医案进了候选
+# 池，不再被 dense 阈值滤掉。但 RRF 本身把它排到第 31 名，没进 hybrid 的
+# top-3——"进不进候选池"跟"进了候选池排第几"是两个不同的问题，这里修的是
+# 后者。
+#
+# 算过三个修法，用的是跟 tests/test_retrieval_hybrid.py 里新增的复现测试
+# 同一组数字（目标 dense#100/bm25#2，对手 A dense#1/bm25#50，B dense#2/
+# bm25#60，C dense#3/bm25#80），不是这条真实案例本身未经验证的近似值：
+#
+# 修法 A（调小 RRF_K）：解不了，跟 K 取多少无关。目标跟对手 A 的融合分差
+#     f(K) = [1/(K+100) - 1/(K+50)] + [1/(K+2) - 1/(K+1)]
+#          = -50/[(K+100)(K+50)] - 1/[(K+2)(K+1)]
+# 两项对任意 K>0 都恒为负——dense 排名 1 对 100 名的位置优势，比 bm25
+# 排名 2 对 50 名的优势大得多，这是排名差距本身的问题，不是 K 没调对。
+#
+# 修法 B（加权 RRF，w_dense/(K+r_dense) + w_bm25/(K+r_bm25)）：数学上可行——
+# K=60、w_dense=1.0 时，w_bm25≈1.44 是压过对手 A 的门槛，w_bm25=2.0 时
+# 目标反超全部三个对手（0.0385 对 0.0346/0.0328/0.0302）。但这个权重数值
+# 本身要靠"dense 对中医术语的区分度有多低"这类实测校准，这台沙盒没有真实
+# 语料算不出这个校准值——为了不凭空定一个没有依据的权重，没选这条。
+#
+# 修法 C（bm25 top-N 强制保底，本次采用）：不用猜数值，N 直接从已知的真实
+# 排名推出来——AutoDL 实测 bm25 排名第 1 的是另一条医案（ye_tianshi-0026-
+# p9-3），目标医案排第 2；N=1 时保底集合只有第 1 名那条，目标依然进不去，
+# 验证 C 还是未命中；N=2 时保底集合含目标，能进最终结果。这是从两个已经
+# 测过的真实排名直接推出来的，不是拍脑袋，但这行代码本身还没跑过真实语料——
+# 这正是 verify_hybrid_fusion.py 存在的理由，等 AutoDL 用扩展后的排名分解
+# 重跑一次验证 C 才算真正确认。
+#
+# 为什么不会让 hybrid 退化成"就是 bm25"（E8 消融还有意义）：保底只保证
+# bm25 排名前 floor_n 的条目一定在最终结果里，floor_n 会被夹到 min(N, k-1)——
+# 生产环境 k=3、N=2 时留了 1 个名额纯给 RRF 融合排名决定，dense/graph 信号
+# 仍然能在那个名额上顶掉 bm25 保底之外的条目；就算 k 小到只剩 N 个名额，
+# 保底集合内部的相对顺序、以及展示给用户的分数，仍然是 RRF 融合分/真实
+# dense 相似度，不是裸的 bm25 分——跟纯 bm25 模式返回的是同一组 case_id
+# 但排序依据和展示语义都不同。见 tests/test_retrieval_hybrid.py::
+# test_hybrid_floor_leaves_room_for_pure_rrf_when_k_is_small。
+BM25_FLOOR_N = 2
+
+
+def _apply_bm25_floor(
+    fused: list[tuple[int, float]],
+    bm25_ranking: list[tuple[int, float]],
+    floor_n: int,
+) -> list[tuple[int, float]]:
+    """把 bm25 排名前 floor_n 的条目提到 fused 列表最前面，组内仍按 fused
+    分降序（不改成按 bm25 分排序）——保证它们截到 k 之后不会被 RRF 挤掉，
+    但"最靠前的是最可信的"这条既有语义不因为保底而变。纯函数，不依赖检索器
+    状态，跟 _rrf_fuse 同样的理由方便单测。"""
+    if floor_n <= 0:
+        return fused
+    guaranteed = {i for i, _ in bm25_ranking[:floor_n]}
+    head = [pair for pair in fused if pair[0] in guaranteed]
+    tail = [pair for pair in fused if pair[0] not in guaranteed]
+    return head + tail
+
+
 class HybridRetriever(DenseRetriever):
     """继承 DenseRetriever 复用稠密检索那一路（_ensure_encoded/_embeddings），
     新增 BM25 一路和 RRF 融合。mode 由调用方传入，缺省读 RETRIEVER_MODE 环境
@@ -250,6 +310,11 @@ class HybridRetriever(DenseRetriever):
             if query_elements:
                 rankings.append([i for i, _ in self._graph_ranking(query_elements, idxs)])
             fused = _rrf_fuse(rankings)
+            # bm25 保底：见 BM25_FLOOR_N 上面那段注释。floor_n 夹到
+            # max(0, k-1)——k 很小时也要留至少 1 个名额给纯 RRF 排名，不然
+            # 保底会把 hybrid 的返回集合挤成跟 bm25 的 top-N 完全一样。
+            floor_n = min(BM25_FLOOR_N, max(0, k - 1))
+            fused = _apply_bm25_floor(fused, bm25_ranking, floor_n)
             # dense_ranking 覆盖了 idxs 里的全部条目（min_score=0.0，不过滤），
             # .get(i, 0.0) 这个兜底理论上不会触发——保留它只是防御性写法
             # （万一某条医案不在 idxs 里却混进了 fused，那是别的 bug，不该
