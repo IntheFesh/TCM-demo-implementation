@@ -24,6 +24,13 @@ PHYSICIANS: dict[str, dict] = {
         "school": "温病",
         "color": "#D85A30",
     },
+    "zhang_xichun": {
+        "name": "张锡纯",
+        "book": "医学衷中参西录",
+        "years": "1860-1933",
+        "school": "衷中参西",
+        "color": "#3B7DD8",
+    },
 }
 
 
