@@ -98,8 +98,17 @@ tests/     pytest 用例与测试主诉
 必须说明用的是哪一种，不能只报一个裸数字）。**基线：13 处（截至 `974c8c7`）。**
 M1 加了 5 处（`HerbItem.name`、`FormulaCandidate.name`/`rationale`/`herb_items`、
 `S3Syndrome`/`S3SyndromeUnreferenced` 共用基类的 `formula_candidates`），
-现在是 18 处——这个 18 是新数法数出来的新基线，跟这段被替换之前口头引用过的
-"18 处"（那其实是旧数法、旧文件的巧合重合）不是同一回事。
+`421df4f`~`e6a8c32` 期间到 19 处。`2f0d174` 掉到 17 处——**这不是放松**：
+X3 那轮把 `CaseTripleItem.p`/`CaseTripleRecord.p` 的 `str = Field(min_length=1)`
+换成了 `p: CaseTriplePredicate`（六个合法值的 `Literal`），Literal 能接受的
+值集合比"任何非空字符串"小得多，是收紧不是放松。**当前基线：17 处
+（截至 `acd8cd0`）。**
+
+这条铁律里的数字**允许合法下降**——用更强约束（`Literal`、枚举、更具体的
+子类型）替换 `Field(min_length=1)` 属于收紧，不违反"不许放松"；只有改成
+可选（`| None`）或 `min_length=0` 才算放松，才是这条铁律真正禁止的事。
+核实一处变化是收紧还是放松，看替换后的类型能接受的值集合是变大了还是
+变小了，不要看这个数字本身是涨了还是跌了。
 
 ### 安全否决在 S2 之前
 

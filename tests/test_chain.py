@@ -222,6 +222,38 @@ def test_format_case_block_header_has_case_id_and_visit_label():
     assert "第2诊" in block
 
 
+def test_run_physician_embeds_raw_excerpt_in_the_real_prompt_after_the_example(monkeypatch):
+    """上面几条 _format_case_block 单测只测格式化函数本身对不对，测不出它的
+    输出有没有真的送到模型看得见的地方——P0 要修的根因恰恰是"参考医案的内容
+    没进到 prompt 里"。这里跑一次真实的 run_physician()，断言 raw_excerpt
+    的内容确实出现在发给 LLM 的 system prompt 里、且排在示例 JSON 之后
+    （P0-3 的顺序要求）。E3 在 AutoDL 上重跑不过时，靠这条测试排除"格式化对了
+    但没送到模型那里"这种可能——如果这条测试绿了还是不过，问题在别处
+    （比如模型没理会 prompt），不在这个环节。"""
+    excerpt = "此患者形瘦神疲，纳谷不香，脘腹痞满，特征串POCKMARK7f3a用于定位"
+    case = _case(raw_excerpt=excerpt, symptoms=["纳差"], tongue="淡红", pulse="细弱")
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever([case]))
+
+    s1 = S1Normalize(symptoms=["纳差", "乏力"], tongue="淡红", pulse="细弱", unmapped=[])
+    s2 = S2Elements(
+        elements=[ElementHit(element="脾", kind="location",
+                             supporting_symptoms=["纳差"], confidence="high")],
+        unexplained_symptoms=[],
+    )
+    chain.run_physician(s1, s2, "ye_tianshi", "叶天士")
+
+    assert len(fake_llm.s3_systems) == 1
+    system = fake_llm.s3_systems[0]
+    assert excerpt in system, "raw_excerpt 的内容必须真的出现在发给 LLM 的 system prompt 里"
+    assert system.index("病名占位") < system.index(excerpt), (
+        "参考医案（含 raw_excerpt）必须排在示例 JSON 之后，不能被示例盖过（P0-3）"
+    )
+
+
 def test_shared_stages_run_once_per_physician_stages_run_twice(monkeypatch):
     """S1 和 S2 全局各只跑一次，S3 每位医家一次。
 
