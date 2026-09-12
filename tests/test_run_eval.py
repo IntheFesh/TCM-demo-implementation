@@ -175,9 +175,22 @@ def test_retrieval_mode_comparison_identical_modes_zero_discordant():
 #             ablation_output_effect（E3/E4/E9 共用）----------
 
 
-def _fake_consult(rejected=False, insufficient=False, herbs_by_physician=None):
+def _fake_consult(
+    rejected=False, insufficient=False, herbs_by_physician=None,
+    refs_by_physician=None, no_reference_by_physician=None,
+):
+    """refs_by_physician/no_reference_by_physician 是 P0-8 补的可选参数——
+    老调用点（不传这两个）保持跟改造前完全一样的字典形状，_herb_pairs_from_
+    outcomes 对缺失的 refs/no_reference_cases 键有 .get() 兜底，不会因为
+    老测试没带这两个键就 KeyError。"""
+    refs_by_physician = refs_by_physician or {}
+    no_reference_by_physician = no_reference_by_physician or {}
     results = [
-        {"physician": p, "s3": SimpleNamespace(herbs=herbs)}
+        {
+            "physician": p, "s3": SimpleNamespace(herbs=herbs),
+            "refs": refs_by_physician.get(p, []),
+            "no_reference_cases": no_reference_by_physician.get(p, False),
+        }
         for p, herbs in (herbs_by_physician or {}).items()
     ]
     return {"rejected": rejected, "insufficient": insufficient, "results": results}
@@ -210,6 +223,42 @@ def test_collect_ablation_pairs_pairs_by_query_and_physician():
     assert p["query"] == "主诉甲" and p["physician"] == "叶天士"
     assert p["own_herbs"] == {"党参", "白术"}
     assert p["ablated_herbs"] == {"党参", "黄芪"}
+
+
+def test_collect_ablation_pairs_captures_refs_ids_scores_and_empty_flags():
+    """P0-8：逐条明细要看到检索到的医案 id/相似度，不能只有用药集合。"""
+    def consult_fn(query, **kwargs):
+        refs = {
+            False: [{"case_id": "ye_tianshi-001", "score": 0.82}],
+            True: [{"case_id": "ye_tianshi-002", "score": 0.65}],
+        }
+        return _fake_consult(
+            herbs_by_physician={"叶天士": ["党参"]},
+            refs_by_physician={"叶天士": refs[kwargs["use_react"]]},
+        )
+
+    pairs = re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    p = pairs[0]
+    assert p["own_refs_ids"] == ["ye_tianshi-001"]
+    assert p["own_refs_scores"] == [0.82]
+    assert p["ablated_refs_ids"] == ["ye_tianshi-002"]
+    assert p["own_refs_empty"] is False and p["ablated_refs_empty"] is False
+
+
+def test_collect_ablation_pairs_marks_empty_refs_on_both_sides():
+    def consult_fn(query, **kwargs):
+        return _fake_consult(
+            herbs_by_physician={"叶天士": []},
+            no_reference_by_physician={"叶天士": True},
+        )
+
+    pairs = re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    assert pairs[0]["own_refs_empty"] is True
+    assert pairs[0]["ablated_refs_empty"] is True
 
 
 def test_collect_ablation_pairs_skips_when_baseline_side_rejected():
@@ -353,6 +402,103 @@ def test_ablation_output_effect_missing_paired_epsilon_counted_separately():
     assert r["n_no_paired_epsilon"] == 1
     assert r["n_above_paired_epsilon"] == 0 and r["n_within_paired_epsilon"] == 0
     assert r["rate_above_paired_epsilon"] is None
+
+
+# ---------- P0-7/P0-8：n_empty_refs 排除 + per_pair 逐条明细 ----------
+
+
+def _pair(query="q1", physician="叶天士", own_herbs=None, ablated_herbs=None,
+          own_refs_empty=False, ablated_refs_empty=False,
+          own_refs_ids=None, own_refs_scores=None, ablated_refs_ids=None):
+    return {
+        "skipped": False, "query": query, "physician": physician,
+        "own_herbs": own_herbs or {"党参"}, "ablated_herbs": ablated_herbs or {"党参"},
+        "own_refs_empty": own_refs_empty, "ablated_refs_empty": ablated_refs_empty,
+        "own_refs_ids": own_refs_ids or [], "own_refs_scores": own_refs_scores or [],
+        "ablated_refs_ids": ablated_refs_ids or [],
+    }
+
+
+def test_ablation_output_effect_excludes_both_sides_empty_from_change_rate():
+    """own 和消融侧两边检索都为空的样本：两侧看到的输入完全一样，距离恒为 0，
+    混进分母会系统性拉低 change_rate（P0-7 报告的根因）——要从分母里剔除。"""
+    pairs = [
+        _pair(query="q1", own_herbs={"党参"}, ablated_herbs={"黄芪"}),  # 距离 1，有对照
+        _pair(query="q2", own_herbs=set(), ablated_herbs=set(),
+              own_refs_empty=True, ablated_refs_empty=True),  # 双侧空引用，距离 0（无意义）
+    ]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    assert r["n_usable"] == 2
+    assert r["n_empty_refs"] == 1
+    assert r["n_scored"] == 1
+    assert r["change_rate"] == pytest.approx(1.0)  # 只算 q1 那条，不被 q2 的 0 拉低
+
+
+def test_ablation_output_effect_only_one_side_empty_is_not_excluded():
+    """只有一侧检索为空（比如换了参考医案库之后，对方库里正好检索不到）
+    ——两侧输入不完全一样，是消融本身可能造成的真实差异，不能排除。"""
+    pairs = [_pair(own_herbs={"党参"}, ablated_herbs=set(),
+                   own_refs_empty=False, ablated_refs_empty=True)]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    assert r["n_empty_refs"] == 0
+    assert r["n_scored"] == 1
+
+
+def test_ablation_output_effect_all_usable_pairs_empty_refs_change_rate_is_none():
+    pairs = [_pair(own_herbs=set(), ablated_herbs=set(),
+                   own_refs_empty=True, ablated_refs_empty=True)]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    assert r["n_usable"] == 1
+    assert r["n_empty_refs"] == 1
+    assert r["n_scored"] == 0
+    assert r["change_rate"] is None
+    assert r["gate_pass"] is None
+
+
+def test_ablation_output_effect_per_pair_carries_refs_ids_and_scores():
+    pairs = [_pair(own_refs_ids=["ye_tianshi-001"], own_refs_scores=[0.82],
+                   ablated_refs_ids=["ye_tianshi-002"],
+                   own_herbs={"党参"}, ablated_herbs={"黄芪"})]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    assert len(r["per_pair"]) == 1
+    detail = r["per_pair"][0]
+    assert detail["own_refs_ids"] == ["ye_tianshi-001"]
+    assert detail["own_refs_scores"] == [0.82]
+    assert detail["ablated_refs_ids"] == ["ye_tianshi-002"]
+    assert detail["jaccard"] == pytest.approx(1.0)
+
+
+def test_ablation_output_effect_per_pair_verdict_empty_refs_excluded():
+    pairs = [_pair(own_herbs=set(), ablated_herbs=set(),
+                   own_refs_empty=True, ablated_refs_empty=True)]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    assert r["per_pair"][0]["verdict"] == "empty_refs_excluded"
+
+
+def test_ablation_output_effect_per_pair_verdict_above_and_within_epsilon():
+    pairs = [
+        _pair(query="q1", own_herbs={"党参", "白术"}, ablated_herbs={"党参", "黄芪"}),
+        _pair(query="q2", own_herbs={"党参", "白术"}, ablated_herbs={"党参", "黄芪"}),
+    ]
+    epsilon_detail = _epsilon_detail([
+        ("q1", "叶天士", 0.9),  # ε 比距离大 -> within_epsilon
+        ("q2", "叶天士", 0.1),  # ε 比距离小 -> above_epsilon
+    ])
+    r = re.ablation_output_effect(pairs, epsilon_detail, "swapped")
+    verdicts = {d["query"]: d["verdict"] for d in r["per_pair"]}
+    assert verdicts["q1"] == "within_epsilon"
+    assert verdicts["q2"] == "above_epsilon"
+
+
+def test_ablation_output_effect_backward_compatible_with_pairs_missing_refs_keys():
+    """老的 pairs（没有 own_refs_empty 等键，比如直接手写的测试字典）不该
+    KeyError——缺键按"没有信息"处理，不假装知道，也不影响 change_rate 计算。"""
+    pairs = [{"skipped": False, "query": "q1", "physician": "叶天士",
+              "own_herbs": {"党参"}, "ablated_herbs": {"黄芪"}}]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    assert r["n_empty_refs"] == 0
+    assert r["n_scored"] == 1
+    assert r["change_rate"] == pytest.approx(1.0)
 
 
 # ---------- E8：collect_retriever_mode_samples / retriever_mode_output_effect ----------

@@ -30,7 +30,7 @@ from core.followup import (
 )
 from core.physicians import PHYSICIANS
 from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
-from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
+from core.retrieval import adaptive_min_score, get_retriever
 from core.retrieval_hybrid import ALLOWED_MODES
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
 from core.safety_output import assess_formula_safety, format_blocking_issues
@@ -38,8 +38,9 @@ from core.schemas import (
     CaseRecord, FollowupResult, S1Normalize, S2Elements, S3Syndrome, S3SyndromeUnreferenced,
 )
 
-# MIN_RETRIEVAL_SCORE 挪到 core/retrieval.py 了（ReAct 的 search_cases 工具也要用同一个
-# 阈值，而 tools 不能反向 import chain）。这里 re-export，老调用方不受影响。
+# min_score 不再是 core/retrieval.py 写死的 MIN_RETRIEVAL_SCORE=0.70，改成
+# adaptive_min_score() 逐请求算（P0-7）。这个函数也挪在 core/retrieval.py：
+# ReAct 的 search_cases 工具也要用同一个函数，而 tools 不能反向 import chain。
 
 # offline/estimate_epsilon.py 的产物。模块级只放路径常量，不在 import 时读文件——
 # 惰性初始化的一贯做法，且这里没有单例可惰性化，每次 consult() 直接读（文件几 KB，
@@ -251,6 +252,11 @@ def _search_cases(
        给 hybrid 也传的话，默认的两路融合会变成三路，那是在没人要求的情况下
        改掉了默认检索行为，也就改掉了 E8 消融的对照基线。三路融合（K3b）目前
        从 consult 走不到，这一轮不顺手打开它，要开该是单独一轮、带对照数字地开。
+
+    min_score 不写死了（P0-7）：先用 adaptive_min_score() 探测这次 (query,
+    physician) 该用多严的阈值，再拿这个阈值做真正的检索——探测调用复用同一份
+    kwargs（跟真正调用完全一致的 mode/query_elements），不是额外传一个只有
+    探测才用的参数。
     """
     kwargs: dict = {}
     if retriever_mode is not None:
@@ -259,9 +265,9 @@ def _search_cases(
         kwargs["query_elements"] = [h.element for h in s2.elements]
 
     try:
-        return get_retriever().search(
-            query, physician, k=3, min_score=MIN_RETRIEVAL_SCORE, **kwargs
-        )
+        retriever = get_retriever()
+        min_score = adaptive_min_score(retriever, query, physician, **kwargs)
+        return retriever.search(query, physician, k=3, min_score=min_score, **kwargs)
     except (ValueError, FileNotFoundError) as e:
         # 只翻译、不吞：检索层照旧大声报错（K3b 的 graph 模式故意不静默降级），
         # 这里把它裹成 RetrievalUnavailable 交给 consult 转成一句人话，避免

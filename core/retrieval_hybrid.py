@@ -39,7 +39,7 @@ import os
 import threading
 from pathlib import Path
 
-from core.retrieval import DenseRetriever, CASES_PATH, _case_to_text
+from core.retrieval import DenseRetriever, CASES_PATH
 from core.retrieval_graph import ElementRetriever
 from core.schemas import CaseRecord
 
@@ -116,7 +116,11 @@ class HybridRetriever(DenseRetriever):
             from rank_bm25 import BM25Okapi
 
             self._ensure_jieba()
-            corpus = [self._tokenize(_case_to_text(c)) for c in self._cases]
+            # 复用 DenseRetriever.__init__ 已经算好、过滤过的 self._case_texts
+            # （P0-6），不重新调用 _case_to_text——两处各算一遍不仅重复，一旦
+            # 逻辑漂移还会让 BM25 语料和 dense 那一路对同一条医案编码出不同
+            # 文本，语义上应该是同一件事却分叉成两份实现。
+            corpus = [self._tokenize(t) for t in self._case_texts]
             self._bm25 = BM25Okapi(corpus)
 
     def _dense_ranking(

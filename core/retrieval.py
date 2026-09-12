@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -11,9 +12,30 @@ from core.schemas import CaseRecord
 CASES_PATH = Path(__file__).resolve().parent.parent / "cases.json"
 
 # 检索相似度下限。实测正常匹配在 0.85-0.90，低于 0.70 基本是"库里没有相关案子"，
-# 此时给空列表比塞三条不相关的更诚实。定义在这里而不是 chain.py：ReAct 的
-# search_cases 工具也要用同一个阈值，而 tools 不能反向 import chain（循环）。
+# 此时给空列表比塞三条不相关的更诚实。这是两位医家、839 条医案时校准的固定值，
+# 现在只用于 eval/run_eval.py 的 E8（检索模式对比）——那里比较的是"同一批
+# (query,physician) 在不同 RETRIEVER_MODE 下 top-1 是否够可信"，McNemar 检验
+# 要求两个待比较分支套用同一条判据，阈值本身不能随分支变化；跟下面
+# adaptive_min_score() 回答的不是同一个问题（那个是"这一次真实检索该筛掉
+# 哪些结果"，是个逐请求的操作性阈值，不是评测用的固定判据）——两处都叫
+# "阈值"但职责不同，故意没有合并成一个（CLAUDE.md「同一概念的匹配逻辑只能
+# 有一处实现」的例外条款：不是同一个问题）。真实检索路径（_search_cases、
+# ReAct 的 search_cases 工具）已经从这个固定值改成 adaptive_min_score()，
+# 见 P0-7。
 MIN_RETRIEVAL_SCORE = 0.70
+
+# P0-7：三位医家加入张锡纯（87 条、大量方论体）后，MIN_RETRIEVAL_SCORE=0.70
+# 这个写死的阈值对医案少/覆盖窄的医家经常把结果全部卡空（真实出现过"叶天士
+# 未检索到相关医案"）。ADAPTIVE_MIN_SCORE_FLOOR 是新阈值的下限——不管这次
+# 探测出来的 p25 多低，都不能低于这个值，否则退化成"什么都收"。
+ADAPTIVE_MIN_SCORE_FLOOR = 0.60
+ADAPTIVE_MIN_SCORE_PROBE_K = 10
+ADAPTIVE_MIN_SCORE_PERCENTILE = 25
+
+# P0-6：编码进检索向量/BM25 语料的原文摘录长度。跟 core.chain.
+# CASE_EXCERPT_TRUNCATE_CHARS（300，喂给 S3 prompt 给模型读）是两个不同长度
+# ——这里只是给向量化定位语义用，不需要那么多上下文，更短的窗口足够。
+CASE_TO_TEXT_EXCERPT_CHARS = 200
 
 
 class Retriever(ABC):
@@ -27,22 +49,102 @@ class Retriever(ABC):
         raise NotImplementedError
 
 
-def _case_to_text(case: CaseRecord) -> str:
-    """把结构化医案编码成一段紧凑文本用于向量化。
+def _case_to_text(case: CaseRecord) -> str | None:
+    """把结构化医案编码成一段紧凑文本用于向量化。返回 None 表示这条医案没有
+    任何可编码的内容（无 symptoms 也无 raw_excerpt），调用方应该跳过、不建
+    索引，不能编码成占位文字硬凑一条。
+
+    P0-6 根因：约一半复诊记录的原文只是"加减了什么药"（如"加∶葶苈(一钱五分)
+    二帖"），没有症状描述——旧实现对这类医案编码出"（无记录症状）。舌未记，
+    脉未记"，所有这类医案的向量几乎完全相同，对任何主诉的相似度也一样，
+    是纯噪声：检索命中它们时 own/swapped 两侧看到的都是同一批噪声，
+    change_rate 当然还是低（这跟 P0-1~P0-4 修的"喂给模型看的内容"是两回事
+    ——那边修的是 prompt 展示，这里修的是检索本身用什么信号排序，检索排序
+    错了，展示层修得再好也没用：检索到的本来就是不该被检索到的医案）。
+
+    有 symptoms 时：症状+舌+脉 之后拼上 raw_excerpt 前
+    CASE_TO_TEXT_EXCERPT_CHARS 字，比原来多一路真实原文信号，不是替换掉
+    结构化字段（结构化字段是人工整理过的，仍有信息量，两者互补）。
+    symptoms 为空但有 raw_excerpt 时：只用 raw_excerpt，不再拼"（无记录
+    症状）"这种占位文字——那正是让向量塌缩到同一点的元凶。
 
     复诊段要跟初诊区分开：复诊原文常只写"服药后如何"，症状极简
     （"肿胀未除""汗至眉上"），如果和初诊平等编码，检索时会大量命中
     这些碎片——实测吴鞠通的 top-3 曾全是第 6/11 诊，一条初诊都没有。
     把治疗反应拼进文本，让复诊段的向量落在"疗效描述"而不是"主诉"附近。
+    这条框架只在有 symptoms 时套用——symptoms 为空的复诊段直接退化成
+    "只用 raw_excerpt"分支，不再叠加"现症：（无记录症状）"这种空壳。
     """
-    symptoms = "；".join(case.symptoms) if case.symptoms else "（无记录症状）"
+    excerpt = (case.raw_excerpt or "")[:CASE_TO_TEXT_EXCERPT_CHARS]
+    if not case.symptoms:
+        return excerpt or None
+
     tongue = case.tongue or "未记"
     pulse = case.pulse or "未记"
-    base = f"{symptoms}。舌{tongue}，脉{pulse}"
+    base = f"{'；'.join(case.symptoms)}。舌{tongue}，脉{pulse}"
     if case.visit_index and case.visit_index > 0:
         resp = case.response_to_prior or "（未记疗效）"
-        return f"复诊第{case.visit_index + 1}诊。前次治疗后：{resp}。现症：{base}"
+        base = f"复诊第{case.visit_index + 1}诊。前次治疗后：{resp}。现症：{base}"
+    if excerpt:
+        base = f"{base}。原文：{excerpt}"
     return base
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    """线性插值百分位数（等价于 numpy.percentile 默认的 'linear' 方法）。
+    这里的输入规模是个位数到十位数（top-10 探测），不为这么小的数据引入
+    numpy 依赖——DenseRetriever._load 里的 numpy 用法是给几百条医案批量
+    编码用的，跟这里"给十个数排个百分位"是两件事，不共用。"""
+    if not sorted_values:
+        raise ValueError("空列表没有百分位数")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = (pct / 100) * (len(sorted_values) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = rank - lo
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac
+
+
+def adaptive_min_score(
+    retriever: Retriever, query: str, physician: str, **search_kwargs
+) -> float:
+    """P0-7：给这次 (query, physician) 检索算一个自适应的 min_score，取代写死
+    的 MIN_RETRIEVAL_SCORE。全项目只在这里实现一次——core.chain._search_cases
+    和 core.tools.search_cases 工具都调这一个函数，不各自算一遍（CLAUDE.md
+    「同一概念的匹配逻辑只能有一处实现」）。
+
+    取该医家这次查询的原始相似度 top-10（min_score=0.0 探测，不过滤），
+    算这 top-10 的第 25 百分位，跟 ADAPTIVE_MIN_SCORE_FLOOR 取较大值——
+    医案少/覆盖窄的医家，top-10 本身就够不上多高的相似度，p25 自然走低，
+    阈值随之放宽；医案多、覆盖广的医家能挤出更高的 top-10，阈值保持接近
+    原来的 0.70，不放松。
+
+    只通过 Retriever.search() 这一个抽象接口方法探测，不要求具体实现额外
+    暴露内部排名方法——测试用的 FakeRetriever、将来别的检索后端都不用为
+    这个功能改 search() 之外的任何东西。**search_kwargs 原样转给探测调用
+    （比如 retriever_mode 对应的 mode 关键字），跟 core/chain.py::
+    _search_cases「不传 mode 就不加这个关键字」的规则保持一致——这里只是
+    转发，不新增判断，也不强制探测用某个特定 mode。
+
+    这个阈值只对 dense/graph 这类 [0,1] 有界相似度的过滤有实际效果——跟
+    MIN_RETRIEVAL_SCORE 本身的适用范围一样（core/retrieval_hybrid.py 模块
+    文档字符串）。hybrid 模式下 min_score=0.0 探测时，dense 那一路的原始
+    相似度覆盖了返回结果的全部展示分（没有任何结果被 min_score 过滤掉，
+    "没有真实稠密相似度可展示才回退到 0.0"那条规则不会触发），所以探测到
+    的分数就是真实的 dense 相似度，跟"该医家 top-10 相似度"这个要求是
+    同一件事；bm25/graph 模式下游本来就不拿 min_score 做过滤（HybridRetriever
+    .search() 的对应分支根本不读这个参数），探测出来的值不会被用到，
+    不需要为这两种模式特判。
+    """
+    probe = retriever.search(
+        query, physician, k=ADAPTIVE_MIN_SCORE_PROBE_K, min_score=0.0, **search_kwargs
+    )
+    if not probe:
+        return ADAPTIVE_MIN_SCORE_FLOOR
+    scores = sorted(score for _, score in probe)
+    p25 = _percentile(scores, ADAPTIVE_MIN_SCORE_PERCENTILE)
+    return max(ADAPTIVE_MIN_SCORE_FLOOR, p25)
 
 
 class DenseRetriever(Retriever):
@@ -57,7 +159,32 @@ class DenseRetriever(Retriever):
             )
         with cases_path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
-        self._cases: list[CaseRecord] = [CaseRecord.model_validate(r) for r in raw]
+
+        # P0-6：既无 symptoms 也无 raw_excerpt 的医案编码不出任何有意义的文本
+        # （_case_to_text 返回 None），不能勉强塞进索引——那样它在向量空间里
+        # 落点是未定义的（旧实现会落在"（无记录症状）"这个人工占位点，跟其他
+        # 同样没内容的医案完全重合，变成检索噪声）。这里在构造时一次性过滤、
+        # 一次性把 _case_to_text 的结果缓存进 self._case_texts，_load()/BM25
+        # 语料构建都复用这份缓存，不重复调用 _case_to_text。
+        self._cases: list[CaseRecord] = []
+        self._case_texts: list[str] = []
+        self.skipped_no_content_ids: list[str] = []
+        for r in raw:
+            case = CaseRecord.model_validate(r)
+            text = _case_to_text(case)
+            if text is None:
+                self.skipped_no_content_ids.append(case.case_id)
+                continue
+            self._cases.append(case)
+            self._case_texts.append(text)
+        if self.skipped_no_content_ids:
+            print(
+                f"[retrieval] {len(self.skipped_no_content_ids)} 条医案既无 symptoms "
+                f"也无 raw_excerpt，编码不出任何文本，已从检索索引跳过（不影响 cases.json "
+                f"本身，只影响能否被检索到）：{self.skipped_no_content_ids[:10]}"
+                + ("……" if len(self.skipped_no_content_ids) > 10 else ""),
+                file=sys.stderr,
+            )
 
         self._model = None  # 惰性加载，避免 import 阶段就下载/加载模型
         self._embeddings = None  # 惰性编码，随 _model 一起初始化
@@ -88,8 +215,12 @@ class DenseRetriever(Retriever):
         # _ensure_encoded 的锁外快路径只认 _embeddings，它最后一个写入，
         # 别的线程看到它非 None 时 _model 一定已经就位。
         model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-        texts = [_case_to_text(c) for c in self._cases]
-        embeddings = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        # 复用 __init__ 里已经算好、过滤过的 self._case_texts，不重新调用
+        # _case_to_text——两处算出不一致的文本会让 self._cases 和 self._embeddings
+        # 的下标错位（P0-6 引入的过滤逻辑只在 __init__ 跑一次，这里必须认它）。
+        embeddings = model.encode(
+            self._case_texts, normalize_embeddings=True, convert_to_numpy=True
+        )
         self._model = model
         self._embeddings = embeddings
 

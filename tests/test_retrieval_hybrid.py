@@ -177,6 +177,44 @@ def test_bm25_ranking_has_no_min_score_parameter():
     assert "min_score" not in sig.parameters
 
 
+# ---------- P0-6：BM25 语料复用 DenseRetriever 过滤/编码过的 _case_texts ----------
+
+
+def test_bm25_ranking_matches_on_raw_excerpt_content(tmp_path):
+    """BM25 语料现在是 self._case_texts（含 raw_excerpt），不是重新调用
+    _case_to_text——这里验证的是"raw_excerpt 里的关键词真的能被 BM25 检索到"，
+    不是内部实现走了哪条路径。"""
+    cases = [
+        CaseRecord(case_id="thin", case_group_id="thin", physician="ye_tianshi",
+                   raw="原文", symptoms=[], raw_excerpt="六两，加葶苈子二帖。"),
+        *_filler_cases(),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+
+    ranking = retriever._bm25_ranking("葶苈子", idxs=[0, 1, 2])
+    assert ranking[0][0] == 0  # 只有 raw_excerpt 里含"葶苈子"的那条排第一
+
+
+def test_no_content_case_is_excluded_from_bm25_corpus_and_indices_stay_aligned(tmp_path):
+    """没有 symptoms 也没有 raw_excerpt 的医案在 DenseRetriever.__init__ 就被
+    跳过（P0-6），不会进 self._cases——这里验证跳过之后 BM25 语料的下标仍然
+    跟 self._cases 对齐，不会因为跳过了中间一条而错位。"""
+    cases = [
+        _case("keep1", "ye_tianshi", ["纳差乏力"]),
+        CaseRecord(case_id="skip", case_group_id="skip", physician="ye_tianshi",
+                   raw="原文", symptoms=[], raw_excerpt=None),
+        _case("keep2", "ye_tianshi", ["噎膈反胃"]),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+
+    assert [c.case_id for c in retriever._cases] == ["keep1", "keep2"]
+    assert retriever.skipped_no_content_ids == ["skip"]
+    ranking = retriever._bm25_ranking("噎膈反胃", idxs=[0, 1])
+    assert dict(ranking).keys() == {0, 1}  # 下标只到 1（两条医案），没有越界
+
+
 # ---------- search()：三种 mode 的调度 ----------
 
 

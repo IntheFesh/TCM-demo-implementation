@@ -29,15 +29,18 @@ def _setup(monkeypatch, physicians=("ye_tianshi", "wu_jutong")):
 
 
 def test_own_mode_is_the_default_and_searches_each_physicians_own_corpus(monkeypatch):
+    """用 set 而不是排序列表比较：P0-7 之后每位医家会调两次 search()
+    （adaptive_min_score 探测一次 + 真正查询一次），这里测的是"own 模式检索
+    的是每位医家自己的库"，跟检索层内部调几次 search() 是两件事，不该混着断言。"""
     r, _ = _setup(monkeypatch)
     chain.consult("纳差乏力")
-    assert sorted(c["physician"] for c in r.calls) == ["wu_jutong", "ye_tianshi"]
+    assert {c["physician"] for c in r.calls} == {"wu_jutong", "ye_tianshi"}
 
 
 def test_own_mode_explicit_matches_default(monkeypatch):
     r, _ = _setup(monkeypatch)
     chain.consult("纳差乏力", refs_mode="own")
-    assert sorted(c["physician"] for c in r.calls) == ["wu_jutong", "ye_tianshi"]
+    assert {c["physician"] for c in r.calls} == {"wu_jutong", "ye_tianshi"}
 
 
 # ---------- swapped ----------
@@ -51,7 +54,8 @@ def test_swapped_mode_searches_the_other_physicians_corpus(monkeypatch):
     called_physicians = {c["physician"] for c in r.calls}
     # 两次调用打到的都是"对方"的库，而不是自己的库
     assert called_physicians == {"wu_jutong", "ye_tianshi"}
-    assert len(r.calls) == 2
+    # 每位医家两次（P0-7：adaptive_min_score 探测一次 + 真正查询一次）
+    assert len(r.calls) == 4
 
 
 def test_swap_physician_id_cycles_through_registry_order(monkeypatch):

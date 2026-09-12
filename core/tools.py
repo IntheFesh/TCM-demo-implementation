@@ -375,16 +375,18 @@ class SearchCasesInput(BaseModel):
 
 
 def search_cases(query: str, physician: str, k: int = 3) -> dict:
-    from core.retrieval import MIN_RETRIEVAL_SCORE, get_retriever
+    from core.retrieval import adaptive_min_score, get_retriever
 
     try:
         retriever = get_retriever()
     except FileNotFoundError as e:
         return {"available": False, "cases": [], "note": str(e)}
 
-    # 跟 run_physician 用同一个相似度下限：这里不设的话，模型会拿到几条相似度 0.3
-    # 的不相关医案并被鼓励去引用它们。
-    hits = retriever.search(query, physician, k=k, min_score=MIN_RETRIEVAL_SCORE)
+    # 跟 run_physician（core/chain.py::_search_cases）用同一个阈值算法（P0-7：
+    # adaptive_min_score，不再是写死的 MIN_RETRIEVAL_SCORE）——这里不设的话，
+    # 模型会拿到几条相似度很低的不相关医案并被鼓励去引用它们。
+    min_score = adaptive_min_score(retriever, query, physician)
+    hits = retriever.search(query, physician, k=k, min_score=min_score)
     return {
         "available": True,
         "cases": [

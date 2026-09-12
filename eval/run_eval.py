@@ -286,10 +286,26 @@ def _herb_pairs_from_outcomes(query: str, baseline: dict, ablated: dict) -> list
     for physician in baseline_by_physician:
         if physician not in ablated_by_physician:
             continue
+        own = baseline_by_physician[physician]
+        ablated_r = ablated_by_physician[physician]
         pairs.append({
             "query": query, "skipped": False, "physician": physician,
-            "own_herbs": normalized_herb_set(baseline_by_physician[physician]["s3"].herbs),
-            "ablated_herbs": normalized_herb_set(ablated_by_physician[physician]["s3"].herbs),
+            "own_herbs": normalized_herb_set(own["s3"].herbs),
+            "ablated_herbs": normalized_herb_set(ablated_r["s3"].herbs),
+            # P0-8：逐条明细要看到检索到的医案 id/相似度，不能只有用药集合——
+            # own_refs_scores 尤其关键，改变率低时要能分清是"检索质量不够"
+            # 还是"prompt 没利用好检索结果"。.get() 兜底是因为一部分老测试
+            # 用的假 outcome 字典没有这两个键（不是真实 run_physician() 的产出，
+            # 缺了不代表真的没有 refs），不能因为缺键就 KeyError。
+            "own_refs_ids": [r["case_id"] for r in own.get("refs") or []],
+            "own_refs_scores": [r["score"] for r in own.get("refs") or []],
+            "ablated_refs_ids": [r["case_id"] for r in ablated_r.get("refs") or []],
+            # P0-7：own 和消融侧两边检索都为空时，两侧看到的输入实际上完全
+            # 一样（都走 S3SyndromeUnreferenced），改变率天然是 0——这不是
+            # "开关没有效果"，是这条样本压根没有产生对照，ablation_output_effect
+            # 要单独识别、排除出 change_rate 的分母。
+            "own_refs_empty": bool(own.get("no_reference_cases")),
+            "ablated_refs_empty": bool(ablated_r.get("no_reference_cases")),
         })
     return pairs
 
@@ -372,6 +388,21 @@ def ablation_output_effect(
     均值，逐对比较：距离 > 配对 ε 才算"超出噪声地板的真实差异"；
     epsilon.json 没跑过、或这条主诉/医家组合查不到配对 ε 的样本单独计数，
     不悄悄并进"真实差异"或"噪声"任何一边——那样会让这两个分母失真。
+
+    P0-7 补充：own 和消融侧两边检索都为空的样本（比如医家覆盖窄，这条主诉
+    在他库里连一条过线的参考医案都没有），两侧看到的输入实际上完全一样
+    （都走 S3SyndromeUnreferenced），改变率天然是 0——这不是"这个开关没有
+    效果"，是这条样本压根没有产生对照，混进 change_rate 的分母会系统性把
+    整体数字拉低。这类样本单独计数（n_empty_refs），从算 change_rate 的
+    分母（n_scored）里剔除，但仍然出现在 per_pair 里
+    （verdict="empty_refs_excluded"），不是悄悄消失——CLAUDE.md「任何数字
+    都必须带对照」：被排除的样本本身也要留下痕迹，不能只报排除后的数字。
+
+    P0-8：per_pair 是逐条 (主诉,医家) 明细。汇总的 change_rate 一个数字
+    看不出重跑不过时该往哪查——per_pair 里的 own_refs_scores 尤其关键：
+    如果 top-3 全是刚过 0.6-0.7 这种勉强线的分数，说明改变率低的根因是
+    检索质量不够（该查 P0-7 的阈值/P0-6 的编码），不是 prompt 没利用好
+    检索结果（该查 P0-1~P0-4）。
     """
     usable = [p for p in pairs if not p.get("skipped")]
     n_total = len(pairs)
@@ -379,13 +410,11 @@ def ablation_output_effect(
     if not usable:
         return {
             "label": label, "n_total": n_total, "n_usable": 0,
+            "n_empty_refs": 0, "n_scored": 0,
             "change_rate": None, "gate_threshold": GATE_OUTPUT_CHANGE_RATE,
-            "gate_pass": None,
+            "gate_pass": None, "per_pair": [],
             "note": f"{label}：没有可用样本（全部被安全否决/信息不足跳过）。",
         }
-
-    distances = [jaccard_distance(p["own_herbs"], p["ablated_herbs"]) for p in usable]
-    change_rate = round(sum(distances) / len(distances), 4)
 
     epsilon_lookup: dict[tuple[str, str], float] = {}
     for q_record in (epsilon_online_detail or {}).get("per_query", []):
@@ -395,21 +424,63 @@ def ablation_output_effect(
             if stats and stats.get("mean") is not None:
                 epsilon_lookup[(q_record["query"], physician)] = stats["mean"]
 
-    n_above, n_within, n_no_epsilon = 0, 0, 0
-    for p, d in zip(usable, distances):
+    per_pair = []
+    scored: list[tuple[float, float | None]] = []  # (distance, epsilon)，双侧空引用的样本不进这里
+    n_empty_refs = 0
+    for p in usable:
+        distance = jaccard_distance(p["own_herbs"], p["ablated_herbs"])
         eps = epsilon_lookup.get((p["query"], p["physician"]))
-        if eps is None:
-            n_no_epsilon += 1
-        elif d > eps:
-            n_above += 1
+        both_empty = bool(p.get("own_refs_empty")) and bool(p.get("ablated_refs_empty"))
+        if both_empty:
+            n_empty_refs += 1
+            verdict = "empty_refs_excluded"
+        elif eps is None:
+            verdict = "no_epsilon_data"
+        elif distance > eps:
+            verdict = "above_epsilon"
         else:
-            n_within += 1
+            verdict = "within_epsilon"
+        per_pair.append({
+            "query": p["query"], "physician": p["physician"],
+            "own_refs_ids": p.get("own_refs_ids", []),
+            "own_refs_scores": p.get("own_refs_scores", []),
+            "ablated_refs_ids": p.get("ablated_refs_ids", []),
+            "own_herbs": sorted(p["own_herbs"]),
+            "ablated_herbs": sorted(p["ablated_herbs"]),
+            "jaccard": round(distance, 4),
+            "epsilon": eps,
+            "verdict": verdict,
+        })
+        if not both_empty:
+            scored.append((distance, eps))
+
+    n_scored = len(scored)
+    change_rate = round(sum(d for d, _ in scored) / n_scored, 4) if n_scored else None
+
+    n_above = sum(1 for d, eps in scored if eps is not None and d > eps)
+    n_within = sum(1 for d, eps in scored if eps is not None and d <= eps)
+    n_no_epsilon = sum(1 for _, eps in scored if eps is None)
     n_paired = n_above + n_within
 
-    gate_pass = change_rate >= GATE_OUTPUT_CHANGE_RATE
+    # change_rate 是 None（可用样本两侧检索全为空）时闸门本身无法判定——
+    # 不能用 `change_rate is not None and ...` 简写，那样 None 会短路成
+    # False，跟"跑了、但没通过"混在一起，跟上面"没有可用样本"分支里
+    # gate_pass=None 的语义不一致。
+    gate_pass = None if change_rate is None else change_rate >= GATE_OUTPUT_CHANGE_RATE
+    empty_clause = (
+        f"，其中 {n_empty_refs} 条两侧检索都为空（无参考医案可对照，改变率天然为 0），"
+        "已从 change_rate 分母剔除" if n_empty_refs else ""
+    )
+    change_rate_clause = (
+        f"{n_scored} 条计入 change_rate，用药 Jaccard 距离均值（改变率）={change_rate}，"
+        f"闸门 ≥{GATE_OUTPUT_CHANGE_RATE}（{'通过' if gate_pass else '未通过'}）"
+        if change_rate is not None
+        else "计入 change_rate 的样本为 0（可用样本两侧检索全为空），无法判定闸门"
+    )
     return {
         "label": label,
         "n_total": n_total, "n_usable": n_usable,
+        "n_empty_refs": n_empty_refs, "n_scored": n_scored,
         "change_rate": change_rate,
         "gate_threshold": GATE_OUTPUT_CHANGE_RATE,
         "gate_pass": gate_pass,
@@ -417,10 +488,10 @@ def ablation_output_effect(
         "n_within_paired_epsilon": n_within,
         "n_no_paired_epsilon": n_no_epsilon,
         "rate_above_paired_epsilon": round(n_above / n_paired, 3) if n_paired else None,
+        "per_pair": per_pair,
         "note": (
-            f"{label}：{n_usable}/{n_total} 条(主诉,医家)样本可用，"
-            f"用药 Jaccard 距离均值（改变率）={change_rate}，"
-            f"闸门 ≥{GATE_OUTPUT_CHANGE_RATE}（{'通过' if gate_pass else '未通过'}）。"
+            f"{label}：{n_usable}/{n_total} 条(主诉,医家)样本可用{empty_clause}。"
+            f"{change_rate_clause}。"
             "按主诉+医家配对跟噪声地板逐条比较（不是减一个全局 ε）："
             + (f"{n_above}/{n_paired} 条超出各自的噪声地板、算真实差异，"
                f"{n_within}/{n_paired} 条落在噪声地板以内、不算真实差异"
