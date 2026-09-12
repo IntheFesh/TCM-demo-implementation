@@ -171,7 +171,8 @@ def test_retrieval_mode_comparison_identical_modes_zero_discordant():
     assert r["n_top1_differs"] == 0
 
 
-# ---------- collect_refs_mode_pair / reference_case_effect（E3/E4）----------
+# ---------- 消融通用机制：collect_ablation_pairs / collect_refs_mode_pairs /
+#             ablation_output_effect（E3/E4/E9 共用）----------
 
 
 def _fake_consult(rejected=False, insufficient=False, herbs_by_physician=None):
@@ -180,55 +181,6 @@ def _fake_consult(rejected=False, insufficient=False, herbs_by_physician=None):
         for p, herbs in (herbs_by_physician or {}).items()
     ]
     return {"rejected": rejected, "insufficient": insufficient, "results": results}
-
-
-def test_collect_refs_mode_pair_pairs_by_query_and_physician():
-    calls = []
-
-    def consult_fn(query, refs_mode):
-        calls.append((query, refs_mode))
-        herbs = {"own": {"叶天士": ["党参", "白术"]}, "swapped": {"叶天士": ["党参", "黄芪"]}}
-        return _fake_consult(herbs_by_physician=herbs[refs_mode])
-
-    pairs = re.collect_refs_mode_pair(["主诉甲"], "swapped", consult_fn=consult_fn)
-    assert calls == [("主诉甲", "own"), ("主诉甲", "swapped")]
-    assert len(pairs) == 1
-    p = pairs[0]
-    assert p["skipped"] is False
-    assert p["query"] == "主诉甲" and p["physician"] == "叶天士"
-    assert p["own_herbs"] == {"党参", "白术"}
-    assert p["ablated_herbs"] == {"党参", "黄芪"}
-
-
-def test_collect_refs_mode_pair_skips_when_own_side_rejected():
-    def consult_fn(query, refs_mode):
-        if refs_mode == "own":
-            return _fake_consult(rejected=True)
-        return _fake_consult(herbs_by_physician={"叶天士": ["党参"]})
-
-    pairs = re.collect_refs_mode_pair(["主诉甲"], "swapped", consult_fn=consult_fn)
-    assert pairs == [{"query": "主诉甲", "skipped": True,
-                       "reason": "own 或 ablated 侧被安全否决/信息不足，无法配对比较"}]
-
-
-def test_collect_refs_mode_pair_skips_when_ablated_side_insufficient():
-    def consult_fn(query, refs_mode):
-        if refs_mode == "none":
-            return _fake_consult(insufficient=True)
-        return _fake_consult(herbs_by_physician={"叶天士": ["党参"]})
-
-    pairs = re.collect_refs_mode_pair(["主诉甲"], "none", consult_fn=consult_fn)
-    assert pairs[0]["skipped"] is True
-
-
-def test_collect_refs_mode_pair_only_keeps_physicians_present_on_both_sides():
-    def consult_fn(query, refs_mode):
-        if refs_mode == "own":
-            return _fake_consult(herbs_by_physician={"叶天士": ["党参"], "吴鞠通": ["黄芪"]})
-        return _fake_consult(herbs_by_physician={"叶天士": ["党参"]})  # 吴鞠通这次没有结果
-
-    pairs = re.collect_refs_mode_pair(["主诉甲"], "swapped", consult_fn=consult_fn)
-    assert [p["physician"] for p in pairs] == ["叶天士"]
 
 
 def _epsilon_detail(entries):
@@ -240,51 +192,144 @@ def _epsilon_detail(entries):
     return {"per_query": list(per_query.values())}
 
 
-def test_reference_case_effect_change_rate_is_mean_jaccard_distance():
+def test_collect_ablation_pairs_pairs_by_query_and_physician():
+    calls = []
+
+    def consult_fn(query, **kwargs):
+        calls.append((query, kwargs.get("use_react")))
+        herbs = {False: {"叶天士": ["党参", "白术"]}, True: {"叶天士": ["党参", "黄芪"]}}
+        return _fake_consult(herbs_by_physician=herbs[kwargs["use_react"]])
+
+    pairs = re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    assert calls == [("主诉甲", False), ("主诉甲", True)]
+    assert len(pairs) == 1
+    p = pairs[0]
+    assert p["skipped"] is False
+    assert p["query"] == "主诉甲" and p["physician"] == "叶天士"
+    assert p["own_herbs"] == {"党参", "白术"}
+    assert p["ablated_herbs"] == {"党参", "黄芪"}
+
+
+def test_collect_ablation_pairs_skips_when_baseline_side_rejected():
+    def consult_fn(query, **kwargs):
+        if not kwargs["use_react"]:
+            return _fake_consult(rejected=True)
+        return _fake_consult(herbs_by_physician={"叶天士": ["党参"]})
+
+    pairs = re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    assert pairs == [{"query": "主诉甲", "skipped": True,
+                       "reason": "基线或消融侧被安全否决/信息不足，无法配对比较"}]
+
+
+def test_collect_ablation_pairs_skips_when_ablated_side_insufficient():
+    def consult_fn(query, **kwargs):
+        if kwargs["use_react"]:
+            return _fake_consult(insufficient=True)
+        return _fake_consult(herbs_by_physician={"叶天士": ["党参"]})
+
+    pairs = re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    assert pairs[0]["skipped"] is True
+
+
+def test_collect_ablation_pairs_only_keeps_physicians_present_on_both_sides():
+    def consult_fn(query, **kwargs):
+        if not kwargs["use_react"]:
+            return _fake_consult(herbs_by_physician={"叶天士": ["党参"], "吴鞠通": ["黄芪"]})
+        return _fake_consult(herbs_by_physician={"叶天士": ["党参"]})  # 吴鞠通这次没有结果
+
+    pairs = re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    assert [p["physician"] for p in pairs] == ["叶天士"]
+
+
+def test_collect_ablation_pairs_isolating_defaults_can_be_overridden():
+    """baseline_kwargs/ablated_kwargs 里显式传的 use_react 要覆盖隔离默认值
+    ——E9 消融的就是这个开关本身。"""
+    seen_use_react = []
+
+    def consult_fn(query, **kwargs):
+        seen_use_react.append(kwargs["use_react"])
+        return _fake_consult(herbs_by_physician={"叶天士": ["党参"]})
+
+    re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    assert seen_use_react == [False, True]
+
+
+def test_collect_refs_mode_pairs_shares_own_across_modes():
+    """E3+E4 一起跑时 own 只应该被调用一次每条主诉，不是每个 ablated_mode
+    各调用一次——这是它跟 collect_ablation_pairs 分开存在的唯一理由。"""
+    calls = []
+
+    def consult_fn(query, **kwargs):
+        calls.append(kwargs["refs_mode"])
+        herbs = {
+            "own": {"叶天士": ["党参"]},
+            "swapped": {"叶天士": ["黄芪"]},
+            "none": {"叶天士": []},
+        }
+        return _fake_consult(herbs_by_physician=herbs[kwargs["refs_mode"]])
+
+    pairs_by_mode = re.collect_refs_mode_pairs(["主诉甲"], ["swapped", "none"], consult_fn=consult_fn)
+    assert calls.count("own") == 1
+    assert calls.count("swapped") == 1 and calls.count("none") == 1
+    assert pairs_by_mode["swapped"][0]["ablated_herbs"] == {"黄芪"}
+    assert pairs_by_mode["none"][0]["ablated_herbs"] == set()
+
+
+def test_ablation_output_effect_change_rate_is_mean_jaccard_distance():
     pairs = [
         {"skipped": False, "query": "q1", "physician": "叶天士",
          "own_herbs": {"党参", "白术"}, "ablated_herbs": {"党参", "白术"}},  # 距离 0
         {"skipped": False, "query": "q2", "physician": "叶天士",
          "own_herbs": {"党参"}, "ablated_herbs": {"黄芪"}},  # 距离 1（毫无重叠）
     ]
-    r = re.reference_case_effect(pairs, epsilon_online_detail=None, ablated_mode="swapped")
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
     assert r["change_rate"] == pytest.approx(0.5)
     assert r["n_usable"] == 2 and r["n_total"] == 2
+    assert r["label"] == "swapped"
 
 
-def test_reference_case_effect_gate_threshold():
+def test_ablation_output_effect_gate_threshold():
     high = [{"skipped": False, "query": "q1", "physician": "叶天士",
              "own_herbs": {"党参"}, "ablated_herbs": {"黄芪"}}]  # 距离 1.0
     low = [{"skipped": False, "query": "q1", "physician": "叶天士",
             "own_herbs": {"党参", "白术"}, "ablated_herbs": {"党参", "白术", "黄芪"}}]  # 距离 1/3
-    assert re.reference_case_effect(high, None, "swapped")["gate_pass"] is True
-    assert re.reference_case_effect(low, None, "swapped")["gate_pass"] is False
+    assert re.ablation_output_effect(high, None, "swapped")["gate_pass"] is True
+    assert re.ablation_output_effect(low, None, "swapped")["gate_pass"] is False
 
 
-def test_reference_case_effect_skips_skipped_pairs_from_denominator():
+def test_ablation_output_effect_skips_skipped_pairs_from_denominator():
     pairs = [
         {"skipped": True, "query": "q1", "reason": "x"},
         {"skipped": False, "query": "q2", "physician": "叶天士",
          "own_herbs": {"党参"}, "ablated_herbs": {"党参"}},
     ]
-    r = re.reference_case_effect(pairs, None, "swapped")
+    r = re.ablation_output_effect(pairs, None, "swapped")
     assert r["n_total"] == 2 and r["n_usable"] == 1
 
 
-def test_reference_case_effect_no_usable_pairs_returns_none_change_rate():
-    r = re.reference_case_effect(
+def test_ablation_output_effect_no_usable_pairs_returns_none_change_rate():
+    r = re.ablation_output_effect(
         [{"skipped": True, "query": "q1", "reason": "x"}], None, "swapped"
     )
     assert r["change_rate"] is None and r["gate_pass"] is None
 
 
-def test_reference_case_effect_pairs_epsilon_by_query_and_physician_not_global():
+def test_ablation_output_effect_pairs_epsilon_by_query_and_physician_not_global():
     """核心行为：ε 必须按 (query, physician) 找配对值，不能用全局 ε 做减法——
-    这里两条样本的原始距离一样（都是 0.5），但配对 ε 不同，一条该判真实差异，
-    另一条不该。"""
+    这里两条样本的原始距离一样，但配对 ε 不同，一条该判真实差异，另一条不该。"""
     pairs = [
         {"skipped": False, "query": "q1", "physician": "叶天士",
-         "own_herbs": {"党参", "白术"}, "ablated_herbs": {"党参", "黄芪"}},  # 距离 1/3... 用更干净的例子
+         "own_herbs": {"党参", "白术"}, "ablated_herbs": {"党参", "黄芪"}},
         {"skipped": False, "query": "q2", "physician": "叶天士",
          "own_herbs": {"党参", "白术"}, "ablated_herbs": {"党参", "黄芪"}},
     ]
@@ -293,21 +338,204 @@ def test_reference_case_effect_pairs_epsilon_by_query_and_physician_not_global()
         ("q1", "叶天士", 0.9),   # ε 比距离大 -> 不算真实差异
         ("q2", "叶天士", 0.1),   # ε 比距离小 -> 算真实差异
     ])
-    r = re.reference_case_effect(pairs, epsilon_detail, "swapped")
+    r = re.ablation_output_effect(pairs, epsilon_detail, "swapped")
     assert r["n_above_paired_epsilon"] == 1
     assert r["n_within_paired_epsilon"] == 1
     assert r["n_no_paired_epsilon"] == 0
 
 
-def test_reference_case_effect_missing_paired_epsilon_counted_separately():
+def test_ablation_output_effect_missing_paired_epsilon_counted_separately():
     pairs = [
         {"skipped": False, "query": "q1", "physician": "叶天士",
          "own_herbs": {"党参"}, "ablated_herbs": {"黄芪"}},
     ]
-    r = re.reference_case_effect(pairs, epsilon_online_detail=None, ablated_mode="swapped")
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
     assert r["n_no_paired_epsilon"] == 1
     assert r["n_above_paired_epsilon"] == 0 and r["n_within_paired_epsilon"] == 0
     assert r["rate_above_paired_epsilon"] is None
+
+
+# ---------- E8：collect_retriever_mode_samples / retriever_mode_output_effect ----------
+
+
+def test_collect_retriever_mode_samples_records_herb_sets_per_mode():
+    def consult_fn(query, **kwargs):
+        herbs = {"dense": ["党参"], "graph": ["党参", "白术"]}
+        return {
+            "retrieval_error": None, "rejected": False, "insufficient": False,
+            "results": [{"physician": "叶天士", "s3": SimpleNamespace(herbs=herbs[kwargs["retriever_mode"]])}],
+        }
+
+    records = re.collect_retriever_mode_samples(["主诉甲"], ["dense", "graph"], consult_fn=consult_fn)
+    assert len(records) == 1
+    r = records[0]
+    assert r["query"] == "主诉甲" and r["physician"] == "叶天士"
+    assert r["herb_sets"] == [{"党参"}, {"党参", "白术"}]
+    assert r["n_modes_available"] == 2
+    assert r["unavailable_modes"] == []
+
+
+def test_collect_retriever_mode_samples_records_unavailable_modes_without_dropping_query():
+    def consult_fn(query, **kwargs):
+        if kwargs["retriever_mode"] == "graph":
+            return {"retrieval_error": "缺 element_index.json", "rejected": False,
+                     "insufficient": False, "results": []}
+        return {"retrieval_error": None, "rejected": False, "insufficient": False,
+                "results": [{"physician": "叶天士", "s3": SimpleNamespace(herbs=["党参"])}]}
+
+    records = re.collect_retriever_mode_samples(["主诉甲"], ["dense", "graph"], consult_fn=consult_fn)
+    assert len(records) == 1
+    assert records[0]["n_modes_available"] == 1
+    assert records[0]["unavailable_modes"] == ["graph"]
+
+
+def test_retriever_mode_output_effect_uses_pairwise_jaccard_stats():
+    records = [
+        {"query": "q1", "physician": "叶天士", "herb_sets": [{"党参"}, {"黄芪"}],
+         "n_modes_available": 2, "unavailable_modes": []},
+    ]
+    r = re.retriever_mode_output_effect(records, ["dense", "graph"])
+    assert r["output_difference_rate"] == pytest.approx(1.0)  # 毫无重叠
+    assert r["n_usable"] == 1 and r["n_total"] == 1
+
+
+def test_retriever_mode_output_effect_excludes_samples_with_fewer_than_two_modes():
+    records = [
+        {"query": "q1", "physician": "叶天士", "herb_sets": [{"党参"}],
+         "n_modes_available": 1, "unavailable_modes": ["graph"]},
+    ]
+    r = re.retriever_mode_output_effect(records, ["dense", "graph"])
+    assert r["n_usable"] == 0
+    assert r["output_difference_rate"] is None
+    assert r["n_unavailable_by_mode"]["graph"] == 1
+
+
+def test_retriever_mode_output_effect_carries_graph_caveat_only_when_graph_included():
+    r_with_graph = re.retriever_mode_output_effect([], ["dense", "graph"])
+    r_without_graph = re.retriever_mode_output_effect([], ["dense", "bm25"])
+    assert r_with_graph["graph_mode_caveat"] is not None
+    assert "element_index" in r_with_graph["graph_mode_caveat"]
+    assert r_without_graph["graph_mode_caveat"] is None
+
+
+def test_element_index_coverage_computed_from_current_file_not_hardcoded(tmp_path, monkeypatch):
+    """覆盖率现算，不写死——element_index.json 会随 cases.json 重新抽取而变，
+    写死一个数字下次数据一变就是假的（跟 syndromes.jsonl 17->337 那次同类
+    教训）。"""
+    index_path = tmp_path / "element_index.json"
+    index_path.write_text(json.dumps({
+        "c1": {"physician": "ye_tianshi", "elements": ["胃", "气滞"]},
+        "c2": {"physician": "ye_tianshi", "elements": []},
+        "c3": {"physician": "wu_jutong", "elements": ["脾"]},
+    }), encoding="utf-8")
+    monkeypatch.setattr("core.retrieval_graph.ELEMENT_INDEX_PATH", index_path)
+
+    covered, total = re._element_index_coverage()
+    assert (covered, total) == (2, 3)
+    caveat = re._graph_mode_caveat()
+    assert "2/3" in caveat and "67%" in caveat
+
+
+def test_element_index_coverage_none_when_file_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr("core.retrieval_graph.ELEMENT_INDEX_PATH", tmp_path / "no_such_file.json")
+    assert re._element_index_coverage() is None
+    caveat = re._graph_mode_caveat()
+    assert "未知" in caveat and "build_element_index" in caveat
+
+
+# ---------- E9：collect_react_process_samples / react_process_summary ----------
+
+
+def _react_trace(n_steps=2, terminated_by="finish", llm_calls=3):
+    return SimpleNamespace(
+        steps=[object()] * n_steps, terminated_by=terminated_by, llm_calls=llm_calls,
+    )
+
+
+def test_collect_react_process_samples_records_steps_and_terminated_by():
+    def consult_fn(query, **kwargs):
+        return {
+            "rejected": False, "insufficient": False,
+            "results": [
+                {"physician": "叶天士", "react_trace": _react_trace(3, "finish")},
+                {"physician": "吴鞠通", "react_trace": _react_trace(5, "max_steps")},
+            ],
+        }
+
+    records = re.collect_react_process_samples(["主诉甲"], consult_fn=consult_fn)
+    assert len(records) == 2
+    assert records[0] == {"query": "主诉甲", "physician": "叶天士", "n_steps": 3,
+                           "terminated_by": "finish", "llm_calls": 3}
+    assert records[1]["terminated_by"] == "max_steps" and records[1]["n_steps"] == 5
+
+
+def test_collect_react_process_samples_skips_rejected_and_missing_traces():
+    def consult_fn(query, **kwargs):
+        return {"rejected": True, "insufficient": False, "results": []}
+
+    assert re.collect_react_process_samples(["主诉甲"], consult_fn=consult_fn) == []
+
+
+def test_react_process_summary_distributions():
+    records = [
+        {"query": "q1", "physician": "叶天士", "n_steps": 2, "terminated_by": "finish", "llm_calls": 3},
+        {"query": "q1", "physician": "吴鞠通", "n_steps": 5, "terminated_by": "max_steps", "llm_calls": 6},
+    ]
+    r = re.react_process_summary(records)
+    assert r["n_samples"] == 2
+    assert r["terminated_by_distribution"] == {"finish": 1, "max_steps": 1}
+    assert r["step_distribution"]["mean"] == pytest.approx(3.5)
+    assert "prompt" in r["terminated_by_caveat"]
+
+
+def test_react_process_summary_empty_records():
+    r = re.react_process_summary([])
+    assert r["n_samples"] == 0
+    assert r["step_distribution"] is None
+    assert r["terminated_by_caveat"]  # 空样本时也要带这条限定，不是只有有数据才提醒
+
+
+# ---------- divergence_per_query_detail ----------
+
+
+def test_divergence_per_query_detail_computes_net_difference_and_verdict():
+    results = [
+        {"query": "q1", "rejected": False, "insufficient": False,
+         "divergence": {"herb_jaccard": 0.6}},
+        {"query": "q2", "rejected": False, "insufficient": False,
+         "divergence": {"herb_jaccard": 0.1}},
+    ]
+    epsilon_detail = _epsilon_detail([("q1", "叶天士", 0.3), ("q1", "吴鞠通", 0.1),
+                                       ("q2", "叶天士", 0.5)])
+    out = re.divergence_per_query_detail(results, epsilon_detail)
+    # q1: ε = mean(0.3, 0.1) = 0.2, net = 0.6-0.2 = 0.4 > 0 -> real_divergence
+    assert out[0] == {"query": "q1", "herb_jaccard": 0.6, "epsilon": 0.2,
+                       "net_difference": 0.4, "verdict": "real_divergence"}
+    # q2: ε = 0.5, net = 0.1-0.5 = -0.4 <= 0 -> within_noise_floor
+    assert out[1] == {"query": "q2", "herb_jaccard": 0.1, "epsilon": 0.5,
+                       "net_difference": -0.4, "verdict": "within_noise_floor"}
+
+
+def test_divergence_per_query_detail_unusable_when_rejected():
+    results = [{"query": "q1", "rejected": True, "insufficient": False, "divergence": None}]
+    out = re.divergence_per_query_detail(results, None)
+    assert out[0]["verdict"] == "unusable"
+
+
+def test_divergence_per_query_detail_no_epsilon_data_when_query_not_found():
+    results = [{"query": "q-not-in-epsilon", "rejected": False, "insufficient": False,
+                "divergence": {"herb_jaccard": 0.5}}]
+    out = re.divergence_per_query_detail(results, _epsilon_detail([("其他主诉", "叶天士", 0.2)]))
+    assert out[0]["verdict"] == "no_epsilon_data"
+    assert out[0]["herb_jaccard"] == 0.5 and out[0]["epsilon"] is None
+
+
+def test_divergence_per_query_detail_missing_query_tag_does_not_guess():
+    out = re.divergence_per_query_detail(
+        [{"rejected": False, "insufficient": False, "divergence": {"herb_jaccard": 0.5}}], None
+    )
+    assert out[0]["verdict"] == "no_query_tag"
+    assert out[0]["query"] is None
 
 
 # ---------- build_report / render_markdown ----------
@@ -361,3 +589,44 @@ def test_main_writes_report_json_and_md(tmp_path, monkeypatch):
     data = json.loads(out_json.read_text(encoding="utf-8"))
     assert data["n_queries"] == 1
     assert out_md.exists()
+
+
+def test_main_runs_e3_e4_e8_e9_end_to_end(tmp_path, monkeypatch):
+    """接线测试：--e3/--e4/--e8/--e9 真的把 main() 的参数传对了地方，不是
+    只有各自的收集器/度量函数单测通过——单测传的是手写好的 pairs/records，
+    测不出 main() 里参数名拼错、忘记传 consult_fn 之类的接线错误。"""
+    queries_path = tmp_path / "queries.txt"
+    queries_path.write_text("主诉一\n", encoding="utf-8")
+    out_json = tmp_path / "report.json"
+    out_md = tmp_path / "report.md"
+
+    def fake_consult(complaint, **kwargs):
+        herbs = ["黄芪"] if kwargs.get("refs_mode") == "swapped" else ["党参"]
+        trace = _react_trace(2, "finish") if kwargs.get("use_react") else None
+        return {
+            "rejected": False, "insufficient": False, "retrieval_error": None,
+            "divergence": {"herb_jaccard": 0.4},
+            "results": [{
+                "physician": "叶天士", "s3": SimpleNamespace(herbs=herbs),
+                "hallucinated": [], "no_reference_cases": False, "react_trace": trace,
+            }],
+            "manifest": {"llm_calls": 6},
+        }
+
+    monkeypatch.setattr("core.chain.consult", fake_consult)
+    monkeypatch.setattr(re, "load_epsilon_online", lambda: 0.1)
+    monkeypatch.setattr(re, "load_epsilon_online_detail", lambda: None)
+
+    re.main(["--queries-path", str(queries_path), "--out-json", str(out_json),
+             "--out-md", str(out_md), "--e3", "--e4", "--e8", "--e9"])
+
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+    labels = {a["label"] for a in data["ablations"]}
+    assert labels == {"swapped", "none", "react_on"}
+    assert data["retriever_mode_effect"] is not None
+    assert data["retriever_mode_effect"]["n_total"] > 0
+    assert data["react_process"] is not None
+    assert data["react_process"]["n_samples"] > 0
+    md = out_md.read_text(encoding="utf-8")
+    assert "E8" in md or "检索模式消融" in md
+    assert "ReAct 过程统计" in md
