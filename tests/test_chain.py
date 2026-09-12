@@ -148,6 +148,80 @@ def _fake_cases() -> list[CaseRecord]:
     ]
 
 
+# ---------- V5 P0-1：_format_case_block（原文摘录 + 结构化字段）----------
+
+
+def _case(**overrides):
+    base = dict(
+        case_id="ye_tianshi-001", case_group_id="ye_tianshi-001",
+        physician="ye_tianshi", raw="原文", visit_index=0,
+    )
+    base.update(overrides)
+    return CaseRecord(**base)
+
+
+def test_format_case_block_puts_raw_excerpt_before_structured_fields():
+    case = _case(raw_excerpt="患者胃脘胀痛，嗳气泛酸，舌淡红苔薄白，脉弦。",
+                 symptoms=["胃脘胀痛"], tongue="淡红", herbs=["柴胡"])
+    block = chain._format_case_block(case)
+    raw_pos = block.index("患者胃脘胀痛")
+    structured_pos = block.index("结构化：")
+    assert raw_pos < structured_pos, "原文摘录必须排在结构化字段前面（P0-1 的核心改动）"
+
+
+def test_format_case_block_truncates_long_raw_excerpt():
+    long_text = "甲" * 500
+    case = _case(raw_excerpt=long_text)
+    block = chain._format_case_block(case)
+    assert "甲" * chain.CASE_EXCERPT_TRUNCATE_CHARS in block
+    assert "甲" * (chain.CASE_EXCERPT_TRUNCATE_CHARS + 1) not in block
+
+
+def test_format_case_block_missing_raw_excerpt_says_so_explicitly():
+    """raw_excerpt 为 None 时不能假装有原文，也不能整段消失——退回结构化
+    字段，但要标注原文缺失（用户原话：这 3% 的医案退回结构化字段，标注
+    "（原文缺失）"）。"""
+    case = _case(raw_excerpt=None, symptoms=["纳差"])
+    block = chain._format_case_block(case)
+    assert "原文缺失" in block
+    assert "结构化：症状=纳差" in block
+
+
+def test_format_case_block_omits_missing_fields_instead_of_writing_unrecorded():
+    """P0 根因修复的核心：缺失字段直接省略，不写"未记"——三个"未记"比什么都
+    不写更削弱这条医案的可信度（跟示例的具体内容相比，看起来像"这条参考
+    没什么用"）。"""
+    case = _case(raw_excerpt="原文内容", symptoms=["纳差"])  # 无舌/脉/证/病机/治法/方/药
+    block = chain._format_case_block(case)
+    assert "未记" not in block
+    assert "结构化：症状=纳差" in block  # 只有症状这一项，其余字段整个不出现
+
+
+def test_format_case_block_includes_all_present_structured_fields():
+    case = _case(
+        raw_excerpt="原文", symptoms=["胃脘胀痛"], tongue="淡红", pulse="弦",
+        syndrome="肝胃不和证", pathogenesis="肝郁犯胃", treatment_principle="疏肝和胃",
+        formula="柴胡疏肝散", herbs=["柴胡", "白芍"],
+    )
+    block = chain._format_case_block(case)
+    for expected in ("症状=胃脘胀痛", "舌=淡红", "脉=弦", "证=肝胃不和证",
+                      "病机=肝郁犯胃", "治法=疏肝和胃", "方=柴胡疏肝散", "药=柴胡、白芍"):
+        assert expected in block
+
+
+def test_format_case_block_no_structured_fields_at_all():
+    case = _case(raw_excerpt="原文")  # symptoms 默认空列表，其余全 None
+    block = chain._format_case_block(case)
+    assert "结构化：（无结构化字段）" in block
+
+
+def test_format_case_block_header_has_case_id_and_visit_label():
+    case = _case(case_id="wu_jutong-002-p1-0", visit_index=1, raw_excerpt="原文")
+    block = chain._format_case_block(case)
+    assert "wu_jutong-002-p1-0" in block
+    assert "第2诊" in block
+
+
 def test_shared_stages_run_once_per_physician_stages_run_twice(monkeypatch):
     """S1 和 S2 全局各只跑一次，S3 每位医家一次。
 

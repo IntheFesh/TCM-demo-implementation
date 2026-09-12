@@ -116,25 +116,61 @@ RESIDUAL_THRESHOLD = 0.30
 normalize_herb = _herbs.normalize_herb
 
 
-def _format_case_line(case: CaseRecord) -> str:
-    """把一个参考医案压缩成一行，喂给 S3 prompt。"""
-    symptoms = "；".join(case.symptoms) if case.symptoms else "无"
-    herbs = "、".join(case.herbs) if case.herbs else "无"
+# V5 P0-1：原文摘录的截断长度。医案原文中位数约 1500 字，三条全塞进去会
+# 挤占模型注意力；300 字通常够到"证型/治法/方药"那一段——但这个数字没有在
+# 真实语料上逐条核验过（这个环境没有 cases.json，抽样核验需要真实医案，
+# 见 offline/extract_cases.py 的产出），如实标注为待验证的估计值，不是
+# 已经验证过的常量。真实语料上核验时，如果发现大量截断点落在方药描述
+# 之前，按用户原话的建议调到 400。
+CASE_EXCERPT_TRUNCATE_CHARS = 300
+
+
+def _format_case_block(case: CaseRecord) -> str:
+    """把一个参考医案格式化成两段喂给 S3 prompt：原文摘录在前、结构化字段在后。
+
+    **V5 P0 根因修复**：原来是十个结构化字段压成一行（_format_case_line，
+    已删除），大部分医案只有 10.8% 有证型标注，绝大多数字段是"未记"——
+    三行几乎全是"未记"的参考，跟 prompt 里紧接着的完整示例相比信息量
+    近似于零，模型会转而依赖示例里的具体方药。E3/E4 消融（own vs
+    swapped/none 改变率都远低于 0.4 的闸门）证实了这一点：换掉参考医案
+    和完全不给参考医案，对输出的影响一样小，说明参考医案的内容根本没被
+    利用。真正信息量最丰富的信号——raw_excerpt（97% 的医案有）——反而
+    从来没有进过 prompt。
+
+    这一版原文摘录放最前面，结构化字段放后面、且缺失的字段直接省略
+    （不写"未记"）——三个"未记"比什么都不写更削弱这条医案的可信度，
+    等于在告诉模型"这条参考没什么信息"。
+    """
     vi = case.visit_index or 0
     visit_desc = "初诊" if vi == 0 else f"第{vi + 1}诊"
-    fields = [
-        f"id={case.case_id}",
-        f"诊次={visit_desc}",
-        f"症状={symptoms}",
-        f"舌={case.tongue or '未记'}",
-        f"脉={case.pulse or '未记'}",
-        f"证={case.syndrome or '未记'}",
-        f"病机={case.pathogenesis or '未记'}",
-        f"治法={case.treatment_principle or '未记'}",
-        f"方={case.formula or '未记'}",
-        f"药={herbs}",
-    ]
-    return "；".join(fields)
+    header = f"【参考医案】{case.case_id}（{visit_desc}）"
+
+    if case.raw_excerpt:
+        excerpt = case.raw_excerpt[:CASE_EXCERPT_TRUNCATE_CHARS]
+        raw_line = f"原文：{excerpt}"
+    else:
+        raw_line = "原文：（原文缺失）"
+
+    structured_parts = []
+    if case.symptoms:
+        structured_parts.append(f"症状={'；'.join(case.symptoms)}")
+    if case.tongue:
+        structured_parts.append(f"舌={case.tongue}")
+    if case.pulse:
+        structured_parts.append(f"脉={case.pulse}")
+    if case.syndrome:
+        structured_parts.append(f"证={case.syndrome}")
+    if case.pathogenesis:
+        structured_parts.append(f"病机={case.pathogenesis}")
+    if case.treatment_principle:
+        structured_parts.append(f"治法={case.treatment_principle}")
+    if case.formula:
+        structured_parts.append(f"方={case.formula}")
+    if case.herbs:
+        structured_parts.append(f"药={'、'.join(case.herbs)}")
+    structured_line = "结构化：" + ("；".join(structured_parts) if structured_parts else "（无结构化字段）")
+
+    return "\n".join([header, raw_line, structured_line])
 
 
 def _format_elements_summary(s2: S2Elements) -> str:
@@ -318,7 +354,7 @@ def run_physician(
         }
         for case, score in hits
     ]
-    refs_text = "\n".join(_format_case_line(case) for case, _ in hits) or "（无可用参考医案）"
+    refs_text = "\n\n".join(_format_case_block(case) for case, _ in hits) or "（无可用参考医案）"
 
     # S3 证候+治法+方
     s3_prompt = load_prompt("s3_syndrome")

@@ -439,10 +439,18 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
 
 
 def _s3_prompt_embedded_example() -> dict:
-    """s3_syndrome.yaml 末尾嵌了一段完整的输出示例——schema hint 对嵌套结构
+    """s3_syndrome.yaml 中段嵌了一段格式示例——schema hint 对嵌套结构
     表达力有限，实测（M1）证实了这一点，示例能显著降低格式错误率。这段示例
     是手写的 JSON，藏在一大段 prose 里，改 prompt 时最容易被顺手改坏（多一个
-    逗号、少一个引号）而不会有任何报错提示——除非有测试盯着它。"""
+    逗号、少一个引号）而不会有任何报错提示——除非有测试盯着它。
+
+    V5 P0 把示例从文件末尾挪到了 $elements_summary/$symptoms/$refs 之前
+    （参考医案要紧贴输出指令，见 core/chain.py::_format_case_block 的
+    文档字符串），示例后面还跟着证素分析/患者症状/参考医案/引用要求这些
+    prose——不能再假设"从第一个顶格 { 到文件末尾"就是完整示例，改用
+    json.JSONDecoder.raw_decode 按大括号配平找真正的结束位置，忽略后面的
+    trailing 内容。
+    """
     import json
 
     from core.llm import load_prompt
@@ -452,7 +460,8 @@ def _s3_prompt_embedded_example() -> dict:
     opening_braces = [i for i, line in enumerate(lines) if line.strip() == "{"]
     assert opening_braces, "s3_syndrome.yaml 里没找到嵌入的 JSON 示例（顶格的 { 都没有）"
     example_text = "\n".join(lines[opening_braces[0]:])
-    return json.loads(example_text)
+    obj, _ = json.JSONDecoder().raw_decode(example_text)
+    return obj
 
 
 def test_s3_prompt_embedded_example_is_valid_json():
@@ -462,12 +471,18 @@ def test_s3_prompt_embedded_example_is_valid_json():
 def test_s3_prompt_embedded_example_validates_against_the_real_schema():
     """不仅要是合法 JSON，还要真的能喂进 core.schemas.S3Syndrome——包括 M1/M2
     加的那些 model_validator（selected 越界检查、base_formula 双向约束）。
-    示例本身违反自己教模型遵守的约束，比没有示例更糟。"""
+    示例本身违反自己教模型遵守的约束，比没有示例更糟。
+
+    V5 P0 把示例里的真实方名/药名换成了占位符（"方名A"/"药名X"）——完整
+    病例示例会教会模型"这种情况开这个方"而不是"输出应该长这个形状"，原来
+    的示例证型恰好是测试主诉里最常见的"肝胃不和证"、方名是"柴胡疏肝散"，
+    E3/E4 消融证实模型确实在依赖这个示例而不是真实的参考医案。这里断言
+    "方名A"是刻意的契约变更，不是随手改断言让它变绿。"""
     from core.schemas import S3Syndrome
 
     obj = _s3_prompt_embedded_example()
     s3 = S3Syndrome.model_validate(obj)
-    assert s3.formula == "柴胡疏肝散"  # 对应 selected=0 那个 classic 候选方
+    assert s3.formula == "方名A"  # 对应 selected=0 那个 classic 候选方（占位符，不是真实方名）
 
 
 def test_s3_prompt_embedded_example_demonstrates_all_three_sources_and_varied_confidence():
@@ -495,12 +510,54 @@ def test_s3_prompt_embedded_example_includes_reasoning_plain_without_jargon():
         )
 
 
+def test_s3_prompt_example_has_no_real_formula_or_herb_names():
+    """V5 P0-2：示例只示范字段结构，不该出现任何真实方名/药名/证型——完整
+    病例示例会教会模型"这种情况开这个方"而不是"输出应该长这个形状"。这里
+    把示例序列化回文本再 grep，不是只查 formula 字段：herb_items 的 name、
+    rationale 里也可能不小心带真实药名。"""
+    import json
+
+    obj = _s3_prompt_embedded_example()
+    example_text = json.dumps(obj, ensure_ascii=False)
+    banned = [
+        "柴胡疏肝散", "瓜蒌薤白半夏汤", "保和丸", "六君子汤",
+        "柴胡", "白芍", "陈皮", "香附", "枳壳", "瓦楞子", "佛手",
+        "郁金", "黄连", "吴茱萸", "木香", "砂仁",
+        "肝胃不和证", "脾胃气虚证", "脾胃湿热证",
+    ]
+    found = [term for term in banned if term in example_text]
+    assert not found, f"示例里出现了真实方名/药名/证型，会带偏模型：{found}"
+
+
+def test_s3_prompt_example_comes_before_reference_cases():
+    """V5 P0-3：示例要排在参考医案（$refs）前面，参考医案紧贴输出指令——
+    recency 效应下，最该被模型利用的内容（参考医案）要放在离结论最近的
+    位置，不能被夹在示例和输出指令之间被稀释。"""
+    from core.llm import load_prompt
+
+    system = load_prompt("s3_syndrome")["system"]
+    lines = system.split("\n")
+    opening_braces = [i for i, line in enumerate(lines) if line.strip() == "{"]
+    assert opening_braces, "找不到嵌入的 JSON 示例"
+    example_pos = opening_braces[0]
+    refs_pos = next(i for i, line in enumerate(lines) if "$refs" in line)
+    output_instruction_pos = next(
+        i for i, line in enumerate(lines) if "只输出符合 schema 的 JSON" in line
+    )
+    assert example_pos < refs_pos < output_instruction_pos, (
+        "顺序应为：示例 → ... → 参考医案($refs) → ... → 输出指令，"
+        f"实际位置 example={example_pos} refs={refs_pos} 输出指令={output_instruction_pos}"
+    )
+
+
 @pytest.mark.parametrize("phrase", [
     "至少要有一个",  # 至少一个 classic 候选方的硬约束
     "不要三个候选方都填high",
     "剂量不确定时填null，不要猜一个数",
     "这个字段关系到用药安全",  # decoction 字段的安全性说明
     "不能出现",  # reasoning_plain 禁止专业术语那句的开头
+    "参考医案中哪一条",  # V5 P0-4：显式要求引用参考医案的具体内容
+    "cited_case_ids仍然填相关度最高的那一条",  # P0-4：不相关时不放松 min_length=1
 ])
 def test_s3_prompt_contains_the_hard_constraints(phrase):
     """这几句不是随手写的修饰语，是 M3 要解决的具体问题（模型倾向三个都填

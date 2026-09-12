@@ -39,7 +39,7 @@ system: |
     modified —— 在经典方基础上加减，base_formula 必须填原方名，rationale
                 里说明加了什么、减了什么、为什么这么改
     composed —— 根据药性药理自组方，没有对应的经典方，rationale 里说明
-                组方思路（君臣佐使怎么搭配、针对哪个病机）
+                组方思路（君臣佐使怎么搭配，针对哪个病机）
 
   confidence 按你对该方与本证契合度的真实判断填 high/medium/low——**不要
   三个候选方都填 high**，如果它们契合度真的一样高，你给的就不是三个有意义
@@ -75,6 +75,47 @@ system: |
   - doses_count：建议剂数，如 7（不确定就填 null）
   - usage：用法，如"水煎服，每日1剂，分2次温服"（不确定就填 null）
 
+  下面是一个格式示例（只示范字段结构和嵌套关系，不是内容示范——病名、
+  证型、方名、药名全部是占位符，跟本次该给出的结论无关，不要被占位符的
+  具体写法带偏成某个特定的证型或方剂）：
+
+  {
+    "disease": "病名占位（按本例证素填真实病名，证素不足以支持任何病名时填 null）",
+    "syndrome": "证型占位（按本例证素填真实证型）",
+    "reasoning": "此处应写从证素到证型的完整推理——为什么这些证素支持这个证型，是示范格式不是示范内容，按本次证素分析给出真实推理链条。",
+    "reasoning_plain": "此处是上面推理的通俗语言版本，给患者看，不出现专业术语。",
+    "treatment_principle": "治法占位（按本例证素给出真实治法）",
+    "formula_candidates": [
+      {
+        "name": "方名A", "source": "classic", "base_formula": null, "confidence": "high",
+        "rationale": "说明这个经典方跟本证病机的对应关系。",
+        "herb_items": [
+          {"name": "药名X", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "君", "function_in_formula": "这味药在本方中的作用", "dose_evidence": []}
+        ],
+        "doses_count": 7, "usage": "水煎服，每日1剂，分2次温服"
+      },
+      {
+        "name": "方名A加减", "source": "modified", "base_formula": "方名A", "confidence": "medium",
+        "rationale": "说明在方名A基础上加了什么、减了什么、为什么这么改。",
+        "herb_items": [
+          {"name": "药名X", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "君", "function_in_formula": "这味药在本方中的作用", "dose_evidence": []}
+        ],
+        "doses_count": 7, "usage": "水煎服，每日1剂，分2次温服"
+      },
+      {
+        "name": "方名B", "source": "composed", "base_formula": null, "confidence": "low",
+        "rationale": "说明组方思路——君臣佐使怎么搭配、针对哪个病机。",
+        "herb_items": [
+          {"name": "药名Y", "dose": 9.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "君", "function_in_formula": "这味药在本方中的作用", "dose_evidence": []}
+        ],
+        "doses_count": null, "usage": null
+      }
+    ],
+    "selected": 0,
+    "cited_case_ids": ["占位id，实际必须来自下面参考医案列表里真实出现的 id"],
+    "note": null
+  }
+
   证素分析：
   $elements_summary
 
@@ -83,84 +124,43 @@ system: |
   参考医案（来自 $name 本人医案库，按相关度排序）：
   $refs
 
-  只输出符合 schema 的 JSON，不要输出解释或 markdown 围栏。下面是一个完整
-  的输出示例（内容是示范用的虚构病例，不代表本次应该给出的结论），注意看
-  三个候选方分别是 classic / modified / composed 三种来源，写法不一样：
+  ## 引用参考医案的要求
 
-  {
-    "disease": "胃痛",
-    "syndrome": "肝胃不和证",
-    "reasoning": "患者胃脘胀痛、嗳气泛酸、情志不畅则发，证素分析示病位在肝、胃，病性属气滞。肝主疏泄，肝气郁结则横逆犯胃，胃失和降，故见胀痛、嗳气；肝郁化火，肝胃郁热则见泛酸。舌脉与情志诱因均支持肝胃不和证。",
-    "reasoning_plain": "你这个胃胀、打嗝反酸，跟情绪不好一发作就加重是对应的——中医认为情绪不畅会影响身体调节气机的能力，这股不顺的气会横向影响到胃，导致胃的正常蠕动和消化功能受阻，这就是胀痛、打嗝的原因；情绪不畅的时间长了还会产生内热，热气往上冲就会反酸。所以治疗上要先把情绪这方面理顺，胃自然就会舒服。",
-    "treatment_principle": "疏肝理气，和胃降逆",
-    "formula_candidates": [
-      {
-        "name": "柴胡疏肝散",
-        "source": "classic",
-        "base_formula": null,
-        "confidence": "high",
-        "rationale": "本方专为肝气郁结、横逆犯胃而设，与本证病机高度吻合，原方组成即可覆盖主症。",
-        "herb_items": [
-          {"name": "柴胡", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "君", "function_in_formula": "疏肝解郁，为诸药之向导", "dose_evidence": []},
-          {"name": "白芍", "dose": 12.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "臣", "function_in_formula": "养血柔肝，缓急止痛", "dose_evidence": []},
-          {"name": "陈皮", "dose": 9.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "佐", "function_in_formula": "理气和胃", "dose_evidence": []},
-          {"name": "香附", "dose": 9.0, "dose_unit": "g", "processing": "醋制", "decoction": null, "role": "臣", "function_in_formula": "助柴胡疏肝理气", "dose_evidence": []},
-          {"name": "枳壳", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "佐", "function_in_formula": "行气宽中", "dose_evidence": []},
-          {"name": "甘草", "dose": 3.0, "dose_unit": "g", "processing": "炙", "decoction": null, "role": "使", "function_in_formula": "调和诸药", "dose_evidence": []}
-        ],
-        "doses_count": 7,
-        "usage": "水煎服，每日1剂，分2次温服"
-      },
-      {
-        "name": "柴胡疏肝散加减",
-        "source": "modified",
-        "base_formula": "柴胡疏肝散",
-        "confidence": "medium",
-        "rationale": "在原方基础上加瓦楞子、佛手，针对泛酸偏重与嗳气明显这两个兼症加强制酸和胃之力；原方剂量偏平和，此处不改动。",
-        "herb_items": [
-          {"name": "柴胡", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "君", "function_in_formula": "疏肝解郁", "dose_evidence": []},
-          {"name": "白芍", "dose": 12.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "臣", "function_in_formula": "养血柔肝", "dose_evidence": []},
-          {"name": "陈皮", "dose": 9.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "佐", "function_in_formula": "理气和胃", "dose_evidence": []},
-          {"name": "瓦楞子", "dose": 15.0, "dose_unit": "g", "processing": "煅", "decoction": "先煎", "role": "佐", "function_in_formula": "制酸止痛，针对泛酸", "dose_evidence": []},
-          {"name": "佛手", "dose": 9.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "佐", "function_in_formula": "疏肝理气，兼能和胃止呕，针对嗳气", "dose_evidence": []},
-          {"name": "甘草", "dose": 3.0, "dose_unit": "g", "processing": "炙", "decoction": null, "role": "使", "function_in_formula": "调和诸药", "dose_evidence": []}
-        ],
-        "doses_count": 7,
-        "usage": "水煎服，每日1剂，分2次温服"
-      },
-      {
-        "name": "疏肝和胃汤",
-        "source": "composed",
-        "base_formula": null,
-        "confidence": "low",
-        "rationale": "不套用固定成方，以柴胡、郁金疏肝为君，配伍黄连、吴茱萸辛开苦降针对泛酸，木香、砂仁醒脾和胃——组方更贴合本例肝郁兼胃热的具体情况，但缺乏成方依据、契合度判断把握不如前两方。",
-        "herb_items": [
-          {"name": "柴胡", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "君", "function_in_formula": "疏肝解郁", "dose_evidence": []},
-          {"name": "郁金", "dose": 9.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "君", "function_in_formula": "行气解郁，兼能凉血", "dose_evidence": []},
-          {"name": "黄连", "dose": 3.0, "dose_unit": "g", "processing": null, "decoction": null, "role": "臣", "function_in_formula": "清肝胃郁热，针对泛酸", "dose_evidence": []},
-          {"name": "吴茱萸", "dose": 1.5, "dose_unit": "g", "processing": null, "decoction": null, "role": "佐", "function_in_formula": "辛开苦降，反佐黄连之寒", "dose_evidence": []},
-          {"name": "木香", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": "后下", "role": "佐", "function_in_formula": "行气止痛，醒脾", "dose_evidence": []},
-          {"name": "砂仁", "dose": 6.0, "dose_unit": "g", "processing": null, "decoction": "后下", "role": "使", "function_in_formula": "醒脾和胃，引药归中", "dose_evidence": []}
-        ],
-        "doses_count": null,
-        "usage": null
-      }
-    ],
-    "selected": 0,
-    "cited_case_ids": ["ye_tianshi-0012-p1-0"],
-    "note": null
-  }
+  reasoning 里必须说明：参考医案中哪一条（引 id）的哪个方面（症状相似、
+  治法相同、还是用药风格）影响了你的判断——不是泛泛提一句"参考了医案"，
+  要具体到是哪一条、哪个方面。如果三条参考医案跟本例都不相关（证素不
+  对应、症状主线不同），在 note 字段里说明这种不相关；cited_case_ids
+  仍然填相关度最高的那一条（不要留空），并在 note 里如实说明"这条参考
+  实际关联度不高，仅供参考"——不要为了填满这个字段就假装某条参考很相关，
+  也不要因为参考不相关就干脆不引用任何 id。
+
+  只输出符合 schema 的 JSON，不要输出解释或 markdown 围栏。
 notes: "喂给 core.schemas.S3Syndrome 与 S3SyndromeUnreferenced（后者检索为空时用，
   没有 cited_case_ids 字段，其余要求一致——项目里只有这一份 s3 prompt yaml，
   两条路径共用，靠 generate() 传入的 schema 不同来区分，不是两份 prompt 文件，
-  见 core/chain.py 的 s3_schema 选择逻辑）。$name 为医家中文名，$refs 为紧凑
-  格式的参考医案文本，由 core/chain.py 拼装。disease/formula_candidates/
-  herb_items 等字段的语义要求全部写在 system 里、不靠 schema hint 单独表达——
-  M1 阶段裸 schema hint 在一次真实调用里凑巧给出了不错的结果（多候选方、
-  role 填得完整），但那是运气，没有 prompt 层面的约束保证，M3 就是要把这份
-  运气换成明文约束（尤其是「至少一个 classic」「不要三个都填 high」这两条，
-  schema 本身表达不出这种跨字段的软约束）。M3 真实产出（3 条主诉的格式
-  遵从度）见模块报告，不写死在这里——写死了下次改 prompt 没人会记得回来更新。
+  见 core/chain.py 的 s3_schema 选择逻辑）。$name 为医家中文名，$refs 为
+  core.chain._format_case_block 拼装的参考医案文本（原文摘录在前、结构化
+  字段在后，见该函数文档字符串——V5 P0 从「结构化字段单行摘要」改过来的，
+  理由是原来那版几乎全是「未记」，信息量近似于零，模型会转而依赖下面这个
+  示例里的具体方药，E3/E4 消融（own vs swapped/none 改变率远低于 0.4 的
+  闸门）证实了这一点：换不换参考医案、给不给参考医案，输出几乎不变）。
+
+  disease/formula_candidates/herb_items 等字段的语义要求全部写在 system
+  里、不靠 schema hint 单独表达——M1 阶段裸 schema hint 在一次真实调用里
+  凑巧给出了不错的结果（多候选方、role 填得完整），但那是运气，没有
+  prompt 层面的约束保证，M3 就是要把这份运气换成明文约束（尤其是「至少
+  一个 classic」「不要三个都填 high」这两条，schema 本身表达不出这种
+  跨字段的软约束）。M3 真实产出（3 条主诉的格式遵从度）见模块报告，不写
+  死在这里——写死了下次改 prompt 没人会记得回来更新。
+
+  示例从 M3 时期的完整病例（真实方名「柴胡疏肝散」+真实药名+六味药）改成
+  V5 P0 的占位符骨架：完整病例示例会教会模型「这种情况开这个方」而不是
+  「输出应该长这个形状」——尤其是原来的示例证型恰好是测试主诉里最常见的
+  「肝胃不和证」，模型读到 60 行具体生动的示例、又读到几行「未记」的参考
+  医案，示例赢了参考医案，这是 E3/E4 改变率过低的根因之一。占位符骨架
+  只保留字段结构（每个候选方来源的写法、herb_items 的字段形状），不含
+  任何真实方名/药名/证型，避免这个偏置。
+
   M6 加了 reasoning_plain（患者模式用的通俗版推理，见基本要求那条）——
   schema 层这个字段是可选的（不逼几十处旧式 S3Syndrome(...) 构造都补上），
   但这里的 prompt 要求是硬性的：真实调用必须每次都给，patient 角色下这个
