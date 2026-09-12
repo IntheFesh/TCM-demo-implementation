@@ -36,7 +36,6 @@ disease_hint 收窄候选池要用的锚点。也不跟原有 17 条做名字去
 from __future__ import annotations
 
 import argparse
-import json
 import re
 from pathlib import Path
 

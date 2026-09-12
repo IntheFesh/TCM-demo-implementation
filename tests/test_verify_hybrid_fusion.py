@@ -58,10 +58,11 @@ def test_main_returns_one_when_expected_case_id_is_not_in_hybrid_top_n(monkeypat
     _install(monkeypatch, retriever)
 
     code = vhf.main(["--physician", "ye_tianshi", "--expect-case-id", "target"])
-    out = capsys.readouterr().out
+    err = capsys.readouterr().err
 
     assert code == 1
-    assert "✗ 未命中，本次修复未生效" in out
+    # 最终结论打 stderr——退出码之外还要有一行不依赖 stdout 的失败原因。
+    assert "✗ 未命中，本次修复未生效" in err
 
 
 def test_main_reports_rank_beyond_top_n_when_not_hit(monkeypatch, capsys):

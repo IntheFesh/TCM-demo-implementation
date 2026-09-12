@@ -109,10 +109,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"★命中：{args.expect_case_id} 出现在 hybrid 模式 top-{args.top_n} 里，"
               "P0-13 的融合准入修复生效。")
     else:
+        # 命中/未命中的最终结论打 stderr：CI 里 stdout 常被吞掉或另作日志用，
+        # 退出码之外还要有一行肉眼可读的失败原因不依赖 stdout 是否被留下来。
         print(f"✗ 未命中，本次修复未生效：{args.expect_case_id} 没有出现在 "
-              f"hybrid 模式 top-{args.top_n} 里。")
+              f"hybrid 模式 top-{args.top_n} 里。", file=sys.stderr)
     return 0 if hit else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
