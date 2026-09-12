@@ -68,6 +68,10 @@ from core.physicians import PHYSICIANS
 # E8 的四种默认模式取自检索层自己的合法集合，不在这里另抄一份——
 # 见 core/chain.py 对 ALLOWED_MODES 的同一条理由。
 from core.retrieval_hybrid import ALLOWED_MODES
+# E9 dry-run 的调用数上界要按 MAX_STEPS 算，不能只说"可能更高"——
+# 从 core/react.py 现读，不在这里另定一个数字（那样 MAX_STEPS 改了这里会
+# 悄悄漂移）。
+from core.react import MAX_STEPS
 # Jaccard 距离/两两统计全项目只在这里实现一处（core/setstats.py 模块文档
 # 字符串）；offline/estimate_epsilon.py 的噪声估计也走它，E3/E4/E8/E9
 # 跟噪声地板比较、跨模式/跨配置比较用的都是同一把尺子。
@@ -820,14 +824,20 @@ def main(argv: list[str] | None = None) -> None:
             detail.append(f"--e8 另加 {len(queries)} 条 × ~{base_calls_per_query} 次/条 × "
                            f"{len(ALLOWED_MODES)}种模式（{sorted(ALLOWED_MODES)}）")
         if args.e9:
-            # 输出差异率要 use_react False+True 各一轮；过程统计再单独跑一轮 True——
-            # 后者步数不定（ReAct 每步都是一次调用），这里仍按 base_calls_per_query
-            # 的量级估，真实数可能更高，dry-run 只给数量级。
-            e9_total = len(queries) * base_calls_per_query * 3
+            # use_react=False 那一轮跟 base_calls_per_query 同形状；use_react=True
+            # 那一轮每位医家最多 MAX_STEPS 次 ReAct 调用 + S3(含可能重开)，这是
+            # 真正的调用数上界（不是"量级估计，可能更高"）——ReAct 提前 finish
+            # 时实际调用数只会更少，不会超过它。True 那一轮要跑两次：一次算
+            # 跟 False 的输出差异率，一次单独收集步数/terminated_by 过程统计。
+            react_upper_per_query = 2 + len(PHYSICIANS) * (MAX_STEPS + 2)
+            e9_total = len(queries) * (base_calls_per_query + 2 * react_upper_per_query)
             total += e9_total
-            detail.append(f"--e9 另加 {len(queries)} 条 × ~{base_calls_per_query} 次/条 × 3轮"
-                           "（False+True 各一轮算差异率，True 再单独一轮算过程统计；"
-                           "ReAct 每步都是一次调用，真实数可能更高，这里只给数量级）")
+            detail.append(
+                f"--e9 另加 {len(queries)} 条：use_react=False 一轮 ~{base_calls_per_query} 次/条 "
+                f"+ use_react=True 两轮（差异率一轮、过程统计一轮）各 ≤{react_upper_per_query} 次/条"
+                f"（{len(PHYSICIANS)} 位医家 × 最多 MAX_STEPS={MAX_STEPS} 步 ReAct + S3，"
+                "这是真正的调用数上界，ReAct 提前 finish 只会更省）"
+            )
         print(f"--dry-run：预估调用数 ≈ {total}（{'；'.join(detail)}），不真的调用")
         return
 
