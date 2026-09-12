@@ -357,19 +357,23 @@ def test_hybrid_dense_ranking_probe_ignores_the_requested_min_score(tmp_path, mo
     )
 
 
-def test_hybrid_mode_actually_filters_final_output_by_min_score(tmp_path):
-    """P0-9 顺带修复的第二个问题：旧实现融合完成后从不对最终结果做 min_score
-    过滤（只用它去筛 dense 路的候选池），一个案子只要 BM25 分够高就能进
-    hybrid 的最终结果，展示相似度却是被过滤掉后回退的 0.0——min_score
-    「以下的结果不返回」这条契约对 hybrid 模式形同虚设。
-
-    这里构造一个 BM25 关键词命中但语义（稠密相似度）很低的案子：min_score
-    设得足够高时，它不该出现在 hybrid 的结果里，即使纯 bm25 模式会把它排
-    第一。"""
+def test_hybrid_mode_min_score_no_longer_gates_final_output(tmp_path):
+    """**契约变更，P0-13**：这条测试原名
+    test_hybrid_mode_actually_filters_final_output_by_min_score，原断言是
+    "BM25 关键词命中但 dense 分很低的条目不该出现在 hybrid 结果里"——P0-13
+    的诊断证明这条断言本身就是根因：融合之后再套一层单路 dense 阈值，等于
+    让 dense 对 BM25 的发现拥有否决权（AutoDL 实测「情志不畅」那条主诉，
+    全库唯一精确命中的医案就是这样被滤掉的，见
+    test_fusion_admits_bm25_only_match_that_fails_the_dense_threshold）。
+    P0-13 改动 1 之后 min_score 不再gate hybrid 的最终输出——这里反过来
+    断言：BM25 关键词精确命中、dense 分很低的条目现在**会**出现在 hybrid
+    结果里（min_score 只还在 dense 模式下起过滤作用，见下面
+    test_search_min_score_only_filters_dense_path，那条测试的语义没变，
+    dense 分支本身没被这次改动碰过）。"""
     query = "噎膈反胃"
     cases = [
-        _case("irrelevant_but_keyword_match", "ye_tianshi", ["噎膈反胃"]),
-        _case("relevant", "ye_tianshi", ["纳差乏力"]),
+        _case("keyword_match_low_dense", "ye_tianshi", ["噎膈反胃"]),
+        _case("dense_favored", "ye_tianshi", ["纳差乏力"]),
     ]
     cases_path = _write_cases(tmp_path, cases)
     retriever = HybridRetriever(cases_path=cases_path)
@@ -380,14 +384,14 @@ def test_hybrid_mode_actually_filters_final_output_by_min_score(tmp_path):
     )
 
     bm25_hits = retriever.search(query, "ye_tianshi", k=2, mode="bm25")
-    assert bm25_hits[0][0].case_id == "irrelevant_but_keyword_match"  # 纯 bm25 会选它
+    assert bm25_hits[0][0].case_id == "keyword_match_low_dense"  # 纯 bm25 会选它
 
     hybrid_hits = retriever.search(query, "ye_tianshi", k=2, mode="hybrid", min_score=0.5)
     hybrid_ids = [c.case_id for c, _ in hybrid_hits]
-    assert "irrelevant_but_keyword_match" not in hybrid_ids, (
-        "min_score=0.5 时这条医案的稠密相似度只有 0.05，不该出现在 hybrid 结果里"
+    assert "keyword_match_low_dense" in hybrid_ids, (
+        "dense 分只有 0.05、min_score=0.5——但它是 BM25 精确命中的条目，"
+        "P0-13 之后不该再被单路 dense 阈值滤掉"
     )
-    assert hybrid_ids == ["relevant"]
 
 
 def test_hybrid_mode_min_score_zero_keeps_old_behavior_unchanged(tmp_path):
@@ -401,6 +405,67 @@ def test_hybrid_mode_min_score_zero_keeps_old_behavior_unchanged(tmp_path):
     )
     hits = retriever.search(query, "ye_tianshi", k=2, mode="hybrid")
     assert {c.case_id for c, _ in hits} == {"dense_favored", "bm25_favored"}
+
+
+# ---------- P0-13：融合准入不能再套单路（dense）阈值 ----------
+#
+# 这是 P0-9 的返工。P0-9 把 min_score 过滤从"融合前"挪到了"融合后"，
+# 但过滤条件本身没变——融合完成后仍然要求每条结果的 dense 相似度
+# ≥ min_score。这在 k 很小（比如 k=3）时跟"融合前过滤"的效果一样：
+# 能进最终结果的还是只有 dense 认可的那些，BM25 单独找到、dense 分不够
+# 的条目一样进不去。真实案例：AutoDL 实测「情志不畅」这条主诉，全库
+# 唯一精确命中"情志诱因"的医案（ye_tianshi-0030-p0-0）dense 排名在
+# 50 名之外（dense 分远低于 adaptive_min_score 算出的 0.69-0.78），
+# bm25 排第 2——无论 RRF 把它排多靠前，这个阈值都会把它滤掉。
+
+
+def test_fusion_admits_bm25_only_match_that_fails_the_dense_threshold(tmp_path):
+    """精确复现实测的失败场景：三条候选 A（dense 0.80，bm25 零命中）、
+    B（dense 0.79，bm25 部分命中"情志"）、C（dense **0.50**，bm25 **最强**，
+    唯一精确命中全部关键词的一条）。min_score=0.75 时 C 的 dense 分远低于
+    阈值。另垫 2 条完全不相关的 filler——BM25 语料只有 3 篇时，"情志"这个
+    词恰好出现在 2/3 篇里，idf 会退化成负数（跟 test_bm25_ranking_
+    prefers_exact_keyword_overlap 那条注释描述的是同一类退化，只是触发
+    条件不同：这里不是"语料只有 2 篇"，是"某词恰好出现在语料的一半"），
+    垫够 5 篇才能让 idf 恢复成正常的正数、B 的部分命中才能正确排在 A（零
+    命中）和 C（全部命中）之间——这个中间排名本身不是测试要断言的东西，
+    只是为了让"C 是 bm25 里最强的那条"这个前提在正常的 idf 环境下成立，
+    不依赖一次刚好触发退化的边界语料。
+
+    这条测试必须先跑一次确认在修复前是红的（C 不在结果里），修复后
+    （去掉融合后的单路阈值过滤）才应该转绿——不是一上来就是绿的断言，
+    否则测不出真问题（P0-13 的自查清单第 10 条）。"""
+    query = "情志不适即发"
+    cases = [
+        _case("A_dense_favored", "ye_tianshi", ["纳差", "乏力", "头晕"]),
+        _case("B_dense_favored", "ye_tianshi", ["情志不畅", "胃痛"]),
+        _case("C_bm25_exact_match", "ye_tianshi", ["情志不适即发"]),
+        *_filler_cases(),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+    # dense 分直接等于查询向量跟医案向量的点积（FakeModel 不做真实归一化，
+    # 见 _install_fake_dense）：A=0.80，B=0.79，C=0.50，filler 远低于阈值。
+    _install_fake_dense(
+        retriever,
+        embeddings=[[0.80, 0.0], [0.79, 0.0], [0.50, 0.0], [-1.0, 0.0], [-1.0, 0.0]],
+        query_vectors={query: [1.0, 0.0]},
+    )
+    # bm25 排名实测（jieba 分词 + BM25Okapi）：C（精确命中"情志""不适""即发"）
+    # 远高于 B（只命中"情志"）远高于 A/filler（零命中）。
+    bm25_ranking = retriever._bm25_ranking(query, idxs=[0, 1, 2, 3, 4])
+    assert [i for i, _ in bm25_ranking[:3]] == [2, 1, 0], (
+        "这条断言只是确认测试数据本身符合设计意图（C 排 1，B 排 2，A 排 3），"
+        "不是在测产品代码"
+    )
+
+    hits = retriever.search(query, "ye_tianshi", k=3, mode="hybrid", min_score=0.75)
+    hit_ids = {c.case_id for c, _ in hits}
+    assert "C_bm25_exact_match" in hit_ids, (
+        "C 是全库唯一精确命中关键词的医案（bm25 排第 1），dense 分 0.50 远低于 "
+        "min_score=0.75——如果这条断言失败，说明融合准入仍然在用单路 dense "
+        "阈值卡它，P0-13 改动 1 没有生效"
+    )
 
 
 def test_search_min_score_only_filters_dense_path(tmp_path):

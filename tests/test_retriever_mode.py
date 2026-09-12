@@ -58,23 +58,26 @@ def test_default_path_passes_no_mode_kwargs_at_all(monkeypatch):
     mode/query_elements，无条件传的话所有第三方实现（测试里的 FakeRetriever、
     将来别的检索后端）都得跟着改签名。
 
-    每位医家现在调两次 search()（P0-7：adaptive_min_score 先探测一次
-    min_score=0.0 拿原始相似度分布，_search_cases 再拿算出来的阈值真正查一次）
-    ——两次调用的关键字集合必须一样，都不带 mode，不是只有"真正那次"才干净。"""
+    **P0-13 契约变更**：P0-7 曾经让每位医家调两次 search()（探测 min_score
+    一次 + 真正查询一次）。P0-13 发现这个探测只对显式 mode="dense" 才有
+    意义——不传 mode 时会解析成 hybrid，P0-13 改动 1 之后 hybrid 分支完全
+    不读 min_score，探测出来的值没有任何下游用途。adaptive_min_score 现在
+    对非 dense 模式直接跳过探测（core/retrieval.py 的文档字符串），行为
+    退回到 P0-7 之前：每位医家一次调用。"""
     r = _setup(monkeypatch)
     chain.consult("纳差乏力")
-    assert len(r.calls) == 4  # 两位医家 × (探测一次 + 真正查一次)
+    assert len(r.calls) == 2  # 两位医家各一次，不再探测
     for call in r.calls:
         assert set(call) == {"physician"}, f"多传了关键字：{call}"
 
 
 def test_explicit_mode_is_passed_through(monkeypatch):
-    """P0-7 之后每位医家两次调用（探测+真正查询），mode 要在两次里都原样
-    带到——探测那次也得用同一个 mode，否则探测出来的相似度分布跟真正检索
-    用的不是同一路信号，算出来的阈值没有意义。"""
+    """**P0-13 契约变更**：bm25 模式的排名函数本来就不接受 min_score，
+    adaptive_min_score 对它直接跳过探测（跟 default/hybrid 同理），
+    每位医家只有一次真正的 search() 调用。"""
     r = _setup(monkeypatch)
     chain.consult("纳差乏力", retriever_mode="bm25")
-    assert [c["mode"] for c in r.calls] == ["bm25"] * 4
+    assert [c["mode"] for c in r.calls] == ["bm25"] * 2
     for call in r.calls:
         assert "query_elements" not in call, "只有 graph 模式才需要证素"
 
@@ -82,10 +85,12 @@ def test_explicit_mode_is_passed_through(monkeypatch):
 def test_graph_mode_passes_query_elements_from_s2(monkeypatch):
     """graph 模式必须带上 S2 推断出的证素——这是它唯一的输入信号。
     FakeLLM 的 S2 固定返回证素「脾」，这里断言它确实被传下去了。
-    探测调用（P0-7）跟真正查询共用同一份 kwargs，也要带上。"""
+
+    **P0-13 契约变更**：graph 模式的排名函数不接受 min_score，
+    adaptive_min_score 对它跳过探测，每位医家只有一次真正的查询调用。"""
     r = _setup(monkeypatch)
     chain.consult("纳差乏力", retriever_mode="graph")
-    assert [c["mode"] for c in r.calls] == ["graph"] * 4
+    assert [c["mode"] for c in r.calls] == ["graph"] * 2
     for call in r.calls:
         assert call["query_elements"] == ["脾"]
 
@@ -192,11 +197,11 @@ def test_concurrent_consults_do_not_leak_modes(monkeypatch):
     t2.join(timeout=15)
 
     assert not errors, errors
-    # 每位医家两次调用（P0-7：探测 min_score 一次 + 真正查询一次），
-    # 两位医家共 4 次；两次调用用的都是同一个 mode，泄漏检测的判据不变——
+    # 每位医家一次调用（P0-13：bm25/graph 模式不接受 min_score，
+    # adaptive_min_score 跳过探测），两位医家共 2 次；泄漏检测的判据不变——
     # 只要 T-bm25 全程只看到 "bm25"、T-graph 全程只看到 "graph" 就没有串味。
-    assert seen["T-bm25"] == ["bm25"] * 4, seen
-    assert seen["T-graph"] == ["graph"] * 4, seen
+    assert seen["T-bm25"] == ["bm25"] * 2, seen
+    assert seen["T-graph"] == ["graph"] * 2, seen
 
 
 # ---------- 硬约束二：graph 不可用要变人话，不是 500、也不是静默降级 ----------

@@ -260,6 +260,10 @@ def _search_cases(
 
     P0-12：拿到 top-3 之后再过一次 apply_low_discrimination_cutoff——candidates
     之间没有真实区分度时只留 top-1，避免拿三条弱相关的塞满 prompt 稀释信号。
+    只对 dense/graph 模式成立（P0-13 改动 3，见该函数文档字符串）——传
+    kwargs.get("mode") 让它自己判断，这里不重复"是不是 dense/graph"这条
+    判断（跟 adaptive_min_score 只在 mode="dense" 时探测是同一条规则，
+    两处判断都不在 chain.py 里做，chain.py 只转发它已经知道的 mode）。
     """
     kwargs: dict = {}
     if retriever_mode is not None:
@@ -271,7 +275,7 @@ def _search_cases(
         retriever = get_retriever()
         min_score = adaptive_min_score(retriever, query, physician, **kwargs)
         hits = retriever.search(query, physician, k=3, min_score=min_score, **kwargs)
-        return apply_low_discrimination_cutoff(hits)
+        return apply_low_discrimination_cutoff(hits, mode=kwargs.get("mode"))
     except (ValueError, FileNotFoundError) as e:
         # 只翻译、不吞：检索层照旧大声报错（K3b 的 graph 模式故意不静默降级），
         # 这里把它裹成 RetrievalUnavailable 交给 consult 转成一句人话，避免

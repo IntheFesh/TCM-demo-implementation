@@ -54,8 +54,9 @@ def test_swapped_mode_searches_the_other_physicians_corpus(monkeypatch):
     called_physicians = {c["physician"] for c in r.calls}
     # 两次调用打到的都是"对方"的库，而不是自己的库
     assert called_physicians == {"wu_jutong", "ye_tianshi"}
-    # 每位医家两次（P0-7：adaptive_min_score 探测一次 + 真正查询一次）
-    assert len(r.calls) == 4
+    # 每位医家一次：不传 retriever_mode 时走默认（解析成 hybrid），P0-13
+    # 之后 adaptive_min_score 对非 dense 模式直接跳过探测，不发起额外调用。
+    assert len(r.calls) == 2
 
 
 def test_swap_physician_id_cycles_through_registry_order(monkeypatch):

@@ -121,23 +121,36 @@ def adaptive_min_score(
     阈值随之放宽；医案多、覆盖广的医家能挤出更高的 top-10，阈值保持接近
     原来的 0.70，不放松。
 
+    P0-13 改动 2：min_score 参数现在只有 dense 模式的 _dense_ranking 会真的
+    拿它去过滤——bm25/graph 模式的排名函数本来就不接受这个参数；hybrid
+    模式的融合准入在 P0-13 之前也用它过滤，但那正是 P0-13 要修的根因
+    （单路 dense 阈值否决 BM25 的发现），改完之后 hybrid 分支完全不再读
+    这个参数（core/retrieval_hybrid.py::search() 的 hybrid 分支文档字符串）。
+    也就是说，这次探测——完整跑一遍 retriever.search()——只对**显式请求
+    dense 模式**的调用才有意义；default（不传 mode，解析成 hybrid，见
+    HybridRetriever.search() 的 `mode or os.environ.get(..., "hybrid")`）
+    和显式 bm25/graph/hybrid 都用不上探测出来的值，跑这次探测纯粹是浪费
+    ——每次检索多一次完整的 search() 调用。
+
+    所以只在 search_kwargs 里显式带着 mode="dense" 时才真的探测；其余情况
+    （包括 mode 缺省）直接返回 0.0，不发起探测调用。这里只看
+    search_kwargs.get("mode")，不去读 RETRIEVER_MODE 环境变量自己复算一遍
+    "缺省到底解析成什么"——那份解析逻辑只在 HybridRetriever.search() 一处
+    实现，这里重新猜一遍就是把同一个判断散到了第二处（CLAUDE.md「同一
+    概念的匹配逻辑只能有一处实现」）。代价：如果调用方没有显式传 mode、
+    但进程恰好设了 RETRIEVER_MODE=dense（README「检索模式不是环境变量」
+    那条已经点名这是已知的风险操作），这次探测会被跳过、真正的 dense
+    检索会退到 ADAPTIVE_MIN_SCORE_FLOOR 而不是探测出的阈值——比悄悄猜错
+    一个阈值更安全的选择是不猜、给一个已知安全的下限，不是当作没有代价。
+
     只通过 Retriever.search() 这一个抽象接口方法探测，不要求具体实现额外
     暴露内部排名方法——测试用的 FakeRetriever、将来别的检索后端都不用为
-    这个功能改 search() 之外的任何东西。**search_kwargs 原样转给探测调用
-    （比如 retriever_mode 对应的 mode 关键字），跟 core/chain.py::
-    _search_cases「不传 mode 就不加这个关键字」的规则保持一致——这里只是
-    转发，不新增判断，也不强制探测用某个特定 mode。
-
-    这个阈值只对 dense/graph 这类 [0,1] 有界相似度的过滤有实际效果——跟
-    MIN_RETRIEVAL_SCORE 本身的适用范围一样（core/retrieval_hybrid.py 模块
-    文档字符串）。hybrid 模式下 min_score=0.0 探测时，dense 那一路的原始
-    相似度覆盖了返回结果的全部展示分（没有任何结果被 min_score 过滤掉，
-    "没有真实稠密相似度可展示才回退到 0.0"那条规则不会触发），所以探测到
-    的分数就是真实的 dense 相似度，跟"该医家 top-10 相似度"这个要求是
-    同一件事；bm25/graph 模式下游本来就不拿 min_score 做过滤（HybridRetriever
-    .search() 的对应分支根本不读这个参数），探测出来的值不会被用到，
-    不需要为这两种模式特判。
+    这个功能改 search() 之外的任何东西。**search_kwargs 原样转给探测调用，
+    跟 core/chain.py::_search_cases「不传 mode 就不加这个关键字」的规则
+    保持一致——这里只是转发，不新增判断。
     """
+    if search_kwargs.get("mode") != "dense":
+        return 0.0
     probe = retriever.search(
         query, physician, k=ADAPTIVE_MIN_SCORE_PROBE_K, min_score=0.0, **search_kwargs
     )
@@ -154,6 +167,21 @@ def adaptive_min_score(
 # 还占掉 prompt 空间稀释信号。
 LOW_DISCRIMINATION_MARGIN = 0.03
 
+# P0-13 改动 3：这个判据的前提是"展示分就是排序用的那个分"——分差小意味着
+# 排序本身分不出高下。dense/graph 模式满足这个前提：两者的展示分（真实
+# 余弦相似度/真实 Jaccard 相似度）本身就是排序依据。hybrid 模式不满足：
+# 展示分是 dense 相似度，排序依据是 RRF 融合分，P0-13 之后两者彻底脱钩
+# （改动 1）——一条 BM25 精确命中、dense 分很低的医案可能排在很靠前的
+# 融合名次，跟另一条同样是低 dense 分的医案比较展示分差值，比出来的不是
+# "这次排序有没有区分度"，是两条医案凑巧撞上了接近的 dense 分，跟它们
+# 真实的融合名次距离无关——套用这条判据会误砍掉 K3a 恰好要保留的那类
+# 结果。bm25 模式的展示分是无界原始分（10-30 常态），跟按 dense 余弦
+# 相似度校准的 0.03 这个量纲根本不是一个刻度，同样不成立（跟 adaptive_
+# min_score/MIN_RETRIEVAL_SCORE 只对 dense/graph 这类 [0,1] 有界相似度
+# 有意义是同一条已有的设计原则，见 core/retrieval_hybrid.py 模块文档
+# 字符串——这里不是新发明一条规则，是把同一条规则应用到 P0-12 这个新场景）。
+_LOW_DISCRIMINATION_VALID_MODES = {"dense", "graph"}
+
 
 def low_discrimination_cutoff_enabled() -> bool:
     """默认开。全项目唯一的 LOW_DISCRIMINATION_CUTOFF 判定实现——跟
@@ -166,7 +194,8 @@ def low_discrimination_cutoff_enabled() -> bool:
 
 
 def apply_low_discrimination_cutoff(
-    hits: list[tuple[CaseRecord, float]], enabled: bool | None = None
+    hits: list[tuple[CaseRecord, float]], mode: str | None = None,
+    enabled: bool | None = None,
 ) -> tuple[list[tuple[CaseRecord, float]], bool]:
     """P0-12：hits 已经按相似度降序排好（search() 的返回契约）。top-1 和
     最后一条的原始相似度差 < LOW_DISCRIMINATION_MARGIN 时只保留 top-1。
@@ -174,13 +203,21 @@ def apply_low_discrimination_cutoff(
     （core.chain.run_physician）带进结果字典，E3 报告要能看到这个标记
     出现的比例，不是只改行为不留痕迹。
 
+    mode 是这次检索实际请求的模式（跟传给 search() 的 mode 关键字一致，
+    缺省/None 表示会解析成 hybrid，见 HybridRetriever.search()）。P0-13
+    改动 3：这个判据只对 _LOW_DISCRIMINATION_VALID_MODES 里的模式成立——
+    hybrid（含缺省）和 bm25 下，展示分跟真正的排序依据脱钩或量纲不同，
+    比较展示分的差值判断"有没有区分度"是在比较错误的维度，不能套用。
+    这个范围检查独立于 enabled 开关：LOW_DISCRIMINATION_CUTOFF=1 只表示
+    "在成立的场景下要不要用它"，不能反过来在不成立的场景下也用。
+
     enabled=None 时读 low_discrimination_cutoff_enabled()（显式参数优先，
     未指定才读环境变量——跟 core.chain._search_cases 的 retriever_mode/
     refs_mode 同一条规则，不在这个函数内部直接读环境变量，方便测试注入）。
     """
     if enabled is None:
         enabled = low_discrimination_cutoff_enabled()
-    if not enabled or len(hits) < 2:
+    if not enabled or mode not in _LOW_DISCRIMINATION_VALID_MODES or len(hits) < 2:
         return hits, False
     if hits[0][1] - hits[-1][1] < LOW_DISCRIMINATION_MARGIN:
         return hits[:1], True

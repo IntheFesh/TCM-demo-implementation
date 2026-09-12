@@ -116,7 +116,11 @@ class FakeRetriever(Retriever):
     def __init__(self, cases: list[CaseRecord]):
         self.cases = cases
 
-    def search(self, query, physician, k=3, min_score=0.0):
+    def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+        # **kwargs 接住但不用：P0-13 起 adaptive_min_score 在 mode="dense"
+        # 时会真的探测一次（core/retrieval.py），这个假实现不关心 mode 本身
+        # 返回什么结果，只是不能因为多传了这个关键字就报 TypeError——跟
+        # tests/test_retriever_mode.py 的 RecordingRetriever 同一条理由。
         hits = [c for c in self.cases if c.physician == physician][:k]
         return [(c, 0.9) for c in hits]
 
@@ -259,7 +263,11 @@ def test_run_physician_flags_low_discrimination_when_retrieval_scores_are_close(
     要带 low_discrimination=True、refs 收窄到 1 条——不是只在内部悄悄截断，
     调用方（eval/run_eval.py 的 E3 报告）要能看到这个标记。FakeRetriever
     对每条命中都返回固定相似度 0.9，两条命中分差正好是 0，天然落进
-    "没有区分度"这个条件。"""
+    "没有区分度"这个条件。
+
+    **P0-13**：这条判据只对 dense/graph 模式成立（改动 3），所以这里显式
+    传 retriever_mode="dense"——不传的话会走默认（hybrid），这条判据在
+    hybrid 下根本不生效，测的就不是这条判据本身了。"""
     cases = [_case(case_id="ye_tianshi-001", raw_excerpt="甲"),
              _case(case_id="ye_tianshi-002", raw_excerpt="乙")]
     s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
@@ -270,7 +278,7 @@ def test_run_physician_flags_low_discrimination_when_retrieval_scores_are_close(
 
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     s2 = S2Elements(elements=[], unexplained_symptoms=[])
-    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士")
+    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士", retriever_mode="dense")
 
     assert result["low_discrimination"] is True
     assert len(result["refs"]) == 1
@@ -295,7 +303,7 @@ def test_run_physician_no_low_discrimination_flag_when_scores_have_real_spread(m
 
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     s2 = S2Elements(elements=[], unexplained_symptoms=[])
-    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士")
+    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士", retriever_mode="dense")
 
     assert result["low_discrimination"] is False
     assert len(result["refs"]) == 2
@@ -312,10 +320,92 @@ def test_run_physician_low_discrimination_can_be_disabled_via_env(monkeypatch):
 
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     s2 = S2Elements(elements=[], unexplained_symptoms=[])
+    # retriever_mode="dense"：确认关掉的是 LOW_DISCRIMINATION_CUTOFF 这个开关本身
+    # 生效，不是巧合落进了"hybrid 模式下这条判据本来就不生效"这条别的路径。
+    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士", retriever_mode="dense")
+
+    assert result["low_discrimination"] is False
+    assert len(result["refs"]) == 2
+
+
+def test_run_physician_hybrid_mode_never_flags_low_discrimination_even_when_scores_tie(monkeypatch):
+    """P0-13 契约变更的直接验证：同样的"两条命中分差为 0"场景，默认模式
+    （解析成 hybrid）下不该触发——跟上面 test_run_physician_flags_
+    low_discrimination_when_retrieval_scores_are_close 是同一份测试数据，
+    唯一的区别是这里不传 retriever_mode。"""
+    cases = [_case(case_id="ye_tianshi-001", raw_excerpt="甲"),
+             _case(case_id="ye_tianshi-002", raw_excerpt="乙")]
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(cases))
+
+    s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
+    s2 = S2Elements(elements=[], unexplained_symptoms=[])
     result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士")
 
     assert result["low_discrimination"] is False
     assert len(result["refs"]) == 2
+
+
+# ---------- P0-13 验证 B：非 dense 模式下不再有多余的探测调用 ----------
+
+
+class _CountingRetriever(Retriever):
+    """记每次 search() 调用（不区分探测还是真正查询——P0-13 改动 2 之后
+    非 dense 模式根本不该有探测这一步，调用总数就该等于真正查询的次数）。"""
+
+    def __init__(self, cases):
+        self.cases = cases
+        self.call_count = 0
+
+    def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+        self.call_count += 1
+        hits = [c for c in self.cases if c.physician == physician][:k]
+        return [(c, 0.9) for c in hits]
+
+
+def test_search_cases_default_mode_calls_search_exactly_once(monkeypatch):
+    """P0-13 验证 B：_search_cases 在默认（不传 retriever_mode，解析成
+    hybrid）路径下只调用一次 retriever.search()——P0-7 曾经的探测调用
+    （adaptive_min_score）在非 dense 模式下已经被跳过，不是"探测 + 真正
+    查询"两次。"""
+    r = _CountingRetriever([_case(case_id="ye_tianshi-001")])
+    monkeypatch.setattr(chain, "get_retriever", lambda: r)
+    s2 = S2Elements(elements=[], unexplained_symptoms=[])
+
+    chain._search_cases("纳差", "ye_tianshi", s2, retriever_mode=None)
+
+    assert r.call_count == 1
+
+
+@pytest.mark.parametrize("mode", ["bm25", "graph", "hybrid"])
+def test_search_cases_non_dense_modes_call_search_exactly_once(monkeypatch, mode):
+    r = _CountingRetriever([_case(case_id="ye_tianshi-001")])
+    monkeypatch.setattr(chain, "get_retriever", lambda: r)
+    s2 = S2Elements(
+        elements=[ElementHit(element="脾", kind="location",
+                             supporting_symptoms=["纳差"], confidence="high")],
+        unexplained_symptoms=[],
+    )
+
+    chain._search_cases("纳差", "ye_tianshi", s2, retriever_mode=mode)
+
+    assert r.call_count == 1
+
+
+def test_search_cases_dense_mode_calls_search_exactly_twice(monkeypatch):
+    """对照组：显式请求 dense 模式时，adaptive_min_score 的探测才是真的
+    有意义（dense 分支仍然用 min_score 过滤），这里应该是探测 + 真正查询
+    两次——不是"P0-13 之后所有模式都只调一次"，只有 dense 该有两次。"""
+    r = _CountingRetriever([_case(case_id="ye_tianshi-001")])
+    monkeypatch.setattr(chain, "get_retriever", lambda: r)
+    s2 = S2Elements(elements=[], unexplained_symptoms=[])
+
+    chain._search_cases("纳差", "ye_tianshi", s2, retriever_mode="dense")
+
+    assert r.call_count == 2
 
 
 def test_shared_stages_run_once_per_physician_stages_run_twice(monkeypatch):

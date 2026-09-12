@@ -216,16 +216,33 @@ class HybridRetriever(DenseRetriever):
         elif mode == "graph":
             scored = self._graph_ranking(query_elements, idxs)
         else:  # hybrid：query_elements 有就三路融合，没有就退回两路（向后兼容）
-            # P0-9 根因修复：融合阶段不能用 min_score 过滤 dense 路。旧实现在这里
-            # 传真实 min_score，dense_ranking 只剩少数条目，融合时它们必然占据
-            # dense 这一路的高排名（哪怕本身相似度只是刚过线），bm25 路排名靠后
-            # 但没被 dense 卡掉的好结果只拿到单路 RRF 分，打不过"dense+bm25 双路
-            # 都有"的条目——结果 hybrid 系统性地比它自己的两个输入都差（真实案例：
-            # "情志不畅"这条主诉，dense/bm25 单独看都命中了对症的医案，融合完
-            # 反而选出最不对症的一版）。改成融合阶段用 min_score=0.0（不过滤），
-            # 融合排完名之后再对最终结果按 min_score 过滤——过滤的是 dense 展示分，
-            # 语义跟原来一致（"不够像就不展示"），只是把过滤时机从"进融合前"
-            # 挪到"出融合后"，不会再污染融合本身的排名。
+            # P0-13（P0-9 的返工）：融合阶段不用 min_score 过滤 dense 路，这个
+            # P0-9 已经做了；但 P0-9 在融合*之后*留了一个等价的准入条件——
+            # 要求每条最终结果的 dense 相似度 ≥ min_score。k 很小（这里 k=3）
+            # 时这跟"融合前过滤"的效果完全一样：能进最终结果的还是只有 dense
+            # 认可的那些，BM25 单独找到、dense 分不够的条目一样进不去，因为
+            # 不管在流程的哪个位置，"dense 分 ≥ min_score"这个硬性条件本身
+            # 没有变。真实案例：AutoDL 实测「情志不畅」这条主诉，全库唯一
+            # 精确命中"情志诱因"的医案 dense 排名在 50 名之外（远低于
+            # adaptive_min_score 算出的 0.69-0.78），bm25 排第 2——无论 RRF
+            # 把它排多靠前，这个准入条件都会把它滤掉，P0-9 的修复实测没有
+            # 生效（tests/test_retrieval_hybrid.py::
+            # test_fusion_admits_bm25_only_match_that_fails_the_dense_threshold
+            # 精确复现了这个失败）。
+            #
+            # 根因是把 RRF 之上再叠一层单路（dense）阈值，等于让 dense 对
+            # BM25 的发现拥有否决权。RRF 本身就是质量筛选机制——它的设计
+            # 前提是"多路都认可的条目排名靠前"；K3a 引入 BM25 的全部理由
+            # 就是"对中医术语的精确匹配能力是 dense 缺的"（模块文档字符串），
+            # 用 dense 阈值否决 BM25 的发现，等于取消了 K3a 存在的意义。
+            # 改成：融合排完名之后不再对结果做任何单路阈值过滤，min_score
+            # 现在在 hybrid 模式下不影响准入（dense 模式仍然用它过滤，
+            # 见 adaptive_min_score 的适用范围说明）。
+            #
+            # 展示分仍然是 dense 相似度（保持现有语义不变）——dense 分低的
+            # 条目照常返回、展示它真实的低分，不是把它藏起来。前端和 E3
+            # 报告能看到"这条是 BM25 找到的、dense 分只有 0.5"，这比让它
+            # 悄悄消失或悄悄显示成误导性的 0.0 更诚实。
             dense_ranking = self._dense_ranking(query, idxs, min_score=0.0)
             bm25_ranking = self._bm25_ranking(query, idxs)
             dense_scores = dict(dense_ranking)
@@ -233,13 +250,10 @@ class HybridRetriever(DenseRetriever):
             if query_elements:
                 rankings.append([i for i, _ in self._graph_ranking(query_elements, idxs)])
             fused = _rrf_fuse(rankings)
-            # 展示分优先用稠密相似度；dense_ranking 现在覆盖了 idxs 里的全部条目
-            # （上面传的 min_score=0.0），.get(i, 0.0) 这个兜底理论上不会再触发——
-            # 保留它只是防御性写法（万一某条医案不在 idxs 里却混进了 fused，
-            # 那是别的 bug，不该在这里静默吞掉，但也不该在这里崩）。
-            scored = [
-                (i, dense_scores.get(i, 0.0)) for i, _ in fused
-                if dense_scores.get(i, 0.0) >= min_score
-            ]
+            # dense_ranking 覆盖了 idxs 里的全部条目（min_score=0.0，不过滤），
+            # .get(i, 0.0) 这个兜底理论上不会触发——保留它只是防御性写法
+            # （万一某条医案不在 idxs 里却混进了 fused，那是别的 bug，不该
+            # 在这里静默吞掉，但也不该在这里崩）。
+            scored = [(i, dense_scores.get(i, 0.0)) for i, _ in fused]
 
         return [(self._cases[i], score) for i, score in scored[:k]]

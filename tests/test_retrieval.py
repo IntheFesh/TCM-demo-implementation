@@ -177,7 +177,7 @@ class _ScoreListRetriever(Retriever):
 
 def test_adaptive_min_score_empty_probe_returns_floor():
     r = _ScoreListRetriever([])
-    assert adaptive_min_score(r, "q", "ye_tianshi") == ADAPTIVE_MIN_SCORE_FLOOR
+    assert adaptive_min_score(r, "q", "ye_tianshi", mode="dense") == ADAPTIVE_MIN_SCORE_FLOOR
 
 
 def test_adaptive_min_score_uses_p25_of_probe_when_above_floor():
@@ -185,7 +185,7 @@ def test_adaptive_min_score_uses_p25_of_probe_when_above_floor():
     # p25（线性插值）算出来是 0.7625，明显高于 ADAPTIVE_MIN_SCORE_FLOOR=0.60
     scores = [0.65, 0.70, 0.75, 0.80, 0.85, 0.88, 0.90, 0.92, 0.95, 0.98]
     r = _ScoreListRetriever(scores)
-    result = adaptive_min_score(r, "q", "ye_tianshi")
+    result = adaptive_min_score(r, "q", "ye_tianshi", mode="dense")
     assert result == pytest.approx(_percentile(sorted(scores), 25))
     assert result > ADAPTIVE_MIN_SCORE_FLOOR
 
@@ -194,32 +194,54 @@ def test_adaptive_min_score_never_goes_below_floor():
     """医案很少/覆盖窄的医家：探测到的分数普遍很低，p25 也很低，
     仍然不能低于 ADAPTIVE_MIN_SCORE_FLOOR——否则退化成"什么都收"。"""
     r = _ScoreListRetriever([0.05, 0.08, 0.1])
-    assert adaptive_min_score(r, "q", "ye_tianshi") == ADAPTIVE_MIN_SCORE_FLOOR
+    assert adaptive_min_score(r, "q", "ye_tianshi", mode="dense") == ADAPTIVE_MIN_SCORE_FLOOR
 
 
 def test_adaptive_min_score_probes_with_min_score_zero_and_k_ten():
     r = _ScoreListRetriever([0.9] * 10)
-    adaptive_min_score(r, "主诉", "ye_tianshi")
+    adaptive_min_score(r, "主诉", "ye_tianshi", mode="dense")
     assert len(r.calls) == 1
     assert r.calls[0]["min_score"] == 0.0
     assert r.calls[0]["k"] == 10
 
 
-def test_adaptive_min_score_forwards_search_kwargs_to_probe():
-    """探测调用要跟真正查询用同一份 mode/query_elements，否则探测出来的
-    相似度分布跟真正检索用的不是同一路信号，算出来的阈值没有意义。"""
+def test_adaptive_min_score_forwards_mode_dense_to_the_probe_call():
+    """探测调用要跟真正查询用同一个 mode，否则探测出来的相似度分布跟真正
+    检索用的不是同一路信号，算出来的阈值没有意义。"""
     r = _ScoreListRetriever([0.9] * 10)
-    adaptive_min_score(r, "主诉", "ye_tianshi", mode="graph", query_elements=["脾"])
-    assert r.calls[0]["mode"] == "graph"
-    assert r.calls[0]["query_elements"] == ["脾"]
+    adaptive_min_score(r, "主诉", "ye_tianshi", mode="dense")
+    assert r.calls[0]["mode"] == "dense"
 
 
-def test_adaptive_min_score_passes_no_extra_kwargs_when_none_given():
-    """不传 search_kwargs 时探测调用也不该多带任何关键字——保持跟
-    core/chain.py::_search_cases「不传 mode 就不加这个关键字」同一条规则。"""
+def test_adaptive_min_score_passes_no_extra_kwargs_beyond_mode():
+    """探测调用不该多带 mode 以外的任何关键字——保持跟 core/chain.py::
+    _search_cases「不传 mode 就不加这个关键字」同一条规则，只是这里
+    mode 本身必须传（下面几条 P0-13 测试断言的就是"不传/传别的值时
+    根本不会走到这次调用"）。"""
     r = _ScoreListRetriever([0.9] * 10)
-    adaptive_min_score(r, "主诉", "ye_tianshi")
-    assert set(r.calls[0]) == {"query", "physician", "k", "min_score"}
+    adaptive_min_score(r, "主诉", "ye_tianshi", mode="dense")
+    assert set(r.calls[0]) == {"query", "physician", "k", "min_score", "mode"}
+
+
+# ---------- P0-13 改动 2：非 dense 模式下探测是纯浪费，必须跳过 ----------
+
+
+def test_adaptive_min_score_skips_probe_when_mode_is_absent():
+    """不传 mode 时（会在 HybridRetriever.search() 里解析成 hybrid）——
+    P0-13 改动 1 之后 hybrid 分支完全不读 min_score，探测出来的值没有
+    任何下游用途，不该发起这次完整的 search() 调用。"""
+    r = _ScoreListRetriever([0.9] * 10)
+    result = adaptive_min_score(r, "主诉", "ye_tianshi")
+    assert result == 0.0
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("mode", ["bm25", "graph", "hybrid"])
+def test_adaptive_min_score_skips_probe_for_non_dense_modes(mode):
+    r = _ScoreListRetriever([0.9] * 10)
+    result = adaptive_min_score(r, "主诉", "ye_tianshi", mode=mode)
+    assert result == 0.0
+    assert r.calls == []
 
 
 def test_percentile_single_value_returns_it():
@@ -285,7 +307,7 @@ def test_low_discrimination_cutoff_enabled_reads_env_var(monkeypatch):
 
 def test_apply_cutoff_truncates_to_top1_when_scores_are_close():
     hits = _hits(0.80, 0.79, 0.78)  # 分差 0.02 < LOW_DISCRIMINATION_MARGIN=0.03
-    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="dense", enabled=True)
     assert triggered is True
     assert len(result) == 1
     assert result[0][1] == 0.80
@@ -293,7 +315,7 @@ def test_apply_cutoff_truncates_to_top1_when_scores_are_close():
 
 def test_apply_cutoff_keeps_all_hits_when_scores_have_real_spread():
     hits = _hits(0.90, 0.70, 0.60)  # 分差 0.30，明显有区分度
-    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="dense", enabled=True)
     assert triggered is False
     assert result == hits
 
@@ -303,27 +325,27 @@ def test_apply_cutoff_boundary_exactly_at_margin_is_not_low_discrimination():
     "小于"margin，不是"小于等于"，跟 min_score 用 >= 的方向一致（差多少
     才算够，边界值算"够"而不是"不够"）。"""
     hits = _hits(0.80, 0.80 - LOW_DISCRIMINATION_MARGIN)
-    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="dense", enabled=True)
     assert triggered is False
     assert result == hits
 
 
 def test_apply_cutoff_single_hit_never_triggers():
     hits = _hits(0.80)
-    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="dense", enabled=True)
     assert triggered is False
     assert result == hits
 
 
 def test_apply_cutoff_empty_hits_never_triggers():
-    result, triggered = apply_low_discrimination_cutoff([], enabled=True)
+    result, triggered = apply_low_discrimination_cutoff([], mode="dense", enabled=True)
     assert triggered is False
     assert result == []
 
 
 def test_apply_cutoff_disabled_returns_hits_unchanged_even_when_close():
     hits = _hits(0.80, 0.79, 0.78)
-    result, triggered = apply_low_discrimination_cutoff(hits, enabled=False)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="dense", enabled=False)
     assert triggered is False
     assert result == hits
 
@@ -333,8 +355,49 @@ def test_apply_cutoff_enabled_none_reads_environment(monkeypatch):
     refs_mode 同一条规则。"""
     hits = _hits(0.80, 0.79, 0.78)
     monkeypatch.setenv("LOW_DISCRIMINATION_CUTOFF", "0")
-    result, triggered = apply_low_discrimination_cutoff(hits)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="dense")
     assert triggered is False
     assert result == hits
+
+
+def test_apply_cutoff_graph_mode_also_valid():
+    """graph 模式的展示分（真实 Jaccard 相似度）就是排序依据本身，跟 dense
+    同理——这条判据对它也成立。"""
+    hits = _hits(0.80, 0.79, 0.78)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="graph", enabled=True)
+    assert triggered is True
+    assert len(result) == 1
+
+
+# ---------- P0-13 改动 3：hybrid/bm25 模式下这条判据不成立 ----------
+
+
+@pytest.mark.parametrize("mode", [None, "hybrid", "bm25"])
+def test_apply_cutoff_does_not_apply_to_hybrid_or_bm25_or_default(mode):
+    """P0-13 契约变更：hybrid（含缺省，会解析成 hybrid）模式下展示分是
+    dense 相似度，但排序依据是 RRF 融合分，两者脱钩——比较展示分差值
+    判断"有没有区分度"是在比较错误的维度：一条 BM25 精确命中、dense 分
+    很低的医案可能排在很靠前的融合名次，却可能因为跟另一条同样低 dense
+    分的医案凑巧分差很小而被误砍。bm25 模式的展示分是无界原始分，跟这个
+    按 dense 余弦相似度校准的 0.03 阈值不是一个刻度，同样不成立。这两种
+    情况即使分差很小也不该触发截断。"""
+    hits = _hits(0.80, 0.79, 0.78)  # 分差 0.02，若判据成立会触发
+    result, triggered = apply_low_discrimination_cutoff(hits, mode=mode, enabled=True)
+    assert triggered is False
+    assert result == hits
+
+
+def test_apply_cutoff_hybrid_does_not_cut_bm25_found_low_dense_item():
+    """P0-13 自查清单第 5 条要求的那条测试：hybrid 模式下，一条 BM25 引入
+    的低 dense 分候选（跟 top-1 的高 dense 分候选分差很大，但两条低 dense
+    分候选之间分差很小）不该被误判成"没有区分度"而被砍到只剩 1 条。"""
+    # top-1 是 dense 强势候选（0.85），后两条是 bm25 找到的、dense 分都很低
+    # 且彼此接近（0.55/0.53，分差 0.02 < margin）——如果误套用这条判据，
+    # 会把这两条里的一条砍掉，恰恰是 K3a 引入 BM25 想保留的那类结果。
+    hits = _hits(0.85, 0.55, 0.53)
+    result, triggered = apply_low_discrimination_cutoff(hits, mode="hybrid", enabled=True)
+    assert triggered is False
+    assert result == hits
+    assert len(result) == 3
 
 
