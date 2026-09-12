@@ -306,6 +306,11 @@ def _herb_pairs_from_outcomes(query: str, baseline: dict, ablated: dict) -> list
             # 要单独识别、排除出 change_rate 的分母。
             "own_refs_empty": bool(own.get("no_reference_cases")),
             "ablated_refs_empty": bool(ablated_r.get("no_reference_cases")),
+            # P0-12：这次检索到的候选之间没有真实区分度时 run_physician()
+            # 已经把 top-3 收窄成了 top-1——E3 报告要能看到这个标记出现的
+            # 比例（LOW_DISCRIMINATION_CUTOFF 默认开，要能跑两遍对比）。
+            "own_low_discrimination": bool(own.get("low_discrimination")),
+            "ablated_low_discrimination": bool(ablated_r.get("low_discrimination")),
         })
     return pairs
 
@@ -413,6 +418,8 @@ def ablation_output_effect(
             "n_empty_refs": 0, "n_scored": 0,
             "change_rate": None, "gate_threshold": GATE_OUTPUT_CHANGE_RATE,
             "gate_pass": None, "per_pair": [],
+            "n_own_low_discrimination": 0, "n_ablated_low_discrimination": 0,
+            "own_low_discrimination_rate": None, "ablated_low_discrimination_rate": None,
             "note": f"{label}：没有可用样本（全部被安全否决/信息不足跳过）。",
         }
 
@@ -427,6 +434,8 @@ def ablation_output_effect(
     per_pair = []
     scored: list[tuple[float, float | None]] = []  # (distance, epsilon)，双侧空引用的样本不进这里
     n_empty_refs = 0
+    n_own_low_discrimination = 0
+    n_ablated_low_discrimination = 0
     for p in usable:
         distance = jaccard_distance(p["own_herbs"], p["ablated_herbs"])
         eps = epsilon_lookup.get((p["query"], p["physician"]))
@@ -440,6 +449,12 @@ def ablation_output_effect(
             verdict = "above_epsilon"
         else:
             verdict = "within_epsilon"
+        own_low_discrimination = bool(p.get("own_low_discrimination"))
+        ablated_low_discrimination = bool(p.get("ablated_low_discrimination"))
+        if own_low_discrimination:
+            n_own_low_discrimination += 1
+        if ablated_low_discrimination:
+            n_ablated_low_discrimination += 1
         per_pair.append({
             "query": p["query"], "physician": p["physician"],
             "own_refs_ids": p.get("own_refs_ids", []),
@@ -450,6 +465,9 @@ def ablation_output_effect(
             "jaccard": round(distance, 4),
             "epsilon": eps,
             "verdict": verdict,
+            # P0-12：这次检索的候选是否被判定为"没有真实区分度"而收窄到 top-1。
+            "own_low_discrimination": own_low_discrimination,
+            "ablated_low_discrimination": ablated_low_discrimination,
         })
         if not both_empty:
             scored.append((distance, eps))
@@ -477,6 +495,14 @@ def ablation_output_effect(
         if change_rate is not None
         else "计入 change_rate 的样本为 0（可用样本两侧检索全为空），无法判定闸门"
     )
+    low_discrimination_clause = (
+        f" own 侧 {n_own_low_discrimination}/{n_usable}"
+        f"（{round(n_own_low_discrimination / n_usable, 3)}）、消融侧 "
+        f"{n_ablated_low_discrimination}/{n_usable}"
+        f"（{round(n_ablated_low_discrimination / n_usable, 3)}）"
+        " 的检索候选被判定为没有真实区分度、收窄到了 top-1（LOW_DISCRIMINATION_CUTOFF）。"
+        if n_usable else ""
+    )
     return {
         "label": label,
         "n_total": n_total, "n_usable": n_usable,
@@ -488,6 +514,17 @@ def ablation_output_effect(
         "n_within_paired_epsilon": n_within,
         "n_no_paired_epsilon": n_no_epsilon,
         "rate_above_paired_epsilon": round(n_above / n_paired, 3) if n_paired else None,
+        # P0-12：own/消融两侧各自独立统计——它们是两次独立的检索调用，
+        # 触发比例不必相同（比如 swapped 检索另一位医家的库，候选分布跟
+        # own 不一样，区分度好不好可能也不一样）。
+        "n_own_low_discrimination": n_own_low_discrimination,
+        "n_ablated_low_discrimination": n_ablated_low_discrimination,
+        "own_low_discrimination_rate": (
+            round(n_own_low_discrimination / n_usable, 3) if n_usable else None
+        ),
+        "ablated_low_discrimination_rate": (
+            round(n_ablated_low_discrimination / n_usable, 3) if n_usable else None
+        ),
         "per_pair": per_pair,
         "note": (
             f"{label}：{n_usable}/{n_total} 条(主诉,医家)样本可用{empty_clause}。"
@@ -498,6 +535,7 @@ def ablation_output_effect(
                if n_paired else "没有可配对的 epsilon_online 数据")
             + (f"；另有 {n_no_epsilon} 条查不到配对 ε，未计入这两个分母。"
                if n_no_epsilon else "。")
+            + low_discrimination_clause
         ),
     }
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from abc import ABC, abstractmethod
@@ -147,6 +148,45 @@ def adaptive_min_score(
     return max(ADAPTIVE_MIN_SCORE_FLOOR, p25)
 
 
+# P0-12：top-1 和 top-k 的原始相似度差小于这个值时，认为这几个候选之间没有
+# 真实区分度——实测 15 个 (主诉,医家) 样本里 8 个 top1-top3 分差 < 0.03，
+# 0.78 和 0.80 的差别在 bge-small-zh 的噪声范围内，塞三条等于随机三选三，
+# 还占掉 prompt 空间稀释信号。
+LOW_DISCRIMINATION_MARGIN = 0.03
+
+
+def low_discrimination_cutoff_enabled() -> bool:
+    """默认开。全项目唯一的 LOW_DISCRIMINATION_CUTOFF 判定实现——跟
+    USE_REACT（core/react.py::react_enabled）/FAST_MODE
+    （core/followup.py::fast_mode_enabled）同一个约定：住在它主要治理的
+    模块（检索层）里，显式参数优先、未指定才读环境变量。这条不确定是不是
+    净收益（三条弱相关 vs 一条弱相关，谁更好没有先验答案），做成开关是为了
+    让 E3 能跑两遍对比，不是先验认定它必然更好。"""
+    return os.environ.get("LOW_DISCRIMINATION_CUTOFF", "1").lower() in ("1", "true", "yes")
+
+
+def apply_low_discrimination_cutoff(
+    hits: list[tuple[CaseRecord, float]], enabled: bool | None = None
+) -> tuple[list[tuple[CaseRecord, float]], bool]:
+    """P0-12：hits 已经按相似度降序排好（search() 的返回契约）。top-1 和
+    最后一条的原始相似度差 < LOW_DISCRIMINATION_MARGIN 时只保留 top-1。
+    返回 (处理后的 hits, 是否触发了这次截断)——第二个值原样交给调用方
+    （core.chain.run_physician）带进结果字典，E3 报告要能看到这个标记
+    出现的比例，不是只改行为不留痕迹。
+
+    enabled=None 时读 low_discrimination_cutoff_enabled()（显式参数优先，
+    未指定才读环境变量——跟 core.chain._search_cases 的 retriever_mode/
+    refs_mode 同一条规则，不在这个函数内部直接读环境变量，方便测试注入）。
+    """
+    if enabled is None:
+        enabled = low_discrimination_cutoff_enabled()
+    if not enabled or len(hits) < 2:
+        return hits, False
+    if hits[0][1] - hits[-1][1] < LOW_DISCRIMINATION_MARGIN:
+        return hits[:1], True
+    return hits, False
+
+
 class DenseRetriever(Retriever):
     """用 sentence-transformers 的 bge-small-zh-v1.5 做稠密检索。惰性加载模型，
     禁止在模块顶层实例化（加载模型是重操作，不该在 import 时就发生）。"""
@@ -229,6 +269,24 @@ class DenseRetriever(Retriever):
     # 长序列里的中段复诊有时正好记录了证型转变。
     INITIAL_VISIT_BOOST = 1.08
 
+    # P0-11：herbs 为空的医案不剔除（剔除会损失约 21% 语料——实测张锡纯这类
+    # 医案少的医家会因此只剩 74 条），排序时打折。它对"这位医家怎么开方"的
+    # 参考价值低（S3 要学的是用药风格，没有方就没有风格可学），但症状描述
+    # 仍有检索价值（可能带出同一病人有方的其他诊次）。跟 INITIAL_VISIT_BOOST
+    # 同一个机制：只调整排序用的分，不改真实展示的相似度。
+    NO_HERBS_PENALTY = 0.9
+
+    def _rank_score(self, case: CaseRecord, raw_score: float) -> float:
+        """把原始相似度转成排序用的加权分。DenseRetriever.search() 和
+        HybridRetriever._dense_ranking() 共用这一份公式（CLAUDE.md「同一
+        概念的匹配逻辑只能有一处实现」）——两处各写一份的话，日后再加一个
+        调整项（这次是 NO_HERBS_PENALTY）必然会漏改一处。"""
+        vi = case.visit_index or 0
+        score = raw_score * (self.INITIAL_VISIT_BOOST if vi == 0 else 1.0)
+        if not case.herbs:
+            score *= self.NO_HERBS_PENALTY
+        return score
+
     def search(
         self, query: str, physician: str, k: int = 3, min_score: float = 0.0
     ) -> list[tuple[CaseRecord, float]]:
@@ -247,8 +305,7 @@ class DenseRetriever(Retriever):
             raw_score = float(self._embeddings[i] @ query_vec)
             if raw_score < min_score:
                 continue
-            vi = self._cases[i].visit_index or 0
-            rank_score = raw_score * (self.INITIAL_VISIT_BOOST if vi == 0 else 1.0)
+            rank_score = self._rank_score(self._cases[i], raw_score)
             # 排序用加权分，返回给上层的仍是真实相似度，不要把加成混进展示值
             scored.append((i, rank_score, raw_score))
 

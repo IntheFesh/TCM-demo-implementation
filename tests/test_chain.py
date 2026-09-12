@@ -254,6 +254,70 @@ def test_run_physician_embeds_raw_excerpt_in_the_real_prompt_after_the_example(m
     )
 
 
+def test_run_physician_flags_low_discrimination_when_retrieval_scores_are_close(monkeypatch):
+    """P0-12：检索到的几条候选之间没有真实区分度时，run_physician() 的返回值
+    要带 low_discrimination=True、refs 收窄到 1 条——不是只在内部悄悄截断，
+    调用方（eval/run_eval.py 的 E3 报告）要能看到这个标记。FakeRetriever
+    对每条命中都返回固定相似度 0.9，两条命中分差正好是 0，天然落进
+    "没有区分度"这个条件。"""
+    cases = [_case(case_id="ye_tianshi-001", raw_excerpt="甲"),
+             _case(case_id="ye_tianshi-002", raw_excerpt="乙")]
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(cases))
+
+    s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
+    s2 = S2Elements(elements=[], unexplained_symptoms=[])
+    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士")
+
+    assert result["low_discrimination"] is True
+    assert len(result["refs"]) == 1
+
+
+def test_run_physician_no_low_discrimination_flag_when_scores_have_real_spread(monkeypatch):
+    class SpreadRetriever(Retriever):
+        def __init__(self, cases):
+            self.cases = cases
+
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            hits = [c for c in self.cases if c.physician == physician][:k]
+            scores = [0.90, 0.60, 0.50]
+            return [(c, scores[i]) for i, c in enumerate(hits)]
+
+    cases = [_case(case_id="ye_tianshi-001"), _case(case_id="ye_tianshi-002")]
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: SpreadRetriever(cases))
+
+    s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
+    s2 = S2Elements(elements=[], unexplained_symptoms=[])
+    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士")
+
+    assert result["low_discrimination"] is False
+    assert len(result["refs"]) == 2
+
+
+def test_run_physician_low_discrimination_can_be_disabled_via_env(monkeypatch):
+    monkeypatch.setenv("LOW_DISCRIMINATION_CUTOFF", "0")
+    cases = [_case(case_id="ye_tianshi-001"), _case(case_id="ye_tianshi-002")]
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(cases))
+
+    s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
+    s2 = S2Elements(elements=[], unexplained_symptoms=[])
+    result = chain.run_physician(s1, s2, "ye_tianshi", "叶天士")
+
+    assert result["low_discrimination"] is False
+    assert len(result["refs"]) == 2
+
+
 def test_shared_stages_run_once_per_physician_stages_run_twice(monkeypatch):
     """S1 和 S2 全局各只跑一次，S3 每位医家一次。
 

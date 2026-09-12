@@ -7,11 +7,14 @@ import pytest
 from core.retrieval import (
     ADAPTIVE_MIN_SCORE_FLOOR,
     CASE_TO_TEXT_EXCERPT_CHARS,
+    LOW_DISCRIMINATION_MARGIN,
     DenseRetriever,
     Retriever,
     _case_to_text,
     _percentile,
     adaptive_min_score,
+    apply_low_discrimination_cutoff,
+    low_discrimination_cutoff_enabled,
 )
 from core.schemas import CaseRecord
 
@@ -226,3 +229,112 @@ def test_percentile_single_value_returns_it():
 def test_percentile_matches_hand_computed_linear_interpolation():
     # rank = 0.25 * 3 = 0.75 -> 在下标 0 和 1 之间插值 75%
     assert _percentile([0.0, 4.0, 8.0, 12.0], 25) == pytest.approx(3.0)
+
+
+# ---------- P0-11：herbs 为空的医案排序降权，不剔除 ----------
+
+
+def _retriever(tmp_path):
+    """_rank_score 不碰 _model/_embeddings，随便一条医案就能建实例。"""
+    path = _write_cases_json(tmp_path, [_case(case_id="seed", symptoms=["纳差"]).model_dump()])
+    return DenseRetriever(cases_path=path)
+
+
+def test_rank_score_penalizes_cases_with_no_herbs(tmp_path):
+    retriever = _retriever(tmp_path)
+    with_herbs = _case(herbs=["党参"], visit_index=1)  # visit_index=1：不叠加初诊加成，隔离变量
+    without_herbs = _case(herbs=[], visit_index=1)
+    assert retriever._rank_score(without_herbs, 0.8) == pytest.approx(0.8 * 0.9)
+    assert retriever._rank_score(with_herbs, 0.8) == pytest.approx(0.8)
+
+
+def test_rank_score_no_herbs_penalty_does_not_exclude_the_case():
+    """P0-11 的要求是降权不剔除——这里只是确认惩罚后的分数仍然是正数、
+    不是被打成 0 或负数变相等于剔除。"""
+    retriever_score = DenseRetriever.NO_HERBS_PENALTY
+    assert 0 < retriever_score < 1
+
+
+def test_rank_score_combines_initial_visit_boost_and_no_herbs_penalty(tmp_path):
+    """初诊加成和无方剂惩罚是两个独立的调整项，同一条医案可能同时命中——
+    没方药又是初诊的医案：两个系数要连乘，不是互斥的 if/elif。"""
+    retriever = _retriever(tmp_path)
+    case = _case(herbs=[], visit_index=0)  # 初诊 + 无方
+    expected = 0.8 * DenseRetriever.INITIAL_VISIT_BOOST * DenseRetriever.NO_HERBS_PENALTY
+    assert retriever._rank_score(case, 0.8) == pytest.approx(expected)
+
+
+# ---------- P0-12：candidates 之间没有真实区分度时只留 top-1 ----------
+
+
+def _hits(*scores):
+    return [(_case(case_id=f"c{i}"), s) for i, s in enumerate(scores)]
+
+
+def test_low_discrimination_cutoff_enabled_default_on(monkeypatch):
+    monkeypatch.delenv("LOW_DISCRIMINATION_CUTOFF", raising=False)
+    assert low_discrimination_cutoff_enabled() is True
+
+
+def test_low_discrimination_cutoff_enabled_reads_env_var(monkeypatch):
+    monkeypatch.setenv("LOW_DISCRIMINATION_CUTOFF", "0")
+    assert low_discrimination_cutoff_enabled() is False
+    monkeypatch.setenv("LOW_DISCRIMINATION_CUTOFF", "1")
+    assert low_discrimination_cutoff_enabled() is True
+
+
+def test_apply_cutoff_truncates_to_top1_when_scores_are_close():
+    hits = _hits(0.80, 0.79, 0.78)  # 分差 0.02 < LOW_DISCRIMINATION_MARGIN=0.03
+    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    assert triggered is True
+    assert len(result) == 1
+    assert result[0][1] == 0.80
+
+
+def test_apply_cutoff_keeps_all_hits_when_scores_have_real_spread():
+    hits = _hits(0.90, 0.70, 0.60)  # 分差 0.30，明显有区分度
+    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    assert triggered is False
+    assert result == hits
+
+
+def test_apply_cutoff_boundary_exactly_at_margin_is_not_low_discrimination():
+    """分差正好等于 LOW_DISCRIMINATION_MARGIN 时不算"没有区分度"——判据是
+    "小于"margin，不是"小于等于"，跟 min_score 用 >= 的方向一致（差多少
+    才算够，边界值算"够"而不是"不够"）。"""
+    hits = _hits(0.80, 0.80 - LOW_DISCRIMINATION_MARGIN)
+    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    assert triggered is False
+    assert result == hits
+
+
+def test_apply_cutoff_single_hit_never_triggers():
+    hits = _hits(0.80)
+    result, triggered = apply_low_discrimination_cutoff(hits, enabled=True)
+    assert triggered is False
+    assert result == hits
+
+
+def test_apply_cutoff_empty_hits_never_triggers():
+    result, triggered = apply_low_discrimination_cutoff([], enabled=True)
+    assert triggered is False
+    assert result == []
+
+
+def test_apply_cutoff_disabled_returns_hits_unchanged_even_when_close():
+    hits = _hits(0.80, 0.79, 0.78)
+    result, triggered = apply_low_discrimination_cutoff(hits, enabled=False)
+    assert triggered is False
+    assert result == hits
+
+
+def test_apply_cutoff_enabled_none_reads_environment(monkeypatch):
+    """enabled=None（默认）时才读环境变量——显式传参优先，跟 retriever_mode/
+    refs_mode 同一条规则。"""
+    hits = _hits(0.80, 0.79, 0.78)
+    monkeypatch.setenv("LOW_DISCRIMINATION_CUTOFF", "0")
+    result, triggered = apply_low_discrimination_cutoff(hits)
+    assert triggered is False
+    assert result == hits
+
+

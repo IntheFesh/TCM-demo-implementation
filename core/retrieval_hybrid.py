@@ -128,7 +128,8 @@ class HybridRetriever(DenseRetriever):
     ) -> list[tuple[int, float]]:
         """按稠密相似度降序返回 (下标, 真实余弦相似度) 全排名（不截断到 k）。
         min_score 只作用于这一路——BM25 的分数不在同一尺度上，套用同一个阈值
-        没有意义。返回的分是未经初诊加成的真实相似度，加成只用于排序。"""
+        没有意义。返回的分是未经初诊加成/无方剂惩罚的真实相似度，那些调整
+        只用于排序（DenseRetriever._rank_score，两处共用同一份公式）。"""
         self._ensure_encoded()
         query_vec = self._model.encode(
             [query], normalize_embeddings=True, convert_to_numpy=True
@@ -138,8 +139,7 @@ class HybridRetriever(DenseRetriever):
             raw_score = float(self._embeddings[i] @ query_vec)
             if raw_score < min_score:
                 continue
-            vi = self._cases[i].visit_index or 0
-            rank_score = raw_score * (self.INITIAL_VISIT_BOOST if vi == 0 else 1.0)
+            rank_score = self._rank_score(self._cases[i], raw_score)
             scored.append((i, rank_score, raw_score))
         scored.sort(key=lambda x: -x[1])
         return [(i, raw) for i, _rank, raw in scored]
@@ -216,17 +216,30 @@ class HybridRetriever(DenseRetriever):
         elif mode == "graph":
             scored = self._graph_ranking(query_elements, idxs)
         else:  # hybrid：query_elements 有就三路融合，没有就退回两路（向后兼容）
-            dense_ranking = self._dense_ranking(query, idxs, min_score)
+            # P0-9 根因修复：融合阶段不能用 min_score 过滤 dense 路。旧实现在这里
+            # 传真实 min_score，dense_ranking 只剩少数条目，融合时它们必然占据
+            # dense 这一路的高排名（哪怕本身相似度只是刚过线），bm25 路排名靠后
+            # 但没被 dense 卡掉的好结果只拿到单路 RRF 分，打不过"dense+bm25 双路
+            # 都有"的条目——结果 hybrid 系统性地比它自己的两个输入都差（真实案例：
+            # "情志不畅"这条主诉，dense/bm25 单独看都命中了对症的医案，融合完
+            # 反而选出最不对症的一版）。改成融合阶段用 min_score=0.0（不过滤），
+            # 融合排完名之后再对最终结果按 min_score 过滤——过滤的是 dense 展示分，
+            # 语义跟原来一致（"不够像就不展示"），只是把过滤时机从"进融合前"
+            # 挪到"出融合后"，不会再污染融合本身的排名。
+            dense_ranking = self._dense_ranking(query, idxs, min_score=0.0)
             bm25_ranking = self._bm25_ranking(query, idxs)
             dense_scores = dict(dense_ranking)
             rankings = [[i for i, _ in dense_ranking], [i for i, _ in bm25_ranking]]
             if query_elements:
                 rankings.append([i for i, _ in self._graph_ranking(query_elements, idxs)])
             fused = _rrf_fuse(rankings)
-            # 展示分优先用稠密相似度（min_score 过滤剩下的那些才有）；一个案子
-            # 只在 BM25/graph 那一路进了排名、稠密分被 min_score 过滤掉了，就没有
-            # 真实稠密相似度可展示，回退到 0.0——这种案子本来就是"关键词/证素
-            # 命中但语义上不够像"，展示分低是符合直觉的，不是 bug。
-            scored = [(i, dense_scores.get(i, 0.0)) for i, _ in fused]
+            # 展示分优先用稠密相似度；dense_ranking 现在覆盖了 idxs 里的全部条目
+            # （上面传的 min_score=0.0），.get(i, 0.0) 这个兜底理论上不会再触发——
+            # 保留它只是防御性写法（万一某条医案不在 idxs 里却混进了 fused，
+            # 那是别的 bug，不该在这里静默吞掉，但也不该在这里崩）。
+            scored = [
+                (i, dense_scores.get(i, 0.0)) for i, _ in fused
+                if dense_scores.get(i, 0.0) >= min_score
+            ]
 
         return [(self._cases[i], score) for i, score in scored[:k]]

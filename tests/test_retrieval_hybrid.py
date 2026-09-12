@@ -326,6 +326,83 @@ def test_search_hybrid_mode_promotes_case_relevant_in_either_signal(tmp_path):
     assert hybrid_hits[0][0].case_id == "keyword_exact"
 
 
+# ---------- P0-9：hybrid 融合阶段不能被 min_score 污染 ----------
+
+
+def test_hybrid_dense_ranking_probe_ignores_the_requested_min_score(tmp_path, monkeypatch):
+    """融合阶段必须用未过滤的 dense 排名——旧实现把真实 min_score 传进
+    _dense_ranking，dense 路只剩少数条目，它们在融合里必然占据高排名
+    （哪怕本身相似度只是刚过线），bm25 路排名靠后但没被 dense 卡掉的好结果
+    打不过"dense+bm25 双路都有"的条目。这里用 spy 直接断言融合阶段调用
+    _dense_ranking 时传的 min_score 是 0.0，不是请求方给的那个值。"""
+    query = "q"
+    cases = [_case("a", "ye_tianshi", ["纳差"]), _case("b", "ye_tianshi", ["乏力"])]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+    _install_fake_dense(retriever, embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                        query_vectors={query: [1.0, 0.0]})
+
+    seen_min_scores = []
+    original = retriever._dense_ranking
+
+    def spy(query, idxs, min_score):
+        seen_min_scores.append(min_score)
+        return original(query, idxs, min_score)
+
+    monkeypatch.setattr(retriever, "_dense_ranking", spy)
+    retriever.search(query, "ye_tianshi", k=2, mode="hybrid", min_score=0.9)
+    assert seen_min_scores == [0.0], (
+        f"融合阶段调用 _dense_ranking 时必须传 min_score=0.0（不过滤），"
+        f"实际传的是 {seen_min_scores}——请求方给的 0.9 不该在这一步生效"
+    )
+
+
+def test_hybrid_mode_actually_filters_final_output_by_min_score(tmp_path):
+    """P0-9 顺带修复的第二个问题：旧实现融合完成后从不对最终结果做 min_score
+    过滤（只用它去筛 dense 路的候选池），一个案子只要 BM25 分够高就能进
+    hybrid 的最终结果，展示相似度却是被过滤掉后回退的 0.0——min_score
+    「以下的结果不返回」这条契约对 hybrid 模式形同虚设。
+
+    这里构造一个 BM25 关键词命中但语义（稠密相似度）很低的案子：min_score
+    设得足够高时，它不该出现在 hybrid 的结果里，即使纯 bm25 模式会把它排
+    第一。"""
+    query = "噎膈反胃"
+    cases = [
+        _case("irrelevant_but_keyword_match", "ye_tianshi", ["噎膈反胃"]),
+        _case("relevant", "ye_tianshi", ["纳差乏力"]),
+    ]
+    cases_path = _write_cases(tmp_path, cases)
+    retriever = HybridRetriever(cases_path=cases_path)
+    # idx0（关键词命中）稠密相似度很低；idx1 稠密相似度很高
+    _install_fake_dense(
+        retriever, embeddings=[[0.05, 0.0], [1.0, 0.0]],
+        query_vectors={query: [1.0, 0.0]},
+    )
+
+    bm25_hits = retriever.search(query, "ye_tianshi", k=2, mode="bm25")
+    assert bm25_hits[0][0].case_id == "irrelevant_but_keyword_match"  # 纯 bm25 会选它
+
+    hybrid_hits = retriever.search(query, "ye_tianshi", k=2, mode="hybrid", min_score=0.5)
+    hybrid_ids = [c.case_id for c, _ in hybrid_hits]
+    assert "irrelevant_but_keyword_match" not in hybrid_ids, (
+        "min_score=0.5 时这条医案的稠密相似度只有 0.05，不该出现在 hybrid 结果里"
+    )
+    assert hybrid_ids == ["relevant"]
+
+
+def test_hybrid_mode_min_score_zero_keeps_old_behavior_unchanged(tmp_path):
+    """min_score=0.0（默认）时融合前后都不过滤，跟改造前的行为一致——
+    P0-9 只改了"非零 min_score 时过滤时机"，不该影响默认路径。"""
+    query = "噎膈反胃，食入即吐"
+    retriever = _build_two_case_retriever(
+        tmp_path,
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+        query_vectors={query: [1.0, 0.0]},
+    )
+    hits = retriever.search(query, "ye_tianshi", k=2, mode="hybrid")
+    assert {c.case_id for c, _ in hits} == {"dense_favored", "bm25_favored"}
+
+
 def test_search_min_score_only_filters_dense_path(tmp_path):
     query = "噎膈反胃"
     cases = [

@@ -30,7 +30,7 @@ from core.followup import (
 )
 from core.physicians import PHYSICIANS
 from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
-from core.retrieval import adaptive_min_score, get_retriever
+from core.retrieval import adaptive_min_score, apply_low_discrimination_cutoff, get_retriever
 from core.retrieval_hybrid import ALLOWED_MODES
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
 from core.safety_output import assess_formula_safety, format_blocking_issues
@@ -239,9 +239,9 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
 
 def _search_cases(
     query: str, physician: str, s2: S2Elements, retriever_mode: str | None
-) -> list[tuple[CaseRecord, float]]:
+) -> tuple[list[tuple[CaseRecord, float]], bool]:
     """检索该医家的 top-3 医案。全项目唯一一处把 retriever_mode 翻译成
-    search() 关键字参数的地方。
+    search() 关键字参数的地方。返回 (hits, low_discrimination)。
 
     两条判断都在这里，不散到调用点：
 
@@ -257,6 +257,9 @@ def _search_cases(
     physician) 该用多严的阈值，再拿这个阈值做真正的检索——探测调用复用同一份
     kwargs（跟真正调用完全一致的 mode/query_elements），不是额外传一个只有
     探测才用的参数。
+
+    P0-12：拿到 top-3 之后再过一次 apply_low_discrimination_cutoff——candidates
+    之间没有真实区分度时只留 top-1，避免拿三条弱相关的塞满 prompt 稀释信号。
     """
     kwargs: dict = {}
     if retriever_mode is not None:
@@ -267,7 +270,8 @@ def _search_cases(
     try:
         retriever = get_retriever()
         min_score = adaptive_min_score(retriever, query, physician, **kwargs)
-        return retriever.search(query, physician, k=3, min_score=min_score, **kwargs)
+        hits = retriever.search(query, physician, k=3, min_score=min_score, **kwargs)
+        return apply_low_discrimination_cutoff(hits)
     except (ValueError, FileNotFoundError) as e:
         # 只翻译、不吞：检索层照旧大声报错（K3b 的 graph 模式故意不静默降级），
         # 这里把它裹成 RetrievalUnavailable 交给 consult 转成一句人话，避免
@@ -333,10 +337,10 @@ def run_physician(
     # 这个条件本身，也省一次不会被用到的检索调用。
     query = f"{symptoms_text}。舌{s1.tongue or '未记'}，脉{s1.pulse or '未记'}"
     if refs_mode == "none":
-        hits = []
+        hits, low_discrimination = [], False
     else:
         search_physician = physician if refs_mode == "own" else _swap_physician_id(physician)
-        hits = _search_cases(query, search_physician, s2, retriever_mode)
+        hits, low_discrimination = _search_cases(query, search_physician, s2, retriever_mode)
     # 一条相关医案都没有时换用不含 cited_case_ids 的 schema（见 S3SyndromeUnreferenced
     # 的文档字符串）。不是放松 min_length=1，是这个场景下根本没有可引用的东西。
     s3_schema = S3Syndrome if hits else S3SyndromeUnreferenced
@@ -478,6 +482,10 @@ def run_physician(
         # True = 检索为空，这位医家的结论没有任何医案支撑；前端要明示，不能当成
         # "引用了 0 条"静默过去
         "no_reference_cases": not hits,
+        # P0-12：True = 检索到的候选之间没有真实区分度，_search_cases 已经
+        # 把 top-3 收窄成了 top-1——不是"检索为空"，是"检索到了但塞三条等于
+        # 随机三选三"。eval/run_eval.py 的 E3 报告要能看到这个标记的比例。
+        "low_discrimination": low_discrimination,
         "hallucinated": hallucinated,
         # 只在 EVAL_MODE 下可能非空：demo 模式命中这里就抛 SafetyVeto 了，走不到返回。
         "safety_flag": react_safety_flag,

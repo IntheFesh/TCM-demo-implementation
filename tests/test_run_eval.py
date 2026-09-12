@@ -178,18 +178,21 @@ def test_retrieval_mode_comparison_identical_modes_zero_discordant():
 def _fake_consult(
     rejected=False, insufficient=False, herbs_by_physician=None,
     refs_by_physician=None, no_reference_by_physician=None,
+    low_discrimination_by_physician=None,
 ):
-    """refs_by_physician/no_reference_by_physician 是 P0-8 补的可选参数——
-    老调用点（不传这两个）保持跟改造前完全一样的字典形状，_herb_pairs_from_
-    outcomes 对缺失的 refs/no_reference_cases 键有 .get() 兜底，不会因为
-    老测试没带这两个键就 KeyError。"""
+    """refs_by_physician/no_reference_by_physician（P0-8）、
+    low_discrimination_by_physician（P0-12）都是可选参数——老调用点（不传
+    这些）保持跟改造前完全一样的字典形状，_herb_pairs_from_outcomes 对
+    缺失的键有 .get() 兜底，不会因为老测试没带这些键就 KeyError。"""
     refs_by_physician = refs_by_physician or {}
     no_reference_by_physician = no_reference_by_physician or {}
+    low_discrimination_by_physician = low_discrimination_by_physician or {}
     results = [
         {
             "physician": p, "s3": SimpleNamespace(herbs=herbs),
             "refs": refs_by_physician.get(p, []),
             "no_reference_cases": no_reference_by_physician.get(p, False),
+            "low_discrimination": low_discrimination_by_physician.get(p, False),
         }
         for p, herbs in (herbs_by_physician or {}).items()
     ]
@@ -259,6 +262,20 @@ def test_collect_ablation_pairs_marks_empty_refs_on_both_sides():
     )
     assert pairs[0]["own_refs_empty"] is True
     assert pairs[0]["ablated_refs_empty"] is True
+
+
+def test_collect_ablation_pairs_captures_low_discrimination_flag():
+    def consult_fn(query, **kwargs):
+        return _fake_consult(
+            herbs_by_physician={"叶天士": ["党参"]},
+            low_discrimination_by_physician={"叶天士": True},
+        )
+
+    pairs = re.collect_ablation_pairs(
+        ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
+    )
+    assert pairs[0]["own_low_discrimination"] is True
+    assert pairs[0]["ablated_low_discrimination"] is True
 
 
 def test_collect_ablation_pairs_skips_when_baseline_side_rejected():
@@ -409,13 +426,16 @@ def test_ablation_output_effect_missing_paired_epsilon_counted_separately():
 
 def _pair(query="q1", physician="叶天士", own_herbs=None, ablated_herbs=None,
           own_refs_empty=False, ablated_refs_empty=False,
-          own_refs_ids=None, own_refs_scores=None, ablated_refs_ids=None):
+          own_refs_ids=None, own_refs_scores=None, ablated_refs_ids=None,
+          own_low_discrimination=False, ablated_low_discrimination=False):
     return {
         "skipped": False, "query": query, "physician": physician,
         "own_herbs": own_herbs or {"党参"}, "ablated_herbs": ablated_herbs or {"党参"},
         "own_refs_empty": own_refs_empty, "ablated_refs_empty": ablated_refs_empty,
         "own_refs_ids": own_refs_ids or [], "own_refs_scores": own_refs_scores or [],
         "ablated_refs_ids": ablated_refs_ids or [],
+        "own_low_discrimination": own_low_discrimination,
+        "ablated_low_discrimination": ablated_low_discrimination,
     }
 
 
@@ -488,6 +508,39 @@ def test_ablation_output_effect_per_pair_verdict_above_and_within_epsilon():
     verdicts = {d["query"]: d["verdict"] for d in r["per_pair"]}
     assert verdicts["q1"] == "within_epsilon"
     assert verdicts["q2"] == "above_epsilon"
+
+
+def test_ablation_output_effect_reports_low_discrimination_counts_separately():
+    """own 和消融侧是两次独立的检索调用，触发比例不必相同——分开报，
+    不合并成一个数（合并会看不出是哪一侧的检索候选缺区分度）。"""
+    pairs = [
+        _pair(query="q1", own_low_discrimination=True, ablated_low_discrimination=False),
+        _pair(query="q2", own_low_discrimination=True, ablated_low_discrimination=True),
+        _pair(query="q3", own_low_discrimination=False, ablated_low_discrimination=False),
+    ]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    assert r["n_own_low_discrimination"] == 2
+    assert r["n_ablated_low_discrimination"] == 1
+    assert r["own_low_discrimination_rate"] == round(2 / 3, 3)
+    assert r["ablated_low_discrimination_rate"] == round(1 / 3, 3)
+
+
+def test_ablation_output_effect_per_pair_carries_low_discrimination_flags():
+    pairs = [_pair(own_low_discrimination=True, ablated_low_discrimination=False)]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="swapped")
+    detail = r["per_pair"][0]
+    assert detail["own_low_discrimination"] is True
+    assert detail["ablated_low_discrimination"] is False
+
+
+def test_ablation_output_effect_no_usable_pairs_low_discrimination_fields_are_none():
+    r = re.ablation_output_effect(
+        [{"skipped": True, "query": "q1", "reason": "x"}], None, "swapped"
+    )
+    assert r["n_own_low_discrimination"] == 0
+    assert r["n_ablated_low_discrimination"] == 0
+    assert r["own_low_discrimination_rate"] is None
+    assert r["ablated_low_discrimination_rate"] is None
 
 
 def test_ablation_output_effect_backward_compatible_with_pairs_missing_refs_keys():
