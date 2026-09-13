@@ -323,3 +323,36 @@ def test_collect_main_end_to_end(tmp_path, monkeypatch):
     ])
     result = json.loads(out_path.read_text(encoding="utf-8"))
     assert result["wins"]["ye_tianshi"] == 1
+
+
+def test_collect_main_resolves_chinese_names_at_the_cli_boundary(tmp_path, monkeypatch):
+    """P1-1.1b：--physician-a/-b 是外部输入，过 resolve_physician_id。之前直接
+    拿字符串跟答案表里的 id 比，传中文名会静默算成 0 胜（SOURCES.md 第 31 条
+    同一形状的坑）。"""
+    _pin_physicians(monkeypatch, mc, ["ye_tianshi", "wu_jutong"])
+    items_path = tmp_path / "items.json"
+    key_path = tmp_path / "key.json"
+    out_path = tmp_path / "out.json"
+    items_path.write_text(json.dumps([_item("i0", "A")]), encoding="utf-8")
+    key_path.write_text(json.dumps({"i0": {"A": "ye_tianshi", "B": "wu_jutong"}}), encoding="utf-8")
+
+    mc.main([
+        "--items-path", str(items_path), "--answer-key-path", str(key_path),
+        "--out", str(out_path), "--physician-a", "叶天士", "--physician-b", "吴鞠通",
+    ])
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result["wins"] == {"ye_tianshi": 1, "wu_jutong": 0}
+
+
+def test_collect_main_rejects_unregistered_physician_with_choices(tmp_path, monkeypatch):
+    _pin_physicians(monkeypatch, mc, ["ye_tianshi", "wu_jutong"])
+    items_path = tmp_path / "items.json"
+    key_path = tmp_path / "key.json"
+    items_path.write_text(json.dumps([_item("i0", "A")]), encoding="utf-8")
+    key_path.write_text(json.dumps({"i0": {"A": "ye_tianshi", "B": "wu_jutong"}}), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="华佗"):
+        mc.main([
+            "--items-path", str(items_path), "--answer-key-path", str(key_path),
+            "--out", str(tmp_path / "out.json"), "--physician-a", "华佗",
+        ])

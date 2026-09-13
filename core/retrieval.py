@@ -49,6 +49,12 @@ class Retriever(ABC):
         也不要塞三条不相关的案子进 prompt 逼模型模仿。"""
         raise NotImplementedError
 
+    def case_count(self, physician: str) -> int | None:
+        """这位医家在索引里有多少条医案；None = 这个实现不知道（测试里的假
+        检索器）。给 search_cases 空返回时报"已查 N 条"用——那句话要让模型
+        知道"确实查了、不是没查"，N 未知就老实说未知，不编一个数。"""
+        return None
+
 
 def _case_to_text(case: CaseRecord) -> str | None:
     """把结构化医案编码成一段紧凑文本用于向量化。返回 None 表示这条医案没有
@@ -265,6 +271,9 @@ class DenseRetriever(Retriever):
 
         self._model = None  # 惰性加载，避免 import 阶段就下载/加载模型
         self._embeddings = None  # 惰性编码，随 _model 一起初始化
+
+    def case_count(self, physician: str) -> int | None:
+        return sum(1 for c in self._cases if c.physician == physician)
 
     _encode_lock = threading.Lock()
 

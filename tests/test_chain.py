@@ -704,6 +704,23 @@ def _react_setup(monkeypatch):
     return fake_llm
 
 
+def test_react_receives_physician_id_not_only_chinese_name(monkeypatch):
+    """P1-1.1b：run_physician 手里的 physician 已经是 id，必须显式传给
+    run_react（prompt 里 $physician_id 的来源）——不能只传中文名让 run_react
+    去反查，反查是兜底不是主路径（SOURCES.md 第 31 条）。"""
+    _react_setup(monkeypatch)
+    seen = []
+    real = chain.run_react
+
+    def spy(**kwargs):
+        seen.append((kwargs["name"], kwargs.get("physician_id")))
+        return real(**kwargs)
+
+    monkeypatch.setattr(chain, "run_react", spy)
+    chain.consult("纳差乏力", use_react=True)
+    assert seen == [("叶天士", "ye_tianshi"), ("吴鞠通", "wu_jutong")]
+
+
 def test_react_off_by_default_leaves_s3_prompt_untouched(monkeypatch):
     """不开 ReAct 时 S3 的提示词里不能多出任何东西——多一个字，
     use_react 的 A/B 就混进了 prompt 变化这个额外变量。"""

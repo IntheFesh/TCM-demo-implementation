@@ -150,6 +150,24 @@ X3 那轮把 `CaseTripleItem.p`/`CaseTripleRecord.p` 的 `str = Field(min_length
 「要不要在辨证开始前拦截整个请求」，合并成一张，以后改一边会看不出会不会
 连带影响另一边。走这条例外时必须在代码里写清楚两个问题的区别。
 
+### 标识符只有一种规范形式，边界上统一解析
+
+数据文件里存 id（physician=ye_tianshi、syndrome=SP-01），展示层用中文名。
+任何接收外部输入的边界（模型输出、HTTP 请求、CLI）都必须过一个统一的
+`resolve_*_id` 函数（医家是 `core/physicians.py` 的 `resolve_physician_id`），
+不要在过滤处直接比较。模型看得到的 prompt 里，要同时给出 id 和中文名，
+并说明参数填哪个。
+
+踩过的坑：ReAct 的 physician 参数（SOURCES.md 第 31 条）——模型只能看到
+中文名，填中文名，而过滤用 id，医案层工具恒返回空，9 次调用全空，直到
+trace 被打出来才发现。单元测试测不出这种 bug：工具没报错、返回结构合法、
+`available: true`——所以工具返回空的时候必须能区分"参数错了"（返回
+`error`，列出可用值让模型自我纠正）、"数据文件不存在"（`available: false`）
+和"数据在、确实没匹配"（`note` 里带"已查 N 条"）这三种情况。
+
+后面阶段会再引入药材标识（阶段二药理层）、更多证候编码（阶段三教材扩充），
+同样的形状：每种标识符一个 `resolve_*_id`，加在边界上，不加在过滤处。
+
 ### 评测代码放 eval/，不放 tests/
 
 `tests/` 必须保持"不需要网络、不需要 API key、秒级跑完"的性质。

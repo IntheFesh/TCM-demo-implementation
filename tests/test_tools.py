@@ -314,6 +314,123 @@ def test_search_cases_does_not_waste_an_adaptive_min_score_probe(monkeypatch):
     assert r.call_count == 1, "不该多出一次探测调用——search_cases 从不请求 dense 模式"
 
 
+# ---------- P1-1.1b：physician 参数填中文名也要能查到（唯一解析入口） ----------
+#
+# AutoDL 真实 trace：模型填 'physician': '叶天士'，医案库按 id（ye_tianshi）
+# 存，医案层工具 9 次调用全空——工具没报错、结构合法、available:true，
+# 对着"静默空返回"写的测试全是绿的（SOURCES.md 第 31 条）。这组测试用合成
+# 数据钉住：physician 存 id、工具传中文名、返回必须非空；解析失败要报
+# error 不是静默空；空返回的三种情况分开。
+
+
+def test_query_case_graph_accepts_chinese_physician_name(triples_file):
+    out = query_case_graph(physician="叶天士")
+    assert out["available"] is True
+    assert out["total_matched"] == 2
+    assert {t["physician"] for t in out["triples"]} == {"ye_tianshi"}
+    assert "error" not in out
+
+
+def test_query_case_graph_unknown_physician_returns_error_not_silent_empty(triples_file):
+    from core.physicians import PHYSICIANS
+
+    out = query_case_graph(physician="华佗")
+    assert out["available"] is True
+    assert out["triples"] == []
+    assert "华佗" in out["error"]
+    for pid, info in PHYSICIANS.items():  # 报错必须列出可用值，模型才能自我纠正
+        assert f"{pid}({info['name']})" in out["error"]
+
+
+def test_query_case_graph_no_match_reports_scanned_count(triples_file):
+    """③ 数据在、确实没匹配：note 里的"已查 N 条"告诉模型确实查了、不是没查。
+    N 是过了 physician 过滤之后的条数——wu_jutong 在合成数据里有 2 条。"""
+    out = query_case_graph(symptom="不存在的症状", physician="wu_jutong")
+    assert out["available"] is True
+    assert out["triples"] == []
+    assert "error" not in out
+    assert "已查 2 条三元组" in out["note"]
+
+
+def test_search_cases_accepts_chinese_physician_name(monkeypatch):
+    """检索器只认 id：工具传中文名，到检索器那里必须已经是 ye_tianshi。"""
+    import core.retrieval as retrieval
+    from core.schemas import CaseRecord
+
+    seen = []
+
+    class _R(retrieval.Retriever):
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            seen.append(physician)
+            if physician != "ye_tianshi":
+                return []
+            return [(CaseRecord(case_id="ye_tianshi-0001-p1-0", case_group_id="g",
+                                physician="ye_tianshi", raw="原文", symptoms=["胃脘胀痛"]), 0.9)]
+
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: _R())
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "叶天士"})
+    assert seen == ["ye_tianshi"]
+    assert out["available"] is True
+    assert [c["case_id"] for c in out["cases"]] == ["ye_tianshi-0001-p1-0"]
+
+
+def test_search_cases_unknown_physician_returns_error_before_touching_retriever(monkeypatch):
+    import core.retrieval as retrieval
+
+    def _must_not_be_called():
+        raise AssertionError("physician 解析失败时不该去碰检索器")
+
+    monkeypatch.setattr(retrieval, "get_retriever", _must_not_be_called)
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "华佗"})
+    assert out["available"] is True
+    assert out["cases"] == []
+    assert "华佗" in out["error"] and "ye_tianshi(叶天士)" in out["error"]
+
+
+def test_search_cases_no_hit_reports_scanned_count(monkeypatch):
+    import core.retrieval as retrieval
+
+    class _R(retrieval.Retriever):
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            return []
+
+        def case_count(self, physician):
+            return 495
+
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: _R())
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
+    assert out["available"] is True and out["cases"] == [] and "error" not in out
+    assert "已查 495 条医案" in out["note"]
+
+
+def test_search_cases_no_hit_with_unknown_count_says_unknown_not_a_made_up_number(monkeypatch):
+    """假检索器（Retriever 基类默认 case_count=None）不知道条数——老实说未知，
+    不编一个 0 或别的数进 note。"""
+    import core.retrieval as retrieval
+
+    class _R(retrieval.Retriever):
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            return []
+
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: _R())
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
+    assert "条数未知" in out["note"]
+    assert "已查 0 条" not in out["note"]
+
+
+def test_case_layer_tool_descriptions_say_id_and_list_every_registered_physician():
+    """query_case_graph 的描述之前写死了「ye_tianshi / wu_jutong」，张锡纯
+    注册后没人改——现在从 PHYSICIANS 动态生成，三位都要在，而且要说填 id。"""
+    from core.physicians import PHYSICIANS
+
+    manifest = {m["name"]: m for m in tools_manifest()}
+    for tool in ("search_cases", "query_case_graph"):
+        desc = manifest[tool]["parameters"]["properties"]["physician"]["description"]
+        assert "id" in desc and "不是中文名" in desc, tool
+        for pid, info in PHYSICIANS.items():
+            assert pid in desc and info["name"] in desc, f"{tool} 的描述漏了 {pid}"
+
+
 # ---------- lookup_standard ----------
 
 def test_lookup_standard_by_code_and_name():

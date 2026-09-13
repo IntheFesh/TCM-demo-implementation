@@ -33,6 +33,7 @@ from typing import Callable
 from pydantic import BaseModel, Field
 
 from core.graph.store import NetworkXStore
+from core.physicians import physician_choices_text, resolve_physician_id
 
 ROOT = Path(__file__).resolve().parent.parent
 GRAPH_PATH = ROOT / "data" / "graph.json"
@@ -127,6 +128,12 @@ def _load_case_triples() -> list[dict] | None:
             rows.append(row if isinstance(row, dict) else {"_bad_line": lineno})
         _case_triples = rows
         return _case_triples
+
+
+def _unknown_physician_error(value: str) -> str:
+    """physician 既不是 id 也不是已注册的中文名时给模型的报错——必须列出可用值，
+    模型才能自我纠正；只回一句"未知医家"它下一步还是瞎猜。"""
+    return f"physician={value!r} 不是已注册的医家。可用值：{physician_choices_text()}"
 
 
 # ---------- 工具注册表 ----------
@@ -295,7 +302,12 @@ class QueryCaseGraphInput(BaseModel):
         description="只看这一类关系，如 提示 / 治以 / 用药（X3 受控词表六选一："
                     "提示/属于/治以/用方/含/用药，见 core.schemas.CaseTriplePredicate）",
     )
-    physician: str | None = Field(default=None, description="只看这位医家的医案（ye_tianshi / wu_jutong）")
+    # 描述从 PHYSICIANS 动态生成，不写死医家清单——之前这里手写了
+    # 「ye_tianshi / wu_jutong」，张锡纯注册进来之后没人记得改这一处。
+    physician: str | None = Field(
+        default=None,
+        description=f"只看这位医家的医案，填医家 id（不是中文名），可用值：{physician_choices_text()}",
+    )
     case_id: str | None = Field(default=None, description="只看这条医案")
     limit: int = Field(default=20, ge=1, le=200)
 
@@ -303,6 +315,17 @@ class QueryCaseGraphInput(BaseModel):
 def query_case_graph(symptom: str | None = None, predicate: str | None = None,
                      physician: str | None = None, case_id: str | None = None,
                      limit: int = 20) -> dict:
+    # 三种"空"必须分开（见模块顶部约束 2 和 SOURCES.md 第 31 条）：
+    #   ① 参数错了 —— available:true + error，模型据此改参数重查
+    #   ② 数据文件不存在 —— available:false + note
+    #   ③ 数据在、确实没匹配 —— available:true + note（带"已查 N 条"）
+    # 旧实现把 ① 和 ③ 混成同一个静默的 triples:[]，模型以为"这位医家没有
+    # 相关医案"，实际是 physician 填了中文名匹配不上 id（AutoDL 实测 9 次全空）。
+    if physician is not None:
+        resolved = resolve_physician_id(physician)
+        if resolved is None:
+            return {"available": True, "triples": [], "error": _unknown_physician_error(physician)}
+        physician = resolved
     rows = _load_case_triples()
     if rows is None:
         return {
@@ -320,6 +343,11 @@ def query_case_graph(symptom: str | None = None, predicate: str | None = None,
     n_no_span = sum(1 for r in rows if not (r.get("source_span") or "").strip())
     rows = [r for r in rows if (r.get("source_span") or "").strip()]
 
+    # "已查 N 条"给模型看：③ 那种真的没匹配时，N 告诉它"确实查了、不是没查"，
+    # 不会误以为数据缺失而放弃医案层。N 是过了 physician 过滤之后的条数。
+    n_scanned = sum(
+        1 for r in rows if physician is None or r.get("physician") == physician
+    )
     matched = []
     for r in rows:
         s, o = r.get("s") or "", r.get("o") or ""
@@ -356,6 +384,9 @@ def query_case_graph(symptom: str | None = None, predicate: str | None = None,
         ],
     }
     notes = []
+    if not matched:
+        scope = f"该医家（{physician}）" if physician is not None else "全部医家"
+        notes.append(f"{scope}的医案三元组里没有匹配项，已查 {n_scanned} 条三元组")
     if bad_lines:
         notes.append(f"三元组文件有 {len(bad_lines)} 行无法解析，已跳过（行号：{bad_lines[:10]}）")
     if n_no_span:
@@ -370,12 +401,22 @@ def query_case_graph(symptom: str | None = None, predicate: str | None = None,
 
 class SearchCasesInput(BaseModel):
     query: str = Field(min_length=1, description="检索用的症状描述文本")
-    physician: str = Field(min_length=1, description="在这位医家的医案库里检索")
+    physician: str = Field(
+        min_length=1,
+        description=f"在这位医家的医案库里检索，填医家 id（不是中文名），可用值：{physician_choices_text()}",
+    )
     k: int = Field(default=3, ge=1, le=10)
 
 
 def search_cases(query: str, physician: str, k: int = 3) -> dict:
     from core.retrieval import adaptive_min_score, get_retriever
+
+    # 三种"空"分开报，见 query_case_graph 里同一段注释：① 参数错 → error，
+    # ② 数据文件不存在 → available:false，③ 真没匹配 → note 带"已查 N 条"。
+    resolved = resolve_physician_id(physician)
+    if resolved is None:
+        return {"available": True, "cases": [], "error": _unknown_physician_error(physician)}
+    physician = resolved
 
     try:
         retriever = get_retriever()
@@ -387,6 +428,14 @@ def search_cases(query: str, physician: str, k: int = 3) -> dict:
     # 模型会拿到几条相似度很低的不相关医案并被鼓励去引用它们。
     min_score = adaptive_min_score(retriever, query, physician)
     hits = retriever.search(query, physician, k=k, min_score=min_score)
+    if not hits:
+        n = retriever.case_count(physician)
+        scanned = f"已查 {n} 条医案" if n is not None else "医案库已查完（条数未知）"
+        return {
+            "available": True,
+            "cases": [],
+            "note": f"该医家（{physician}）医案中没有相似度达标的匹配项，{scanned}",
+        }
     return {
         "available": True,
         "cases": [

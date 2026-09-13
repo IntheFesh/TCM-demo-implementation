@@ -953,3 +953,69 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     标准数据重放的两条真实 trace），不是"E9 这次一定能过 0.4 这道闸门"。
     如果 AutoDL 实测医案层占比上去了但 E9 仍不过，说明问题在下一层
     （`format_trace_for_s3`），不该在这轮硬凑，留给下一轮。
+
+    **更新：条目 30 的修复生效了（医案层占比 12% → 55%，退出码 0），但
+    真实 trace 暴露了下一层问题——医案层工具 9 次调用全部返回空，见条目 31。**
+
+31. **两套标识符在边界上没有统一解析：模型填中文名，过滤用 id，医案层工具
+    恒返回空——单元测试测不出来，只有真实 trace 能看见。** 条目 30 把模型
+    引导到医案层之后，`scripts/verify_react_tools.py` 在 AutoDL 真实数据
+    （941 条医案 + 34211 条三元组，数据是齐的）上打出的三条 trace 里，
+    `search_cases` / `query_case_graph` 共 9 次调用**没有一次返回过数据**
+    （`{"available": true, "cases": []}` / `{"available": true,
+    "total_matched": 0, "triples": []}`）。模型查了 3 次空之后退回国标层，
+    完全合理——它不是不听话，是医案层真的给不出东西。E9=0.332 有很大一部分
+    是这个造成的：模型被引导去查医案（条目 30 的成果），结果查 9 次全空。
+
+    根因：trace 里模型填的是 `'physician': '叶天士'`，而 `core/tools.py` 的
+    两个医案层工具把这个值直接拿去跟 cases.json / case_triples.jsonl 里存的
+    id（`ye_tianshi`）比较——中文名永远匹配不到 id。模型为什么填中文名？
+    因为 `prompts/v1/s3_react.yaml` 只给了它中文名（`$name`），它手里根本
+    没有 id；两个工具的 schema 描述也没说要填 id（`query_case_graph` 的描述
+    还写死了「ye_tianshi / wu_jutong」，张锡纯注册后没人记得改）。
+    `run_physician` 那条主路径不受影响，它内部直接传 id——所以 E3/E4 没被
+    拖累，只有走 ReAct 的 `search_cases` 拿不到医案。
+
+    **为什么单元测试测不出来**：工具本身没报错、返回结构合法、
+    `available: true`——对着"静默空返回"写的测试全是绿的。这也说明条目 30
+    加 `react_process.samples` 存 trace 那条做对了，没有它这个 bug 还藏着。
+
+    修法（三处 + 三个同类隐患）：
+      - `core/physicians.py::resolve_physician_id`：全项目唯一的 name→id
+        入口，两个医案层工具、`/api/trajectories/{physician}` 路径参数、
+        `run_react` 的兜底都过它，不在过滤处直接比较。解析失败（既不是 id
+        也不是已注册中文名）时工具返回列出可用值的 `error`，不是静默空——
+        模型据此能自我纠正，静默空它只会以为"这位医家没有相关医案"。
+      - prompt 同时给 id 和中文名（`「$name」（id: $physician_id）`），并明确
+        说"physician 参数请填 id"；`run_react` 多接 `physician_id`，
+        `core/chain.py` 把已经是 id 的 `physician` 传进去。解析函数是兜底
+        不是主路径——让模型一开始就填对，比事后解析可靠。
+      - 工具 schema 的 physician 描述从 `PHYSICIANS` 动态生成
+        （`physician_choices_text()`），以后加医家不用再改这里。
+      - 工具返回空的三种情况分开报：① 参数错 → `error`；② 数据文件不存在 →
+        `available: false`；③ 数据在、确实没匹配 → `note` 带"已查 N 条"。
+        ③ 的 N 是给模型看的——"确实查了、不是没查"，不会误以为数据缺失而
+        放弃医案层。`Retriever.case_count()` 就是为这个 N 加的，假检索器
+        不知道条数时如实说"条数未知"，不编数。
+      - `scripts/verify_react_tools.py` 的判据从"医案层占比 > 35%"改成
+        "占比 > 35% **且**返回非空率 > 50%"——上一轮的判据只看调用次数，
+        所以 9 次全空也能过 55%。
+      - 全局扫了一遍所有拿 physician 做过滤/比较的地方（`grep -rn physician
+        core/ eval/ api/ offline/`），逐个确认是 id 还是 name：内部传递
+        （`core/chain.py` 的 `PHYSICIANS.items()` 循环、`_swap_physician_id`、
+        divergence 分组、`core/retrieval*.py` 的 `c.physician == physician`、
+        `eval/run_eval.py` 的 by_physician 配对、`eval/mes/*` 的答案表、
+        `offline/*` 的抽取产出）全部已经是 id，不动；接收外部输入的边界
+        只有三处——ReAct 工具参数（本轮 bug）、`/api/trajectories/{physician}`
+        路径参数（原来 `not in PHYSICIANS` 只认 id，现在 id/中文名都认）、
+        CLI 的 `--physician-a/-b`（`eval/mes/collect.py`，默认值就是 id，
+        传中文名会静默算成 0 胜——同一形状的坑，一起过 resolve）。
+        `ConsultRequest` 请求体不带 physician 字段，不涉及。
+      - 规矩写进 CLAUDE.md（「标识符只有一种规范形式，边界上统一解析」）：
+        阶段二药理层的药材标识、阶段三教材扩充的证候编码会再引入新的标识符，
+        每种一个 `resolve_*_id`，加在边界上。
+
+    **留给自己的坑：** 修复在沙盒里是用合成数据验证的（physician 存 id、
+    工具传中文名、断言返回非空），不是在 AutoDL 真实语料上——
+    `scripts/verify_react_tools.py` 两道闸门都过（退出码 0）才算真正确认，
+    E9 也只有在这之后重跑才有意义：上一轮即使重跑，ReAct 拿到的也是 9 次空。

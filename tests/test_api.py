@@ -209,6 +209,20 @@ def test_api_trajectories_unknown_physician_404():
     assert resp.status_code == 404
 
 
+def test_api_trajectories_accepts_chinese_name_at_the_boundary(monkeypatch):
+    """P1-1.1b：路径参数是外部输入，过 resolve_physician_id——id 和中文名都认，
+    返回体里的 physician 统一成 id（SOURCES.md 第 31 条同一形状的坑）。"""
+    import core.transition as transition_mod
+
+    fake = {"ye_tianshi": [{"case_group_id": "g1", "n_visits": 2, "visits": []}]}
+    monkeypatch.setattr(transition_mod, "load_trajectories", lambda: fake)
+    resp = TestClient(api_main.app).get("/api/trajectories/叶天士")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["physician"] == "ye_tianshi"
+    assert body["trajectories"][0]["case_group_id"] == "g1"
+
+
 def test_api_trajectories_missing_data_returns_503(monkeypatch):
     import core.transition as transition_mod
 

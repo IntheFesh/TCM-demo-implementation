@@ -423,7 +423,9 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         "s1_normalize": {"complaint"},
         "s2_elements": {"elements", "symptoms", "tongue", "pulse"},
         "s3_syndrome": {"name", "elements_summary", "symptoms", "refs"},
-        "s3_react": {"name", "symptoms", "elements_summary", "tools", "history", "remaining"},
+        # physician_id 是 P1-1.1b 加的（模型要填 id 不是中文名，SOURCES.md 第 31 条），
+        # 调用方 core/react.py::run_react 已同步传它——这条是有意的契约变更。
+        "s3_react": {"name", "physician_id", "symptoms", "elements_summary", "tools", "history", "remaining"},
         "patient_sim": {"profile", "history", "question"},
         "sdt_extract": {"clinical_data"},
         "sdt_select": {"reasoning_block", "clinical_data", "pathogenesis_options", "syndrome_options"},

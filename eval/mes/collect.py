@@ -18,7 +18,7 @@ import json
 import string
 from pathlib import Path
 
-from core.physicians import PHYSICIANS
+from core.physicians import PHYSICIANS, physician_choices_text, resolve_physician_id
 from eval.mcnemar import mcnemar_test
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -115,7 +115,17 @@ def main(argv: list[str] | None = None) -> None:
     items = json.loads(args.items_path.read_text(encoding="utf-8"))
     answer_key = json.loads(args.answer_key_path.read_text(encoding="utf-8"))
 
-    result = collect_ratings(items, answer_key, args.physician_a, args.physician_b)
+    # CLI 参数是外部输入，过唯一的解析入口（id 或中文名都认）。之前直接拿
+    # 字符串去跟答案表里的 id 比，传中文名会静默算成 0 胜——跟 ReAct 那个
+    # physician 参数是同一形状的坑（SOURCES.md 第 31 条）。
+    physician_a = resolve_physician_id(args.physician_a)
+    physician_b = resolve_physician_id(args.physician_b)
+    if physician_a is None or physician_b is None:
+        raise SystemExit(
+            f"--physician-a/--physician-b 必须是已注册的医家 id 或中文名"
+            f"（收到 {args.physician_a!r} / {args.physician_b!r}），可用值：{physician_choices_text()}"
+        )
+    result = collect_ratings(items, answer_key, physician_a, physician_b)
     print(result["note"])
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

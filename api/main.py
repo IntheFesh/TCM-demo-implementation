@@ -23,7 +23,7 @@ from core.audit import append_audit
 from core.chain import consult, explained_symptoms
 from core.diseases import get_disease, triage_advice
 from core.herbs import is_western_drug, strip_dose_and_parens
-from core.physicians import PHYSICIANS
+from core.physicians import PHYSICIANS, resolve_physician_id
 from core.prescription import compute_herb_diffs, format_pharmacy_text
 from core.safety_output import assess_formula_safety
 from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, S1Normalize
@@ -147,8 +147,12 @@ def api_trajectories(physician: str) -> dict:
     缺失是这台 demo 环境的正常状态（数据要在有真实 LLM 的机器上生成），
     不是服务器错误——用 503 而不是 500，前端可以据此显示"这项功能待数据
     就绪"而不是当成系统故障。"""
-    if physician not in PHYSICIANS:
+    # 路径参数是外部输入，过唯一的解析入口（id 或中文名都认），不在这里直接
+    # 拿字符串跟注册表比——CLAUDE.md「标识符只有一种规范形式，边界上统一解析」。
+    physician_id = resolve_physician_id(physician)
+    if physician_id is None:
         raise HTTPException(status_code=404, detail=f"未知医家：{physician}")
+    physician = physician_id
 
     from core.transition import load_trajectories
 

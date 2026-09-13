@@ -24,6 +24,7 @@ from typing import Callable
 
 from core.followup import fast_mode_enabled
 from core.llm import LLMError, get_llm, load_prompt, render
+from core.physicians import resolve_physician_id
 from core.schemas import ReActStep, ReActStepRecord, ReActTrace
 from core.tools import TOOLS, run_tool, tools_manifest
 
@@ -163,9 +164,17 @@ def run_react(
     elements_summary: str,
     max_steps: int | None = None,
     on_step: StepFn | None = None,
+    physician_id: str | None = None,
 ) -> ReActTrace:
     """跑一轮 ReAct，返回完整轨迹。不抛异常：LLM 调用失败也记进轨迹返回，
     让上层决定要不要继续——一次工具层的意外不该让整条问诊挂掉。
+
+    physician_id 是 prompt 里 $physician_id 的来源：模型调 search_cases /
+    query_case_graph 时 physician 参数要填的就是它。生产路径（core/chain.py）
+    显式传 id；不传时用 resolve_physician_id(name) 从中文名反查——这是兜底
+    不是主路径，让模型一开始就拿到 id 比事后解析可靠。连中文名都反查不到
+    （未注册的名字，只有测试会这么传）就原样放 name：工具层那边会返回列出
+    可用值的报错，模型能据此纠正，比在这里编一个 id 诚实。
 
     max_steps=None 时按 FAST_MODE 决定（开着降到 FAST_MODE_MAX_STEPS，否则
     MAX_STEPS），显式传数字优先。形状跟 use_react=None / eval_mode=None 一致。
@@ -179,6 +188,8 @@ def run_react(
     的条数——这是它的不变量，别在某个 continue 分支漏调。"""
     if max_steps is None:
         max_steps = FAST_MODE_MAX_STEPS if fast_mode_enabled() else MAX_STEPS
+    if physician_id is None:
+        physician_id = resolve_physician_id(name) or name
     prompt = load_prompt("s3_react")
     records: list[ReActStepRecord] = []
     seen: dict[str, int] = {}
@@ -205,6 +216,7 @@ def run_react(
         system = render(
             prompt["system"],
             name=name,
+            physician_id=physician_id,
             symptoms=symptoms,
             elements_summary=elements_summary,
             tools=format_tools(),

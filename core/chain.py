@@ -391,6 +391,9 @@ def run_physician(
     if use_react:
         trace = run_react(
             name=physician_name,
+            # physician 在这里已经是 id：prompt 里的 $physician_id 直接用它，
+            # 不让 run_react 再从中文名反查一遍（反查是兜底，不是主路径）。
+            physician_id=physician,
             symptoms=symptoms_text,
             elements_summary=_format_elements_summary(s2),
             on_step=on_step,

@@ -419,6 +419,52 @@ def test_hint_absent_when_query_graph_miss_then_hit(scripted, monkeypatch):
     assert react.GRAPH_MISS_HINT not in trace.steps[1].observation
 
 
+# ---------- P1-1.1b：prompt 同时给 id 和中文名 ----------
+#
+# 模型在 ReAct 里只能看到 prompt 给的东西。之前只给中文名（$name），它填
+# physician 参数时自然填中文名，而医案库按 id 存——医案层工具 9 次调用全空
+# （SOURCES.md 第 31 条）。这三条钉住 $physician_id 真的被填进 prompt。
+
+
+class _CapturingLLM(ScriptedLLM):
+    """在 ScriptedLLM 基础上把每次收到的 system 提示词存下来。"""
+
+    def __init__(self, steps):
+        super().__init__(steps)
+        self.systems: list[str] = []
+
+    def generate(self, system, user, schema, temperature=0.0, **kwargs):
+        self.systems.append(system)
+        return super().generate(system, user, schema, temperature, **kwargs)
+
+
+def test_prompt_carries_physician_id_resolved_from_chinese_name(monkeypatch):
+    llm = _CapturingLLM([ReActStep(thought="够了", action="finish")])
+    monkeypatch.setattr(react, "get_llm", lambda: llm)
+    run_react(name="叶天士", symptoms="纳差", elements_summary="脾")
+    system = llm.systems[0]
+    assert "「叶天士」（id: ye_tianshi）" in system
+    assert "physician 参数请填 id（ye_tianshi）" in system
+    assert "$physician_id" not in system  # 占位符必须被真的替换掉
+
+
+def test_prompt_uses_explicit_physician_id_over_name_lookup(monkeypatch):
+    """core/chain.py 显式传 id——主路径不靠中文名反查。"""
+    llm = _CapturingLLM([ReActStep(thought="够了", action="finish")])
+    monkeypatch.setattr(react, "get_llm", lambda: llm)
+    run_react(name="叶天士", symptoms="纳差", elements_summary="脾", physician_id="wu_jutong")
+    assert "id: wu_jutong" in llm.systems[0]
+
+
+def test_prompt_falls_back_to_raw_name_when_name_is_unregistered(monkeypatch):
+    """反查不到就原样放 name，不编一个 id——工具层会回列出可用值的报错，
+    模型据此能纠正（见 run_react 文档字符串）。"""
+    llm = _CapturingLLM([ReActStep(thought="够了", action="finish")])
+    monkeypatch.setattr(react, "get_llm", lambda: llm)
+    run_react(name="华佗", symptoms="纳差", elements_summary="脾")
+    assert "「华佗」（id: 华佗）" in llm.systems[0]
+
+
 def test_on_step_fires_on_llm_error_and_no_progress_too(monkeypatch):
     """error 和 no_progress 这两种终止路径也不能漏——它们各自只有一条
     独立的 return 语句，跟其余五条路径不共用同一段收尾代码。"""
