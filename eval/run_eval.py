@@ -837,6 +837,53 @@ def divergence_per_query_detail(
 # ---------- 汇总与报告 ----------
 
 
+def school_pair_summary(consult_results: list[dict]) -> dict:
+    """1.3（E2）的判据：「跨学派分歧 > 师承内分歧」在多数主诉上成立——报出，
+    不是硬闸门。逐条读 divergence 里的 lineage_mean / cross_school_mean
+    （core/chain.py::pairwise_divergence 算的），只数两个都有值的主诉；
+    被拦截/信息不足/只有两位医家（没有跨学派对）的主诉不计入分母，报在
+    n_skipped 里，不让它们把"成立比例"稀释成一个假数。"""
+    n_cross_gt = 0
+    n_comparable = 0
+    n_skipped = 0
+    lineage_vals: list[float] = []
+    cross_vals: list[float] = []
+    for r in consult_results:
+        div = None if (r.get("rejected") or r.get("insufficient")) else (r.get("divergence") or {})
+        lm = (div or {}).get("lineage_mean")
+        cm = (div or {}).get("cross_school_mean")
+        if lm is None or cm is None:
+            n_skipped += 1
+            continue
+        n_comparable += 1
+        lineage_vals.append(lm)
+        cross_vals.append(cm)
+        if cm > lm:
+            n_cross_gt += 1
+    lineage_mean = round(sum(lineage_vals) / len(lineage_vals), 3) if lineage_vals else None
+    cross_mean = round(sum(cross_vals) / len(cross_vals), 3) if cross_vals else None
+    holds_on_majority = (n_cross_gt * 2 > n_comparable) if n_comparable else None
+    return {
+        "n_comparable": n_comparable,
+        "n_skipped": n_skipped,
+        "n_cross_school_gt_lineage": n_cross_gt,
+        "lineage_mean": lineage_mean,
+        "cross_school_mean": cross_mean,
+        "holds_on_majority": holds_on_majority,
+        "note": (
+            "没有可比较的主诉（全部被拦截/信息不足，或注册表里不足两个学派、"
+            "没有跨学派配对）——1.3 的判据无法评估，不是「不成立」。"
+            if not n_comparable else
+            f"{n_comparable} 条主诉可比较（另 {n_skipped} 条不计入）：其中 "
+            f"{n_cross_gt} 条跨学派分歧 > 师承内分歧（{n_cross_gt}/{n_comparable}），"
+            f"师承内均值 {lineage_mean} vs 跨学派均值 {cross_mean}。"
+            f"判据「多数主诉成立」：{'成立' if holds_on_majority else '不成立'}"
+            "（只报出，不作硬闸门；两位医家同为温病学派、第三位衷中参西派，"
+            "学派分组来自 core/physicians.py 的 school 字段）。"
+        ),
+    }
+
+
 def build_report(
     consult_results: list[dict],
     retrieval_comparisons: list[dict] | None = None,
@@ -856,6 +903,8 @@ def build_report(
         # 逐条明细：跟上面的汇总并列存在，不是取代它——见
         # divergence_per_query_detail 的文档字符串。
         "divergence_per_query": divergence_per_query_detail(consult_results, epsilon_detail),
+        # 1.3（E2）：师承内 vs 跨学派的两两配对汇总，判据只报出不硬卡。
+        "school_pairs": school_pair_summary(consult_results),
         "hallucination": hallucination_by_reference_availability(consult_results),
         "safety_veto": safety_veto_summary(consult_results),
         "retrieval_mode_comparisons": retrieval_comparisons or [],
@@ -907,6 +956,9 @@ def render_markdown(report: dict) -> str:
             lines.append(f"- {c['note']}")
     else:
         lines.append("（本次未跑检索模式对比）")
+    lines.append("")
+    lines.append("## 学派两两配对（E2：师承内 vs 跨学派）")
+    lines.append(f"- {report['school_pairs']['note']}")
     lines.append("")
     lines.append("## 消融（E3 own vs swapped / E4 own vs none / E9 react off vs on）")
     if report["ablations"]:

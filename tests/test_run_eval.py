@@ -736,6 +736,63 @@ def test_react_process_summary_empty_records():
     assert r["samples"] == []
 
 
+# ---------- 1.3（E2）：school_pair_summary ----------
+
+
+def _result_with_school_pairs(lineage_mean, cross_school_mean, rejected=False):
+    return {
+        "rejected": rejected, "insufficient": False,
+        "divergence": {"lineage_mean": lineage_mean, "cross_school_mean": cross_school_mean},
+    }
+
+
+def test_school_pair_summary_counts_majority_and_reports_means():
+    results = [
+        _result_with_school_pairs(0.3, 0.8),   # 跨学派 > 师承内
+        _result_with_school_pairs(0.5, 0.6),   # 跨学派 > 师承内
+        _result_with_school_pairs(0.7, 0.2),   # 反过来
+    ]
+    r = re.school_pair_summary(results)
+    assert r["n_comparable"] == 3 and r["n_skipped"] == 0
+    assert r["n_cross_school_gt_lineage"] == 2
+    assert r["lineage_mean"] == pytest.approx(0.5)
+    assert r["cross_school_mean"] == pytest.approx(0.533)
+    assert r["holds_on_majority"] is True
+    assert "2/3" in r["note"] and "成立" in r["note"]
+
+
+def test_school_pair_summary_skips_rejected_and_two_physician_results():
+    """被拦截、或只有两位医家（cross_school_mean=None）的主诉不进分母，
+    报在 n_skipped 里——否则"成立比例"会被稀释成假数。"""
+    results = [
+        _result_with_school_pairs(0.3, 0.8),
+        _result_with_school_pairs(0.3, None),          # 只有两位医家，没有跨学派对
+        _result_with_school_pairs(0.3, 0.9, rejected=True),
+        {"rejected": False, "insufficient": True, "divergence": None},
+    ]
+    r = re.school_pair_summary(results)
+    assert r["n_comparable"] == 1 and r["n_skipped"] == 3
+    assert r["holds_on_majority"] is True
+
+
+def test_school_pair_summary_no_comparable_says_unevaluable_not_false():
+    r = re.school_pair_summary([_result_with_school_pairs(None, None)])
+    assert r["n_comparable"] == 0
+    assert r["holds_on_majority"] is None  # 无法评估 ≠ 不成立
+    assert "无法评估" in r["note"]
+
+
+def test_build_report_carries_school_pairs_and_markdown_mentions_it():
+    results = [_result_with_school_pairs(0.3, 0.8)]
+    for r in results:  # build_report 里别的汇总函数还要读这些键
+        r.update({"safety_flag": None, "results": [], "manifest": {"llm_calls": 1}, "query": "q"})
+    report = re.build_report(results)
+    assert report["school_pairs"]["n_comparable"] == 1
+    md = re.render_markdown(report)
+    assert "学派两两配对" in md
+    assert report["school_pairs"]["note"] in md
+
+
 # ---------- divergence_per_query_detail ----------
 
 

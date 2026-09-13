@@ -465,7 +465,10 @@ def test_divergence_true_when_syndromes_differ(monkeypatch):
     outcome = chain.consult("纳差乏力")
 
     assert outcome["divergence"]["same"] is False
-    assert outcome["divergence"]["method"] == "exact_string_match"
+    # 1.3（E2）有意的契约变更：method 从过时的 "exact_string_match"（第一版按
+    # 证型名字符串比对，早就换成药物集合了，字段一直没跟着改）改成
+    # "pairwise_herb_jaccard"——主指标是两两配对的药物 Jaccard 距离。
+    assert outcome["divergence"]["method"] == "pairwise_herb_jaccard"
 
 
 def test_hallucination_detected_when_cited_id_not_in_refs(monkeypatch):
@@ -1247,6 +1250,122 @@ def test_disease_via_alias_does_not_get_warning(monkeypatch):
 
     for r in outcome["results"]:
         assert r["s3"].note is None
+
+
+# ---------- 1.3（E2）：分歧两两配对，师承内 vs 跨学派 ----------
+#
+# 三家 set.intersection 只有三家都用的药才算共同，jaccard 天然偏向 1.0，
+# 分不清师承内（叶×吴，同温病学派）和跨学派（叶×张、吴×张）。pairs 三对
+# 分别算，group 从 PHYSICIANS 的 school 字段判，year_gap 从 years 字段算。
+
+
+def _s3_with_herbs(pid, herbs, tp="健脾益气"):
+    return S3Syndrome(syndrome="脾胃气虚", reasoning="x", treatment_principle=tp,
+                      cited_case_ids=[f"{pid}-001"], herbs=herbs)
+
+
+def test_pairwise_divergence_three_physicians_separates_lineage_from_cross_school(monkeypatch):
+    """对着真实注册表（三位、两个学派）跑：三对各自的 Jaccard、分组、生年差，
+    师承内均值 / 跨学派均值并列，判据 cross_school_gt_lineage 报出。"""
+    from core.physicians import PHYSICIANS as REAL_PHYSICIANS
+
+    assert len(REAL_PHYSICIANS) == 3 and len({i["school"] for i in REAL_PHYSICIANS.values()}) == 2
+
+    herbs = {
+        "ye_tianshi": ["党参", "白术", "茯苓", "甘草"],
+        "wu_jutong": ["党参", "白术", "茯苓", "陈皮"],          # 跟叶天士 3/5 重合
+        "zhang_xichun": ["黄芪", "山药", "党参"],                # 跟两位温病医家只共 1 味
+    }
+    fake_llm = FakeLLM({info["name"]: _s3_with_herbs(pid, herbs[pid]) for pid, info in REAL_PHYSICIANS.items()})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "PHYSICIANS", REAL_PHYSICIANS)  # 覆盖 autouse 的两位钉死
+    cases = [
+        CaseRecord(case_id=f"{pid}-001", case_group_id=f"{pid}-001", physician=pid, raw="原文",
+                   symptoms=["纳差"], syndrome="脾胃气虚", herbs=["党参"])
+        for pid in REAL_PHYSICIANS
+    ]
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(cases))
+
+    div = chain.consult("纳差乏力")["divergence"]
+
+    assert div["method"] == "pairwise_herb_jaccard"
+    by_pair = {(p["a"], p["b"]): p for p in div["pairs"]}
+    assert set(by_pair) == {("ye_tianshi", "wu_jutong"), ("ye_tianshi", "zhang_xichun"),
+                            ("wu_jutong", "zhang_xichun")}
+    ye_wu = by_pair[("ye_tianshi", "wu_jutong")]
+    assert ye_wu["group"] == "lineage"
+    assert ye_wu["herb_jaccard"] == round(1 - 3 / 5, 3)
+    assert ye_wu["shared_herbs"] == ["党参", "白术", "茯苓"]
+    assert ye_wu["name_a"] == "叶天士" and ye_wu["name_b"] == "吴鞠通"
+    assert ye_wu["year_gap"] == 1758 - 1667
+    ye_zhang = by_pair[("ye_tianshi", "zhang_xichun")]
+    assert ye_zhang["group"] == "cross_school"
+    assert ye_zhang["herb_jaccard"] == round(1 - 1 / 6, 3)
+    assert ye_zhang["year_gap"] == 1860 - 1667
+    wu_zhang = by_pair[("wu_jutong", "zhang_xichun")]
+    assert wu_zhang["group"] == "cross_school"
+    assert wu_zhang["year_gap"] == 1860 - 1758
+    # 汇总：师承内 1 对、跨学派 2 对，均值各算各的，判据报出
+    assert div["n_lineage_pairs"] == 1 and div["n_cross_school_pairs"] == 2
+    assert div["lineage_mean"] == round(1 - 3 / 5, 3)
+    assert div["cross_school_mean"] == round((round(1 - 1 / 6, 3) + round(1 - 1 / 6, 3)) / 2, 3)
+    assert div["cross_school_gt_lineage"] is True
+    # 三家交并比仍然保留（eval/run_eval.py 和前端主行还在读它），且确实比两两的都偏高
+    assert div["herb_jaccard"] == round(1 - 1 / 7, 3)
+    assert all(div["herb_jaccard"] >= p["herb_jaccard"] for p in div["pairs"])
+
+
+def test_pairwise_divergence_two_physicians_has_one_pair_and_no_cross_school_means(monkeypatch):
+    """两位医家（autouse 钉住的叶/吴，同学派）：只有一对、group=lineage，跨学派
+    均值和判据都是 None（不适用），不是 0 或 False。"""
+    s3_ye = _s3_with_herbs("ye_tianshi", ["党参", "白术"])
+    s3_wu = _s3_with_herbs("wu_jutong", ["党参", "陈皮"])
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    div = chain.consult("纳差乏力")["divergence"]
+    assert len(div["pairs"]) == 1
+    assert div["pairs"][0]["group"] == "lineage"
+    assert div["lineage_mean"] == round(1 - 1 / 3, 3)
+    assert div["cross_school_mean"] is None
+    assert div["cross_school_gt_lineage"] is None
+
+
+def test_pairwise_divergence_pure_function_edge_cases(monkeypatch):
+    """纯函数直接调：两边都没开药 → jaccard None（不是 0）；医家不在注册表
+    → group=unknown、year_gap None；治法是否相同逐对报。"""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(chain, "PHYSICIANS", {
+        "ye_tianshi": {"name": "叶天士", "school": "温病", "years": "1667-1746"},
+        "wu_jutong": {"name": "吴鞠通", "school": "温病", "years": "1758-1836"},
+    })
+    results = [
+        {"physician": "ye_tianshi", "s3": SimpleNamespace(herbs=[], treatment_principle="健脾")},
+        {"physician": "wu_jutong", "s3": SimpleNamespace(herbs=[], treatment_principle="清热")},
+        {"physician": "someone_else", "s3": SimpleNamespace(herbs=["党参"], treatment_principle="健脾")},
+    ]
+    out = chain.pairwise_divergence(results)
+    by_pair = {(p["a"], p["b"]): p for p in out["pairs"]}
+    assert by_pair[("ye_tianshi", "wu_jutong")]["herb_jaccard"] is None
+    assert by_pair[("ye_tianshi", "wu_jutong")]["treatment_principle_same"] is False
+    assert by_pair[("ye_tianshi", "someone_else")]["group"] == "unknown"
+    assert by_pair[("ye_tianshi", "someone_else")]["year_gap"] is None
+    assert by_pair[("ye_tianshi", "someone_else")]["herb_jaccard"] == 1.0  # 一边空一边有：毫无重叠
+    assert by_pair[("ye_tianshi", "someone_else")]["treatment_principle_same"] is True
+    assert out["lineage_mean"] is None  # 唯一的师承内对没有可比的数
+    assert chain.pairwise_divergence([]) == {
+        "pairs": [], "lineage_mean": None, "cross_school_mean": None,
+        "n_lineage_pairs": 0, "n_cross_school_pairs": 0, "cross_school_gt_lineage": None,
+    }
+
+
+def test_birth_year_parses_registry_format_and_rejects_garbage():
+    assert chain._birth_year("1667-1746") == 1667
+    assert chain._birth_year(" 1860-1933 ") == 1860
+    assert chain._birth_year(None) is None
+    assert chain._birth_year("清代") is None
 
 
 # ---------- registry 增长回归：钉两位是权宜之计，不是终局 ----------

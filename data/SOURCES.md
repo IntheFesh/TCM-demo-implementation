@@ -1019,3 +1019,23 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     工具传中文名、断言返回非空），不是在 AutoDL 真实语料上——
     `scripts/verify_react_tools.py` 两道闸门都过（退出码 0）才算真正确认，
     E9 也只有在这之后重跑才有意义：上一轮即使重跑，ReAct 拿到的也是 9 次空。
+
+32. **三方交并比在三位医家上分不清师承内和跨学派（总纲 1.3 / E2）。**
+    `core/chain.py` 的分歧主指标原来是三家 `set.intersection`——只有三家都用
+    的药才算共同，第三位医家一加进来 jaccard 就天然偏向 1.0，叶×吴（同温病
+    学派）和叶×张、吴×张（跨学派）被压成同一个数；`method` 字段还写着第一版
+    的 "exact_string_match"，指标早换了字段没跟着改（"每个数字带对照"这条纪律
+    在这里的对照物是"这个数到底量的是什么"）。改成两两配对：`pairs` 三对分别算
+    药物 Jaccard 距离，`group` 从 `core/physicians.py` 的 `school` 字段判
+    （lineage / cross_school，任一方没登记学派就是 unknown），`year_gap` 从
+    `years` 的生年差算（年代探针：叶×张 193 年 vs 吴×张 102 年），
+    `lineage_mean` / `cross_school_mean` 并列，`cross_school_gt_lineage` 是 1.3
+    的判据——**只报出，不硬卡**；`eval/run_eval.py::school_pair_summary` 按主诉
+    数"多数成立"报，被拦截/只有两位医家（没有跨学派对）的主诉不进分母。三家
+    交并比 `herb_jaccard` 保留（前端主行和 E-系列汇总还在读它），注释里写明它
+    是 n 方指标、三位医家时偏高。前端横幅第二行列三对。
+
+    **留给自己的坑：** 判据"跨学派 > 师承内在多数主诉上成立"是一个待验证的
+    假设，不是已经成立的结论——沙盒里只用合成用药集合验证了计算本身
+    （叶/吴 3/5 重合、张只共 1 味 → 跨学派均值 0.833 > 师承内 0.4），真实数字要
+    等 AutoDL 上 `python -m eval.run_eval` 的 `school_pairs` 段。

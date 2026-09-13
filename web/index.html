@@ -81,6 +81,8 @@
     border-radius: 8px;
     font-size: 13.5px;
     margin-bottom: 16px;
+    /* 1.3（E2）：第二行列三对两两配对的分歧，textContent 里用 \n 分行 */
+    white-space: pre-line;
   }
   #divergence-banner.show { display: block; }
   #input-panel {
@@ -1910,7 +1912,25 @@ function renderDivergence(divergence) {
       epsNote = `；ε=${eps}（已超出噪声范围）`;
     }
     const sharedText = shared.length ? `，共用 ${shared.join("、")}` : "";
-    banner.textContent = `${tp}；${level}（药物 Jaccard 距离 ${j}${sharedText}${epsNote}）`;
+    let text = `${tp}；${level}（药物 Jaccard 距离 ${j}${sharedText}${epsNote}）`;
+    // 1.3（E2）：三位医家时 herb_jaccard 是三家交并比（只有三家都用的药才算
+    // 共同，天然偏向 1.0），分不清师承内和跨学派——第二行按两两配对列出来，
+    // 师承内均值 / 跨学派均值并列。只有两位医家时 pairs 只有一对，不重复报。
+    const pairs = divergence.pairs || [];
+    if (pairs.length >= 2) {
+      const groupLabel = { lineage: "师承内", cross_school: "跨学派", unknown: "学派未知" };
+      const pairText = pairs.map((p) => {
+        const jac = p.herb_jaccard === null || p.herb_jaccard === undefined ? "不适用" : p.herb_jaccard;
+        const gap = p.year_gap === null || p.year_gap === undefined ? "" : `，相隔 ${p.year_gap} 年`;
+        return `${p.name_a}×${p.name_b} ${jac}（${groupLabel[p.group] || p.group}${gap}）`;
+      }).join("　");
+      const lm = divergence.lineage_mean, cm = divergence.cross_school_mean;
+      const means = (lm !== null && lm !== undefined && cm !== null && cm !== undefined)
+        ? `；师承内均值 ${lm} vs 跨学派均值 ${cm}（${cm > lm ? "跨学派分歧更大" : "跨学派分歧未大于师承内"}）`
+        : "";
+      text += `\n两两配对：${pairText}${means}`;
+    }
+    banner.textContent = text;
     banner.classList.add("show");
   } else if (divergence && divergence.same === false) {
     banner.textContent = "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";

@@ -19,6 +19,7 @@ import sys
 
 import json
 import time
+from itertools import combinations
 from pathlib import Path
 
 from core import herbs as _herbs
@@ -302,6 +303,78 @@ def _swap_physician_id(physician: str) -> str:
     ids = list(PHYSICIANS)
     idx = ids.index(physician)
     return ids[(idx + 1) % len(ids)]
+
+
+def _birth_year(years: str | None) -> int | None:
+    """注册表里的 years 是「1667-1746」这种生卒年字符串，取生年。年代探针
+    （叶×张 约 190 年 vs 吴×张 约 100 年）按生年差算——两位医家"相隔多久"
+    看的是他们各自成长的年代，不是谁先去世。解析不了（None/格式不对）返回
+    None，不猜一个数。"""
+    if not years:
+        return None
+    head = years.strip().split("-")[0].strip()
+    return int(head) if head.isdigit() else None
+
+
+def pairwise_divergence(results: list[dict]) -> dict:
+    """1.3（E2）：医家两两配对的分歧，替代"三家 set.intersection"那种只有三家都
+    用的药才算共同的 n 方交并比——那个指标在三位医家时天然偏向 1.0，分不清
+    师承内（叶×吴，同为温病学派）和跨学派（叶×张、吴×张）。
+
+    每对给：药物 Jaccard 距离（跟 herb_jaccard 同一把尺子，只是两两算）、
+    共用药、治法是否相同、group（lineage=同学派 / cross_school=跨学派，从
+    PHYSICIANS 的 school 字段判，任一方没登记学派就是 unknown）、year_gap
+    （生年差，年代探针）。汇总给 lineage_mean / cross_school_mean 并列，
+    以及 cross_school_gt_lineage——这是 1.3 的判据（"跨学派分歧大于师承内"
+    在多数主诉上成立），只报出不硬卡。
+
+    results 少于两位、或某对两边都没开药时，对应的数是 None 不是 0：0 会被
+    读成"两边用药完全一致"，而实际是"这个维度不适用"。纯函数，不依赖
+    consult() 的其他状态，方便单测。"""
+    pairs: list[dict] = []
+    for ra, rb in combinations(results, 2):
+        a, b = ra["physician"], rb["physician"]
+        set_a = _herbs.normalized_herb_set(ra["s3"].herbs)
+        set_b = _herbs.normalized_herb_set(rb["s3"].herbs)
+        union = set_a | set_b
+        inter = set_a & set_b
+        jaccard = round(1.0 - len(inter) / len(union), 3) if union else None
+        info_a, info_b = PHYSICIANS.get(a, {}), PHYSICIANS.get(b, {})
+        school_a, school_b = info_a.get("school"), info_b.get("school")
+        if school_a and school_b:
+            group = "lineage" if school_a == school_b else "cross_school"
+        else:
+            group = "unknown"
+        birth_a, birth_b = _birth_year(info_a.get("years")), _birth_year(info_b.get("years"))
+        pairs.append({
+            "a": a, "b": b,
+            # 展示层用中文名，数据层用 id——两者都给，前端不用再查一遍注册表
+            "name_a": info_a.get("name", a), "name_b": info_b.get("name", b),
+            "school_a": school_a, "school_b": school_b,
+            "group": group,
+            "year_gap": abs(birth_a - birth_b) if birth_a is not None and birth_b is not None else None,
+            "herb_jaccard": jaccard,
+            "shared_herbs": sorted(inter),
+            "treatment_principle_same": ra["s3"].treatment_principle == rb["s3"].treatment_principle,
+        })
+
+    def _mean(group: str) -> float | None:
+        vals = [p["herb_jaccard"] for p in pairs if p["group"] == group and p["herb_jaccard"] is not None]
+        return round(sum(vals) / len(vals), 3) if vals else None
+
+    lineage_mean, cross_school_mean = _mean("lineage"), _mean("cross_school")
+    return {
+        "pairs": pairs,
+        "lineage_mean": lineage_mean,
+        "cross_school_mean": cross_school_mean,
+        "n_lineage_pairs": sum(1 for p in pairs if p["group"] == "lineage"),
+        "n_cross_school_pairs": sum(1 for p in pairs if p["group"] == "cross_school"),
+        # None = 两类里至少一类没有可比的对（比如只有两位医家、或某类全没开药）
+        "cross_school_gt_lineage": (
+            cross_school_mean > lineage_mean
+            if lineage_mean is not None and cross_school_mean is not None else None
+        ),
+    }
 
 
 def run_physician(
@@ -838,6 +911,7 @@ def consult(
     syndromes = {r["physician"]: r["s3"].syndrome for r in results}
     values = list(syndromes.values())
     same = len(set(values)) <= 1
+    pairwise = pairwise_divergence(results)
 
     # EVAL_MODE 下 ReAct 的追问可能问出危重症状而没有中止（见 run_physician），
     # 把那个本该拦截的原因收上来。demo 模式走不到这里——那条路会抛 SafetyVeto。
@@ -891,10 +965,16 @@ def consult(
 
     divergence = {
         "same": same,
-        "method": "exact_string_match",
-        # 0=用药完全一致，1=毫无重叠
+        # 1.3（E2）：主指标是两两配对的药物 Jaccard 距离（pairs），不再是过时的
+        # "exact_string_match"（那是第一版按证型名字符串比对的写法，早就换成
+        # 药物集合了，字段一直没跟着改）。herb_jaccard 保留：它是"三家共用"的
+        # n 方交并比，三位医家时只有三家都用的药才算共同，天然偏向 1.0，
+        # 分不清师承内（叶×吴）和跨学派（叶×张、吴×张）——pairs 才分得清。
+        "method": "pairwise_herb_jaccard",
+        # 0=用药完全一致，1=毫无重叠（n 方交并比，见上）
         "herb_jaccard": round(herb_jaccard, 3) if herb_jaccard is not None else None,
         "shared_herbs": shared_herbs,
+        **pairwise,
         "treatment_principle_same": tp_same,
         # None = 两位医家都没开西药，这个维度不适用（不是"完全一致"）
         "western_drug_overlap": western_overlap,
