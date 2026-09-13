@@ -910,3 +910,46 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     数字：目标 dense#100/bm25#2，对手 dense#1/2/3+bm25#50/60/80），不是
     在真实语料上跑出来的——`BM25_FLOOR_N=2` 这行代码本身还没在 AutoDL 上
     用扩展后的 verify 脚本重新验证过，退出码 0 才算真正确认。
+
+30. **ReAct 查错层：prompt 清单本身偏向国标层，模型只是照着清单在做。**
+    P1 诊断（4 条主诉×3 医家=12 个样本、60 次工具调用）实测：国标层
+    （lookup_standard 38% + query_graph 35% = 73%）远高于医案层
+    （search_cases 12% + query_case_graph 0%），`query_case_graph` 一次
+    都没被调用过，`terminated_by=max_steps` 占 25/27（93%）。三条真实
+    trace 里能看到具体机制：一条（trace A）证明模型本来就会主动 finish，
+    推理能力不是问题；两条（trace B/C）把步数花在国标层的死胡同上——
+    trace B 连续两次换词查国标图谱查不到（患者原话不在国标 93/1282 个
+    标准症状节点里），trace C 在同一次 lookup_standard 返回的两个候选
+    证候编号（SP-10/TB-127）之间来回查，这个区分对最终开什么方没有影响。
+
+    根因在 `prompts/v1/s3_react.yaml` 的取证清单本身：原文"查国标图谱…
+    查医家医案…查标准证候定义…"三件事里两件是国标层，医案层夹在中间、
+    没有任何强调——不是模型不听话，是清单本身就偏。工具描述本身没问题
+    （`query_case_graph` 的 description 已经写明"回答这位医家实际怎么
+    处理"），所以这轮没有碰工具描述，改的是清单顺序/措辞和两条止损机制：
+
+      - 清单重排：医案层（search_cases/query_case_graph）排第一位，
+        并说明理由——国标证候名和医家医案里的说法是两套术语，开什么方
+        只有医案能告诉你；标准层查一次即可，不必纠结证候编号；国标层
+        用于确认症状覆盖。刻意没写成"必须按 1→2→3 顺序"，推理顺序仍由
+        病例决定，清单只回答"该查什么、查够了没有"。
+      - 两条止损提示（`core/react.py`）：连续两次 `lookup_standard` 都
+        查证候编号（不是证候名）→ 提示转查医案层；连续两次 `query_graph`
+        都 `found:false` → 提示改用 `search_cases`。都是"提示不是禁止"，
+        模型仍可以选择继续查——判定逻辑写成纯函数（`_should_hint_code_
+        disambiguation`/`_should_hint_graph_miss`），已经用真实
+        `data/graph.json`/`data/standard/syndromes.jsonl`（不是 mock）
+        端到端重放过 trace B/C，两条提示都在预期的那一步准确触发。
+      - `eval/run_eval.py` 的 `react_process_summary` 新增
+        `samples`（前 10 条完整动作序列，`report.json` 能直接看到），
+        以后不用再像这轮一样手写 `python -c` 现抓 trace。
+      - `scripts/verify_react_tools.py`：跟 `scripts/verify_hybrid_
+        fusion.py` 同一个理由同一个形状，打印工具调用分布/terminated_by
+        分布/医案层占比/前 3 条完整 trace，退出码按医案层占比 > 35% 判定。
+
+    **这一条本身也留一个坑给自己：** 这轮改的是"取证清单查什么"，不是
+    "取证结果怎么进 S3 的 prompt"（`format_trace_for_s3`）——沙盒里验证
+    的是"医案层占比确实能被清单顺序拉上去"（4 个离线场景，含用真实图谱/
+    标准数据重放的两条真实 trace），不是"E9 这次一定能过 0.4 这道闸门"。
+    如果 AutoDL 实测医案层占比上去了但 E9 仍不过，说明问题在下一层
+    （`format_trace_for_s3`），不该在这轮硬凑，留给下一轮。

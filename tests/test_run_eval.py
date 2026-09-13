@@ -646,26 +646,37 @@ def test_element_index_coverage_none_when_file_missing(tmp_path, monkeypatch):
 
 
 def _react_trace(n_steps=2, terminated_by="finish", llm_calls=3):
-    return SimpleNamespace(
-        steps=[object()] * n_steps, terminated_by=terminated_by, llm_calls=llm_calls,
-    )
+    steps = [
+        SimpleNamespace(step=i, action="query_graph", action_input={"node": f"节点{i}"},
+                         thought=f"第{i}步在查什么", observation="{}")
+        for i in range(1, n_steps + 1)
+    ]
+    return SimpleNamespace(steps=steps, terminated_by=terminated_by, llm_calls=llm_calls)
 
 
 def test_collect_react_process_samples_records_steps_and_terminated_by():
+    """P1 ReAct 修复：record 现在多带一个 "steps" 字段（trace.steps 原样
+    带出来，给 react_process_summary 建 samples 用），这是刻意的契约变更——
+    见 CLAUDE.md"改动前后都要报一个准确数"那条邻近的规则第 3 条：不悄悄
+    放松断言，这里是显式扩了字段并在这条测试里逐条写清楚。"""
+    trace_a = _react_trace(3, "finish")
+    trace_b = _react_trace(5, "max_steps")
+
     def consult_fn(query, **kwargs):
         return {
             "rejected": False, "insufficient": False,
             "results": [
-                {"physician": "叶天士", "react_trace": _react_trace(3, "finish")},
-                {"physician": "吴鞠通", "react_trace": _react_trace(5, "max_steps")},
+                {"physician": "叶天士", "react_trace": trace_a},
+                {"physician": "吴鞠通", "react_trace": trace_b},
             ],
         }
 
     records = re.collect_react_process_samples(["主诉甲"], consult_fn=consult_fn)
     assert len(records) == 2
     assert records[0] == {"query": "主诉甲", "physician": "叶天士", "n_steps": 3,
-                           "terminated_by": "finish", "llm_calls": 3}
+                           "terminated_by": "finish", "llm_calls": 3, "steps": trace_a.steps}
     assert records[1]["terminated_by"] == "max_steps" and records[1]["n_steps"] == 5
+    assert records[1]["steps"] == trace_b.steps
 
 
 def test_collect_react_process_samples_skips_rejected_and_missing_traces():
@@ -676,8 +687,15 @@ def test_collect_react_process_samples_skips_rejected_and_missing_traces():
 
 
 def test_react_process_summary_distributions():
+    step1 = SimpleNamespace(
+        step=1, action="lookup_standard", action_input={"query": "脾胃虚寒证"},
+        thought="核对主症是否齐备" * 15,  # 8字*15=120，故意超过 100 字，测 thought_head 截断
+        observation="found:true" * 30,  # 10字*30=300，故意超过 100 字，测 observation_head 截断
+    )
     records = [
-        {"query": "q1", "physician": "叶天士", "n_steps": 2, "terminated_by": "finish", "llm_calls": 3},
+        {"query": "q1", "physician": "叶天士", "n_steps": 2, "terminated_by": "finish",
+         "llm_calls": 3, "steps": [step1]},
+        # 第二条不带 "steps"——react_process_summary 要能处理这种缺省，不能 KeyError
         {"query": "q1", "physician": "吴鞠通", "n_steps": 5, "terminated_by": "max_steps", "llm_calls": 6},
     ]
     r = re.react_process_summary(records)
@@ -686,12 +704,36 @@ def test_react_process_summary_distributions():
     assert r["step_distribution"]["mean"] == pytest.approx(3.5)
     assert "prompt" in r["terminated_by_caveat"]
 
+    assert len(r["samples"]) == 2
+    sample0 = r["samples"][0]
+    assert sample0["query"] == "q1" and sample0["physician"] == "叶天士"
+    assert sample0["terminated_by"] == "finish"
+    assert len(sample0["steps"]) == 1
+    step_summary = sample0["steps"][0]
+    assert step_summary["step"] == 1
+    assert step_summary["action"] == "lookup_standard"
+    assert step_summary["action_input_summary"] == str({"query": "脾胃虚寒证"})[:60]
+    assert len(step_summary["thought_head"]) == 100
+    assert len(step_summary["observation_head"]) == 100
+    assert r["samples"][1]["steps"] == []  # 没给 steps 的那条，空列表不是 KeyError
+
+
+def test_react_process_summary_caps_samples_at_ten():
+    records = [
+        {"query": f"q{i}", "physician": "叶天士", "n_steps": 1, "terminated_by": "finish",
+         "llm_calls": 1, "steps": []}
+        for i in range(15)
+    ]
+    r = re.react_process_summary(records)
+    assert len(r["samples"]) == 10
+
 
 def test_react_process_summary_empty_records():
     r = re.react_process_summary([])
     assert r["n_samples"] == 0
     assert r["step_distribution"] is None
     assert r["terminated_by_caveat"]  # 空样本时也要带这条限定，不是只有有数据才提醒
+    assert r["samples"] == []
 
 
 # ---------- divergence_per_query_detail ----------

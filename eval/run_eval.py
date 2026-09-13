@@ -698,35 +698,73 @@ def collect_react_process_samples(queries: list[str], consult_fn=None) -> list[d
             records.append({
                 "query": query, "physician": r["physician"],
                 "n_steps": len(trace.steps), "terminated_by": trace.terminated_by,
-                "llm_calls": trace.llm_calls,
+                "llm_calls": trace.llm_calls, "steps": trace.steps,
             })
     return records
 
 
+# report.json 里存的动作序列样本数上限——存全部样本会让 report.json 跟着
+# 查询数量线性膨胀，10 条足够看清"工具调用分布长什么样"这个问题，不是为了
+# 穷举每一条。
+_TRACE_SAMPLE_LIMIT = 10
+# observation/thought 存进 report.json 时的截断长度——完整 observation
+# 有的上千字（search_cases 一次返回三条完整医案），存全量会让 report.json
+# 没法直接打开看，只留头部够诊断"这一步查了什么、大致查到了什么"就够。
+_ACTION_INPUT_SUMMARY_LEN = 60
+_THOUGHT_HEAD_LEN = 100
+_OBSERVATION_HEAD_LEN = 100
+
+
+def _step_sample(step) -> dict:
+    return {
+        "step": step.step,
+        "action": step.action,
+        "action_input_summary": str(step.action_input)[:_ACTION_INPUT_SUMMARY_LEN],
+        "thought_head": (step.thought or "")[:_THOUGHT_HEAD_LEN],
+        "observation_head": (step.observation or "")[:_OBSERVATION_HEAD_LEN],
+    }
+
+
 def react_process_summary(records: list[dict]) -> dict:
-    """E9 的步数分布 + terminated_by 分布。
+    """E9 的步数分布 + terminated_by 分布 + 前 _TRACE_SAMPLE_LIMIT 条完整
+    动作序列样本。
 
     step_distribution 复用 core.setstats.aggregate_stats 算 mean/p50/p95——
     它原本是给"多组已经算好的统计量再聚合一层"设计的，这里直接喂原始步数
     列表：数学上就是同一个 mean/p50/p95 计算，没有必要为了"输入形状不是
     严格意义上的统计量"再写一份一模一样的分位数代码。
+
+    samples 是这轮（P1 ReAct 修复）新加的：光有分布统计看不出"工具调用
+    分布 73% 落在国标层"这类问题具体是怎么发生的——上一轮就是靠手写
+    python -c 现抓的三条 trace 才诊断出根因，很不方便。records 里的
+    "steps" 字段是可选的（不是所有调用方都会附带完整轨迹，见
+    test_react_process_summary_distributions 那条不带 steps 的record），
+    缺失时该条样本的 steps 就是空列表，不报错。
     """
     n = len(records)
     if not n:
         return {
             "n_samples": 0, "step_distribution": None, "terminated_by_distribution": {},
-            "terminated_by_caveat": _TERMINATED_BY_PROMPT_CAVEAT,
+            "terminated_by_caveat": _TERMINATED_BY_PROMPT_CAVEAT, "samples": [],
             "note": "没有可用样本（全部被拦截/信息不足，或本次没有开 ReAct 的结果）。",
         }
     terminated_by_counts: dict[str, int] = {}
     for r in records:
         terminated_by_counts[r["terminated_by"]] = terminated_by_counts.get(r["terminated_by"], 0) + 1
     step_stats = aggregate_stats([float(r["n_steps"]) for r in records])
+    samples = [
+        {
+            "query": r["query"], "physician": r["physician"], "terminated_by": r["terminated_by"],
+            "steps": [_step_sample(s) for s in r.get("steps", [])],
+        }
+        for r in records[:_TRACE_SAMPLE_LIMIT]
+    ]
     return {
         "n_samples": n,
         "step_distribution": step_stats,
         "terminated_by_distribution": terminated_by_counts,
         "terminated_by_caveat": _TERMINATED_BY_PROMPT_CAVEAT,
+        "samples": samples,
         "note": (
             f"{n} 条 (主诉,医家) 样本开了 ReAct：步数 mean={step_stats['mean']} "
             f"p50={step_stats['p50']} p95={step_stats['p95']}；"

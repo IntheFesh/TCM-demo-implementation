@@ -319,6 +319,106 @@ def test_on_step_fires_once_per_recorded_step_including_continue_paths(scripted)
     assert events[0][1]["physician_name"] == "叶天士"
 
 
+# ---------- P1 ReAct 修复：两条止损提示 ----------
+#
+# 三条真实 trace 里两条把 max_steps 花在国标层的死胡同上：trace C 在两个
+# 候选证候编号之间来回查，trace B 连续换词查国标图谱查不到。这两条测试组
+# 分别钉住纯函数判定（快、精确）和端到端行为（提示真的进了 observation）。
+
+
+def test_looks_like_standard_code_recognizes_all_three_real_formats():
+    """data/standard/syndromes.jsonl 里真实出现的三种编号格式都要认得出来，
+    证候名（纯中文）不能被误判成编号。"""
+    assert react._looks_like_standard_code("SP-10") is True
+    assert react._looks_like_standard_code("TB-127") is True
+    assert react._looks_like_standard_code("B04.06.02.03.01.03") is True
+    assert react._looks_like_standard_code("脾胃虚寒证") is False
+    assert react._looks_like_standard_code(None) is False
+    assert react._looks_like_standard_code("") is False
+
+
+def test_should_hint_code_disambiguation_requires_both_consecutive_and_both_codes():
+    # 两次都是编号——trace C 的场景，触发
+    assert react._should_hint_code_disambiguation(
+        "lookup_standard", "TB-127", "lookup_standard", "SP-10") is True
+    # 两次都是证候名——正常试错（trace B 换名字就查到了），不触发
+    assert react._should_hint_code_disambiguation(
+        "lookup_standard", "脾阳虚证", "lookup_standard", "脾胃虚寒证") is False
+    # 一个编号一个名字——不是"同类目标"
+    assert react._should_hint_code_disambiguation(
+        "lookup_standard", "TB-127", "lookup_standard", "脾胃虚寒证") is False
+    # 上一步不是 lookup_standard——不连续，不触发
+    assert react._should_hint_code_disambiguation(
+        "query_graph", "TB-127", "lookup_standard", "SP-10") is False
+
+
+def test_should_hint_graph_miss_requires_both_consecutive_and_both_false():
+    assert react._should_hint_graph_miss(
+        "query_graph", {"found": False}, "query_graph", {"found": False}) is True
+    assert react._should_hint_graph_miss(
+        "query_graph", {"found": False}, "query_graph", {"found": True}) is False
+    assert react._should_hint_graph_miss(
+        "query_graph", {"found": True}, "query_graph", {"found": False}) is False
+    # lookup_standard 的 found:false 是另一件事，不归这条提示管
+    assert react._should_hint_graph_miss(
+        "lookup_standard", {"found": False}, "query_graph", {"found": False}) is False
+    assert react._should_hint_graph_miss(None, None, "query_graph", {"found": False}) is False
+
+
+def test_hint_appears_when_two_consecutive_lookup_standard_query_codes(scripted, monkeypatch):
+    monkeypatch.setattr(react, "run_tool", lambda name, args: {"found": False, "candidates": []})
+    scripted([
+        ReActStep(thought="查第一个候选编号", action="lookup_standard", action_input={"query": "TB-127"}),
+        ReActStep(thought="查第二个候选编号", action="lookup_standard", action_input={"query": "SP-10"}),
+        ReActStep(thought="够了", action="finish"),
+    ])
+    trace = _run()
+    assert react.CODE_DISAMBIGUATION_HINT not in trace.steps[0].observation
+    assert react.CODE_DISAMBIGUATION_HINT in trace.steps[1].observation
+
+
+def test_hint_absent_when_lookup_standard_queries_are_different_kinds(scripted, monkeypatch):
+    """连续两次都是 lookup_standard，但换的是证候名不是编号——trace B 那种
+    正常试错，不该被打断。"""
+    monkeypatch.setattr(react, "run_tool", lambda name, args: {"found": False, "candidates": []})
+    scripted([
+        ReActStep(thought="先按编号查", action="lookup_standard", action_input={"query": "TB-127"}),
+        ReActStep(thought="换成名字查", action="lookup_standard", action_input={"query": "脾胃虚寒证"}),
+        ReActStep(thought="够了", action="finish"),
+    ])
+    trace = _run()
+    assert react.CODE_DISAMBIGUATION_HINT not in trace.steps[0].observation
+    assert react.CODE_DISAMBIGUATION_HINT not in trace.steps[1].observation
+
+
+def test_hint_appears_when_two_consecutive_query_graph_miss(scripted, monkeypatch):
+    monkeypatch.setattr(react, "run_tool", lambda name, args: {"found": False, "near_matches": []})
+    scripted([
+        ReActStep(thought="查第一个词", action="query_graph", action_input={"node": "胃中隐痛"}),
+        ReActStep(thought="换个词再查", action="query_graph", action_input={"node": "胃脘痛"}),
+        ReActStep(thought="够了", action="finish"),
+    ])
+    trace = _run()
+    assert react.GRAPH_MISS_HINT not in trace.steps[0].observation
+    assert react.GRAPH_MISS_HINT in trace.steps[1].observation
+
+
+def test_hint_absent_when_query_graph_miss_then_hit(scripted, monkeypatch):
+    results = iter([
+        {"found": False, "near_matches": []},
+        {"found": True, "node": "symptom::口苦", "neighbors": []},
+    ])
+    monkeypatch.setattr(react, "run_tool", lambda name, args: next(results))
+    scripted([
+        ReActStep(thought="查第一个词", action="query_graph", action_input={"node": "胃中隐痛"}),
+        ReActStep(thought="换个词再查", action="query_graph", action_input={"node": "口苦"}),
+        ReActStep(thought="够了", action="finish"),
+    ])
+    trace = _run()
+    assert react.GRAPH_MISS_HINT not in trace.steps[0].observation
+    assert react.GRAPH_MISS_HINT not in trace.steps[1].observation
+
+
 def test_on_step_fires_on_llm_error_and_no_progress_too(monkeypatch):
     """error 和 no_progress 这两种终止路径也不能漏——它们各自只有一条
     独立的 return 语句，跟其余五条路径不共用同一段收尾代码。"""

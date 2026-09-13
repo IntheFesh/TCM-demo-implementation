@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Callable
 
 from core.followup import fast_mode_enabled
@@ -91,6 +92,71 @@ def _call_key(action: str, action_input: dict) -> str:
     return f"{action}::{json.dumps(action_input, ensure_ascii=False, sort_keys=True)}"
 
 
+# ---------------------------------------------------------------------------
+# P1 ReAct 修复：两条止损提示。实测 60 次工具调用里国标层（lookup_standard+
+# query_graph）占 73%、医案层（search_cases+query_case_graph）只占 12%，
+# 三条真实 trace 里有两条把 max_steps 花在国标层的死胡同上——一条在两个
+# 候选证候编号之间来回查（trace C），一条连续换词查国标图谱查不到（trace B）。
+# 这两条是"给模型的信息，不是强制"：观察窗口够宽（连续两次才触发），命中后
+# 也只是在 observation 里加一句建议，模型仍然可以继续按自己的判断查下去——
+# 剥夺它在特殊病例上的判断空间，比"没提示"更危险。
+#
+# 只覆盖了三条真实 trace 里出现过的场景：trace B 那种"连续两次换词查国标
+# 图谱查不到"，trace C 那种"连续两次在两个证候编号之间来回查"。故意不覆盖
+# "连续两次查近义证候名"（比如 trace B 里 lookup_standard 从「脾阳虚证」
+# 换成「脾胃虚寒证」、第二次就查到了那种）——那是正常的试错，换个说法就能
+# 查到，提示反而会打断一次本来会成功的尝试。
+# ---------------------------------------------------------------------------
+
+_STANDARD_CODE_RE = re.compile(r"^[A-Za-z]{1,4}[-.\d]+$")
+
+CODE_DISAMBIGUATION_HINT = (
+    "【提示】继续区分标准证候编号对最终开什么方帮助有限——标准证候名和这位"
+    "医家医案里的说法是两套术语。建议转查 search_cases 或 query_case_graph，"
+    "看这位医家遇到类似症状实际用了什么方。"
+)
+
+GRAPH_MISS_HINT = (
+    "【提示】患者原话往往不在国标的 1282 个症状节点里（这是清代医案与"
+    "现代国标术语体系差异的已知结果，见 SOURCES.md）。继续换词查大概率"
+    "还是查不到，建议改用 search_cases 检索这位医家的医案原文。"
+)
+
+
+def _looks_like_standard_code(query: str | None) -> bool:
+    """query 是不是证候编号（如 SP-10、TB-127、B04.06.02.03.01.03），不是
+    证候名。三种真实编号格式都是纯 ASCII（字母打头，后面跟数字/点/横杠），
+    证候名全是中文——两者字符集不重叠，不需要对照 data/standard 实际枚举
+    一遍就能分辨。"""
+    return bool(_STANDARD_CODE_RE.match((query or "").strip()))
+
+
+def _should_hint_code_disambiguation(
+    prev_action: str | None, prev_query: str | None,
+    action: str, query: str | None,
+) -> bool:
+    """连续两次 lookup_standard 都在查证候编号——大概率是在纠结"到底是哪个
+    编号"（trace C：「痰饮」查出 SP-10/TB-127 两个候选后，接连两步分别查
+    这两个编号，这个区分对最终开什么方没有影响）。只覆盖"两次都是编号"，
+    不覆盖"两次都是证候名"——见模块顶部那段注释，后一种是正常试错。"""
+    if prev_action != "lookup_standard" or action != "lookup_standard":
+        return False
+    return _looks_like_standard_code(prev_query) and _looks_like_standard_code(query)
+
+
+def _should_hint_graph_miss(
+    prev_action: str | None, prev_result: dict | None,
+    action: str, result: dict,
+) -> bool:
+    """连续两次 query_graph 都 found:false（trace B：「胃中隐痛」「胃脘痛」
+    连续两次查不到）。只看 query_graph 自己的 found 字段——lookup_standard
+    的 found:false 是另一个工具的另一件事，止损提示是 CODE_DISAMBIGUATION_
+    HINT，不在这里管。"""
+    if prev_action != "query_graph" or action != "query_graph":
+        return False
+    return (prev_result or {}).get("found") is False and result.get("found") is False
+
+
 def run_react(
     name: str,
     symptoms: str,
@@ -119,6 +185,12 @@ def run_react(
     consecutive_dupes = 0
     llm_calls = 0
     retrieved: list[str] = []
+    # 连续两次止损提示要看的是"上一次真正执行的工具调用"，不是"上一步"——
+    # 工具名写错、重复调用这两类 continue 分支没有真的查任何东西，不该打断
+    # 或冒充一次连续性。只在下面真正执行工具的分支末尾更新这三个变量。
+    prev_action: str | None = None
+    prev_result: dict | None = None
+    prev_query: str | None = None
 
     def emit_step() -> None:
         if on_step is None:
@@ -218,12 +290,21 @@ def run_react(
         result = run_tool(action, out.action_input)
         if action == "search_cases":
             retrieved.extend(c.get("case_id") for c in result.get("cases", []) if c.get("case_id"))
+
+        observation = _observation_text(result)
+        query = out.action_input.get("query")
+        if _should_hint_code_disambiguation(prev_action, prev_query, action, query):
+            observation = f"{observation}\n{CODE_DISAMBIGUATION_HINT}"
+        elif _should_hint_graph_miss(prev_action, prev_result, action, result):
+            observation = f"{observation}\n{GRAPH_MISS_HINT}"
+
         records.append(ReActStepRecord(
             step=step, thought=out.thought, action=action,
-            action_input=out.action_input, observation=_observation_text(result),
+            action_input=out.action_input, observation=observation,
             note="参数不合法" if "error" in result else None,
         ))
         emit_step()
+        prev_action, prev_result, prev_query = action, result, query
 
     return ReActTrace(steps=records, retrieved_case_ids=retrieved, terminated_by="max_steps", llm_calls=llm_calls)
 
