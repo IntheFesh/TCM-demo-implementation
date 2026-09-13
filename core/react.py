@@ -224,7 +224,12 @@ def run_react(
             remaining=str(max_steps - step + 1),
         )
         try:
-            out: ReActStep = get_llm().generate(system=system, user="", schema=ReActStep)
+            # physician_id 传下去是给本地后端选 LoRA adapter 用的（阶段五每位
+            # 医家一个）：ReAct 的每一步也是这位医家在推理，不是通用步骤。
+            # 云端后端如实忽略这个参数，见 core/llm.py::LLMBackend._complete。
+            out: ReActStep = get_llm().generate(
+                system=system, user="", schema=ReActStep, physician=physician_id,
+            )
             llm_calls += 1
         except LLMError as e:
             records.append(ReActStepRecord(

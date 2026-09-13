@@ -120,15 +120,27 @@ def test_claude_cli_warning_names_backend_and_says_not_comparable(monkeypatch):
 
 def test_vllm_backend_metadata(monkeypatch):
     monkeypatch.delenv("LLM_MODEL_PATH", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)  # model_name() 会回落到它
     b = VLLMBackend()
     assert b.backend_id() == "local"
     assert b.model_name() == "vllm-unconfigured"
     assert b.comparability_warning() is not None
 
 
-def test_vllm_complete_still_not_implemented():
-    with pytest.raises(NotImplementedError):
-        VLLMBackend()._complete([{"role": "user", "content": "x"}], 0.0)
+def test_vllm_complete_is_implemented_not_a_placeholder():
+    """**有意的契约变更**：原来这条测的是 `_complete` 抛 NotImplementedError
+    （占位实现）。本地模型接入这一轮要求 VLLMBackend 真正可用，占位被删掉了，
+    所以这条断言从"必须抛 NotImplementedError"翻转成"不许再是占位"。
+
+    这里只查"不是占位"这一件事——真正的行为（guided_json / LoRA / 两种模式）
+    在 tests/test_llm_local_backend.py 里用假 OpenAI 客户端和假 vllm 模块测，
+    不在这个文件里重复一遍。"""
+    import inspect
+
+    src = inspect.getsource(VLLMBackend._complete)
+    assert "NotImplementedError" not in src
+    # 抽象方法本身仍然该是 NotImplementedError（那是接口声明，属于既有豁免）
+    assert "NotImplementedError" in inspect.getsource(LLMBackend._complete)
 
 
 # ---------- 超时配置 ----------

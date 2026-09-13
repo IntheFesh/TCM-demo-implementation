@@ -89,7 +89,7 @@ cp .env.example .env
 
 | 字段 | 说明 |
 |---|---|
-| `LLM_MODE` | `api`（默认，走 OpenAI 兼容接口）或 `local`（正式阶段本地 vLLM 部署用，demo 阶段不要求跑通） |
+| `LLM_MODE` | `api`（默认，走 OpenAI 兼容接口）/ `local`（本地 vLLM 的 OpenAI 兼容 server）/ `local_inproc`（进程内 vLLM，批量评测用）/ `claude_cli`。后两种见下面「本地模型部署」一节 |
 | `LLM_API_KEY` | DeepSeek（或其他 OpenAI 兼容服务）的 API key |
 | `LLM_BASE_URL` | 默认 `https://api.deepseek.com` |
 | `LLM_MODEL` | 默认 `deepseek-chat` |
@@ -682,6 +682,68 @@ devtools 照样能看到。
 
 **researcher**（默认）：跟改造前的行为逐字节一致，包括 `manifest` 这类
 只对开发/评测有意义的技术元数据。
+
+## 本地模型部署（vLLM）
+
+两种模式，取舍不同，**都是可用实现**（不是占位）：
+
+| | `LLM_MODE=local` | `LLM_MODE=local_inproc` |
+|---|---|---|
+| 怎么跑 | 对着 vLLM 起的 OpenAI 兼容 server 说话 | 进程内 `vllm.LLM(...)` 直接加载权重 |
+| 适合 | 在线服务、演示（`api/main.py` 多线程问诊共用一个 server） | 批量评测（`run_eval`/`estimate_epsilon` 动辄上千次调用，省掉每次 HTTP 往返） |
+| 代价 | 多一跳 HTTP | 模型跟脚本同进程：起停慢、并发要自己管、没法给 API 服务共用 |
+| 实现 | `VLLMBackend`，**继承** `OpenAICompatBackend`（客户端构造/重试/max_tokens 只有一份实现） | `VLLMInProcessBackend` |
+
+环境变量（跟 `scripts/start_vllm.sh` 读的是同一套）：
+
+| 字段 | 说明 |
+|---|---|
+| `LLM_MODEL_PATH` | 本地权重目录。**`manifest.model` 记的是这个**，不是 served name——`tcm-local` 这种别名对复现没用 |
+| `LLM_MODEL` | server 模式下是 `--served-model-name`（HTTP 请求里的 `model` 字段填它）。没设就用权重路径 |
+| `LLM_BASE_URL` | 默认 `http://127.0.0.1:8000/v1` |
+| `LLM_API_KEY` | 可不设：vLLM 默认不校验，代码会填一个明显的占位串 `EMPTY`（OpenAI SDK 不允许空值）。server 开了 `--api-key` 就设成真值 |
+| `LORA_DIR` | 可选。阶段五每位医家一个 adapter，放在 `$LORA_DIR/<physician_id>/`。**不设 = 跑基座模型**；设了但某位医家的目录不存在 → **报错，不静默退化**（静默退化会让"这位医家用的是他自己的 LoRA"这句声称变成假的） |
+| `VLLM_GUIDED_JSON_KEY` | 默认 `guided_json`。vLLM 这个参数名在版本间变过，撞上不认时改这个变量即可，不必改代码 |
+| `VLLM_MAX_MODEL_LEN` / `VLLM_GPU_MEMORY_UTILIZATION` | 只对 `local_inproc` 生效（server 模式由启动参数决定），默认 8192 / 0.85 |
+
+### 起服务并验证
+
+```bash
+export LLM_MODEL_PATH=/root/autodl-tmp/models/Qwen2.5-1.5B-Instruct
+export LORA_DIR=/root/autodl-tmp/lora        # 可选，adapter 还没训就别设
+bash scripts/start_vllm.sh                    # 另一个终端里
+
+export LLM_MODE=local
+export LLM_MODEL=tcm-local                    # 跟启动脚本的 --served-model-name 一致
+python -m scripts.verify_local_backend        # 退出码 0 = 真的接上了
+```
+
+`verify_local_backend` 的三道闸门：① 一次 `generate()` 拿到通过 pydantic
+校验的输出；② **这次只调用了后端一次**——guided_decoding 生效时输出必然
+合法、不该触发 `generate()` 的重试，一旦重试说明 `guided_json` 这个键没被
+这个 vLLM 版本认（配置问题，必须暴露，不能"反正重试也能成"地放过）；
+③ `LORA_DIR` 设了的话每位已注册医家都有 adapter 目录。
+
+`python -m scripts.verify_local_backend --show-prompt-budget` 不发请求，只从
+真实 prompt 现算 `--max-model-len` 该给多少——`scripts/start_vllm.sh` 里那个
+值就是这么来的（当前 16384，最坏路径实测约 13.5k tokens：ReAct trace + S3 +
+两次重试回灌）。改了 prompt 就重算一遍，`tests/test_verify_local_backend.py`
+有一条测试钉住脚本里的值跟现算值一致，脱节就会红。
+
+### 相对云端 API 多出来的两件事
+
+- **guided_decoding**：`extra_body={"guided_json": schema.model_json_schema()}`
+  从解码层保证输出符合 schema。云端那套是"prompt 里塞 schema +
+  `response_format=json_object`"的弱约束，模型仍可能给出不合 schema 的 JSON，
+  靠三次重试兜底。
+- **LoRA 热切换**：一个 server 进程按请求切 adapter
+  （`extra_body={"lora_request": {...}}`）。`core/chain.py::run_physician` 把
+  **医家 id**（不是中文名）传给 `generate(physician=...)`，每位医家的结果里
+  带一个 `lora` 字段记实际挂的 adapter（`null` = 基座模型），`manifest.lora_dir`
+  记 adapter 根目录。
+
+> **本地模型跑出来的数字不可与 DeepSeek 的直接比较**，
+> `manifest.comparability_warning` 会把后端、权重路径、LoRA 状态一路带进报告。
 
 ## 处方安全
 

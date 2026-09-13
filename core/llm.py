@@ -233,7 +233,10 @@ class LLMBackend(ABC):
     @abstractmethod
     def _complete(
         self, messages: list[dict], temperature: float,
-        max_tokens: int | None = None, **kwargs,
+        max_tokens: int | None = None,
+        schema: type[BaseModel] | None = None,
+        physician: str | None = None,
+        **kwargs,
     ) -> str:
         """单次原始调用：给定 [{"role", "content"}] 返回模型原始文本。
         不做 schema 校验、不重试——那些由 generate() 统一负责。
@@ -241,7 +244,22 @@ class LLMBackend(ABC):
         max_tokens 是显式参数不是塞进 **kwargs：OpenAICompatBackend 原来
         自己读环境变量算这个值，如果调用方也通过 kwargs 传一份同名参数，
         会在传给 SDK 时撞上"重复关键字参数"。None 表示"用这个后端自己的
-        默认值"（不是"不设上限"——CLI 后端本来就没有这个旋钮）。"""
+        默认值"（不是"不设上限"——CLI 后端本来就没有这个旋钮）。
+
+        schema / physician 同样是显式参数、同样不塞 **kwargs，理由也一样：
+        OpenAICompatBackend 把 `**kwargs` 原样转给 OpenAI SDK，多一个它不认的
+        关键字参数就是 TypeError。两个参数都只有本地后端用得上：
+          - schema：vLLM 的 guided_decoding 要拿 `schema.model_json_schema()`
+            从解码层保证输出合法（比"prompt 里塞 schema + json_object"这种
+            弱约束强）。API 后端拿不到这个能力，如实忽略。
+          - physician：阶段五每位医家一个 LoRA，vLLM server 支持按请求切
+            adapter。用显式参数而不是线程局部/全局"当前医家"：LoRA 选错会让
+            "张锡纯用的是他自己的 LoRA"这句声称变成假的，而隐式上下文一旦
+            哪个调用点忘了设，错的是静默的——看 run_physician 这一行看不出
+            adapter 是从哪来的。api/main.py 是多线程并发问诊，模块级"当前
+            医家"还会有竞态。知道医家是谁的调用点（core/chain.py 的
+            run_physician、core/react.py 的 run_react）自己报出来，最直接。
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -264,6 +282,21 @@ class LLMBackend(ABC):
         一路带到报告里，不靠人记得手加——默认后端返回 None。"""
         return None
 
+    def lora_for(self, physician: str | None) -> str | None:
+        """这次调用实际会挂哪个 LoRA adapter 名，None = 基座模型/没有这回事。
+
+        只有本地 vLLM 后端会返回非 None。做成基类方法（而不是让调用方判断
+        "如果是 VLLMBackend 就问一下"）是为了让 core/chain.py 那一行无条件
+        可写：调用方不该知道有几种后端、哪种支持 LoRA。
+        """
+        return None
+
+    def lora_dir(self) -> str | None:
+        """这一轮配置的 LoRA 根目录，None = 没配。manifest 记它是为了说明
+        "这次跑的 adapter 是从哪来的"——per-physician 的实际 adapter 记在每位
+        医家的结果里（见 core/chain.py::run_physician 的 "lora" 字段）。"""
+        return None
+
     def generate(
         self,
         system: str,
@@ -271,9 +304,15 @@ class LLMBackend(ABC):
         schema: type[T],
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        physician: str | None = None,
         **kwargs,
     ) -> T:
         """给定 system/user 提示与目标 pydantic 模型，返回校验通过的模型实例。
+
+        physician 只在本地后端（vLLM + LoRA）下有意义：知道这一次是替哪位医家
+        推理的调用点（run_physician / run_react）显式传医家 id，后端据此选
+        adapter；其余后端如实忽略。不传 = 不指定 adapter（走基座模型），
+        S1/S2 这类跟医家无关的调用就是这种情况。理由详见 _complete 的文档。
 
         重试语义：首次 + 最多 2 次重试；第 2 次起把上次的原始返回和 pydantic
         校验错误一起回灌，要求模型修正。实测这一步是必要的——换模型时字段名
@@ -306,7 +345,10 @@ class LLMBackend(ABC):
         last_raw = ""
         for attempt in range(self.MAX_ATTEMPTS):
             try:
-                raw = self._complete(messages, temperature, max_tokens=max_tokens, **kwargs)
+                raw = self._complete(
+                    messages, temperature, max_tokens=max_tokens,
+                    schema=schema, physician=physician, **kwargs,
+                )
             except Exception as e:  # noqa: BLE001 - 传输类错误：超时/非零退出/API 异常
                 # 这一类没有"上一次输出"可回灌——回灌上一轮的陈旧 raw 或空串只会让
                 # 模型收到文不对题的纠错指令。原样重试，但重试前先退避一下。
@@ -368,10 +410,25 @@ class LLMBackend(ABC):
 
 class OpenAICompatBackend(LLMBackend):
     """走 OpenAI 兼容接口（DeepSeek 等）。惰性创建 client，避免模块加载时就要求
-    环境变量齐全（测试环境可能没有 LLM_API_KEY）。"""
+    环境变量齐全（测试环境可能没有 LLM_API_KEY）。
+
+    VLLMBackend 继承它：vLLM 起了 `vllm.entrypoints.openai.api_server` 之后接口
+    跟 OpenAI 完全兼容，客户端构造、重试语义、max_tokens 默认值这些逻辑一模一样，
+    不该有第二份（CLAUDE.md「同一概念只能有一处实现」）。差异只落在下面这几个
+    可覆盖的钩子上：`_default_base_url` / `_api_key` / `_request_model_name`，
+    以及子类自己在 `_complete` 里补 extra_body 后委托回 `super()._complete`。
+    """
 
     def __init__(self) -> None:
         self._client = None
+
+    def _default_base_url(self) -> str:
+        """LLM_BASE_URL 没设时用的地址。子类（本地 vLLM）覆盖成本机 server。"""
+        return "https://api.deepseek.com"
+
+    def _api_key(self) -> str | None:
+        """子类覆盖：vLLM server 不校验 api_key，但 OpenAI SDK 要求非空。"""
+        return os.environ.get("LLM_API_KEY")
 
     @property
     def client(self):
@@ -379,8 +436,8 @@ class OpenAICompatBackend(LLMBackend):
             from openai import OpenAI
 
             self._client = OpenAI(
-                api_key=os.environ.get("LLM_API_KEY"),
-                base_url=os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
+                api_key=self._api_key(),
+                base_url=os.environ.get("LLM_BASE_URL", self._default_base_url()),
                 # SDK 默认读超时 600s 且自带 2 次静默重试：一次挂起的连接最坏阻塞
                 # 3(SDK)×3(generate)×600s，而且 SDK 的重试不计入 llm_calls，
                 # 让"重试只在基类实现一份"这句话不成立。重试统一交给 generate()。
@@ -392,15 +449,32 @@ class OpenAICompatBackend(LLMBackend):
     def model_name(self) -> str:
         return os.environ.get("LLM_MODEL", "deepseek-chat")
 
+    def _request_model_name(self) -> str:
+        """HTTP 请求里 `model` 字段的值。默认跟 model_name() 同一个——对 DeepSeek
+        这类云端 API，"模型叫什么"和"请求里填什么"本来就是一件事。
+
+        留这个钩子是为了 vLLM：`--served-model-name tcm-local` 可以跟权重路径
+        完全不同，请求必须填 served name 才认，而 manifest 要记的是权重路径
+        （"tcm-local"这种别名对复现毫无用处）。两个值分开，而不是让 model_name()
+        为了让请求能通就去报别名——那正是 model_name() 文档里禁止的"伪装"。
+        """
+        return self.model_name()
+
     def backend_id(self) -> str:
         return "api"
 
     def _complete(
         self, messages: list[dict], temperature: float,
-        max_tokens: int | None = None, **kwargs,
+        max_tokens: int | None = None,
+        schema: type[BaseModel] | None = None,
+        physician: str | None = None,
+        **kwargs,
     ) -> str:
+        # schema / physician 在这一层如实忽略：云端 API 既没有 guided_decoding
+        # 也没有 LoRA adapter 可切。**不能转给 SDK**——多一个它不认的关键字
+        # 参数就是 TypeError（这也是这两个参数为什么是显式形参、不塞 kwargs）。
         resp = self.client.chat.completions.create(
-            model=self.model_name(),
+            model=self._request_model_name(),
             messages=messages,
             temperature=temperature,
             response_format={"type": "json_object"},
@@ -504,8 +578,14 @@ class ClaudeCLIBackend(LLMBackend):
 
     def _complete(
         self, messages: list[dict], temperature: float,
-        max_tokens: int | None = None, **kwargs,
+        max_tokens: int | None = None,
+        schema: type[BaseModel] | None = None,
+        physician: str | None = None,
+        **kwargs,
     ) -> str:
+        # schema / physician 如实忽略：CLI 既没有 guided_decoding 也没有 LoRA。
+        # schema 的约束已经通过 generate() 拼进 system prompt 了（弱约束，
+        # 靠重试兜底），这里没有更强的手段可用。
         # temperature：CLI 没有对应开关，这里如实忽略而不是假装设置了。
         # 影响：claude_cli 后端下 temperature=0 的"可复现"承诺不成立，
         # 所以它更不能用来测 ε（噪声地板）——ε 本来就是在测抖动。
@@ -553,34 +633,256 @@ class ClaudeCLIBackend(LLMBackend):
         return result
 
 
-class VLLMBackend(LLMBackend):
-    """正式阶段本地部署时启用，需核对 vLLM 版本 API；支持 guided_decoding 与 LoRA 热切换。
+# vLLM 的 guided_decoding 参数名在版本间变过（`guided_json` 走 extra_body 是
+# 0.4~0.8.x 一直支持的写法，更新的版本另外支持 OpenAI 标准的
+# `response_format: json_schema`）。默认用 `guided_json`，留一个环境变量是因为
+# 这个项目没法在沙盒里对着真实 vLLM 验版本——真撞上版本不认这个键时，运维侧
+# 改一个环境变量就能绕过，不必改代码等下一轮。**不是**给"随便调调看哪个能跑"
+# 用的：scripts/verify_local_backend.py 会把实际生效的键打出来。
+VLLM_GUIDED_JSON_KEY = os.environ.get("VLLM_GUIDED_JSON_KEY", "guided_json")
 
-    demo 阶段不要求能跑通——这里只占位声明接口形状，让 get_backend() 的分支
-    完整、将来切换时不用改调用方。真正接入时大致是：
-      - 用 vllm.LLM 或 vllm 的 OpenAI 兼容 server（走 OpenAICompatBackend 复用即可）
-      - guided_decoding 传 schema.model_json_schema() 做结构化约束，替代
-        OpenAICompatBackend 里"提示词里塞 schema + json_object"的弱约束方式
-      - LoRA 热切换通过 vllm 的 lora_request 参数，按 physician 选择不同 LoRA_DIR
+
+def _resolve_lora_path(lora_dir: str | None, physician: str | None) -> Path | None:
+    """按医家找 LoRA adapter 目录。返回 None = 这次不挂 adapter，走基座模型。
+
+    三种情况分清楚（两个本地后端共用这一处判断，不各写一遍）：
+      - `LORA_DIR` 没设置：阶段五的 LoRA 还没训，走基座模型，返回 None。
+      - 设置了但这次调用没带 physician（S1/S2 这类跟医家无关的步骤）：
+        同样返回 None——不是错误，这些步骤本来就没有"哪位医家"可言。
+      - 设置了、带了 physician、但目录不存在：**抛异常，不静默退化成基座模型**。
+        静默退化会让"张锡纯用的是他自己的 LoRA"这句声称变成假的，而且是静默
+        变假——报告照样写着 LoRA 跑的，实际跑的是基座，没有任何地方能看出来。
+        宁可这次调用失败，让人去修路径。
+    """
+    if not lora_dir or physician is None:
+        return None
+    path = Path(lora_dir) / physician
+    if not path.is_dir():
+        raise LLMError(
+            f"LORA_DIR={lora_dir} 已设置，但医家 {physician!r} 的 adapter 目录不存在："
+            f"{path}。不静默退化成基座模型——那会让「这位医家用的是他自己的 LoRA」"
+            f"这句声称变成假的。请确认 adapter 已训好并放在 {lora_dir}/<physician_id>/，"
+            f"或者取消设置 LORA_DIR 明确表示这一轮跑基座模型。"
+        )
+    return path
+
+
+class VLLMBackend(OpenAICompatBackend):
+    """本地 vLLM，**server 模式**（`LLM_MODE=local`）：对着
+    `python -m vllm.entrypoints.openai.api_server` 起的 OpenAI 兼容接口说话。
+
+        LLM_MODE=local
+        LLM_BASE_URL=http://127.0.0.1:8000/v1     # 不设就用这个默认值
+        LLM_MODEL=tcm-local                        # server 的 --served-model-name
+        LLM_MODEL_PATH=/root/autodl-tmp/models/Qwen2.5-1.5B-Instruct
+        LORA_DIR=/root/autodl-tmp/lora             # 可选，阶段五 LoRA 训好之后
+
+    继承 OpenAICompatBackend 而不是复制它：客户端构造、重试语义、max_tokens
+    默认值这些完全一样，差异只有 base_url/api_key/请求里的 model 名，以及
+    多传一个 extra_body。启动命令见 scripts/start_vllm.sh。
+
+    比云端 API 多出来的两个能力，都在 extra_body 里：
+      - guided_json：从解码层保证输出符合 schema。云端那套"prompt 里塞 schema
+        + response_format=json_object"是弱约束，模型仍可能给出不合 schema 的
+        JSON，靠 generate() 三次重试兜底；guided_decoding 生效时理论上不该再
+        触发那些重试——如果本地模型仍然频繁重试，说明这个键没生效（版本不认），
+        是配置问题，要暴露出来而不是静默退化，scripts/verify_local_backend.py
+        专门查这一点。
+      - lora_request：阶段五每位医家一个 adapter，一个 server 进程按请求切换。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._model_path = os.environ.get("LLM_MODEL_PATH")
+        self._lora_dir = os.environ.get("LORA_DIR")
+
+    def _default_base_url(self) -> str:
+        return "http://127.0.0.1:8000/v1"
+
+    def _api_key(self) -> str | None:
+        # vLLM server 默认不校验 api_key，但 OpenAI SDK 不允许空值（会去找
+        # OPENAI_API_KEY 环境变量、找不到就抛）。给一个明显是占位的串，
+        # 同时仍然尊重显式设置的 LLM_API_KEY（server 可以用 --api-key 开鉴权）。
+        return os.environ.get("LLM_API_KEY") or "EMPTY"
+
+    def model_name(self) -> str:
+        """manifest 记的是权重路径，不是 served name 别名：别名（"tcm-local"）
+        对复现毫无用处，路径才说明跑的是哪个模型。两者都没有就如实说没配置。"""
+        return self._model_path or os.environ.get("LLM_MODEL") or "vllm-unconfigured"
+
+    def _request_model_name(self) -> str:
+        """请求里填 served name（server 只认它）；没设 served name 时 vLLM 用
+        权重路径当模型名，那就填路径。"""
+        return os.environ.get("LLM_MODEL") or self._model_path or "vllm-unconfigured"
+
+    def backend_id(self) -> str:
+        return "local"
+
+    def lora_for(self, physician: str | None) -> str | None:
+        """这次调用实际会挂哪个 adapter（None = 基座模型）。manifest 用它如实
+        记录，不靠"配置了 LORA_DIR 就假设每位医家都用上了自己的 adapter"。"""
+        path = _resolve_lora_path(self._lora_dir, physician)
+        return physician if path is not None else None
+
+    def lora_dir(self) -> str | None:
+        return self._lora_dir
+
+    def comparability_warning(self) -> str | None:
+        lora = f"LoRA: {self._lora_dir}（按医家挂 adapter）" if self._lora_dir else "LoRA: 未加载"
+        return (
+            f"后端：local（vLLM {self.model_name()}），非 DeepSeek。{lora}。"
+            "数字不可与 API 后端（DeepSeek）直接比较。"
+        )
+
+    def _complete(
+        self, messages: list[dict], temperature: float,
+        max_tokens: int | None = None,
+        schema: type[BaseModel] | None = None,
+        physician: str | None = None,
+        **kwargs,
+    ) -> str:
+        extra_body = dict(kwargs.pop("extra_body", None) or {})
+        if schema is not None:
+            extra_body[VLLM_GUIDED_JSON_KEY] = schema.model_json_schema()
+        lora_path = _resolve_lora_path(self._lora_dir, physician)
+        if lora_path is not None:
+            extra_body["lora_request"] = {
+                "lora_name": physician,
+                "lora_path": str(lora_path),
+            }
+        # 委托回父类：客户端、max_tokens 默认值、response_format 全部复用，
+        # 这里只负责把本地特有的 extra_body 补上。schema/physician 不再往下传
+        # ——父类那一层只会如实忽略它们，而它们要表达的东西已经变成 extra_body。
+        return super()._complete(
+            messages, temperature, max_tokens=max_tokens,
+            extra_body=extra_body, **kwargs,
+        )
+
+
+class VLLMInProcessBackend(LLMBackend):
+    """本地 vLLM，**进程内模式**（`LLM_MODE=local_inproc`）：不起 server，直接在
+    本进程里 `vllm.LLM(...)` 加载权重。
+
+        LLM_MODE=local_inproc
+        LLM_MODEL_PATH=/root/autodl-tmp/models/Qwen2.5-1.5B-Instruct
+        LORA_DIR=/root/autodl-tmp/lora     # 可选
+
+    跟 server 模式的取舍：批量评测（run_eval/estimate_epsilon 动辄上千次调用）
+    省掉每次的 HTTP 往返和 JSON 编解码；代价是模型跟评测脚本绑在同一个进程里，
+    起停慢、并发要自己管，也没法给 api/main.py 的多线程问诊共用。所以在线服务
+    和演示用 server 模式，离线批量评测用这个。
+
+    **`import vllm` 必须延迟到真正要用的时候**（`_engine` 属性里），不能放模块
+    顶层：沙盒和 CI 都没装 vllm，顶层 import 会让 `core.llm` 整个 import 不了，
+    1600 多个测试全崩——而那些测试跟 vLLM 一点关系都没有。
     """
 
     def __init__(self) -> None:
         self._model_path = os.environ.get("LLM_MODEL_PATH")
         self._lora_dir = os.environ.get("LORA_DIR")
+        self._llm = None
+        self._lora_ids: dict[str, int] = {}  # adapter 名 -> LoRARequest 的整数 id
+
+    @property
+    def _engine(self):
+        """惰性加载 vllm.LLM。加载模型是几十秒级的重 IO，不能在 __init__ 里做
+        （get_backend() 在 manifest 里问一句 model_name() 都会触发加载）。"""
+        if self._llm is None:
+            if not self._model_path:
+                raise LLMError(
+                    "LLM_MODE=local_inproc 需要 LLM_MODEL_PATH 指向本地权重目录，"
+                    "现在没有设置。"
+                )
+            import vllm  # 延迟 import：见类文档
+
+            self._llm = vllm.LLM(
+                model=self._model_path,
+                # LoRA 要在引擎创建时就开，之后不能改；没配 LORA_DIR 时不开，
+                # 省掉 LoRA 的显存与调度开销。
+                enable_lora=bool(self._lora_dir),
+                max_model_len=int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192")),
+                gpu_memory_utilization=float(
+                    os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.85")
+                ),
+            )
+        return self._llm
 
     def model_name(self) -> str:
         return self._model_path or "vllm-unconfigured"
 
     def backend_id(self) -> str:
-        return "local"
+        return "local_inproc"
+
+    def lora_for(self, physician: str | None) -> str | None:
+        path = _resolve_lora_path(self._lora_dir, physician)
+        return physician if path is not None else None
+
+    def lora_dir(self) -> str | None:
+        return self._lora_dir
 
     def comparability_warning(self) -> str | None:
-        return "后端：local（vLLM），非 DeepSeek，数字不可与 AutoDL 直接比较。"
-
-    def _complete(self, messages: list[dict], temperature: float, **kwargs) -> str:
-        raise NotImplementedError(
-            "VLLMBackend 尚未实现，正式阶段本地部署时补全（见类注释）。"
+        lora = f"LoRA: {self._lora_dir}（按医家挂 adapter）" if self._lora_dir else "LoRA: 未加载"
+        return (
+            f"后端：local_inproc（进程内 vLLM {self.model_name()}），非 DeepSeek。"
+            f"{lora}。数字不可与 API 后端（DeepSeek）直接比较。"
         )
+
+    def _lora_request(self, physician: str | None):
+        """构造 vllm.lora.request.LoRARequest。id 必须在进程内稳定且唯一——
+        同一个 adapter 每次给不同 id，vLLM 会当成不同 adapter 反复加载。"""
+        path = _resolve_lora_path(self._lora_dir, physician)
+        if path is None:
+            return None
+        from vllm.lora.request import LoRARequest  # 延迟 import
+
+        if physician not in self._lora_ids:
+            self._lora_ids[physician] = len(self._lora_ids) + 1
+        return LoRARequest(physician, self._lora_ids[physician], str(path))
+
+    def _sampling_params(
+        self, temperature: float, max_tokens: int | None,
+        schema: type[BaseModel] | None,
+    ):
+        from vllm import SamplingParams  # 延迟 import
+
+        guided = None
+        if schema is not None:
+            from vllm.sampling_params import GuidedDecodingParams
+
+            guided = GuidedDecodingParams(json=schema.model_json_schema())
+        return SamplingParams(
+            temperature=temperature,
+            max_tokens=(
+                max_tokens if max_tokens is not None
+                else int(os.environ.get("LLM_MAX_TOKENS", "8192"))
+            ),
+            guided_decoding=guided,
+        )
+
+    def _complete(
+        self, messages: list[dict], temperature: float,
+        max_tokens: int | None = None,
+        schema: type[BaseModel] | None = None,
+        physician: str | None = None,
+        **kwargs,
+    ) -> str:
+        outputs = self._engine.chat(
+            messages,
+            sampling_params=self._sampling_params(temperature, max_tokens, schema),
+            lora_request=self._lora_request(physician),
+            **kwargs,
+        )
+        # chat() 按输入的 batch 返回列表；这里一次只喂一轮对话，所以取第 0 条。
+        # 结构不符合预期时报错而不是靜默返回空串：空串会被 generate() 当成
+        # "模型输出了不合 schema 的东西"重试三次，真实原因（vLLM 版本返回
+        # 结构变了）就被埋掉了。
+        if not outputs or not getattr(outputs[0], "outputs", None):
+            raise LLMError(
+                f"进程内 vLLM 返回结构不符合预期（拿到 {outputs!r}）：期望 "
+                "[RequestOutput(outputs=[CompletionOutput(text=...)])]。"
+                "大概率是 vllm 版本的返回结构变了，核对 vllm.LLM.chat 的文档。"
+            )
+        return outputs[0].outputs[0].text or ""
 
 
 def get_backend() -> LLMBackend:
@@ -588,6 +890,8 @@ def get_backend() -> LLMBackend:
     mode = os.environ.get("LLM_MODE", "api")
     if mode == "local":
         return VLLMBackend()
+    if mode == "local_inproc":
+        return VLLMInProcessBackend()
     if mode == "claude_cli":
         return ClaudeCLIBackend()
     return OpenAICompatBackend()

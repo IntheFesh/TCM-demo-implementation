@@ -38,7 +38,7 @@ class FakeLLM:
         self._current_physician: str | None = None
 
     # manifest 现在从后端问模型名/后端名（不再读 LLM_MODEL 环境变量），
-    # 假后端要跟着实现这三个方法，否则 _build_manifest 会 AttributeError。
+    # 假后端要跟着实现这几个方法，否则 _build_manifest 会 AttributeError。
     def model_name(self) -> str:
         return "fake-model"
 
@@ -47,6 +47,16 @@ class FakeLLM:
 
     def comparability_warning(self) -> str | None:
         return "后端：fake（离线测试用），不产生任何可用于报告的数字。"
+
+    # 本地模型接入那一轮新加的两个：run_physician 把"这位医家实际挂了哪个
+    # LoRA adapter"记进结果、_build_manifest 记 adapter 根目录，两处都要问
+    # 后端。假后端跟真后端的默认实现保持一致——没有 adapter 这回事就是 None
+    # （core/llm.py::LLMBackend.lora_for/lora_dir 的默认返回值）。
+    def lora_for(self, physician: str | None) -> str | None:
+        return None
+
+    def lora_dir(self) -> str | None:
+        return None
 
     def generate(self, system: str, user: str, schema, temperature: float = 0.0, **kwargs):
         self.calls.append(schema.__name__)
@@ -573,6 +583,75 @@ def _s3(syndrome, herbs, case_id):
         syndrome=syndrome, reasoning="...", treatment_principle="健脾益气",
         herbs=herbs, cited_case_ids=[case_id],
     )
+
+
+# ---------- 本地模型：physician 传下去、实际挂的 adapter 记下来 ----------
+
+
+def test_physician_id_is_passed_to_generate_not_the_chinese_name(monkeypatch):
+    """本地后端（vLLM + LoRA）按 physician 选 adapter，所以 S3 这次调用是替谁
+    做的必须传下去——而且传的是**医家 id 不是中文名**：SOURCES.md 第 31 条
+    那个坑就是 id/中文名混用，按 id 索引的东西恒空、单元测试全绿。
+    S1/S2 跟医家无关，不该带 physician（对应基座模型）。"""
+    seen: list[str | None] = []
+
+    class RecordingFakeLLM(FakeLLM):
+        def generate(self, system, user, schema, temperature=0.0, physician=None, **kwargs):
+            seen.append(physician)
+            return super().generate(system, user, schema, temperature, **kwargs)
+
+    fake_llm = RecordingFakeLLM({
+        "叶天士": _s3("脾胃气虚", ["党参"], "ye_tianshi-001"),
+        "吴鞠通": _s3("脾胃气虚", ["黄芪"], "wu_jutong-001"),
+    })
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    chain.consult("纳差乏力")
+
+    assert seen[:2] == [None, None]  # S1 / S2
+    assert set(seen[2:]) == {"ye_tianshi", "wu_jutong"}  # 两位医家的 S3
+    assert "叶天士" not in seen and "吴鞠通" not in seen  # 不是中文名
+
+
+def test_each_physician_result_records_the_adapter_actually_used(monkeypatch, tmp_path):
+    """「这位医家用的是他自己的 LoRA」这句声称只有在每位医家的结果上才可验证
+    ——manifest 是整次问诊一份，而 adapter 是按医家切的。manifest 只记
+    adapter 根目录（"从哪来的"）。"""
+    class LoRAAwareFakeLLM(FakeLLM):
+        def lora_for(self, physician):
+            return physician  # 像配好了 LORA_DIR 的真后端那样按医家回答
+
+        def lora_dir(self):
+            return str(tmp_path)
+
+    fake_llm = LoRAAwareFakeLLM({
+        "叶天士": _s3("脾胃气虚", ["党参"], "ye_tianshi-001"),
+        "吴鞠通": _s3("脾胃气虚", ["黄芪"], "wu_jutong-001"),
+    })
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    outcome = chain.consult("纳差乏力")
+    by_physician = {r["physician"]: r for r in outcome["results"]}
+    assert by_physician["ye_tianshi"]["lora"] == "ye_tianshi"
+    assert by_physician["wu_jutong"]["lora"] == "wu_jutong"
+    assert outcome["manifest"]["lora_dir"] == str(tmp_path)
+
+
+def test_lora_fields_are_none_on_backends_without_adapters(monkeypatch):
+    """默认（云端）后端下这两个字段必须是 None——字段存在不能让读报告的人
+    以为挂了 adapter。"""
+    fake_llm = FakeLLM({
+        "叶天士": _s3("脾胃气虚", ["党参"], "ye_tianshi-001"),
+        "吴鞠通": _s3("脾胃气虚", ["黄芪"], "wu_jutong-001"),
+    })
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+
+    outcome = chain.consult("纳差乏力")
+    assert all(r["lora"] is None for r in outcome["results"])
+    assert outcome["manifest"]["lora_dir"] is None
 
 
 def test_incompatible_formula_triggers_one_regeneration(monkeypatch):

@@ -1280,3 +1280,86 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     本身留的），两个数字从此只有一个来源。抽成 `_live_server_health_check_
     budget()` 函数是为了能不真的起服务器等 120+ 秒就测这个关系式本身
     （tests/ 要秒级跑完），而不是无法验证只能靠读代码信。
+
+37. **本地模型（vLLM）从占位变成可用：`--max-model-len` 该给多少是这一轮
+    唯一一个"照着提示写就会错"的数。** `VLLMBackend._complete` 原来直接
+    `raise NotImplementedError`，只是个接口壳子。这一轮按两种模式实现：
+    `LLM_MODE=local`（对 vLLM 起的 OpenAI 兼容 server 说话，在线服务/演示用）
+    和 `LLM_MODE=local_inproc`（进程内 `vllm.LLM`，批量评测省掉每次 HTTP
+    往返）。
+
+    **max-model-len：任务描述给的 8192 是错的，现算出来要 16384。** 描述里
+    的依据是"S3 prompt 带三条 raw_excerpt 各 300 字 + 示例，约 3000-4000
+    字符"，但漏掉了 `generate()` 自己拼进 system 的那段 schema 全文
+    （`S3Syndrome.model_json_schema()` 有 6024 字符）。按中文 1 token/字、
+    ASCII 4 字符/token 现算（`python -m scripts.verify_local_backend
+    --show-prompt-budget`）：
+        s3_syndrome 模板                      4328 字符 ≈ 2535 tokens
+        generate() 拼进 system 的 schema 全文  6024 字符 ≈ 2016 tokens
+        三条参考医案                            900 字符 ≈  900 tokens
+        S3 输出（三个候选方，实测量级）          1500 字符 ≈ 1500 tokens
+      单次 S3 已经 ≈ 6951，逼近 8192；再叠上 ReAct（每步一条截断到
+      `MAX_OBSERVATION_CHARS=1200` 的 observation，`MAX_STEPS=5`，最后一步
+      的 ReAct prompt ≈ 7704）和 `generate()` 的两次重试回灌（每次 ≈ +1620），
+      最坏路径 ≈ 13491 tokens。**8192 会在"开了 ReAct 又触发重试"这条真实
+      路径上截断**，而截断的表现是 `LLMTruncatedError` 直接放弃这条主诉，
+      不是慢一点。16384 是 13491 之上最近的 2 的幂（约 21% 余量）。
+      `tests/test_verify_local_backend.py` 有一条测试钉住
+      `scripts/start_vllm.sh` 里的值跟现算值一致——改了 prompt 不重算就会红，
+      不会像上一轮 test_api_stream 的 60 秒那样悄悄跟服务器自己的 120 秒脱节。
+
+    **几处刻意的设计选择，理由记下来**：
+      - `VLLMBackend` **继承** `OpenAICompatBackend` 而不是复制：vLLM server
+        的接口跟 OpenAI 完全兼容，客户端构造/重试/max_tokens 默认值只该有
+        一份实现。差异落在三个可覆盖的钩子上（`_default_base_url` /
+        `_api_key` / `_request_model_name`）+ 子类在 `_complete` 里补
+        `extra_body` 后委托回 `super()`。`test_vllm_server_backend_is_an_
+        openai_compat_subclass` 钉住这个继承关系，改成复制就会红。
+      - **`_request_model_name()` 跟 `model_name()` 分开**：server 的
+        `--served-model-name`（比如 `tcm-local`）可以跟权重路径完全不同，
+        HTTP 请求必须填 served name 才认，而 manifest 要记的是权重路径——
+        别名对复现毫无用处。让 `model_name()` 为了让请求能通就去报别名，
+        正是它自己文档里禁止的"伪装成别的模型"。
+      - **`schema` / `physician` 做成 `_complete` 的显式形参，不塞
+        `**kwargs`**：父类把 `**kwargs` 原样转给 OpenAI SDK，多一个它不认的
+        关键字参数就是 TypeError。`physician` 也没做成线程局部/全局"当前
+        医家"——LoRA 选错会让「这位医家用的是他自己的 LoRA」变成假的，而
+        隐式上下文一旦哪个调用点忘了设，错是静默的；api/main.py 还是多线程
+        并发问诊，模块级"当前医家"会有竞态。知道医家是谁的调用点
+        （`run_physician` / `run_react`）自己报出来最直接。
+      - **LoRA 目录缺失时报错，不静默退化成基座模型**（`_resolve_lora_path`
+        一处实现，两种模式共用；`scripts/start_vllm.sh` 的 `--lora-modules`
+        循环同理）。静默退化的后果是报告照样写着 LoRA 跑的、实际跑的是基座，
+        没有任何地方能看出来。三种情况分清楚：`LORA_DIR` 未设 = 走基座
+        （正常）；设了但这次调用没带 physician（S1/S2 这类跟医家无关的步骤）
+        = 走基座（也正常）；设了、带了 physician、目录不存在 = 抛异常。
+      - **adapter 记在每位医家的结果上**（`run_physician` 返回的 `lora`
+        字段），manifest 只记 `lora_dir`（"从哪来的"）：manifest 是整次问诊
+        一份，而 adapter 是按医家切的，「张锡纯用的是他自己的 LoRA」只有在
+        医家这个粒度上才可验证。
+
+    **没装 vllm 的环境必须照常能跑**：`import vllm` 全部延迟到函数体里。
+    这条用 AST 静态检查钉死（`test_core_llm_has_no_module_level_vllm_import`）
+    而不是"把 vllm 拦掉再 reload 一遍 core.llm"——写这条测试时真的先用了
+    reload 的写法，结果 reload 产出一套新的类对象（新的 `LLMError` /
+    `VLLMBackend`），而其它测试模块 import 时已经绑定了旧的那套，
+    `pytest.raises(LLMError)` 和 isinstance 从此全部假阴性，5 条其它测试
+    直接变红。AST 检查没有全局副作用，而且证明的是更强的性质："源码里没有
+    顶层 vllm import"——在装了 vllm 的机器上同样有效，不依赖"当前机器碰巧
+    没装"。
+
+    **沙盒验证到哪一层、哪一层要在 AutoDL 上验**：guided_json / lora_request
+    的参数是否传对、LoRA 目录缺失是否报错、两种模式的分派、`core.llm` 在
+    没装 vllm 时能否 import——这些全部在沙盒里用假 OpenAI 客户端和塞进
+    `sys.modules` 的假 `vllm` 模块测过（`tests/test_llm_local_backend.py`
+    28 条）。**真的能不能跑通 vLLM 没法在沙盒验**（没有 vllm、没有权重、
+    没有 GPU），所以写成 `scripts/verify_local_backend.py` + 退出码，三道
+    闸门：① 一次 `generate()` 拿到通过校验的输出；② **这次只调用了后端
+    一次**——guided_decoding 生效时输出必然合法、不该触发 `generate()` 的
+    重试，一旦重试说明 `guided_json` 这个键没被这个 vLLM 版本认（vLLM 的
+    参数名在版本间变过，所以留了 `VLLM_GUIDED_JSON_KEY` 环境变量），这是
+    配置问题、必须暴露，不能"反正重试之后也能成"地放过——那等于白花两次
+    调用，本地模型相对云端 API 的这个优势根本没用上；③ `LORA_DIR` 设了的话
+    每位已注册医家都有 adapter 目录。闸门本身的判断逻辑在沙盒里测了
+    （`tests/test_verify_local_backend.py`，假后端模拟"第 N 次才成功"），
+    不然"闸门写错导致永远绿"只能在 AutoDL 上撞到。

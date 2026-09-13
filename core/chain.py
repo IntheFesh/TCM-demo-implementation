@@ -499,7 +499,13 @@ def run_physician(
     # 再包一层 _split_western_into_s3——这一步以前是代码层面的兜底，现在兜底
     # 挪进了 schema 本身，构造完成的这一刻 s3.herbs/s3.western_drugs 就已经是
     # 拆好的（M1 之前这里对 herbs 混西药的拟合方式做了一次真实回归，见 SOURCES.md）。
-    s3 = get_llm().generate(system=s3_system, user="", schema=s3_schema)
+    # physician 传下去是给本地后端选 LoRA adapter 用的（阶段五每位医家一个
+    # adapter，vLLM server 按请求切换）。传的是 id 不是中文名——SOURCES.md
+    # 第 31 条那个坑：id 和中文名混用会让按 id 索引的东西恒空。云端后端
+    # （DeepSeek）如实忽略它，见 core/llm.py::LLMBackend._complete 的文档。
+    s3 = get_llm().generate(
+        system=s3_system, user="", schema=s3_schema, physician=physician,
+    )
 
     # X2 输出侧安全（M2 起覆盖五条规则，见 core/safety_output.assess_formula_safety
     # 的文档字符串）：给每个候选方都算一份 FormulaSafety，不是只算 selected 那个——
@@ -517,7 +523,9 @@ def run_physician(
             f"问题：{format_blocking_issues(selected_safety)}。请重新拟方解决这些"
             "问题，其余要求不变。"
         )
-        s3 = get_llm().generate(system=retry_system, user="", schema=s3_schema)
+        s3 = get_llm().generate(
+            system=retry_system, user="", schema=s3_schema, physician=physician,
+        )
         for cand in s3.formula_candidates:
             cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
         revised = True
@@ -566,6 +574,12 @@ def run_physician(
         # 把 top-3 收窄成了 top-1——不是"检索为空"，是"检索到了但塞三条等于
         # 随机三选三"。eval/run_eval.py 的 E3 报告要能看到这个标记的比例。
         "low_discrimination": low_discrimination,
+        # 这位医家这一次实际挂的 LoRA adapter 名，None = 跑的是基座模型。
+        # 记在每位医家的结果上而不是只记在 manifest 里：manifest 是整次问诊
+        # 一份，而 adapter 是按医家切的——「张锡纯用的是他自己的 LoRA」这句
+        # 声称只有在这个粒度上才可验证。非本地后端恒为 None（没有 adapter
+        # 这回事），lora_for() 的默认实现就返回 None，不用在这里判后端类型。
+        "lora": get_llm().lora_for(physician),
         "hallucinated": hallucinated,
         # 只在 EVAL_MODE 下可能非空：demo 模式命中这里就抛 SafetyVeto 了，走不到返回。
         "safety_flag": react_safety_flag,
@@ -599,6 +613,12 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) ->
         "backend": llm.backend_id(),
         # 非默认后端时非 None。带着走，报告里就不会漏标"这个数不可比"。
         "comparability_warning": llm.comparability_warning(),
+        # 本地后端 + 配了 LORA_DIR 时是那个目录，否则 None（= 这一轮跑的是
+        # 基座模型 / 根本没有 adapter 这回事）。manifest 这一层记"adapter 是
+        # 从哪来的"，具体哪位医家实际挂了哪个 adapter 记在各自的结果里
+        # （run_physician 的 "lora" 字段）——adapter 是按医家切的，整次问诊
+        # 一个值说不清楚。
+        "lora_dir": llm.lora_dir(),
         "prompt_version": "v1",
         "use_react": use_react,
         "cases_sha256": cases_sha,
