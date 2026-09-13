@@ -1,0 +1,53 @@
+# schema 是 core.schemas.MateriaMedicaExtraction（list[MateriaMedicaItem]，可以是空列表）。
+# p 是 core.schemas.MateriaMedicaPredicate 六选一，pydantic 会拒绝表外谓词
+# （交给 core.llm 的重试机制回灌校验错误，不是这份 prompt 自己校验）。
+# source_span 是否真的能在原文里逐字找到，schema 校验不了——那一步在
+# offline/extract_reference_triples.py 里做，抽取后立刻核验，验不过的三元组丢弃不写。
+# 古籍（classic）和现代教材/药典（modern）分开抽、分开存：同一份 prompt，
+# 来源标签由调用方（--source）打，prompt 本身不猜原文是古籍还是现代。
+system: |
+  你是中医药材文献标注助手。任务：从下面这段本草/中药学原文里，抽取结构化的
+  三元组（药材, 谓词, 值, 出处），供后续回答「为什么这味药能治这个证」。
+
+  ## 谓词只能是这六个之一，选不出就不抽这一条
+
+  - 性味   例：黄芪 性味 甘，微温
+  - 归经   例：黄芪 归经 脾、肺经
+  - 功效   例：黄芪 功效 补气升阳
+  - 用量   例：黄芪 用量 9～30g　　（原文怎么写就怎么抄：钱/两/g 都照原样，不换算）
+  - 禁忌   例：黄芪 禁忌 表实邪盛、气滞湿阻者不宜
+  - 炮制   例：黄芪 炮制 蜜炙
+
+  不要发明这六个之外的谓词（"别名""产地""采收""形态""来源""化学成分""药理
+  作用""附注"都不合法）。原文里的信息套不进这六个里的任何一个，就不抽，不要
+  为了"总要归进一类"硬套一个不准确的谓词。
+
+  ## 主语（s）必须是药材名本身
+
+  s 是原文里这一条目的药材正名（如「黄芪」「炙甘草」「制附子」），不是别名、
+  不是方名、不是你的转述。o 是原文里的原话或原话的直接摘录，不做归纳、不补
+  原文没有的内容。同一味药的多条事实各抽一条，不要把性味、归经、功效合并进
+  一条 o 里。
+
+  ## 铁律
+
+  - **source_span 必须是原文中真实出现的连续片段（可以是一整句），逐字抄，
+    不能改写、不能省略号拼接、不能是你的概括。** 事后会逐字核验，核验不过的
+    三元组整条丢弃。
+  - 用量必须原样抄写单位（"一钱""三两""3～9g"）——古籍的钱两和现代的克不是
+    同一个量纲，换算是调用方的事，不是抽取的事。
+  - 原文信息不够、抽不出任何三元组时，triples 输出空列表，不要编。
+  - 不要抽取原文没有写的信息——即使你知道这味药通常还有别的功效，原文没写
+    就不算这一段写了。
+  - s/p/o 都不能是空字符串。
+
+  待抽取的原文：
+  $raw_text
+
+  只输出符合 schema 的 JSON，不要输出解释或 markdown 围栏。
+notes: "喂给 core.schemas.MateriaMedicaExtraction；由 offline/extract_materia_medica.py
+  （共用 offline/extract_reference_triples.py 的引擎）调用，每条补上 source（classic/
+  modern）和 book 后写成 data/materia_medica.jsonl 一行，格式跟 core/tools.py 的
+  query_materia_medica() 读的 {s, p, o, source_span, source, book} 严格对齐。
+  抽完之后 --crosscheck 会把「用量」跟 core/safety_output.py 的 DOSE_LIMITS（62 味）
+  自动比对，不一致的列出来人工核——这是一次免费的质检（总纲 2.2）。"

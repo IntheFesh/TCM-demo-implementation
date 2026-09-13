@@ -39,6 +39,19 @@ def _write_segment(data_root, physician, seg_id, text, head_hints=None, follow_h
     (d / f"{seg_id}.json").write_text(json.dumps(segment, ensure_ascii=False), encoding="utf-8")
 
 
+def test_expand_segment_flags_incompatible_pairs_at_the_extraction_boundary():
+    """总纲 2.5：十八反配伍（海藻 反 甘草）在抽取边界上算好写进 CaseRecord，
+    判定复用 core.safety_output.check_incompatible——李可医案那类会命中，
+    export_sft 据此把它们挡在训练集外。"""
+    segment = {"seg_id": "like-0001", "physician": "ye_tianshi", "text": "某 海藻甘草同用。"}
+    result = SegmentPatients(patients=[
+        CaseSequence(visits=[VisitStructured(visit_index=0, herbs=["海藻", "甘草", "党参"])]),
+        CaseSequence(visits=[VisitStructured(visit_index=0, herbs=["党参", "白术"])]),
+    ])
+    records = extract_cases.expand_segment(segment, result)
+    assert [r.has_incompatible_pair for r in records] == [True, False]
+
+
 def test_full_pipeline_multi_patient_segment_and_cross_validation(tmp_path, monkeypatch):
     data_root = tmp_path / "data"
     out_path = tmp_path / "cases.json"

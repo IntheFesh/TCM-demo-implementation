@@ -64,6 +64,12 @@ class CaseRecord(VisitStructured):
     # 该诊次在 raw 里对应的片段。raw 是整个粗段（同一段的多个诊次共享，
     # 内容完全相同），前端证据链侧栏需要的是"这一诊对应原文哪几行"。
     raw_excerpt: str | None = None
+    # 总纲 2.5：这一诊的处方含十八反十九畏配伍（李可医案那类敢用反药的名家）。
+    # 由 offline/extract_cases.py 用 core.safety_output.check_incompatible 在
+    # 抽取边界上算好，不靠模型标——它是训练集的排除信号（export_sft.py 据此
+    # 过滤），也是 README 里要说明的取舍：系统的安全层会拦这类配伍，数据里
+    # 的反药配伍跟 M2 的检查直接冲突，进训练集等于教模型开反药。
+    has_incompatible_pair: bool = False
 
 
 # ---------- X3：医案三元组（S5 抽取，LLM 输出） ----------
@@ -135,6 +141,80 @@ class CaseTripleRecord(BaseModel):
     p: CaseTriplePredicate
     o: str = Field(min_length=1)
     source_span: str = Field(min_length=1)
+
+
+# ---------- 阶段二（药理层）：本草 / 方剂学三元组（S6/S7 抽取，LLM 输出） ----------
+#
+# 跟 X3 的医案三元组同一套形状（受控谓词 Literal、s/o/source_span 非空、
+# source_span 逐字核验在 offline/extract_reference_triples.py 里做），理由也
+# 一样：谓词不限定时模型会把同一个关系换着说法（见 CaseTriplePredicate 的
+# 文档字符串），query_materia_medica 的字面匹配对同义词无能为力。
+#
+# 古籍与现代必须分开抽、分开存、分开返回（source: classic | modern）：古籍说
+# "细辛，味辛温"，药典说"辛、温，归心肺肾经，1~3g"，术语体系和精度都不同，
+# 混在一起会重演 λ1 那个"证型 0/116 对不上"的教训（SOURCES.md 第 7 节）。
+
+MateriaMedicaPredicate = Literal["性味", "归经", "功效", "用量", "禁忌", "炮制"]
+ReferenceSource = Literal["classic", "modern"]
+
+
+class MateriaMedicaItem(BaseModel):
+    """S6 从一段本草原文里抽出的一条 (药材, 谓词, 值, 出处)。"""
+
+    s: str = Field(min_length=1)
+    p: MateriaMedicaPredicate
+    o: str = Field(min_length=1)
+    source_span: str = Field(min_length=1)
+
+
+class MateriaMedicaExtraction(BaseModel):
+    """S6 单次调用的输出。允许空列表——章节引言、目录页这类原文抽不出任何
+    药材事实，不能因为"总要抽出点什么"就编。"""
+
+    triples: list[MateriaMedicaItem] = Field(default_factory=list)
+
+
+class MateriaMedicaRecord(BaseModel):
+    """写进 data/materia_medica.jsonl 的最终形态：MateriaMedicaItem 补上
+    source（古籍/现代）和 book（出自哪本）。字段名对齐 core/tools.py 的
+    query_materia_medica() 读的格式——那份代码是这个格式的唯一消费者。"""
+
+    s: str = Field(min_length=1)
+    p: MateriaMedicaPredicate
+    o: str = Field(min_length=1)
+    source_span: str = Field(min_length=1)
+    source: ReferenceSource
+    book: str = Field(min_length=1)
+
+
+# 君臣佐使从教材来（总纲 2.3）：M1 的 HerbItem.role 现在靠模型标，准确率未知，
+# 有了教材的标准答案才有对照。
+FormularyPredicate = Literal["组成", "君药", "臣药", "佐药", "使药", "主治", "功用", "加减"]
+
+
+class FormularyItem(BaseModel):
+    """S7 从一段方剂学原文里抽出的一条 (方剂, 谓词, 值, 出处)。「组成」的 o
+    写"药+剂量"（如「麻黄三两」），原文没写剂量就只写药名，不补。"""
+
+    s: str = Field(min_length=1)
+    p: FormularyPredicate
+    o: str = Field(min_length=1)
+    source_span: str = Field(min_length=1)
+
+
+class FormularyExtraction(BaseModel):
+    triples: list[FormularyItem] = Field(default_factory=list)
+
+
+class FormularyRecord(BaseModel):
+    """写进 data/formulary.jsonl 的最终形态，形状同 MateriaMedicaRecord。"""
+
+    s: str = Field(min_length=1)
+    p: FormularyPredicate
+    o: str = Field(min_length=1)
+    source_span: str = Field(min_length=1)
+    source: ReferenceSource
+    book: str = Field(min_length=1)
 
 
 # ---------- 知识图谱：证候定义（人工核对录入，不是 LLM 输出） ----------

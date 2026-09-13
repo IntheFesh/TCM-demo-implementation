@@ -431,6 +431,9 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         "sdt_select": {"reasoning_block", "clinical_data", "pathogenesis_options", "syndrome_options"},
         "sdt_summary": {"reasoning_block", "clinical_data"},
         "s5_extract_triples": {"raw_text"},
+        # 总纲 2.2/2.3：药理层的两份抽取 prompt（offline/extract_reference_triples.py 调用）
+        "s6_extract_materia_medica": {"raw_text"},
+        "s7_extract_formulary": {"raw_text"},
     }
     for path in (PROMPTS_ROOT / "v1").glob("*.yaml"):
         found = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?", load_prompt(path.stem)["system"]))

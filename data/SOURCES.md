@@ -1054,3 +1054,55 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     不显示医家名、顺序打乱），McNemar 的 p 值要等评完。沙盒里验证的是导出/
     回收/配对这三段代码本身（合成 items + 答案表）。总纲 1.4 的判据"20 条盲评
     完成，三对 McNemar p 值"仍然是待办。
+
+34. **总纲阶段二~五的离线预备：能在沙盒里写好并测过的骨架，和明确等数据/GPU/
+    人的部分，分开记。** 沙盒里只有三本医案 txt（`books/`），没有《中药学》
+    《方剂学》《神农本草经》、没有十四五教材五本、没有药监局/卫健委目录、没有
+    GPU、没有评分人——所以下面每一项都写清楚"验证到哪一层"。
+
+    已写好、有测试（合成数据 + 假 LLM）：
+      - 2.2/2.3 抽取：`offline/extract_reference_triples.py` 一份引擎（切块 →
+        调模型 → source_span 逐字核验 → 按块号增量落盘 → 截断/失败分开、
+        `--only-blocks` 重跑），`extract_materia_medica.py` / `extract_formulary.py`
+        是薄入口；schema 走 X3 同一套（`MateriaMedicaPredicate` 六选一、
+        `FormularyPredicate` 八选一、`Field(min_length=1)` 基线 17 → 31，
+        见 CLAUDE.md）；**古籍与现代分开抽、分开存**（`source: classic|modern`
+        + `book`），prompt 不猜年代，标签由 `--source` 打。`--crosscheck` 把
+        「用量」跟 `DOSE_LIMITS`（62 味）交叉校验，只比 modern（古籍钱两不换算），
+        结果分四桶（一致/不一致/表外/解析不了），不一致的列出来人工核。
+      - 2.4d 工具：`query_materia_medica`，药名归一只走 `core.herbs.normalize_herb`
+        一处；三种"空"分开报（条目 31 同一套）；数据文件不存在时 `available:
+        false`——这台沙盒上它永远是这个状态，`tests/test_tools.py` 用合成 jsonl
+        测匹配/来源过滤/谓词校验。
+      - 2.5：`CaseRecord.has_incompatible_pair` 在抽取边界上由
+        `core.safety_output.check_incompatible`（唯一实现）算好；`export_sft.py`
+        按它过滤并把条数打到 stderr。李可医案 docx 本身没在仓库里，进语料时
+        走这条路径即可，README 的取舍说明等数据真进来再写（现在写就是编）。
+      - 5.1：`export_sft.py --format chain` 产出六层链路样本，**每步 rationale
+        只从医案三元组的 source_span 来，找不到就是 None，不退回整段原文冒充**；
+        统计里"带依据/无依据"并列报（一个不带对照的覆盖率没有意义）；train/
+        heldout 按 `case_group_id` 的 sha1 切、同一病人的诊次同侧，确定性。
+        总纲里的"证素→病名"（SDT）、"病名→证型"（教材）、药材 role/性味
+        （药理层）三个来源要等数据就位再往 chain 里加 step，格式不用改。
+      - 阶段四的硬约束 `urgency=high` 不返回任何用药建议：M6 已实现，
+        `tests/test_api.py::test_urgency_high_patient_mode_returns_no_medication_
+        fields` 已经守着，这轮没有动。
+
+    明确等外部输入、这轮不写（写了就是占位）：
+      - 2.1 数据源文件本身（教材/古籍本草/药典）——不在仓库，README 3.1 的
+        下载路径要补这几本。
+      - 2.4a-c/e 图谱第三层（herb/nature/meridian/effect 节点挂进
+        `build_graph.py`、医案药名 → herb 节点、方剂主治 → syndrome 节点、
+        学生模式点药材显示性味归经）——没有 `materia_medica.jsonl` 就没有
+        节点可挂；而且这是图层结构变更，CLAUDE.md 要求 Playwright 真实渲染
+        验收，用合成数据渲染验不出真实数据会撞到的布局问题，等数据。
+      - 阶段三五本教材的解析器——五种字段格式各不相同（外科整段连排最难），
+        没有原文没法写解析器，写了也测不了 OCR 错字修正表。
+      - 阶段四两份目录 `patent_medicines.jsonl` / `food_therapy.jsonl`——人工
+        整理的静态参考表（要进 `data/standard/`），条目要有出处，凭记忆写
+        106 种药食同源的性味/适应证型/禁忌就是编。
+      - 1.2 E8 重跑、1.1 E9 重跑、1.4 盲评、阶段五训练——要 GPU/真实 LLM/
+        评分人。
+      - 1.5a/b README、DEMO 的数字更新——数字要等上面这些重跑；能先做的是
+        `eval/RESULTS.md` 把已有的七组数按"数字 + 对照 + caveat"摆好、待重跑
+        的标成待重跑，不把旧数当新数。

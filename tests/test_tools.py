@@ -39,9 +39,10 @@ def _clean_caches():
 # ---------- 注册表本身 ----------
 
 def test_tools_registry_shape():
+    # query_materia_medica 是总纲 2.4d 加的药理层工具——有意的注册表扩展。
     assert set(TOOLS) == {
         "query_graph", "query_case_graph", "search_cases",
-        "lookup_standard", "check_residual", "ask_user",
+        "lookup_standard", "check_residual", "query_materia_medica", "ask_user",
     }
     for key, spec in TOOLS.items():
         assert spec.name == key, "注册表的 key 必须等于 ToolSpec.name，否则模型按名字调不到"
@@ -429,6 +430,66 @@ def test_case_layer_tool_descriptions_say_id_and_list_every_registered_physician
         assert "id" in desc and "不是中文名" in desc, tool
         for pid, info in PHYSICIANS.items():
             assert pid in desc and info["name"] in desc, f"{tool} 的描述漏了 {pid}"
+
+
+# ---------- query_materia_medica（总纲 2.4d，合成数据） ----------
+
+MATERIA_MEDICA = [
+    {"s": "黄芪", "p": "性味", "o": "甘，微温", "source_span": "甘，微温。", "source": "modern", "book": "中药学"},
+    {"s": "黄芪", "p": "性味", "o": "味甘微温", "source_span": "味甘微温", "source": "classic", "book": "神农本草经"},
+    {"s": "黄芪", "p": "用量", "o": "9～30g", "source_span": "9～30g。", "source": "modern", "book": "中药学"},
+    {"s": "甘草", "p": "禁忌", "o": "反海藻", "source_span": "反海藻", "source": "modern", "book": "中药学"},
+]
+
+
+@pytest.fixture
+def materia_medica_file(tmp_path, monkeypatch):
+    path = tmp_path / "materia_medica.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(t, ensure_ascii=False) for t in MATERIA_MEDICA) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools, "MATERIA_MEDICA_PATH", path)
+    tools.reset_tool_caches()
+    return path
+
+
+def test_query_materia_medica_missing_file_is_unavailable_not_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, "MATERIA_MEDICA_PATH", tmp_path / "nope.jsonl")
+    tools.reset_tool_caches()
+    out = run_tool("query_materia_medica", {"herb": "黄芪"})
+    assert out["available"] is False and out["triples"] == []
+    assert "extract_materia_medica" in out["note"]
+
+
+def test_query_materia_medica_normalizes_herb_and_keeps_classic_and_modern_apart(materia_medica_file):
+    out = run_tool("query_materia_medica", {"herb": "炙黄芪三钱"})  # 炮制前缀+剂量归一后 = 黄芪
+    assert out["available"] is True and out["herb"] == "黄芪"
+    assert out["total_matched"] == 3
+    assert {(t["source"], t["book"]) for t in out["triples"]} == {("modern", "中药学"), ("classic", "神农本草经")}
+    assert all(t["source_span"] for t in out["triples"])  # 出处原样带出
+
+    classic_only = run_tool("query_materia_medica", {"herb": "黄芪", "source": "classic"})
+    assert [t["o"] for t in classic_only["triples"]] == ["味甘微温"]
+    dose_only = run_tool("query_materia_medica", {"herb": "黄芪", "predicate": "用量"})
+    assert [t["o"] for t in dose_only["triples"]] == ["9～30g"]
+
+
+def test_query_materia_medica_no_match_reports_scanned_count(materia_medica_file):
+    out = run_tool("query_materia_medica", {"herb": "人参", "source": "modern"})
+    assert out["available"] is True and out["triples"] == [] and "error" not in out
+    assert "已查 3 条三元组" in out["note"]  # modern 一共 3 条
+
+
+def test_query_materia_medica_rejects_out_of_vocabulary_predicate_and_source(materia_medica_file):
+    assert "error" in run_tool("query_materia_medica", {"herb": "黄芪", "predicate": "别名"})
+    assert "error" in run_tool("query_materia_medica", {"herb": "黄芪", "source": "ancient"})
+
+
+def test_query_materia_medica_description_is_registered_and_mentions_sources():
+    manifest = {m["name"]: m for m in tools_manifest()}
+    desc = manifest["query_materia_medica"]["description"]
+    assert "classic" in desc and "modern" in desc and "source_span" in desc
 
 
 # ---------- lookup_standard ----------

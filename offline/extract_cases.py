@@ -14,6 +14,7 @@ from pathlib import Path
 
 from core.llm import get_llm, load_prompt, render
 from core.herbs import split_western_drugs
+from core.safety_output import check_incompatible
 from core.schemas import CaseRecord, SegmentPatients
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
@@ -117,6 +118,10 @@ def expand_segment(segment: dict, result: SegmentPatients) -> list[CaseRecord]:
             fields["western_drugs"] = list(
                 dict.fromkeys((fields.get("western_drugs") or []) + moved)
             )
+            # 总纲 2.5：十八反十九畏配伍在抽取边界上算好、写进记录（李可医案那类
+            # 敢用反药的名家会命中）。判定只有 core.safety_output.check_incompatible
+            # 一处实现——跟 M2 输出侧安全检查用的是同一张表，不另抄一份。
+            fields["has_incompatible_pair"] = bool(check_incompatible(kept_herbs))
             record = CaseRecord(
                 case_id=case_id,
                 physician=physician,

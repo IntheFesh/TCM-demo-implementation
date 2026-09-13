@@ -101,8 +101,11 @@ M1 加了 5 处（`HerbItem.name`、`FormulaCandidate.name`/`rationale`/`herb_it
 `421df4f`~`e6a8c32` 期间到 19 处。`2f0d174` 掉到 17 处——**这不是放松**：
 X3 那轮把 `CaseTripleItem.p`/`CaseTripleRecord.p` 的 `str = Field(min_length=1)`
 换成了 `p: CaseTriplePredicate`（六个合法值的 `Literal`），Literal 能接受的
-值集合比"任何非空字符串"小得多，是收紧不是放松。**当前基线：17 处
-（截至 `acd8cd0`）。**
+值集合比"任何非空字符串"小得多，是收紧不是放松。**17 处（截至 `acd8cd0`）**
+之后，总纲阶段二的药理层加了 14 处：`MateriaMedicaItem`/`MateriaMedicaRecord`/
+`FormularyItem`/`FormularyRecord` 四个 schema 的 `s`/`o`/`source_span`（+`book`）
+全部 `Field(min_length=1)`，谓词是 `Literal`——跟 X3 医案三元组同一套防幻觉
+约束，纯新增，没有动任何既有字段。**当前基线：31 处。**
 
 这条铁律里的数字**允许合法下降**——用更强约束（`Literal`、枚举、更具体的
 子类型）替换 `Field(min_length=1)` 属于收紧，不违反"不许放松"；只有改成

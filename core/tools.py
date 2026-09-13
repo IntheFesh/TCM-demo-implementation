@@ -33,7 +33,9 @@ from typing import Callable
 from pydantic import BaseModel, Field
 
 from core.graph.store import NetworkXStore
+from core.herbs import normalize_herb
 from core.physicians import physician_choices_text, resolve_physician_id
+from core.schemas import MateriaMedicaPredicate, ReferenceSource
 
 ROOT = Path(__file__).resolve().parent.parent
 GRAPH_PATH = ROOT / "data" / "graph.json"
@@ -43,6 +45,10 @@ STANDARD_PATH = ROOT / "data" / "standard" / "syndromes.jsonl"
 # source_span 是这条三元组在医案原文里的出处片段——没有它，工具查出来的东西
 # 就跟凭空生成的没区别，防幻觉链条在工具这一层断掉。
 CASE_TRIPLES_PATH = ROOT / "data" / "case_triples.jsonl"
+# 总纲 2.2/2.4d：药理层三元组（offline/extract_materia_medica.py 产出，一行一条
+# {s, p, o, source_span, source, book}，source 是 classic/modern）。跟
+# case_triples.jsonl 一样是在有真实 LLM 的机器上生成的产物，不进版本控制。
+MATERIA_MEDICA_PATH = ROOT / "data" / "materia_medica.jsonl"
 
 
 # ---------- 惰性单例（模块顶层不加载任何文件） ----------
@@ -50,15 +56,17 @@ CASE_TRIPLES_PATH = ROOT / "data" / "case_triples.jsonl"
 _graph_store: NetworkXStore | None = None
 _standard_defs: list[dict] | None = None
 _case_triples: list[dict] | None = None
+_materia_medica: list[dict] | None = None
 
 
 def reset_tool_caches() -> None:
     """测试用：清掉所有惰性缓存。改了 monkeypatch 的路径之后必须调一次，
     否则读到的还是上一个用例加载的数据。"""
-    global _graph_store, _standard_defs, _case_triples
+    global _graph_store, _standard_defs, _case_triples, _materia_medica
     _graph_store = None
     _standard_defs = None
     _case_triples = None
+    _materia_medica = None
 
 
 # 三个惰性加载器共用一把锁：它们都是"读文件 → 赋给模块全局"，没有锁时两个
@@ -128,6 +136,35 @@ def _load_case_triples() -> list[dict] | None:
             rows.append(row if isinstance(row, dict) else {"_bad_line": lineno})
         _case_triples = rows
         return _case_triples
+
+
+def _load_materia_medica() -> list[dict] | None:
+    """None = 文件还没生成；坏行记成 {"_bad_line": n} 不中断——跟
+    _load_case_triples 同一套处理，理由也一样（机器生成的文件一行坏了不该让
+    整个工具不可用，行号留给人排查）。"""
+    global _materia_medica
+    if _materia_medica is not None:
+        return _materia_medica
+    with _load_lock:
+        if _materia_medica is not None:
+            return _materia_medica
+        if not MATERIA_MEDICA_PATH.exists():
+            return None
+        rows = []
+        for lineno, line in enumerate(
+            MATERIA_MEDICA_PATH.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                rows.append({"_bad_line": lineno})
+                continue
+            rows.append(row if isinstance(row, dict) else {"_bad_line": lineno})
+        _materia_medica = rows
+        return _materia_medica
 
 
 def _unknown_physician_error(value: str) -> str:
@@ -575,6 +612,75 @@ def check_residual(symptoms: list[str], elements: list[str] | None = None) -> di
     }
 
 
+# ---------- 5b. query_materia_medica（总纲 2.4d，药理层） ----------
+
+
+class QueryMateriaMedicaInput(BaseModel):
+    herb: str = Field(min_length=1, description="药名（如「黄芪」「炙甘草」），炮制前缀/剂量/括号注会被归一后再匹配")
+    predicate: MateriaMedicaPredicate | None = Field(
+        default=None, description="只看这一类：性味 / 归经 / 功效 / 用量 / 禁忌 / 炮制；不填全部"
+    )
+    source: ReferenceSource | None = Field(
+        default=None, description="classic=古籍本草，modern=现代教材/药典；不填两者都返回、各自标明来源"
+    )
+    limit: int = Field(default=20, ge=1, le=200)
+
+
+def query_materia_medica(herb: str, predicate: str | None = None,
+                         source: str | None = None, limit: int = 20) -> dict:
+    """三种"空"分开报，跟 search_cases / query_case_graph 同一套（SOURCES.md
+    第 31 条）：① 参数错 → error；② 数据文件不存在 → available:false；
+    ③ 数据在、确实没匹配 → note 带"已查 N 条"。药名的归一只有
+    core.herbs.normalize_herb 一处实现——两边（查询词、数据里的 s）都过它，
+    不在这里另写一套前缀剥离。"""
+    rows = _load_materia_medica()
+    if rows is None:
+        return {
+            "available": False,
+            "triples": [],
+            "note": (
+                f"药理层数据尚未生成（{MATERIA_MEDICA_PATH} 不存在）。这份数据由 "
+                "offline/extract_materia_medica.py 在有真实 LLM 的机器上从本草/教材"
+                "原文抽取产出，不是代码缺陷。"
+            ),
+        }
+    target = normalize_herb(herb)
+    if not target:
+        return {"available": True, "triples": [],
+                "error": f"herb={herb!r} 归一后为空，不是可查的药名"}
+    bad_lines = [r["_bad_line"] for r in rows if "_bad_line" in r]
+    rows = [r for r in rows if "_bad_line" not in r]
+    n_scanned = sum(1 for r in rows if source is None or r.get("source") == source)
+    matched = [
+        r for r in rows
+        if (source is None or r.get("source") == source)
+        and (predicate is None or r.get("p") == predicate)
+        and normalize_herb(r.get("s") or "") == target
+    ]
+    out = {
+        "available": True,
+        "herb": target,
+        "total_matched": len(matched),
+        # source_span 和 source（古籍/现代）必须原样带出来：前者是出处凭据，
+        # 后者让模型知道"这是古籍怎么说"还是"现代药典怎么说"，两者不混。
+        "triples": [
+            {"s": r.get("s"), "p": r.get("p"), "o": r.get("o"),
+             "source_span": r.get("source_span"), "source": r.get("source"), "book": r.get("book")}
+            for r in matched[:limit]
+        ],
+    }
+    notes = []
+    if not matched:
+        scope = f"{source} 来源" if source else "全部来源"
+        kind = f"「{predicate}」" if predicate else ""
+        notes.append(f"药理层（{scope}）里没有「{target}」的{kind}记录，已查 {n_scanned} 条三元组")
+    if bad_lines:
+        notes.append(f"药理层文件有 {len(bad_lines)} 行无法解析，已跳过（行号：{bad_lines[:10]}）")
+    if notes:
+        out["note"] = "；".join(notes)
+    return out
+
+
 # ---------- 6. ask_user ----------
 
 
@@ -646,6 +752,18 @@ TOOLS: dict[str, ToolSpec] = {
         ),
         input_schema=CheckResidualInput,
         fn=check_residual,
+    ),
+    "query_materia_medica": ToolSpec(
+        name="query_materia_medica",
+        description=(
+            "查药理层：一味药的性味、归经、功效、用量、禁忌、炮制（从本草古籍与"
+            "现代教材/药典原文抽出的三元组，每条带 source_span 出处和 classic/modern"
+            " 来源标签，古籍记载与现代记载分开返回、不混）。用于回答「为什么这味药"
+            "能治这个证」「这味药的用量上限/禁忌是什么」；药名会先归一（炮制前缀、"
+            "剂量、括号注去掉）再匹配。"
+        ),
+        input_schema=QueryMateriaMedicaInput,
+        fn=query_materia_medica,
     ),
     "ask_user": ToolSpec(
         name="ask_user",
