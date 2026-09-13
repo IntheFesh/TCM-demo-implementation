@@ -711,8 +711,23 @@ def test_claude_cli_complete_accepts_and_ignores_max_tokens(monkeypatch):
 
 
 def _truncated_json_for(schema) -> str:
-    """构造一个在字符串字段中途被切断的 JSON，模拟真实撞 max_tokens 的输出。"""
-    return '{"ok": true, "note": "这段话说到一半被砍掉了，后面还有内容但是没'
+    """构造一个在字符串字段中途被切断的 JSON，模拟真实撞 max_tokens 的输出。
+
+    这段文本本身重复拼接到超过 100 字符（core.llm.TRUNCATION_MIN_LENGTH）——
+    这个下限是这一轮为了修复 AutoDL 实测的"2 字符近空响应被误判成截断"加的
+    绝对下限，任何长度小于它的文本都不会被判成截断，不管 EOF 落在哪里。
+    这个 helper 之前只有 43 字符，全部调用方（test_looks_like_truncated_json_
+    detects_eof_at_end_of_text、test_generate_raises_truncated_error_without_
+    retrying）都是想测"EOF 在末尾 → 判成截断"这条真实分支，不是想测新加的
+    绝对下限本身——所以把文本拉长而不是改判断逻辑或断言，测试的意图没变，
+    只是构造出的样本要跟上新的、故意收紧的下限。用重复拼接而不是手写一段
+    定长字符串，是为了避免"人肉数字符数"这类算错的风险（这个项目里已经因为
+    手算字符串长度出过一次真的算错的 bug）。
+    """
+    filler = "这是一段模拟真实输出被 max_tokens 砍断的示例文本，" * 4
+    text = '{"ok": true, "note": "' + filler
+    assert len(text) > 100, "重复次数不够，没有越过 TRUNCATION_MIN_LENGTH"
+    return text
 
 
 def test_looks_like_truncated_json_detects_eof_at_end_of_text():
@@ -743,10 +758,17 @@ def test_looks_like_truncated_json_does_not_flag_mid_text_syntax_errors():
 def test_looks_like_truncated_json_handles_multiline_output():
     """模型有时会把 JSON 打印成多行（缩进/换行），"末尾"要按最后一行算，
     不能直接拿 len(text) 跟 pydantic 报的 column 比——column 是行内位置，
-    多行时那样比较会永远比不上，把真截断当成不是截断。"""
+    多行时那样比较会永远比不上，把真截断当成不是截断。
+
+    文本长度拉到超过 100 字符（core.llm.TRUNCATION_MIN_LENGTH）——原文本
+    只有 40 字符，本轮加的绝对下限会让它无论 EOF 落在哪都被直接判定为
+    "太短不算截断"，测不到这条测试真正要测的多行 EOF 定位逻辑，所以拉长
+    最后一行的内容，结构（三行、最后一行未闭合）不变。"""
     from pydantic import ValidationError
 
-    text = '{\n  "ok": true,\n  "note": "这一行被砍断了没有闭合引号'
+    long_tail = "这一行被砍断了没有闭合引号，为了越过新的绝对长度下限故意重复写长一些，" * 3
+    text = '{\n  "ok": true,\n  "note": "' + long_tail
+    assert len(text) > 100
     try:
         Tiny.model_validate_json(text)
         raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
@@ -785,7 +807,10 @@ def test_looks_like_truncated_json_rejects_output_shorter_than_schema_minimum():
 
 def test_looks_like_truncated_json_still_detects_truncation_on_a_larger_schema():
     """长度门槛不是关掉截断判定——超过这个 schema 的最短合法长度、EOF 又在
-    末尾时，仍然要判成截断。"""
+    末尾时，仍然要判成截断。文本长度拉到超过 100 字符
+    （core.llm.TRUNCATION_MIN_LENGTH），原因同上：原文本只有 77 字符，
+    本轮加的绝对下限会让它被直接判成"太短"，测不到这条测试真正要测的
+    "超过 schema 下限时仍要正确识别截断"这件事。"""
     from pydantic import ValidationError
 
     class Larger(BaseModel):
@@ -793,12 +818,97 @@ def test_looks_like_truncated_json_still_detects_truncation_on_a_larger_schema()
         action: str = Field(min_length=1)
         note: str = Field(min_length=1)
 
-    text = '{"thought": "先看看证素对应哪些证候，这一步的推理稍微长一点", "action": "query_graph", "note": "半路被砍'
+    text = (
+        '{"thought": "先看看证素对应哪些证候，这一步的推理稍微长一点，'
+        '多写几句话把这条测试的文本长度拉过新的绝对下限", '
+        '"action": "query_graph", "note": "半路被砍'
+    )
+    assert len(text) > 100
     try:
         Larger.model_validate_json(text)
         raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
     except ValidationError as e:
         assert _looks_like_truncated_json(e, text, Larger) is True
+
+
+# ---------- AutoDL 真实复现：宽松 schema（无 required 字段）上限失效 ----------
+#
+# 上一轮修复用的 Tiny（ok: bool 必填 + note min_length=1 必填）最短合法长度是
+# 23，`'{"'` 天然小于 23，测不出真问题——真实崩溃的 core/schemas.py::S2Elements
+# 两个字段都有默认值、没有 required，_min_json_length 算出的下限本身就是 2，
+# 跟崩溃输入的长度打平（2 < 2 为 False），单靠 schema 下限完全挡不住。这里
+# 直接用真实 schema 复现，不用 Tiny 这种凑出来的、恰好有严格约束的替身。
+
+
+def test_looks_like_truncated_json_rejects_near_empty_response_even_when_schema_has_no_required_fields():
+    """核心回归（AutoDL 实测崩溃复现）：S2Elements 所有字段都有默认值，
+    schema 结构下限只有 2——单靠这个下限判定 `'{"'`（2 字符）会因为
+    "2 < 2 为 False" 而误判成截断（修复前的真实行为）。TRUNCATION_MIN_LENGTH
+    这个绝对下限就是为了兜住这类"schema 越宽松、下限越没用"的场景：
+    不管 schema 结构下限多低，都不能因为文本长度没跌破 100 就直接放行判定。
+    """
+    from pydantic import ValidationError
+
+    from core.schemas import S2Elements
+
+    text = '{"'
+    try:
+        S2Elements.model_validate_json(text)
+        raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, text, S2Elements) is False
+
+
+def test_looks_like_truncated_json_still_detects_real_truncation_on_strict_schema():
+    """绝对下限不能把真截断也放过：S3Syndrome 是这个项目里最重的输出 schema
+    （结构下限 195，比绝对下限 TRUNCATION_MIN_LENGTH=100 更高——它自己的
+    结构下限才是实际生效的门槛），构造一段超过这个门槛、EOF 落在末尾的
+    截断文本，仍然要判定为截断。
+
+    门槛要用 core.llm._truncation_length_threshold(S3Syndrome) 现算，不能
+    只保证 >100——S3Syndrome 的实际门槛是 195，不是 100，文本长度卡在
+    100~195 之间会被判成"太短"，那不是这条测试想测的东西（想测的是"超过
+    门槛时仍要识别截断"），也不是真的 bug。"""
+    from pydantic import ValidationError
+
+    from core.llm import _truncation_length_threshold
+    from core.schemas import S3Syndrome
+
+    threshold = _truncation_length_threshold(S3Syndrome)
+    filler = "肝气犯胃、横逆克伐、脾胃升降失常，"
+    text = '{"syndrome_name": "肝胃不和证", "pathogenesis": "' + filler * (threshold // len(filler) + 2)
+    assert len(text) > threshold
+    try:
+        S3Syndrome.model_validate_json(text)
+        raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, text, S3Syndrome) is True
+
+
+def test_truncation_min_length_floor_covers_every_generate_schema():
+    """全项目扫一遍所有真的会喂给 generate(schema=...) 的 pydantic 模型——不只
+    core/schemas.py 里的（还有 eval/patient_sim.py::PatientAnswer、
+    eval/sdt/adapter.py 的三个）——断言每一个的实际截断门槛都不低于
+    TRUNCATION_MIN_LENGTH。防的是将来有人往 core/schemas.py 加一个全字段
+    都有默认值的新 schema、又不小心把 TRUNCATION_MIN_LENGTH 改小或删掉这层
+    max()：这条测试会先红。"""
+    import inspect
+
+    import core.schemas as schemas_module
+    from core.llm import TRUNCATION_MIN_LENGTH, _truncation_length_threshold
+    from eval.patient_sim import PatientAnswer
+    from eval.sdt.adapter import CaseSummary, ExtractedInfo, SelectedOptions
+
+    all_schemas = [
+        obj for _, obj in vars(schemas_module).items()
+        if inspect.isclass(obj) and issubclass(obj, BaseModel)
+        and obj is not BaseModel and obj.__module__ == schemas_module.__name__
+    ]
+    all_schemas += [PatientAnswer, ExtractedInfo, SelectedOptions, CaseSummary]
+    assert len(all_schemas) >= 30  # 防止 import 路径写错、悄悄扫到空列表就全绿
+
+    for schema in all_schemas:
+        assert _truncation_length_threshold(schema) >= TRUNCATION_MIN_LENGTH, schema.__name__
 
 
 # ---------- _min_json_length / _min_plausible_output_length：纯函数 ----------
@@ -877,6 +987,26 @@ def test_generate_raises_truncated_error_without_retrying():
     msg = str(ei.value)
     assert "截断" in msg
     assert "backend=scripted" in msg
+
+
+def test_generate_truncated_error_message_distinguishes_unset_from_explicit_max_tokens():
+    """max_tokens=None 不是"配置丢了"，是"这次调用没有显式传，会走后端自己的
+    默认值"——原来直接打 "max_tokens=None" 容易让人去查环境变量，其实哪儿
+    都没错。未传时消息要说"未设置"，显式传了具体值时要如实显示那个值，
+    不能两种情况都打印同一个 None。"""
+    b = ScriptedBackend([_truncated_json_for(Tiny)])
+    with pytest.raises(LLMTruncatedError) as ei:
+        b.generate(system="s", user="u", schema=Tiny)  # 没传 max_tokens
+    msg = str(ei.value)
+    assert "max_tokens=未设置" in msg
+    assert "max_tokens=None" not in msg
+
+    b2 = ScriptedBackend([_truncated_json_for(Tiny)])
+    with pytest.raises(LLMTruncatedError) as ei2:
+        b2.generate(system="s", user="u", schema=Tiny, max_tokens=16384)
+    msg2 = str(ei2.value)
+    assert "max_tokens=16384" in msg2
+    assert "未设置" not in msg2
 
 
 def test_generate_truncated_error_is_also_an_llm_error():

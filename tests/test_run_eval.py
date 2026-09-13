@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.batch import warn_if_failure_rate_high
 from core.llm import LLMError
 from eval import run_eval as re
 
@@ -513,18 +514,14 @@ def test_retriever_mode_output_effect_counts_failed_queries_separately():
     assert "全部失败" in r["note"]
 
 
-def test_warn_if_failure_rate_high_triggers_above_threshold(capsys):
-    re._warn_if_failure_rate_high("E9", 3, 10)  # 30% > 20% 阈值
-    assert "警告" in capsys.readouterr().out
-
-
-def test_warn_if_failure_rate_high_silent_at_or_below_threshold(capsys):
-    re._warn_if_failure_rate_high("E9", 2, 10)  # 恰好等于 20% 阈值，不触发
-    assert capsys.readouterr().out == ""
-
-
-def test_warn_if_failure_rate_high_no_samples_does_not_divide_by_zero():
-    re._warn_if_failure_rate_high("E9", 0, 0)  # 不该抛 ZeroDivisionError
+def test_run_eval_reuses_shared_warn_if_failure_rate_high_not_a_local_copy():
+    """本轮把 _warn_if_failure_rate_high 收进 core/batch.py（estimate_epsilon.py/
+    sdt/run.py 要跑一样的判断，CLAUDE.md「同一概念只能有一处实现」）——
+    这条测试确认 run_eval.py 用的是同一个函数对象，不是各自拷贝一份、
+    以后改一处漏改另一处。原来单独测 _warn_if_failure_rate_high 本身的三条
+    测试（触发/不触发/除零）移到了 tests/test_batch.py，测的是同一份实现，
+    不是重复覆盖。"""
+    assert re.warn_if_failure_rate_high is warn_if_failure_rate_high
 
 
 def test_ablation_output_effect_change_rate_is_mean_jaccard_distance():

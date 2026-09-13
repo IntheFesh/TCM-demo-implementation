@@ -45,6 +45,32 @@ def _read_stream_into(client: TestClient, complaint: str, out_q: queue.Queue) ->
             out_q.put((event_name, data))
 
 
+def _live_server_health_check_budget() -> float:
+    """等待 /health 的预算：`/health` 在 api.main._lifespan 的 startup 阶段
+    跑完之前不会应答（ASGI lifespan 没完成，uvicorn 不会真正开始处理请求），
+    而那个阶段自己最多等 api_main.WARMUP_TIMEOUT_SECONDS 就放弃、开始服务
+    ——这条测试的等待预算必须不小于它，否则两个数字各自维护、迟早再次
+    错位。**旧代码就是这样错位的**：硬编码 60 秒，而服务器自己的预热上限
+    是 120 秒（默认），AutoDL 上真实预热耗时落在 60~120 秒之间时测试永远
+    等不到 /health、稳定超时——不是"改大一个数字蒙过去"，是这个预算原本
+    就该跟着 WARMUP_TIMEOUT_SECONDS 走。抽成函数是为了能在不真的起服务器、
+    不真的等 120+ 秒的前提下单独测这个关系本身（tests/ 要秒级跑完）。
+    额外的 30 秒缓冲量的是"预热之外"的开销（Python import、uvicorn/socket
+    起停、CI 机器繁忙时的调度延迟），不是给预热本身留的——预热的时间预算
+    已经全部算在 WARMUP_TIMEOUT_SECONDS 里了。"""
+    return api_main.WARMUP_TIMEOUT_SECONDS + 30
+
+
+def test_live_server_health_check_budget_tracks_server_warmup_ceiling(monkeypatch):
+    """核心回归：等待预算必须随 WARMUP_TIMEOUT_SECONDS 联动，不能是另一个
+    独立维护的硬编码数字——这条测试不真的起服务器等上百秒，只验证这个
+    关系式本身。"""
+    monkeypatch.setattr(api_main, "WARMUP_TIMEOUT_SECONDS", 5.0)
+    assert _live_server_health_check_budget() >= 5.0
+    monkeypatch.setattr(api_main, "WARMUP_TIMEOUT_SECONDS", 150.0)
+    assert _live_server_health_check_budget() >= 150.0  # 旧的硬编码 60 秒在这里会挂
+
+
 @pytest.fixture
 def live_server():
     """`fastapi.testclient.TestClient` 底下的 httpx ASGITransport 会把整个
@@ -71,13 +97,12 @@ def live_server():
     thread.start()
 
     base_url = f"http://127.0.0.1:{port}"
-    # 等待预算给到 60 秒，不是因为起 uvicorn 慢（本机回环通常 0.2 秒内就绪，
-    # 循环一就绪就退出，不会真等满），而是因为 app 的 startup 钩子会跑真实的
-    # 检索器预热：这台沙箱没有 cases.json，预热几毫秒就跳过了；**有 cases.json
-    # 的机器（AutoDL）会在这里真的加载 embedding 模型**，5 秒根本不够，
-    # 这条测试会在那边莫名其妙地红。发现过程记在模块8：临时造了个合成
-    # cases.json 做验证，这条测试立刻就红了，才看出预算是按空环境定的。
-    deadline = time.time() + 60
+    # 这台沙箱没有 cases.json，预热几毫秒就跳过了，等待预算基本不会真的等满；
+    # 预算本身为什么这么定见 _live_server_health_check_budget 的文档字符串
+    # （核心：必须跟着 api.main.WARMUP_TIMEOUT_SECONDS 走，不能是另一个独立
+    # 维护的硬编码数字，AutoDL 上就是这么错位过的）。
+    health_check_budget = _live_server_health_check_budget()
+    deadline = time.time() + health_check_budget
     while time.time() < deadline:
         try:
             httpx.get(f"{base_url}/health", timeout=1.0)
@@ -85,7 +110,7 @@ def live_server():
         except httpx.TransportError:
             time.sleep(0.05)
     else:
-        raise RuntimeError("uvicorn 没能在 60 秒内起来")
+        raise RuntimeError(f"uvicorn 没能在 {health_check_budget:.0f} 秒内起来")
 
     yield base_url
 

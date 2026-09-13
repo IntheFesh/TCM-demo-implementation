@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
+from core.batch import classify_llm_failure, warn_if_failure_rate_high
 from core.safety import safety_bypassed
-from eval.sdt.adapter import SOLVERS
+from eval.sdt.adapter import SOLVERS, SdtAnswer
 from eval.sdt.data import load_split, write_submission
 
 
@@ -63,10 +65,29 @@ def main(argv: list[str] | None = None) -> None:
               "实际行为，引用时必须标注 ignore_safety_veto=True。")
 
     solver = SOLVERS[args.solver]()
-    lines, rejected, calls = [], [], 0
+    lines, rejected, call_failed, calls = [], [], [], 0
     t0 = time.time()
     for i, r in enumerate(records, 1):
-        answer = solver.solve(r, ignore_safety_veto=bypass_arg)
+        # solver.solve() 内部三次 generate() 调用没有异常捕获——core.llm.generate()
+        # 重试 3 次仍失败会把 LLMError 一路抛到这里。50 条 × 4 次调用一次抖动就
+        # 崩掉整批、前面跑完的全丢，代价很大（跟 offline/extract_case_triples.py、
+        # eval/run_eval.py、offline/estimate_epsilon.py 是同一类坑）。
+        try:
+            answer = solver.solve(r, ignore_safety_veto=bypass_arg)
+        except Exception as e:  # noqa: BLE001 - 单条记录失败不能拖累其余记录
+            call_failed.append(r.record_id)
+            print(
+                f"[eval.sdt.run] 第 {i}/{len(records)} 条（{r.record_id}）调用失败："
+                f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
+            )
+            # 官方评分脚本按记录数算总分，提交文件少一行就会跟金标准错位——
+            # 必须占位提交一条空答案（跟安全否决同样的空壳，得 0 分），但绝不
+            # 写进 answer.safety_rejected：那个字段代表"系统真的拦截了这条"，
+            # 调用失败是基础设施抖动，不是系统的真实行为，两者混在一起会让
+            # 读分数的人误以为这条是被安全层拦下的。call_failed 单独记录，
+            # 跟 rejected 分开报——见 main() 末尾打的警告和 manifest 里的
+            # n_call_failed。
+            answer = SdtAnswer(record_id=r.record_id)
         lines.append(answer.to_line())
         calls += answer.llm_calls
         if answer.safety_rejected:
@@ -97,12 +118,25 @@ def main(argv: list[str] | None = None) -> None:
         # 被安全层拦下的记录：它们提交的是空答案、得 0 分。这个数必须跟分数
         # 一起报，否则读的人会以为是模型答错了。
         "safety_rejected": rejected,
+        # 调用失败（跟安全否决不是一回事，见上面循环里的注释）也提交了空答案、
+        # 也得 0 分——但这些 0 分不代表模型的真实表现，是基础设施抖动。
+        # 单独记数，不跟 safety_rejected 混在一起，报告消费方要能分清楚
+        # "这批分数里有多少是系统真的拦下的、多少是这次跑巧合失败的"。
+        "call_failed": call_failed,
+        "n_call_failed": len(call_failed),
     }
     manifest_path = args.out.with_suffix(".manifest.json")
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n已写出 {args.out}")
     print(f"manifest：{manifest_path}")
     print(f"安全否决拦下 {len(rejected)}/{len(records)} 条（这些条得 0 分）：{rejected}")
+    if call_failed:
+        print(
+            f"【注意】{len(call_failed)}/{len(records)} 条因 LLM 调用失败提交了空答案、"
+            f"得 0 分——这些 0 分不是模型的真实表现，是这次跑的基础设施抖动。"
+            f"本次总分不能跟一次完整无失败的跑直接比较：{call_failed}"
+        )
+    warn_if_failure_rate_high("SDT", len(call_failed), len(records))
 
 
 if __name__ == "__main__":

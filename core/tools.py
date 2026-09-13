@@ -556,13 +556,36 @@ def _symptom_fragments(name: str) -> list[str]:
 
 def _symptom_text_matches(name: str, patient_symptom: str) -> bool:
     """标准症状名（或三元组里的症状文本）跟患者原话对不对得上：双向包含，
-    对不上再按并列片段试一次。**全模块唯一的症状文本匹配器**——
-    _match_graph_symptoms 和 query_case_graph 都走这里。"""
+    对不上再按并列片段试一次，字面都够不到再查一遍 core.syndrome_norm 的
+    SYNONYMS 表。**全模块唯一的症状文本匹配器**——_match_graph_symptoms 和
+    query_case_graph 都走这里。
+
+    AutoDL 实测：query_case_graph 查患者现代说法「胃脘胀痛」查不到医案三
+    元组，而三元组存的是医案原文的古文简写「脘痛」（417 条）——两个词面上
+    没有公共子串，字面双向包含/并列拆分都够不到，是真实的术语映射问题，
+    跟 λ1 恒 0、element_index 覆盖率 47% 同一根：医案原文用的是古代医家自己
+    的措辞，患者/S1 normalize 用的是现代标准词，字面匹配天然覆盖不全。
+
+    这里补的是 CLAUDE.md「同一概念的匹配逻辑只能有一处实现」要求的那种
+    复用——不新开一套症状同义词表，直接查 core.syndrome_norm.SYNONYMS
+    （已经在用于医案门类归一化）：两个文本只要有一个方向能查到 canonical
+    概念、且两边 canonical 后相同，就算匹配上。**这不是术语映射问题的
+    根本解法**：SYNONYMS 现在只覆盖"胃痛"这一类已经登记过的门类词，像
+    「嗳气」这种没有对应门类条目的具体症状词依然查不到——要系统性解决，
+    需要阶段二/三给每个症状词建标准化映射表，这里只是在现有表能覆盖到的
+    范围内，让 query_case_graph 和 _match_graph_symptoms 不必各自绕开
+    SYNONYMS 另写一套。
+    """
     if not name or not patient_symptom:
         return False
     if name in patient_symptom or patient_symptom in name:
         return True
-    return any(f in patient_symptom for f in _symptom_fragments(name))
+    if any(f in patient_symptom for f in _symptom_fragments(name)):
+        return True
+    from core.syndrome_norm import normalize as _syndrome_canonical
+
+    name_concepts = _syndrome_canonical(name)
+    return bool(name_concepts) and bool(name_concepts & _syndrome_canonical(patient_symptom))
 
 
 def _match_graph_symptoms(store: NetworkXStore, patient_symptom: str) -> list[str]:

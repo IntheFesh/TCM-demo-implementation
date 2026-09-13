@@ -35,9 +35,11 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 import time
 from pathlib import Path
 
+from core.batch import classify_llm_failure, warn_if_failure_rate_high
 from core.chain import consult, infer_elements, normalize
 from core.herbs import normalized_herb_set
 from core.llm import get_llm
@@ -73,6 +75,17 @@ def estimate_epsilon_online(
     被安全否决拦截、或信息不足（S2 没推出任何证素）的重复不产出用药，直接跳过；
     一条主诉的全部重复都被拦截/信息不足时，整条主诉跳过并记录原因——不能当成
     "噪声为 0"。
+
+    单次重复的 consult_fn 调用本身失败（LLMError 等，真实 API 会抖动/限流）
+    不能让整条主诉、更不能让整批噪声估算停下——这一层原来没有任何异常捕获，
+    跟 estimate_epsilon_extract 早就在用的"单条失败记录、continue，不崩"
+    是同一个模式，只是没有补过来。**失败的重复要从这条主诉的有效重复次数里
+    剔除，不能当成"这次抖动结果是空集"去参与 Jaccard 计算**：失败的重复
+    根本不往 herb_sets_by_physician 里追加，pairwise_jaccard_stats 只在有效
+    集合 >=2 时才出数，分母天然只数真正跑成的次数。n_call_failures 单独
+    计数，跟"被安全否决"、"信息不足"两种业务性跳过原因分开报——一个是
+    consult() 没跑成，一个是 consult() 跑成了、结果如实是"拒答/信息不足"，
+    混在一起会让"这条主诉的噪声数据够不够"这件事看不清楚。
     """
     consult_fn = consult_fn or (lambda c: consult(c, use_react=False, ask_fn=None))
 
@@ -80,14 +93,24 @@ def estimate_epsilon_online(
     by_physician_distances: dict[str, list[float]] = {}
     per_query: list[dict] = []
     llm_calls = 0
+    n_call_failures_total = 0
 
     for complaint in queries:
         herb_sets_by_physician: dict[str, list[set]] = {}
         n_rejected = 0
         n_insufficient = 0
+        n_call_failures = 0
 
         for _ in range(n_repeats):
-            outcome = consult_fn(complaint)
+            try:
+                outcome = consult_fn(complaint)
+            except Exception as e:  # noqa: BLE001 - 单次重复失败不能拖累这条主诉的其它重复/其它主诉
+                n_call_failures += 1
+                print(
+                    f"[estimate_epsilon_online]「{complaint}」一次重复调用失败："
+                    f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
+                )
+                continue
             llm_calls += (outcome.get("manifest") or {}).get("llm_calls", 0)
             if outcome["rejected"]:
                 n_rejected += 1
@@ -99,16 +122,31 @@ def estimate_epsilon_online(
                 herbs = normalized_herb_set(r["s3"].herbs)
                 herb_sets_by_physician.setdefault(r["physician"], []).append(herbs)
 
-        if n_rejected == n_repeats:
-            per_query.append({"query": complaint, "skipped": True, "reason": "全部重复被安全否决拦截"})
+        n_call_failures_total += n_call_failures
+        n_completed = n_repeats - n_call_failures  # 真正跑完的重复次数，不是 n_repeats
+        if n_completed == 0:
+            per_query.append({
+                "query": complaint, "skipped": True, "reason": "全部重复调用失败",
+                "n_call_failures": n_call_failures,
+            })
             continue
-        if n_insufficient == n_repeats:
-            per_query.append({"query": complaint, "skipped": True, "reason": "全部重复信息不足未产出结论"})
+        if n_rejected == n_completed:
+            per_query.append({
+                "query": complaint, "skipped": True, "reason": "全部重复被安全否决拦截",
+                "n_call_failures": n_call_failures,
+            })
+            continue
+        if n_insufficient == n_completed:
+            per_query.append({
+                "query": complaint, "skipped": True, "reason": "全部重复信息不足未产出结论",
+                "n_call_failures": n_call_failures,
+            })
             continue
 
         q_record: dict = {
             "query": complaint, "skipped": False,
             "n_rejected": n_rejected, "n_insufficient": n_insufficient,
+            "n_call_failures": n_call_failures, "n_completed": n_completed,
             "by_physician": {},
         }
         for physician, sets_ in herb_sets_by_physician.items():
@@ -128,19 +166,39 @@ def estimate_epsilon_online(
         "n_queries": len(queries),
         "n_queries_used": sum(1 for q in per_query if not q["skipped"]),
         "n_repeats": n_repeats,
+        "n_call_failures": n_call_failures_total,
+        "n_attempts": len(queries) * n_repeats,
         "llm_calls": llm_calls,
     }
 
 
 def estimate_epsilon_s2(queries: list[str], n_repeats: int = DEFAULT_N_REPEATS) -> dict:
     """S2 的抖动，S1 只跑一次（跟 CLAUDE.md「S1 全局只跑一次」的约束一致），
-    同一个 S1 反复喂给 `infer_elements()`。"""
+    同一个 S1 反复喂给 `infer_elements()`。
+
+    两处调用都要失败容忍，波及范围不一样：`normalize(complaint)`（S1，只跑
+    一次）失败，这条主诉连 S2 重复实验的输入都没有，直接整条跳过，原因单独
+    标"S1 调用失败"——跟 check_safety 拦截分开记（一个是调用没跑成，一个是
+    调用跑成了、内容触发了安全否决，两件不同的事）。`infer_elements(s1)`
+    （S2，重复 n_repeats 次）单次失败：不影响已经算出来的 S1、不影响这条
+    主诉的其它重复，失败的这一次直接不进 elem_sets——跟 estimate_epsilon_online
+    同一个道理，分母只数真正跑成的次数，不是 n_repeats。全部重复都失败时
+    单独标记跳过（而不是留一个 stats=None 混在"跑成了但凑不出两个集合"
+    这种正常情况里，看不出是真失败还是数据本来就少）。
+    """
     all_distances: list[float] = []
     per_query: list[dict] = []
     llm_calls = 0
+    n_call_failures_total = 0
 
     for complaint in queries:
-        s1 = normalize(complaint)
+        try:
+            s1 = normalize(complaint)
+        except Exception as e:  # noqa: BLE001 - S1 调用失败不能拖累其它主诉
+            n_call_failures_total += 1
+            print(f"[estimate_epsilon_s2]「{complaint}」S1 调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
+            per_query.append({"query": complaint, "skipped": True, "reason": "S1 调用失败"})
+            continue
         llm_calls += 1
         reject = check_safety([complaint] + s1.symptoms + s1.unmapped)
         if reject is not None:
@@ -148,13 +206,34 @@ def estimate_epsilon_s2(queries: list[str], n_repeats: int = DEFAULT_N_REPEATS) 
             continue
 
         elem_sets = []
+        n_call_failures = 0
         for _ in range(n_repeats):
-            s2 = infer_elements(s1)
+            try:
+                s2 = infer_elements(s1)
+            except Exception as e:  # noqa: BLE001 - 单次 S2 重复失败不能拖累这条主诉的其它重复
+                n_call_failures += 1
+                print(
+                    f"[estimate_epsilon_s2]「{complaint}」一次 S2 重复失败："
+                    f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
+                )
+                continue
             llm_calls += 1
             elem_sets.append({h.element for h in s2.elements})
 
+        n_call_failures_total += n_call_failures
+        n_completed = n_repeats - n_call_failures
+        if n_completed == 0:
+            per_query.append({
+                "query": complaint, "skipped": True, "reason": "全部重复调用失败",
+                "n_call_failures": n_call_failures,
+            })
+            continue
+
         stats = pairwise_jaccard_stats(elem_sets)
-        per_query.append({"query": complaint, "skipped": False, "stats": stats})
+        per_query.append({
+            "query": complaint, "skipped": False, "stats": stats,
+            "n_call_failures": n_call_failures, "n_completed": n_completed,
+        })
         if stats:
             all_distances.extend(stats["values"])
 
@@ -165,6 +244,7 @@ def estimate_epsilon_s2(queries: list[str], n_repeats: int = DEFAULT_N_REPEATS) 
         "n_queries": len(queries),
         "n_queries_used": sum(1 for q in per_query if not q["skipped"]),
         "n_repeats": n_repeats,
+        "n_call_failures": n_call_failures_total,
         "llm_calls": llm_calls,
     }
 
@@ -221,10 +301,16 @@ def estimate_epsilon_extract(
         for _ in range(n_repeats):
             try:
                 result = extract_segment(segment)
-            except Exception:  # noqa: BLE001 - 单条抽取失败（LLMError 等）不该让
+            except Exception as e:  # noqa: BLE001 - 单条抽取失败（LLMError 等）不该让
                 # 整个噪声估算停下；失败的这一次不计入这条 case 的重复，
                 # n_extraction_failures 记下来，报告里如实标注不是静默吞掉。
+                # 打到 stderr 而不是完全吞掉——原来这里连 print 都没有，出问题
+                # 只能看最终计数猜，看不到是哪条 case、什么原因。
                 n_extraction_failures += 1
+                print(
+                    f"[estimate_epsilon_extract] case={c['case_id']} 一次重复抽取失败："
+                    f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
+                )
                 continue
             llm_calls += 1
             if not result.patients or not result.patients[0].visits:
@@ -297,12 +383,21 @@ def main(argv: list[str] | None = None) -> None:
     print("\n=== epsilon_online ===")
     online = estimate_epsilon_online(queries, n_repeats=args.n_repeats)
     print(f"  mean={online['mean']} p50={online['p50']} p95={online['p95']}  "
-          f"用了 {online['n_queries_used']}/{online['n_queries']} 条主诉、{online['llm_calls']} 次调用")
+          f"用了 {online['n_queries_used']}/{online['n_queries']} 条主诉、{online['llm_calls']} 次调用"
+          f"（{online['n_call_failures']} 次重复调用失败）")
+    warn_if_failure_rate_high("epsilon_online", online["n_call_failures"], online["n_attempts"])
 
     print("\n=== epsilon_s2 ===")
     s2 = estimate_epsilon_s2(queries, n_repeats=args.n_repeats)
     print(f"  mean={s2['mean']} p50={s2['p50']} p95={s2['p95']}  "
-          f"用了 {s2['n_queries_used']}/{s2['n_queries']} 条主诉、{s2['llm_calls']} 次调用")
+          f"用了 {s2['n_queries_used']}/{s2['n_queries']} 条主诉、{s2['llm_calls']} 次调用"
+          f"（{s2['n_call_failures']} 次调用失败）")
+    # 分母跟 _estimate_call_counts 的 s2 估算同一个形状：每条主诉 1 次 S1 +
+    # n_repeats 次 S2，都是"一次调用"，S1 失败和 S2 单次重复失败在这里
+    # 不分开算失败率——都是"这次批处理里的一次调用没跑成"。
+    warn_if_failure_rate_high(
+        "epsilon_s2", s2["n_call_failures"], len(queries) * (1 + args.n_repeats)
+    )
 
     print("\n=== epsilon_extract ===")
     if extract_available:
@@ -311,7 +406,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         if extract["available"]:
             print(f"  mean={extract['mean']} p50={extract['p50']} p95={extract['p95']}  "
-                  f"用了 {extract['n_cases']} 条医案、{extract['llm_calls']} 次调用")
+                  f"用了 {extract['n_cases']} 条医案、{extract['llm_calls']} 次调用"
+                  f"（{extract['n_extraction_failures']} 次重复抽取失败）")
+            warn_if_failure_rate_high(
+                "epsilon_extract", extract["n_extraction_failures"],
+                extract["n_cases"] * args.n_repeats,
+            )
         else:
             print(f"  不可用：{extract['note']}")
     else:

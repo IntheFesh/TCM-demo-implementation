@@ -226,6 +226,26 @@ def test_query_case_graph_matches_symptom_in_subject_or_object(triples_file):
     assert out["total_matched"] == 3  # 两条宾语命中 + 一条主语命中
 
 
+def test_query_case_graph_matches_modern_phrasing_against_classical_case_text(triples_file):
+    """AutoDL 实测复现：医案三元组存的是原文古文简写「脘痛」，患者/S1
+    normalize 用的是现代标准说法「胃脘胀痛」——两个词面上没有公共子串
+    （胃脘胀痛 ≠ 脘痛 的任何连续片段），字面双向包含/并列拆分都够不到，
+    修复前查「胃脘胀痛」会得到 0 条匹配（跟这条 fixture 里查「脘痛」能拿到
+    的 3 条完全对不上）。core.syndrome_norm.SYNONYMS 已经把「胃脘胀痛」和
+    「脘痛」都归到同一个 canonical 概念"胃痛"，_symptom_text_matches 兜底
+    查这张表之后，两种说法应该查到同样的 3 条。"""
+    out = query_case_graph(symptom="胃脘胀痛")
+    assert out["total_matched"] == 3
+    assert out["total_matched"] == query_case_graph(symptom="脘痛")["total_matched"]
+
+
+def test_query_case_graph_does_not_over_match_unrelated_symptoms(triples_file):
+    """兜底走 SYNONYMS 不能变成"什么都匹配"——跟"脘痛"完全不相关、也没有
+    登记在 SYNONYMS 里的症状词依然应该查不到任何三元组。"""
+    out = query_case_graph(symptom="嗳气")
+    assert out["total_matched"] == 0
+
+
 def test_query_case_graph_returns_source_span(triples_file):
     out = query_case_graph(symptom="脘痛", physician="ye_tianshi")
     assert all(t["source_span"] for t in out["triples"]), \
@@ -903,6 +923,37 @@ def test_generic_fragments_do_not_match_everything():
     assert not {n for n in names if "胃脘" in n or "脘腹" in n}
     # 带部位的片段仍然要能匹配
     assert "胃脘胀满或疼痛" in {store.get_node(i)["name"] for i in tools._match_graph_symptoms(store, "胃脘胀满")}
+
+
+# ---------- _symptom_text_matches：字面够不到时兜底查 SYNONYMS ----------
+#
+# AutoDL 实测：query_case_graph 查患者现代说法「胃脘胀痛」查不到医案三元组，
+# 三元组存的是原文古文简写「脘痛」——两者字面没有公共子串，是术语映射问题，
+# 跟 λ1 恒 0、element_index 覆盖率 47% 同一根，只在 core.syndrome_norm.
+# SYNONYMS 已经登记过的门类词范围内修，不是系统性解决方案。
+
+
+def test_symptom_text_matches_falls_back_to_synonyms_when_literal_match_fails():
+    """核心回归：「脘痛」和「胃脘胀痛」没有公共子串（字面双向包含、并列
+    片段拆分都够不到），但两者在 core.syndrome_norm.SYNONYMS 里都归到
+    canonical 概念"胃痛"——兜底查这张表后应该判定为匹配。"""
+    assert "脘痛" not in "胃脘胀痛" and "胃脘胀痛" not in "脘痛"  # 确认字面确实够不到
+    assert tools._symptom_text_matches("脘痛", "胃脘胀痛") is True
+    assert tools._symptom_text_matches("胃脘胀痛", "脘痛") is True  # 双向都要成立
+
+
+def test_symptom_text_matches_does_not_over_match_via_synonyms_fallback():
+    """SYNONYMS 兜底不能变成"什么都匹配"——没有登记在同一个 canonical 概念下
+    的词依然不该匹配，包括完全不相关的症状词。"""
+    assert tools._symptom_text_matches("脘痛", "嗳气") is False
+    assert tools._symptom_text_matches("口苦", "纳差") is False
+
+
+def test_symptom_text_matches_literal_match_still_takes_priority():
+    """SYNONYMS 兜底不该改变已有的字面匹配行为——直接子串命中的情况
+    （原有测试覆盖的场景）不受这次改动影响。"""
+    assert tools._symptom_text_matches("胃脘胀满", "胃脘胀满或疼痛") is True
+    assert tools._symptom_text_matches("胃脘胀满或疼痛", "胃脘胀满") is True
 
 
 def test_posterior_and_candidates_use_the_same_physician_weights():

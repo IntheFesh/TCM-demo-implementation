@@ -101,6 +101,77 @@ def test_epsilon_online_llm_calls_summed():
     assert r["llm_calls"] == 15
 
 
+# ---------- 失败容忍：一次 consult_fn 调用崩不能让整批噪声估算停下 ----------
+#
+# 这一层原来没有任何异常捕获——真实 API 抖动一次就会让 estimate_epsilon_online
+# 整个崩掉，10 条主诉 × 3 次重复 ≈ 150 次调用，崩一次代价很大。跟
+# eval/run_eval.py 的三个收集器、core.chain.consult_many 是同一类坑。
+
+
+def test_epsilon_online_survives_call_failure_and_excludes_it_from_denominator():
+    """一次重复调用失败：不崩，失败次数记进 n_call_failures，且不参与
+    Jaccard 计算的分母（herb_sets_by_physician 里少了这一次，pairwise_
+    jaccard_stats 用剩下的有效次数算，不是拿 n_repeats 硬除）。"""
+    responses = iter([
+        RuntimeError("模拟 API 抖动"),
+        _outcome(["党参"], ["茯苓"]),
+        _outcome(["党参"], ["茯苓"]),
+    ])
+
+    def consult_fn(_):
+        r = next(responses)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    r = ee.estimate_epsilon_online(["主诉甲"], n_repeats=3, consult_fn=consult_fn)
+    assert r["n_call_failures"] == 1
+    assert r["n_attempts"] == 3
+    q = r["per_query"][0]
+    assert q["skipped"] is False
+    assert q["n_call_failures"] == 1
+    assert q["n_completed"] == 2  # 3 次重复只成功 2 次，不是当成完整的 3 次
+    # 两次成功的重复用药完全一致 -> 噪声为 0，证明确实是拿"完成的 2 次"在算，
+    # 不是把失败那次悄悄当成了一次抖动样本混进去。
+    assert q["by_physician"]["ye_tianshi"]["mean"] == 0.0
+    assert q["by_physician"]["ye_tianshi"]["n_pairs"] == 1  # 2 个有效集合 -> 1 对
+
+
+def test_epsilon_online_all_repeats_failing_is_skipped_not_silently_dropped():
+    """一条主诉的全部重复都调用失败：跟"全部被安全否决"一样单独标记跳过，
+    不能让它悄悄从统计里消失、也不能跟"被拒答"混成一个原因。"""
+    def consult_fn(_):
+        raise RuntimeError("整条主诉全炸")
+
+    r = ee.estimate_epsilon_online(["主诉甲", "主诉乙"], n_repeats=2, consult_fn=consult_fn)
+    assert r["n_queries_used"] == 0
+    assert r["n_call_failures"] == 4  # 2 条主诉 × 2 次重复全部失败
+    assert r["n_attempts"] == 4
+    for q in r["per_query"]:
+        assert q["skipped"] is True
+        assert q["reason"] == "全部重复调用失败"
+        assert q["n_call_failures"] == 2
+
+
+def test_epsilon_online_does_not_crash_the_whole_batch_on_a_single_failure(capsys):
+    """跟一次 LLMError 崩掉 offline/extract_case_triples.py 之前的坑同一类：
+    4 条主诉里第 3 次调用（整体第几次调用，不分主诉/重复）失败，其余主诉/
+    重复要正常产出，不能整批跟着崩。"""
+    calls = {"n": 0}
+
+    def consult_fn(_):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("模拟第 3 次调用失败")
+        return _outcome(["党参"], ["茯苓"])
+
+    queries = ["主诉一", "主诉二", "主诉三", "主诉四"]
+    r = ee.estimate_epsilon_online(queries, n_repeats=1, consult_fn=consult_fn)
+    assert len(r["per_query"]) == 4  # 不崩：4 条主诉都产出了记录
+    assert r["n_call_failures"] == 1
+    assert "调用失败" in capsys.readouterr().err
+
+
 # ---------- estimate_epsilon_s2 ----------
 
 def test_epsilon_s2_reuses_the_same_s1(monkeypatch):
@@ -150,6 +221,71 @@ def test_epsilon_s2_detects_variation(monkeypatch):
     monkeypatch.setattr(ee, "infer_elements", fake_infer)
     r = ee.estimate_epsilon_s2(["单条"], n_repeats=4)
     assert r["mean"] > 0.0
+
+
+def test_epsilon_s2_survives_s1_failure_without_crashing_other_queries(monkeypatch):
+    """normalize()（S1）失败：这条主诉没法做 S2 重复实验，单独跳过、原因
+    标"S1 调用失败"，不跟 check_safety 拦截混在一起；其它主诉不受影响。"""
+    def flaky_normalize(complaint):
+        if complaint == "主诉甲":
+            raise RuntimeError("S1 调用炸了")
+        return S1Normalize(symptoms=["纳差"])
+
+    monkeypatch.setattr(ee, "normalize", flaky_normalize)
+    monkeypatch.setattr(ee, "check_safety", lambda symptoms: None)
+    monkeypatch.setattr(ee, "infer_elements", lambda s1: S2Elements(elements=[ElementHit(
+        element="脾", kind="location", supporting_symptoms=["纳差"], confidence="high")]))
+
+    r = ee.estimate_epsilon_s2(["主诉甲", "主诉乙"], n_repeats=2)
+    by_query = {q["query"]: q for q in r["per_query"]}
+    assert by_query["主诉甲"]["skipped"] is True
+    assert by_query["主诉甲"]["reason"] == "S1 调用失败"
+    assert by_query["主诉乙"]["skipped"] is False
+    assert r["n_call_failures"] == 1
+
+
+def test_epsilon_s2_survives_single_infer_elements_failure_and_excludes_it(monkeypatch):
+    """infer_elements()（S2）单次重复失败：不影响已经算出来的 S1、不影响
+    这条主诉的其它重复，失败的这一次不进 elem_sets，分母是真正跑成的次数
+    （n_completed），不是 n_repeats。"""
+    monkeypatch.setattr(ee, "normalize", lambda c: S1Normalize(symptoms=["纳差"]))
+    monkeypatch.setattr(ee, "check_safety", lambda symptoms: None)
+
+    responses = iter([
+        RuntimeError("模拟 S2 抖动"),
+        S2Elements(elements=[ElementHit(
+            element="脾", kind="location", supporting_symptoms=["纳差"], confidence="high")]),
+        S2Elements(elements=[ElementHit(
+            element="脾", kind="location", supporting_symptoms=["纳差"], confidence="high")]),
+    ])
+
+    def flaky_infer(s1):
+        r = next(responses)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(ee, "infer_elements", flaky_infer)
+    r = ee.estimate_epsilon_s2(["单条"], n_repeats=3)
+    q = r["per_query"][0]
+    assert q["skipped"] is False
+    assert q["n_call_failures"] == 1
+    assert q["n_completed"] == 2
+    assert q["stats"]["n_pairs"] == 1  # 2 个有效集合 -> 1 对，不是 3 次的组合数
+    assert r["n_call_failures"] == 1
+
+
+def test_epsilon_s2_all_repeats_failing_is_skipped_not_silently_dropped(monkeypatch):
+    monkeypatch.setattr(ee, "normalize", lambda c: S1Normalize(symptoms=["纳差"]))
+    monkeypatch.setattr(ee, "check_safety", lambda symptoms: None)
+    monkeypatch.setattr(ee, "infer_elements",
+                        lambda s1: (_ for _ in ()).throw(RuntimeError("S2 全炸")))
+
+    r = ee.estimate_epsilon_s2(["单条"], n_repeats=3)
+    q = r["per_query"][0]
+    assert q["skipped"] is True
+    assert q["reason"] == "全部重复调用失败"
+    assert q["n_call_failures"] == 3
 
 
 # ---------- estimate_epsilon_extract ----------
@@ -246,16 +382,22 @@ def test_dry_run_does_not_call_consult(tmp_path, monkeypatch, capsys):
 
 
 def test_main_writes_epsilon_json(tmp_path, monkeypatch):
+    """monkeypatch 的假返回字典要带上 n_call_failures/n_attempts——这两个
+    字段是本轮加的失败容忍机制新增的（main() 现在无条件读取它们去判断要不要
+    打失败率警告），不是原来就有的可选字段，缺了会 KeyError（真实实现里
+    estimate_epsilon_online/estimate_epsilon_s2 现在总是带这两个键）。"""
     queries_path = tmp_path / "queries.txt"
     queries_path.write_text("主诉一\n", encoding="utf-8")
     out_path = tmp_path / "epsilon.json"
 
     monkeypatch.setattr(ee, "estimate_epsilon_online", lambda q, n_repeats: {
         "mean": 0.1, "p50": 0.1, "p95": 0.1, "by_physician": {}, "per_query": [],
-        "n_queries": 1, "n_queries_used": 1, "n_repeats": n_repeats, "llm_calls": 4})
+        "n_queries": 1, "n_queries_used": 1, "n_repeats": n_repeats, "llm_calls": 4,
+        "n_call_failures": 0, "n_attempts": len(q) * n_repeats})
     monkeypatch.setattr(ee, "estimate_epsilon_s2", lambda q, n_repeats: {
         "mean": 0.05, "p50": 0.05, "p95": 0.05, "per_query": [],
-        "n_queries": 1, "n_queries_used": 1, "n_repeats": n_repeats, "llm_calls": 4})
+        "n_queries": 1, "n_queries_used": 1, "n_repeats": n_repeats, "llm_calls": 4,
+        "n_call_failures": 0})
 
     ee.main(["--queries-path", str(queries_path), "--out", str(out_path),
              "--cases-path", str(tmp_path / "nope.json"), "--n-repeats", "2"])

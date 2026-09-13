@@ -1176,3 +1176,107 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     除零）；另外手写脚本跑了一遍 `main(["--e3", "--e9"])`，用同一个假后端
     在第 5 次调用（落在 E3 的 own 调用上）失败，确认端到端不崩、报告里
     `n_failed` 如实反映、stdout 打出了警告。
+
+36. **条目 35 的截断修复用真实输入验证是无效的——"修复有依据"不等于"修复
+    有效"，这条本身值得记。** 用户拿触发 AutoDL 崩溃的真实输入
+    （`S2Elements` + `'{"'`）原样复现，`_looks_like_truncated_json` 仍然
+    判定为截断：`_min_plausible_output_length(S2Elements)` 算出来的下限
+    是 2（这个 schema 两个字段都有默认值、没有 required），跟崩溃输入的
+    长度打平（`2 < 2` 为 `False`），下限完全没生效。全项目扫一遍会喂给
+    `generate()` 的 pydantic 模型（`core/schemas.py` 31 个 + `eval/
+    patient_sim.py::PatientAnswer`、`eval/sdt/adapter.py` 三个），下限=2
+    的有 9 个——**这个方向本身在宽松 schema 上就是失效的**，不是这一个
+    schema 的特例。
+
+    **根因**：判断"是不是截断"需要的信息不是"这个 schema 最短能有多短"，
+    是"这次返回相对于'生成到一半被砍断'这件事本身有多短"——这跟 schema
+    松紧无关。schema 下限只能防"高估"（把真实很长的最短实例误判成短），
+    防不住"schema 本身就允许极短合法实例"这种情况。
+
+    **修法**：改成两者取较大值——`TRUNCATION_MIN_LENGTH = 100`（绝对下限）
+    和 `_min_plausible_output_length(schema)`（schema 结构下限）取 max。
+    100 这个数不是拍的，是这个项目里两个真实观测量之间的一个保守分界：
+    X3（`offline/extract_case_triples.py`）那次真实截断发生在 20724 字符；
+    `S3Syndrome`（本项目最重的 schema）结构下限就有 195，真实带三个候选
+    方剂的输出实测 1500+ 字符；这次误判的输入只有 2 字符——任何 schema 的
+    真实截断都不会只产出两位数字符，那不是"被砍断"，是"几乎没输出"，只
+    可能是 API 抖动/限流，应该重试。
+
+    **这轮吸取的教训，写进流程**：上一轮"验证过了"其实只验证了 schema
+    本身有严格 required 字段的情况（`Tiny`：`bool` + `str(min_length=1)`，
+    下限 23），没有拿一个"全字段可选"的 schema 试过——而这类 schema 在
+    `core/schemas.py` 里占了近三分之一（9/31）。这次的教训不是"要测得更多"
+    这种空话，是具体的："修复某个下限/阈值类判断时，必须拿这个判断在
+    **它所有输入类型的两端**（这里是"schema 约束最严"和"schema 约束最松"）
+    都试一遍，不能只拿手边现成的那个 schema 验证一次就当作代表了所有情况。"
+    新增的 `test_truncation_min_length_floor_covers_every_generate_schema`
+    把这条钉死：扫全部真实 schema，断言每一个的门槛都不低于
+    `TRUNCATION_MIN_LENGTH`，不是只测两三个手挑的例子。
+
+    **顺带修的两处**：① `LLMTruncatedError` 的消息原来打
+    `max_tokens=None`，容易让人以为配置丢了要去查环境变量——区分"未设置
+    （走后端默认值）"和"设置了具体值"两种情况。② `core/chain.py` 的
+    `divergence["method"]` 曾写成 `"pairwise_herb_jaccard"`，但顶层
+    `herb_jaccard` 字段实际是 `set.intersection(*herb_sets)` 算的 n 方
+    交并比，不是两两配对——`pairs`（`pairwise_divergence()` 产出）才是真
+    两两配对，标签只描述了后者、误导了前者。改成 `"nway_jaccard+pairwise"`，
+    不改任何一个字段的算法本身（E3/E4/E9 的历史数字都基于 `herb_jaccard`，
+    改算法就不可比）。
+
+    **深度审查带出的第三个问题（跟前两个不是同一类，但同一轮一起处理）**：
+    `offline/estimate_epsilon.py` 的 `estimate_epsilon_online`/
+    `estimate_epsilon_s2` 两条路径原来完全没有异常捕获——`estimate_epsilon_
+    extract` 早就有（单条抽取失败记 `n_extraction_failures`、continue），
+    但这个教训没有传到同一个文件里的另外两个函数，也没有传到
+    `eval/sdt/run.py`（50 条记录 × 4 次调用的 `solver.solve()` 循环）。
+    补的方式跟条目 35（run_eval.py 三个收集器）同一个模式：单次重复调用
+    失败不算进这条主诉的"有效重复次数"（不是拿 `n_repeats` 硬除，是
+    `n_repeats - n_call_failures`），全部重复都失败时单独标记跳过（不是
+    留一个 `stats=None`/`elem_sets=[]` 混在"跑成了但凑不出两个集合可比"
+    这种正常情况里）。`eval/sdt/run.py` 的特殊之处：官方评分脚本按记录数
+    对齐提交文件，调用失败的记录必须占位提交一条空答案（跟安全否决同样
+    的空壳、同样得 0 分），但绝不能写进 `answer.safety_rejected`——那个
+    字段代表系统真的拦截了这条，调用失败是基础设施抖动，两者混在一起会
+    让人误判系统的安全否决率，单独一个 `call_failed` 字段记。
+
+    失败分类（`type(err.__cause__).__name__`，不解析错误字符串——X3 那轮
+    定下的规矩）和"失败率超阈值打警告"这两件事在 `run_eval.py`/
+    `estimate_epsilon.py`/`sdt/run.py` 三处是完全相同的逻辑，之前
+    `run_eval.py` 自己实现了一份（还漏了 `__cause__` 解包，裸打
+    `type(e).__name__` 只会看到"LLMError"），收进 `core/batch.py`
+    （`classify_llm_failure`/`warn_if_failure_rate_high`/
+    `FAILURE_RATE_WARNING_THRESHOLD`）三处一起用。**没有抽的部分**：
+    每个收集器"怎么记录失败样本、失败样本占不占哪个分母"这件事本身没有
+    抽象——四处的数据形状完全不同（pairs 列表 / 集合列表 / 答题记录），
+    硬凑一个通用签名比各自的 10 行 try/except 更难读，这是判断过的
+    "不抽"，不是漏抽，理由写在 `core/batch.py` 的模块文档字符串里。
+
+    **第四个问题**：`query_case_graph` 查患者现代说法「胃脘胀痛」查不到
+    医案三元组，而三元组存的是医案原文的古文简写「脘痛」（AutoDL 实测
+    417 条）——两个词面上没有公共子串，`_symptom_text_matches` 现有的字面
+    双向包含/并列片段拆分都够不到，是术语映射问题，跟 λ1 恒 0、
+    `element_index` 覆盖率 47% 同一根：医案原文用的是古代医家自己的措辞，
+    患者/S1 normalize 用的是现代标准词。**这条没有、也不可能在这一轮真正
+    解决**——系统性解决需要阶段二/三给每个症状词建标准化映射表，这轮只做
+    了一个有确凿证据支撑、范围明确的局部改进：给 `_symptom_text_matches`
+    加一层兜底，字面够不到时查 `core.syndrome_norm.SYNONYMS`（本来就在用
+    于医案门类归一化，两个消费者共用同一张表，不是新开一套）；往表里加了
+    `"脘痛": "胃痛"`（`data/ye_tianshi/ye_tianshi-0020.json` 原文有"先已
+    脘痛引背"，`data/standard/diseases.jsonl` 的"胃痛"条目本来就把"胃脘
+    胀痛"等列为 cardinal 症状，这条映射不是编的）。**明确不覆盖的范围**：
+    像"嗳气"这种没有登记在 SYNONYMS 任何门类下的具体症状词依然查不到——
+    加一条测试确认了这一点（`test_query_case_graph_does_not_over_match_
+    unrelated_symptoms`），不让这次局部改进被误读成"问题已解决"。
+
+    **第五个问题**：`tests/test_api_stream.py` 的 `live_server` fixture
+    等待 `/health` 的预算硬编码 60 秒，在有真实 `cases.json` 的机器
+    （AutoDL）上稳定超时。根因：`api/main.py` 的 ASGI lifespan 会让预热
+    线程（加载 embedding、编码几百条医案）跑到 `WARMUP_TIMEOUT_SECONDS`
+    （默认 120 秒）才放弃等待、开始服务，`/health` 在 lifespan 的 startup
+    阶段跑完之前不会应答——60 秒是另一个独立维护、跟服务器自己的等待上限
+    没有关联的数字，AutoDL 上真实预热耗时落在 60~120 秒之间时，测试的
+    等待预算比服务器自己的等待上限还短，永远等不到。改成
+    `WARMUP_TIMEOUT_SECONDS + 30`（30 秒是预热之外的开销缓冲，不是给预热
+    本身留的），两个数字从此只有一个来源。抽成 `_live_server_health_check_
+    budget()` 函数是为了能不真的起服务器等 120+ 秒就测这个关系式本身
+    （tests/ 要秒级跑完），而不是无法验证只能靠读代码信。

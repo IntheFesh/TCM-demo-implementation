@@ -142,6 +142,36 @@ def _min_plausible_output_length(schema: type[BaseModel]) -> int:
     return _min_json_length(full, full.get("$defs", {}))
 
 
+# **AutoDL 实测复现：_min_plausible_output_length 单独当下限对宽松 schema 形同
+# 虚设。** S2Elements 的两个字段都有默认值、没有 required，最短合法实例就是
+# "{}" = 2 字符——schema 越宽松这个下限就越趋近 2，而真实崩溃的返回恰好也是
+# 2 字符（`{"`），下限="2 < 2"判定为 False，完全挡不住。全项目扫一遍会调用
+# generate() 的 schema：CaseStructured/CaseTripleExtraction/FormulaSafety/
+# FormularyExtraction/MateriaMedicaExtraction/S1Normalize/S2Elements/
+# SegmentPatients/VisitStructured/SelectedOptions 等一大批都是 2（字段全部
+# 可选或压根没有必填约束），这个方向本身在这些 schema 上就是无效防护。
+#
+# 真正该问的不是"这个 schema 最短能有多短"，是"这次返回相对于一次正常/被
+# 真实砍断的生成，短到什么程度"——这跟 schema 松紧无关，跟"生成到一半被
+# max_tokens 砍断"这个事件本身的性质有关：砍断的前提是已经生成了相当多
+# 内容，不可能只有几个字符。用这个项目里两次真实观测定绝对下限：
+#   - X3（offline/extract_case_triples.py）那次真实截断发生在 20724 字符处
+#   - S3Syndrome（本项目最重的输出 schema）光结构下限就是 195，真实带三个
+#     候选方剂的输出实测 1500+ 字符
+#   - 这次误判的输入只有 2 字符
+# 100 字符是这三个数字之间一个保守的分界：任何 schema 的真实截断都不会只
+# 产出两位数字符——那不是"被砍断"，是"几乎没输出"，只可能是 API 抖动/限流，
+# 应该重试。跟 schema 下限取较大值：宽松 schema 用这个绝对下限兜底，严格
+# schema（S3Syndrome=195）用它自己更高的结构下限。
+TRUNCATION_MIN_LENGTH = 100
+
+
+def _truncation_length_threshold(schema: type[BaseModel]) -> int:
+    """截断判定的实际长度门槛：schema 结构下限和绝对下限取较大值，见
+    TRUNCATION_MIN_LENGTH 的文档字符串。"""
+    return max(TRUNCATION_MIN_LENGTH, _min_plausible_output_length(schema))
+
+
 def _looks_like_truncated_json(error: Exception, text: str, schema: type[BaseModel]) -> bool:
     """区分"输出被截断"和"随便一种 JSON 语法错误"。
 
@@ -155,12 +185,14 @@ def _looks_like_truncated_json(error: Exception, text: str, schema: type[BaseMod
     不看 max_tokens 数字本身：token 数和字符数的换算在中文文本上不可靠，
     "解析失败的位置是不是文本末尾"是更直接、不需要猜换算比例的信号。
 
-    但"末尾"本身不够：文本短到连这个 schema 的最短合法实例都编不出来时，
-    不管 EOF 落在哪，都不可能是"生成到一半被砍断"——那需要先生成足够内容
-    才谈得上"半路被砍"。这一步查 _min_plausible_output_length，见它的文档
-    字符串（AutoDL 实测的 2 字符误判就是这里补上的）。
+    但"末尾"本身不够：文本短到连 _truncation_length_threshold(schema) 都够不到
+    时，不管 EOF 落在哪，都不可能是"生成到一半被砍断"——那需要先生成足够
+    内容才谈得上"半路被砍"。门槛是 schema 结构下限和绝对下限
+    （TRUNCATION_MIN_LENGTH）取较大值，不是单独用 schema 下限——见后者的
+    文档字符串：单独用 schema 下限在宽松 schema 上形同虚设
+    （AutoDL 实测 S2Elements + 2 字符输入就是这么漏过的）。
     """
-    if len(text) < _min_plausible_output_length(schema):
+    if len(text) < _truncation_length_threshold(schema):
         return False
     errors = getattr(error, "errors", None)
     if not callable(errors):
@@ -294,11 +326,18 @@ class LLMBackend(ABC):
                 # 同一处再次被截断，三次重试只是白烧三次调用。直接失败，
                 # 让调用方（比如 X3 批量抽取）决定要不要跳过这条输入。
                 if _looks_like_truncated_json(e, stripped, schema):
+                    # max_tokens=None 不是"没配置成功"，是"这次调用没有显式传，
+                    # 会走各后端自己的默认值"（比如 OpenAICompatBackend 走
+                    # LLM_MAX_TOKENS 或 8192）——原来直接打 "max_tokens=None"
+                    # 容易让人以为配置丢了，去查环境变量，其实哪儿都没错。
+                    max_tokens_desc = (
+                        "未设置（走后端默认值）" if max_tokens is None else str(max_tokens)
+                    )
                     raise LLMTruncatedError(
                         f"疑似输出在 max_tokens 上限处被截断（JSON 在文本末尾附近"
                         f"解析失败，不是格式错误，不会重试）。backend={self.backend_id()}, "
                         f"model={self.model_name()}, schema={schema.__name__}, "
-                        f"原始返回长度={len(stripped)} 字符, max_tokens={max_tokens}, "
+                        f"原始返回长度={len(stripped)} 字符, max_tokens={max_tokens_desc}, "
                         f"原始错误={e}"
                     ) from e
                 if attempt < self.MAX_ATTEMPTS - 1:

@@ -61,6 +61,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core.batch import classify_llm_failure, warn_if_failure_rate_high
 from core.retrieval import MIN_RETRIEVAL_SCORE
 # ε 文件的路径和读法只在 core/chain.py 一处：这里之前有一份逐字相同的拷贝
 from core.chain import EPSILON_PATH, load_epsilon_online, load_epsilon_online_detail
@@ -265,9 +266,10 @@ GATE_OUTPUT_CHANGE_RATE = 0.40  # E3/E4 的闸门；E9 只报数、不设闸门�
 # 跑完的全丢——跟 core.chain.consult_many 已经修过的坑同一类。三个收集器
 # （collect_ablation_pairs/collect_refs_mode_pairs/collect_retriever_mode_samples）
 # 都要单条失败容忍：失败的 (主诉,医家) 记下来、跳过，不崩，但失败率太高时
-# 结果本身就不可信了，要有人能看见——0.20 是"少量 API 抖动可以接受，
-# 大量失败说明这次跑的结果不能用"这两者之间的一个保守分界，不是精确值。
-FAILURE_RATE_WARNING_THRESHOLD = 0.20
+# 结果本身就不可信了，要有人能看见。失败分类（type(err.__cause__).__name__）
+# 和"失败率超阈值打警告"这两件事 estimate_epsilon.py/sdt/run.py 也要做
+# 同样的事，按 CLAUDE.md「同一概念的匹配逻辑只能有一处实现」收进
+# core/batch.py，这里不再各写一份。
 
 
 def _call_failed_pair(query: str, error: BaseException) -> dict:
@@ -278,29 +280,16 @@ def _call_failed_pair(query: str, error: BaseException) -> dict:
     本身没跑成。两者必须能区分——ablation_output_effect 的 note 要分别报
     "有多少条被安全否决" vs "有多少条调用失败"，混在一起会让人看错原因去查错
     地方（明明是 API 抖动，却去查安全否决逻辑）。
+
+    "reason" 里的失败类型用 classify_llm_failure（取 __cause__ 的真实异常
+    类型名），不是裸的 type(error).__name__——error 这里几乎总是
+    core.llm.LLMError，裸打类型名只会看到"LLMError"，看不出是超时、限流
+    还是别的，四处失败分类要统一口径（X3 那轮定下的规矩）。
     """
     return {
         "query": query, "skipped": True, "skip_reason": "call_failed",
-        "reason": f"consult() 调用失败：{type(error).__name__}: {error}",
+        "reason": f"consult() 调用失败：{classify_llm_failure(error)}: {error}",
     }
-
-
-def _warn_if_failure_rate_high(label: str, n_failed: int, n_total: int) -> None:
-    """失败率超过 FAILURE_RATE_WARNING_THRESHOLD 时在 stdout 打醒目警告。
-
-    只在 main() 里调用（报告本身在 n_failed/note 字段里已经如实记了数，这个
-    函数只管"要不要额外吼一声"）——离线测试单独测这个函数本身，不用真的跑
-    main()。n_total=0 时不判定（没有样本谈不上失败率），避免除零。
-    """
-    if n_total <= 0:
-        return
-    rate = n_failed / n_total
-    if rate > FAILURE_RATE_WARNING_THRESHOLD:
-        print(
-            f"⚠️  警告：{label} 有 {n_failed}/{n_total}（{rate:.1%}）条样本因 consult() "
-            f"调用失败被跳过，超过 {FAILURE_RATE_WARNING_THRESHOLD:.0%} 的警戒线——"
-            "这次结果的可信度存疑，建议检查 LLM 后端是否稳定后重跑，不要直接采信。"
-        )
 
 
 def _herb_pairs_from_outcomes(query: str, baseline: dict, ablated: dict) -> list[dict]:
@@ -394,7 +383,7 @@ def collect_ablation_pairs(
             baseline = consult_fn(query, **{**isolating_defaults, **baseline_kwargs})
             ablated = consult_fn(query, **{**isolating_defaults, **ablated_kwargs})
         except Exception as e:  # noqa: BLE001 - 单条失败不能拖累其余（core.chain.consult_many 同一模式）
-            print(f"[collect_ablation_pairs] 「{query}」调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+            print(f"[collect_ablation_pairs] 「{query}」调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
             pairs.append(_call_failed_pair(query, e))
             continue
         pairs.extend(_herb_pairs_from_outcomes(query, baseline, ablated))
@@ -426,7 +415,7 @@ def collect_refs_mode_pairs(
         try:
             baseline = consult_fn(query, refs_mode="own", use_react=False, ask_fn=None)
         except Exception as e:  # noqa: BLE001 - own 失败波及本条查询的所有 ablated_mode，不拖累其它查询
-            print(f"[collect_refs_mode_pairs] 「{query}」own 调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+            print(f"[collect_refs_mode_pairs] 「{query}」own 调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
             for mode in ablated_modes:
                 pairs_by_mode[mode].append(_call_failed_pair(query, e))
             continue
@@ -434,7 +423,7 @@ def collect_refs_mode_pairs(
             try:
                 ablated = consult_fn(query, refs_mode=mode, use_react=False, ask_fn=None)
             except Exception as e:  # noqa: BLE001 - 只影响这一个 mode
-                print(f"[collect_refs_mode_pairs] 「{query}」{mode} 调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+                print(f"[collect_refs_mode_pairs] 「{query}」{mode} 调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
                 pairs_by_mode[mode].append(_call_failed_pair(query, e))
                 continue
             pairs_by_mode[mode].extend(_herb_pairs_from_outcomes(query, baseline, ablated))
@@ -664,7 +653,7 @@ def collect_retriever_mode_samples(
             except Exception as e:  # noqa: BLE001 - 单个模式失败不拖累其它模式/查询
                 print(
                     f"[collect_retriever_mode_samples] 「{query}」{mode} 调用失败："
-                    f"{type(e).__name__}: {e}", file=sys.stderr,
+                    f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
                 )
                 failed.append(mode)
                 continue
@@ -829,7 +818,7 @@ def collect_react_process_samples(queries: list[str], consult_fn=None) -> list[d
         try:
             outcome = consult_fn(query, use_react=True, ask_fn=None)
         except Exception as e:  # noqa: BLE001 - 单条失败不能拖累其余（core.chain.consult_many 同一模式）
-            print(f"[collect_react_process_samples] 「{query}」调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+            print(f"[collect_react_process_samples] 「{query}」调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
             continue
         if outcome["rejected"] or outcome["insufficient"]:
             continue
@@ -1206,7 +1195,7 @@ def main(argv: list[str] | None = None) -> None:
             report["ablations"].append(effect)
             tag = "E3" if mode == "swapped" else "E4"
             print(f"{tag}：{effect['note']}")
-            _warn_if_failure_rate_high(tag, effect["n_failed"], effect["n_total"])
+            warn_if_failure_rate_high(tag, effect["n_failed"], effect["n_total"])
 
     if args.e8:
         print(f"正在跑 E8（{sorted(ALLOWED_MODES)} 四种检索模式）……")
@@ -1214,7 +1203,7 @@ def main(argv: list[str] | None = None) -> None:
         e8 = retriever_mode_output_effect(records, sorted(ALLOWED_MODES))
         report["retriever_mode_effect"] = e8
         print(f"E8：{e8['note']}")
-        _warn_if_failure_rate_high("E8", e8["n_failed_queries"], e8["n_total"])
+        warn_if_failure_rate_high("E8", e8["n_failed_queries"], e8["n_total"])
 
     if args.e9:
         print("正在跑 E9（use_react False vs True）……")
@@ -1225,7 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
         e9_effect = ablation_output_effect(pairs, epsilon_detail, "react_on")
         report["ablations"].append(e9_effect)
         print(f"E9（输出差异）：{e9_effect['note']}")
-        _warn_if_failure_rate_high("E9（输出差异）", e9_effect["n_failed"], e9_effect["n_total"])
+        warn_if_failure_rate_high("E9（输出差异）", e9_effect["n_failed"], e9_effect["n_total"])
 
         process_records = collect_react_process_samples(queries)
         e9_process = react_process_summary(process_records)

@@ -970,7 +970,15 @@ def consult(
         # 药物集合了，字段一直没跟着改）。herb_jaccard 保留：它是"三家共用"的
         # n 方交并比，三位医家时只有三家都用的药才算共同，天然偏向 1.0，
         # 分不清师承内（叶×吴）和跨学派（叶×张、吴×张）——pairs 才分得清。
-        "method": "pairwise_herb_jaccard",
+        #
+        # method 的值要如实描述这两个字段各自的算法，不能只报一半：曾经写成
+        # "pairwise_herb_jaccard"，但那只是 pairs 的算法——herb_jaccard 本身
+        # 用的是上面几行的 set.intersection(*herb_sets)/set.union(*herb_sets)，
+        # 是 n 方交并比，不是两两配对。读这个 dict 的人只看 method 字段会以为
+        # herb_jaccard 也是两两算的，被这个标签本身带偏——不能改 herb_jaccard
+        # 的算法本身（E3/E4/E9 的历史数字都基于它，改了就不可比），只改
+        # 这个描述性标签，让它跟两个字段的真实算法对得上。
+        "method": "nway_jaccard+pairwise",
         # 0=用药完全一致，1=毫无重叠（n 方交并比，见上）
         "herb_jaccard": round(herb_jaccard, 3) if herb_jaccard is not None else None,
         "shared_herbs": shared_herbs,

@@ -467,8 +467,11 @@ def test_divergence_true_when_syndromes_differ(monkeypatch):
     assert outcome["divergence"]["same"] is False
     # 1.3（E2）有意的契约变更：method 从过时的 "exact_string_match"（第一版按
     # 证型名字符串比对，早就换成药物集合了，字段一直没跟着改）改成
-    # "pairwise_herb_jaccard"——主指标是两两配对的药物 Jaccard 距离。
-    assert outcome["divergence"]["method"] == "pairwise_herb_jaccard"
+    # "nway_jaccard+pairwise"——本轮再次修正：之前一度写成 "pairwise_herb_
+    # jaccard"，但那只描述了 pairs 的算法，顶层 herb_jaccard 字段本身其实是
+    # n 方交并比（set.intersection(*herb_sets)），不是两两配对，标签跟实际
+    # 算法对不上会误导只看这个字段的人。见 core/chain.py 里这个字段旁的注释。
+    assert outcome["divergence"]["method"] == "nway_jaccard+pairwise"
 
 
 def test_hallucination_detected_when_cited_id_not_in_refs(monkeypatch):
@@ -1288,7 +1291,7 @@ def test_pairwise_divergence_three_physicians_separates_lineage_from_cross_schoo
 
     div = chain.consult("纳差乏力")["divergence"]
 
-    assert div["method"] == "pairwise_herb_jaccard"
+    assert div["method"] == "nway_jaccard+pairwise"
     by_pair = {(p["a"], p["b"]): p for p in div["pairs"]}
     assert set(by_pair) == {("ye_tianshi", "wu_jutong"), ("ye_tianshi", "zhang_xichun"),
                             ("wu_jutong", "zhang_xichun")}
