@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.llm import LLMError
 from eval import run_eval as re
 
 
@@ -287,7 +288,7 @@ def test_collect_ablation_pairs_skips_when_baseline_side_rejected():
     pairs = re.collect_ablation_pairs(
         ["主诉甲"], {"use_react": False}, {"use_react": True}, consult_fn=consult_fn
     )
-    assert pairs == [{"query": "主诉甲", "skipped": True,
+    assert pairs == [{"query": "主诉甲", "skipped": True, "skip_reason": "safety_or_insufficient",
                        "reason": "基线或消融侧被安全否决/信息不足，无法配对比较"}]
 
 
@@ -349,6 +350,181 @@ def test_collect_refs_mode_pairs_shares_own_across_modes():
     assert calls.count("swapped") == 1 and calls.count("none") == 1
     assert pairs_by_mode["swapped"][0]["ablated_herbs"] == {"黄芪"}
     assert pairs_by_mode["none"][0]["ablated_herbs"] == set()
+
+
+# ---------- 失败容忍：一次 LLMError 不能崩掉整批（AutoDL 实测教训复现）----------
+#
+# E9 全套要跑约 45 分钟、上千次调用，跑到一半撞上一次 API 抖动/限流就崩掉，
+# 前面已经跑完的几十条全部丢失，代价太大——跟 core.chain.consult_many 已经
+# 修过的坑同一类。下面几条测试用一个"在第 N 次调用时抛 LLMError、其余调用
+# 正常返回"的假后端复现这个场景，断言三个收集器都不崩、失败的样本被结构化
+# 记下来（不是静默消失），且不计入 ablation_output_effect/
+# retriever_mode_output_effect 的改变率分母。
+
+
+def _consult_fn_failing_on_call(n: int, ok_result_fn):
+    """构造一个整个调用序列第 n 次（不区分 baseline/ablated/模式）抛 LLMError
+    的假后端，其余调用正常返回 ok_result_fn(query, **kwargs)——复现"跑到一半
+    某一次调用炸了，前后调用都正常"这个真实场景，不是"这个模式/这条主诉
+    永远失败"。"""
+    state = {"n": 0}
+
+    def consult_fn(query, **kwargs):
+        state["n"] += 1
+        if state["n"] == n:
+            raise LLMError(f"模拟第 {n} 次调用失败（API 抖动/限流）")
+        return ok_result_fn(query, **kwargs)
+
+    return consult_fn
+
+
+def test_collect_ablation_pairs_tolerates_call_failure_and_continues(capsys):
+    def ok(query, **kwargs):
+        herbs = {False: {"叶天士": ["党参"]}, True: {"叶天士": ["党参", "黄芪"]}}
+        return _fake_consult(herbs_by_physician=herbs[kwargs["use_react"]])
+
+    queries = ["主诉一", "主诉二", "主诉三", "主诉四"]
+    # 每条主诉 2 次调用（baseline+ablated），第 3 次落在"主诉二"的 baseline 上。
+    consult_fn = _consult_fn_failing_on_call(3, ok)
+
+    pairs = re.collect_ablation_pairs(
+        queries, {"use_react": False}, {"use_react": True}, consult_fn=consult_fn,
+    )
+    assert len(pairs) == 4  # 不崩：4 条主诉都产出了记录，没有丢失
+    failed = [p for p in pairs if p.get("skip_reason") == "call_failed"]
+    assert len(failed) == 1
+    assert failed[0]["query"] == "主诉二"
+    ok_queries = {p["query"] for p in pairs if not p.get("skipped")}
+    assert ok_queries == {"主诉一", "主诉三", "主诉四"}
+    assert "调用失败" in capsys.readouterr().err
+
+
+def test_collect_refs_mode_pairs_own_failure_marks_all_modes_failed_for_that_query(capsys):
+    """own 调用失败波及本条查询的所有 ablated_mode（own 都没跑成，任何模式都
+    没法配对），但不影响其它查询。"""
+    def consult_fn(query, **kwargs):
+        if kwargs["refs_mode"] == "own" and query == "主诉二":
+            raise LLMError("own 调用炸了")
+        herbs = {"own": ["党参"], "swapped": ["黄芪"], "none": []}
+        return _fake_consult(herbs_by_physician={"叶天士": herbs[kwargs["refs_mode"]]})
+
+    pairs_by_mode = re.collect_refs_mode_pairs(
+        ["主诉一", "主诉二"], ["swapped", "none"], consult_fn=consult_fn,
+    )
+    for mode in ("swapped", "none"):
+        failed = [p for p in pairs_by_mode[mode] if p.get("skip_reason") == "call_failed"]
+        assert len(failed) == 1 and failed[0]["query"] == "主诉二"
+        ok_queries = {p["query"] for p in pairs_by_mode[mode] if not p.get("skipped")}
+        assert ok_queries == {"主诉一"}
+    assert "调用失败" in capsys.readouterr().err
+
+
+def test_collect_refs_mode_pairs_single_mode_failure_does_not_affect_other_mode():
+    """某个 ablated_mode 单独调用失败只影响那一个模式，own 已经跑成了，
+    另一个模式不受牵连。"""
+    def consult_fn(query, **kwargs):
+        if kwargs["refs_mode"] == "swapped":
+            raise LLMError("swapped 调用炸了")
+        herbs = {"own": ["党参"], "none": []}
+        return _fake_consult(herbs_by_physician={"叶天士": herbs[kwargs["refs_mode"]]})
+
+    pairs_by_mode = re.collect_refs_mode_pairs(
+        ["主诉一"], ["swapped", "none"], consult_fn=consult_fn,
+    )
+    assert pairs_by_mode["swapped"][0]["skip_reason"] == "call_failed"
+    assert pairs_by_mode["none"][0]["skipped"] is False
+
+
+def test_collect_retriever_mode_samples_tolerates_call_failure(capsys):
+    def consult_fn(query, **kwargs):
+        if kwargs["retriever_mode"] == "graph" and query == "主诉二":
+            raise LLMError("graph 调用炸了")
+        herbs = {"dense": ["党参"], "graph": ["党参", "白术"]}
+        return {
+            "retrieval_error": None, "rejected": False, "insufficient": False,
+            "results": [{"physician": "叶天士",
+                         "s3": SimpleNamespace(herbs=herbs[kwargs["retriever_mode"]])}],
+        }
+
+    records = re.collect_retriever_mode_samples(
+        ["主诉一", "主诉二"], ["dense", "graph"], consult_fn=consult_fn,
+    )
+    by_query: dict[str, list[dict]] = {}
+    for r in records:
+        by_query.setdefault(r["query"], []).append(r)
+    assert by_query["主诉一"][0]["n_modes_available"] == 2
+    q2 = by_query["主诉二"][0]
+    assert q2["failed_modes"] == ["graph"]
+    assert q2["n_modes_available"] == 1  # dense 那次正常，graph 那次失败
+    assert "调用失败" in capsys.readouterr().err
+
+
+def test_collect_retriever_mode_samples_all_modes_failing_leaves_fallback_record():
+    """一条主诉所有模式全部失败：不能悄悄消失（否则失败率算不出来），
+    补一条 physician=None 的兜底记录，把 failed_modes 带出来。"""
+    def consult_fn(query, **kwargs):
+        raise LLMError("整条主诉全炸")
+
+    records = re.collect_retriever_mode_samples(["主诉一"], ["dense", "graph"], consult_fn=consult_fn)
+    assert len(records) == 1
+    assert records[0]["physician"] is None
+    assert records[0]["failed_modes"] == ["dense", "graph"]
+    assert records[0]["n_modes_available"] == 0
+
+
+def test_ablation_output_effect_excludes_call_failed_pairs_from_change_rate_denominator():
+    """失败样本的分母排除：change_rate 只应该由真正跑成的样本算，n_failed
+    单独报出，不悄悄消失、也不混进"被安全否决"的计数。"""
+    pairs = [
+        {"skipped": False, "query": "q1", "physician": "叶天士",
+         "own_herbs": {"党参"}, "ablated_herbs": {"黄芪"}},  # 距离 1
+        {"query": "q2", "skipped": True, "skip_reason": "call_failed", "reason": "x"},
+    ]
+    r = re.ablation_output_effect(pairs, epsilon_online_detail=None, label="react_on")
+    assert r["n_total"] == 2
+    assert r["n_usable"] == 1
+    assert r["n_failed"] == 1
+    assert r["n_scored"] == 1
+    assert r["change_rate"] == pytest.approx(1.0)
+    assert "调用失败" in r["note"]
+
+
+def test_ablation_output_effect_all_pairs_call_failed_reports_n_failed_and_note():
+    pairs = [
+        {"query": "q1", "skipped": True, "skip_reason": "call_failed", "reason": "x"},
+        {"query": "q2", "skipped": True, "skip_reason": "call_failed", "reason": "y"},
+    ]
+    r = re.ablation_output_effect(pairs, None, "react_on")
+    assert r["n_failed"] == 2
+    assert r["change_rate"] is None
+    assert "调用失败" in r["note"]
+
+
+def test_retriever_mode_output_effect_counts_failed_queries_separately():
+    records = [
+        {"query": "q1", "physician": "叶天士", "herb_sets": [{"党参"}, {"黄芪"}],
+         "n_modes_available": 2, "unavailable_modes": [], "failed_modes": []},
+        {"query": "q2", "physician": None, "herb_sets": [], "n_modes_available": 0,
+         "unavailable_modes": [], "failed_modes": ["dense", "graph"]},
+    ]
+    r = re.retriever_mode_output_effect(records, ["dense", "graph"])
+    assert r["n_failed_queries"] == 1
+    assert r["n_failed_by_mode"] == {"dense": 1, "graph": 1}
+    assert "全部失败" in r["note"]
+
+
+def test_warn_if_failure_rate_high_triggers_above_threshold(capsys):
+    re._warn_if_failure_rate_high("E9", 3, 10)  # 30% > 20% 阈值
+    assert "警告" in capsys.readouterr().out
+
+
+def test_warn_if_failure_rate_high_silent_at_or_below_threshold(capsys):
+    re._warn_if_failure_rate_high("E9", 2, 10)  # 恰好等于 20% 阈值，不触发
+    assert capsys.readouterr().out == ""
+
+
+def test_warn_if_failure_rate_high_no_samples_does_not_divide_by_zero():
+    re._warn_if_failure_rate_high("E9", 0, 0)  # 不该抛 ZeroDivisionError
 
 
 def test_ablation_output_effect_change_rate_is_mean_jaccard_distance():

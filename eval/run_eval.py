@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -260,6 +261,47 @@ def retrieval_mode_comparison(
 GATE_OUTPUT_CHANGE_RATE = 0.40  # E3/E4 的闸门；E9 只报数、不设闸门（过程性开关，
                                  # "改变了多少"不像"有没有参考医案"那样有天然及格线）
 
+# AutoDL 实测教训：E9 跑到一半，一次 LLM 调用炸了（LLMError）就崩掉整批，前面
+# 跑完的全丢——跟 core.chain.consult_many 已经修过的坑同一类。三个收集器
+# （collect_ablation_pairs/collect_refs_mode_pairs/collect_retriever_mode_samples）
+# 都要单条失败容忍：失败的 (主诉,医家) 记下来、跳过，不崩，但失败率太高时
+# 结果本身就不可信了，要有人能看见——0.20 是"少量 API 抖动可以接受，
+# 大量失败说明这次跑的结果不能用"这两者之间的一个保守分界，不是精确值。
+FAILURE_RATE_WARNING_THRESHOLD = 0.20
+
+
+def _call_failed_pair(query: str, error: BaseException) -> dict:
+    """collect_ablation_pairs/collect_refs_mode_pairs 里 consult_fn 调用本身
+    抛异常时用——形状跟 _herb_pairs_from_outcomes 里"安全否决/信息不足"的跳过
+    条目一样（都是 "skipped": True，都不进 change_rate 分母），但 skip_reason
+    不同：那边是 consult() 正常返回、只是业务上判定不可比较；这边是 consult()
+    本身没跑成。两者必须能区分——ablation_output_effect 的 note 要分别报
+    "有多少条被安全否决" vs "有多少条调用失败"，混在一起会让人看错原因去查错
+    地方（明明是 API 抖动，却去查安全否决逻辑）。
+    """
+    return {
+        "query": query, "skipped": True, "skip_reason": "call_failed",
+        "reason": f"consult() 调用失败：{type(error).__name__}: {error}",
+    }
+
+
+def _warn_if_failure_rate_high(label: str, n_failed: int, n_total: int) -> None:
+    """失败率超过 FAILURE_RATE_WARNING_THRESHOLD 时在 stdout 打醒目警告。
+
+    只在 main() 里调用（报告本身在 n_failed/note 字段里已经如实记了数，这个
+    函数只管"要不要额外吼一声"）——离线测试单独测这个函数本身，不用真的跑
+    main()。n_total=0 时不判定（没有样本谈不上失败率），避免除零。
+    """
+    if n_total <= 0:
+        return
+    rate = n_failed / n_total
+    if rate > FAILURE_RATE_WARNING_THRESHOLD:
+        print(
+            f"⚠️  警告：{label} 有 {n_failed}/{n_total}（{rate:.1%}）条样本因 consult() "
+            f"调用失败被跳过，超过 {FAILURE_RATE_WARNING_THRESHOLD:.0%} 的警戒线——"
+            "这次结果的可信度存疑，建议检查 LLM 后端是否稳定后重跑，不要直接采信。"
+        )
+
 
 def _herb_pairs_from_outcomes(query: str, baseline: dict, ablated: dict) -> list[dict]:
     """单条主诉的一次基线 consult() 结果和一次消融 consult() 结果，拆成按医家
@@ -277,7 +319,7 @@ def _herb_pairs_from_outcomes(query: str, baseline: dict, ablated: dict) -> list
     ablated_ok = not ablated["rejected"] and not ablated["insufficient"]
     if not (baseline_ok and ablated_ok):
         return [{
-            "query": query, "skipped": True,
+            "query": query, "skipped": True, "skip_reason": "safety_or_insufficient",
             "reason": "基线或消融侧被安全否决/信息不足，无法配对比较",
         }]
     baseline_by_physician = {r["physician"]: r for r in baseline["results"]}
@@ -337,13 +379,24 @@ def collect_ablation_pairs(
     效果，混进另一个抖动源就说不清改变率是哪个开关造成的——跟
     estimate_epsilon_online 隔离变量的理由一样），baseline_kwargs/
     ablated_kwargs 里显式传了同名参数会覆盖它——E9 就是要覆盖 use_react。
+
+    某条主诉的 baseline/ablated 两次调用只要有一次抛异常，这条主诉就单独记
+    一条 skip_reason="call_failed" 的跳过条目、打到 stderr，不让整批崩掉——
+    跟 core.chain.consult_many 对付单条主诉失败是同一个模式（E9 全套要跑
+    约 45 分钟，一次真实 LLM 抖动就崩掉损失前面几十条已经花钱跑完的结果，
+    代价太大）。
     """
     consult_fn = consult_fn or _default_consult_fn()
     isolating_defaults = {"use_react": False, "ask_fn": None}
     pairs: list[dict] = []
     for query in queries:
-        baseline = consult_fn(query, **{**isolating_defaults, **baseline_kwargs})
-        ablated = consult_fn(query, **{**isolating_defaults, **ablated_kwargs})
+        try:
+            baseline = consult_fn(query, **{**isolating_defaults, **baseline_kwargs})
+            ablated = consult_fn(query, **{**isolating_defaults, **ablated_kwargs})
+        except Exception as e:  # noqa: BLE001 - 单条失败不能拖累其余（core.chain.consult_many 同一模式）
+            print(f"[collect_ablation_pairs] 「{query}」调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+            pairs.append(_call_failed_pair(query, e))
+            continue
         pairs.extend(_herb_pairs_from_outcomes(query, baseline, ablated))
     return pairs
 
@@ -359,13 +412,31 @@ def collect_refs_mode_pairs(
 
     返回 {ablated_mode: pairs}，跟 ablation_output_effect() 一一对应地喂给
     E3/E4 各自的报告条目。
+
+    own 调用失败：这条主诉在所有 ablated_modes 下都记一条 call_failed 跳过
+    条目——own 都没跑成，没法跟任何一个消融模式配对，波及范围是本条查询的
+    全部模式。某个 ablated_mode 单独调用失败：只影响那一个模式，其余模式
+    不受影响，也不拖累下一条查询——两种失败的波及范围不一样，不能共用一段
+    except 处理成一样的效果（同 collect_ablation_pairs 的失败容忍，跟
+    core.chain.consult_many 是同一个"单条失败不拖累其余"模式）。
     """
     consult_fn = consult_fn or _default_consult_fn()
     pairs_by_mode: dict[str, list[dict]] = {m: [] for m in ablated_modes}
     for query in queries:
-        baseline = consult_fn(query, refs_mode="own", use_react=False, ask_fn=None)
+        try:
+            baseline = consult_fn(query, refs_mode="own", use_react=False, ask_fn=None)
+        except Exception as e:  # noqa: BLE001 - own 失败波及本条查询的所有 ablated_mode，不拖累其它查询
+            print(f"[collect_refs_mode_pairs] 「{query}」own 调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+            for mode in ablated_modes:
+                pairs_by_mode[mode].append(_call_failed_pair(query, e))
+            continue
         for mode in ablated_modes:
-            ablated = consult_fn(query, refs_mode=mode, use_react=False, ask_fn=None)
+            try:
+                ablated = consult_fn(query, refs_mode=mode, use_react=False, ask_fn=None)
+            except Exception as e:  # noqa: BLE001 - 只影响这一个 mode
+                print(f"[collect_refs_mode_pairs] 「{query}」{mode} 调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+                pairs_by_mode[mode].append(_call_failed_pair(query, e))
+                continue
             pairs_by_mode[mode].extend(_herb_pairs_from_outcomes(query, baseline, ablated))
     return pairs_by_mode
 
@@ -408,19 +479,30 @@ def ablation_output_effect(
     如果 top-3 全是刚过 0.6-0.7 这种勉强线的分数，说明改变率低的根因是
     检索质量不够（该查 P0-7 的阈值/P0-6 的编码），不是 prompt 没利用好
     检索结果（该查 P0-1~P0-4）。
+
+    n_failed：consult() 调用本身失败（skip_reason="call_failed"，见
+    collect_ablation_pairs/collect_refs_mode_pairs）的样本数——跟被安全否决
+    跳过的样本一样不计入 change_rate 分母，但原因不同（一个是模型主动拒答，
+    一个是调用没跑成），note 里分开报，不能把两者混成一个"跳过"数字，
+    否则看报告的人分不清"这批数字要不要重跑"还是"这批本来就该被拦"。
     """
+    n_failed = sum(1 for p in pairs if p.get("skip_reason") == "call_failed")
     usable = [p for p in pairs if not p.get("skipped")]
     n_total = len(pairs)
     n_usable = len(usable)
     if not usable:
+        failed_note = (
+            f"（其中 {n_failed} 条是 consult() 调用失败，不是被安全否决/信息不足）"
+            if n_failed else ""
+        )
         return {
-            "label": label, "n_total": n_total, "n_usable": 0,
+            "label": label, "n_total": n_total, "n_usable": 0, "n_failed": n_failed,
             "n_empty_refs": 0, "n_scored": 0,
             "change_rate": None, "gate_threshold": GATE_OUTPUT_CHANGE_RATE,
             "gate_pass": None, "per_pair": [],
             "n_own_low_discrimination": 0, "n_ablated_low_discrimination": 0,
             "own_low_discrimination_rate": None, "ablated_low_discrimination_rate": None,
-            "note": f"{label}：没有可用样本（全部被安全否决/信息不足跳过）。",
+            "note": f"{label}：没有可用样本（全部被安全否决/信息不足跳过，或调用失败）{failed_note}。",
         }
 
     epsilon_lookup: dict[tuple[str, str], float] = {}
@@ -503,9 +585,13 @@ def ablation_output_effect(
         " 的检索候选被判定为没有真实区分度、收窄到了 top-1（LOW_DISCRIMINATION_CUTOFF）。"
         if n_usable else ""
     )
+    failed_clause = (
+        f"；另有 {n_failed} 条因 consult() 调用失败被跳过，不计入 change_rate 分母"
+        if n_failed else ""
+    )
     return {
         "label": label,
-        "n_total": n_total, "n_usable": n_usable,
+        "n_total": n_total, "n_usable": n_usable, "n_failed": n_failed,
         "n_empty_refs": n_empty_refs, "n_scored": n_scored,
         "change_rate": change_rate,
         "gate_threshold": GATE_OUTPUT_CHANGE_RATE,
@@ -527,7 +613,7 @@ def ablation_output_effect(
         ),
         "per_pair": per_pair,
         "note": (
-            f"{label}：{n_usable}/{n_total} 条(主诉,医家)样本可用{empty_clause}。"
+            f"{label}：{n_usable}/{n_total} 条(主诉,医家)样本可用{empty_clause}{failed_clause}。"
             f"{change_rate_clause}。"
             "按主诉+医家配对跟噪声地板逐条比较（不是减一个全局 ε）："
             + (f"{n_above}/{n_paired} 条超出各自的噪声地板、算真实差异，"
@@ -553,14 +639,35 @@ def collect_retriever_mode_samples(
     data/element_index.json）时如实记下"不可用"，不静默跳过、也不拿别的
     模式的结果顶替——否则 E8 的数字悄悄只反映"能跑的那几个模式"，读者却
     以为四个模式都测了。
+
+    consult_fn 调用本身失败（LLMError 等）跟 retrieval_error 是两件不同的
+    事——前者是这次调用没跑成，后者是"这台机器上这个模式确实缺数据"的业务
+    信号——不能记进同一个 unavailable_modes 列表，那样 retriever_mode_output_
+    effect 的"graph 覆盖率不足"这类 caveat 会被"这次调用碰巧抖了几次"污染。
+    调用失败单独记进 failed_modes（跟 unavailable_modes 平行的字段），该
+    模式这次跳过，不拖累其它模式或其它查询。如果一条主诉所有模式全部失败/
+    不可用（by_mode 是空的，没有任何 physician），不能让这条主诉的记录
+    整体消失——否则失败率算不出来，读报告的人也看不出这条主诉发生了什么，
+    单独补一条 physician=None 的兜底记录，把 failed_modes/unavailable_modes
+    带出来；如果只是正常的"这条主诉被拦截/信息不足"（没有失败也没有不可用），
+    保持原来的行为，不记录（那是业务上的空，不是需要追踪的异常）。
     """
     consult_fn = consult_fn or _default_consult_fn()
     records: list[dict] = []
     for query in queries:
         by_mode: dict[str, dict[str, set]] = {}
         unavailable: list[str] = []
+        failed: list[str] = []
         for mode in modes:
-            outcome = consult_fn(query, retriever_mode=mode, use_react=False, ask_fn=None)
+            try:
+                outcome = consult_fn(query, retriever_mode=mode, use_react=False, ask_fn=None)
+            except Exception as e:  # noqa: BLE001 - 单个模式失败不拖累其它模式/查询
+                print(
+                    f"[collect_retriever_mode_samples] 「{query}」{mode} 调用失败："
+                    f"{type(e).__name__}: {e}", file=sys.stderr,
+                )
+                failed.append(mode)
+                continue
             if outcome.get("retrieval_error"):
                 unavailable.append(mode)
                 continue
@@ -570,15 +677,22 @@ def collect_retriever_mode_samples(
                 r["physician"]: normalized_herb_set(r["s3"].herbs) for r in outcome["results"]
             }
         physicians = {p for m in by_mode.values() for p in m}
-        for physician in physicians:
-            herb_sets = [
-                by_mode[m][physician] for m in modes
-                if m in by_mode and physician in by_mode[m]
-            ]
+        if physicians:
+            for physician in physicians:
+                herb_sets = [
+                    by_mode[m][physician] for m in modes
+                    if m in by_mode and physician in by_mode[m]
+                ]
+                records.append({
+                    "query": query, "physician": physician,
+                    "herb_sets": herb_sets, "n_modes_available": len(herb_sets),
+                    "unavailable_modes": list(unavailable), "failed_modes": list(failed),
+                })
+        elif failed or unavailable:
             records.append({
-                "query": query, "physician": physician,
-                "herb_sets": herb_sets, "n_modes_available": len(herb_sets),
-                "unavailable_modes": list(unavailable),
+                "query": query, "physician": None,
+                "herb_sets": [], "n_modes_available": 0,
+                "unavailable_modes": list(unavailable), "failed_modes": list(failed),
             })
     return records
 
@@ -623,19 +737,32 @@ def retriever_mode_output_effect(records: list[dict], modes: list[str]) -> dict:
     Jaccard 距离均值，再用 aggregate_stats 把所有样本的均值聚合成一个整体
     数——这跟 offline/estimate_epsilon.py 的"N 次重复两两距离再聚合"是完全
     同一个统计手法，只是这里的"N 次重复"换成了"N 种检索模式"，不新写一套。
+
+    failed_modes（consult() 调用失败）跟 unavailable_modes（retrieval_error
+    业务信号）分别聚合成 n_failed_by_mode / n_unavailable_by_mode，note 里
+    分开报——原因见 collect_retriever_mode_samples 的说明，两者混在一起会让
+    "graph 覆盖率不足"这类结论被调用抖动污染。physician=None 的兜底记录
+    （某条主诉所有模式全部失败/不可用）天然进不了 usable，单独计进
+    n_failed_queries，否则一条主诉整体失败会从这份报告里完全消失。
     """
     usable = [r for r in records if r["n_modes_available"] >= 2]
     n_total = len(records)
     n_usable = len(usable)
+    n_failed_queries = sum(1 for r in records if r.get("physician") is None)
     unavailable_counts: dict[str, int] = {m: 0 for m in modes}
+    failed_counts: dict[str, int] = {m: 0 for m in modes}
     for r in records:
         for m in r.get("unavailable_modes", []):
             unavailable_counts[m] = unavailable_counts.get(m, 0) + 1
+        for m in r.get("failed_modes", []):
+            failed_counts[m] = failed_counts.get(m, 0) + 1
 
     graph_caveat = _graph_mode_caveat() if "graph" in modes else None
     result = {
         "modes": modes, "n_total": n_total, "n_usable": n_usable,
+        "n_failed_queries": n_failed_queries,
         "n_unavailable_by_mode": unavailable_counts,
+        "n_failed_by_mode": failed_counts,
         "graph_mode_caveat": graph_caveat,
     }
     if not usable:
@@ -652,6 +779,9 @@ def retriever_mode_output_effect(records: list[dict], modes: list[str]) -> dict:
     unavailable_note = "；".join(
         f"{m} 在 {c} 条查询上不可用" for m, c in unavailable_counts.items() if c
     )
+    failed_note = "；".join(
+        f"{m} 在 {c} 条查询上调用失败" for m, c in failed_counts.items() if c
+    )
     result.update({
         "output_difference_rate": overall["mean"], "p50": overall["p50"], "p95": overall["p95"],
         "note": (
@@ -659,6 +789,8 @@ def retriever_mode_output_effect(records: list[dict], modes: list[str]) -> dict:
             f"S3 用药输出跨模式差异率（两两 Jaccard 距离均值的均值）="
             f"{overall['mean']}（p50={overall['p50']}, p95={overall['p95']}）。"
             + (f" 另有模式不可用：{unavailable_note}。" if unavailable_note else "")
+            + (f" 另有 {n_failed_queries} 条查询所有模式全部失败/不可用（调用失败：{failed_note}）。"
+               if n_failed_queries else "")
             + (f" {graph_caveat}" if graph_caveat else "")
         ),
     })
@@ -684,11 +816,21 @@ def collect_react_process_samples(queries: list[str], consult_fn=None) -> list[d
     ——那个要基线+消融各一次才能算输出差异率，这个只需要 react=True 那一侧
     的过程数据，两个函数各自负责一件事，不把"顺便再要点别的东西"混进
     收集输出差异率的那个函数里。
+
+    这里跟 collect_ablation_pairs 一样单条失败容忍：这个函数只产出过程性
+    统计（步数分布、terminated_by），不进 change_rate 分母，所以失败的
+    查询直接跳过、打到 stderr 就够，不需要像另外三个收集器那样记
+    skip_reason/算 n_failed——它不是"某个数字的分母需要排除失败样本"这类
+    问题，单纯是"这条主诉这次没跑成，别拖累其余主诉"。
     """
     consult_fn = consult_fn or _default_consult_fn()
     records: list[dict] = []
     for query in queries:
-        outcome = consult_fn(query, use_react=True, ask_fn=None)
+        try:
+            outcome = consult_fn(query, use_react=True, ask_fn=None)
+        except Exception as e:  # noqa: BLE001 - 单条失败不能拖累其余（core.chain.consult_many 同一模式）
+            print(f"[collect_react_process_samples] 「{query}」调用失败：{type(e).__name__}: {e}", file=sys.stderr)
+            continue
         if outcome["rejected"] or outcome["insufficient"]:
             continue
         for r in outcome["results"]:
@@ -1064,6 +1206,7 @@ def main(argv: list[str] | None = None) -> None:
             report["ablations"].append(effect)
             tag = "E3" if mode == "swapped" else "E4"
             print(f"{tag}：{effect['note']}")
+            _warn_if_failure_rate_high(tag, effect["n_failed"], effect["n_total"])
 
     if args.e8:
         print(f"正在跑 E8（{sorted(ALLOWED_MODES)} 四种检索模式）……")
@@ -1071,6 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
         e8 = retriever_mode_output_effect(records, sorted(ALLOWED_MODES))
         report["retriever_mode_effect"] = e8
         print(f"E8：{e8['note']}")
+        _warn_if_failure_rate_high("E8", e8["n_failed_queries"], e8["n_total"])
 
     if args.e9:
         print("正在跑 E9（use_react False vs True）……")
@@ -1081,6 +1225,7 @@ def main(argv: list[str] | None = None) -> None:
         e9_effect = ablation_output_effect(pairs, epsilon_detail, "react_on")
         report["ablations"].append(e9_effect)
         print(f"E9（输出差异）：{e9_effect['note']}")
+        _warn_if_failure_rate_high("E9（输出差异）", e9_effect["n_failed"], e9_effect["n_total"])
 
         process_records = collect_react_process_samples(queries)
         e9_process = react_process_summary(process_records)

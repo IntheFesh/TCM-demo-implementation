@@ -76,7 +76,73 @@ class LLMTruncatedError(LLMError):
 _JSON_EOF_RE = re.compile(r"EOF while parsing.*line (\d+) column (\d+)")
 
 
-def _looks_like_truncated_json(error: Exception, text: str) -> bool:
+def _min_json_length(node: dict, defs: dict, _depth: int = 0) -> int:
+    """给定一段 JSON Schema 节点（`model_json_schema()` 的某个 properties 值，
+    或整份 schema），估算它能编码出的**最短**合法 JSON 实例的字符数：只用
+    必填字段，每个字段取它自己类型下最短的合法取值（空字符串按 minLength、
+    最短的枚举值、一位数字……）。这是一个下界估计，不是精确值——真实的最短
+    合法实例可能因为业务约束（比如 model_validator）比这个数还长，但从不会
+    比它短，因为 schema 本身已经排除了更短的取值。低估比高估安全：低估只会让
+    截断判定的门槛设低了一点，顶多多判几次真截断成"值得重试"（白烧一次调用，
+    不会崩）；高估才会把真正的截断误判成"太短不算"，反而漏判。
+
+    存在的理由：AutoDL 实测过一次"2 字符响应（内容是 `{"`）被判成截断"——
+    EOF 确实落在文本末尾，`_looks_like_truncated_json` 的 EOF 判据本身没错，
+    但它没有排除"这段输出短到连这个 schema 的最短合法实例都编不出来"这种
+    情况——那不可能是"生成到一半被 max_tokens 砍断"（砍断意味着已经生成了
+    大量内容，不可能只有 2 个字符），更像是网络抖动/限流吐回了一个几乎空的
+    响应，应该走正常重试，不该被判定为"重试无意义"直接放弃。
+
+    不看 max_tokens 数字本身（跟 `_looks_like_truncated_json` 原来的理由一样：
+    token 数和字符数的换算在中文文本上不可靠），改用 schema 自身能推出的
+    下界——这个下界跟语言、跟 max_tokens 具体设了多少都无关，是结构上的
+    硬约束：不管 max_tokens 有多大，任何合法实例都不可能比它更短。
+    """
+    if "$ref" in node:
+        return _min_json_length(defs.get(node["$ref"].rsplit("/", 1)[-1], {}), defs, _depth)
+    if _depth > 8:
+        return 2  # 防御自引用/深度嵌套 schema——这个项目里不会出现，纯保险
+    for key in ("anyOf", "oneOf"):
+        if key in node:
+            options = node[key]
+            return min(_min_json_length(o, defs, _depth + 1) for o in options)
+    if "enum" in node:
+        return min(len(json.dumps(v, ensure_ascii=False)) for v in node["enum"])
+    node_type = node.get("type")
+    if node_type == "object" or "properties" in node:
+        required = node.get("required", [])
+        if not required:
+            return 2  # "{}"
+        props = node.get("properties", {})
+        field_parts = sum(
+            len(json.dumps(name)) + 1 + _min_json_length(props.get(name, {}), defs, _depth + 1)
+            for name in required
+        )
+        return 2 + field_parts + (len(required) - 1)  # 花括号 + 字段间逗号
+    if node_type == "array":
+        min_items = node.get("minItems", 0)
+        if min_items == 0:
+            return 2  # "[]"
+        item_len = _min_json_length(node.get("items", {}), defs, _depth + 1)
+        return 2 + min_items * item_len + (min_items - 1)
+    if node_type == "string":
+        return 2 + node.get("minLength", 0)  # 引号 + 内容
+    if node_type in ("integer", "number"):
+        return 1
+    if node_type == "boolean":
+        return 4  # "true"
+    if node_type == "null":
+        return 4  # "null"
+    return 2  # 未识别的节点类型（这份 schema 词表之外），保守取最小值不高估
+
+
+def _min_plausible_output_length(schema: type[BaseModel]) -> int:
+    """schema 对应的最短合法 JSON 实例长度，见 _min_json_length。"""
+    full = schema.model_json_schema()
+    return _min_json_length(full, full.get("$defs", {}))
+
+
+def _looks_like_truncated_json(error: Exception, text: str, schema: type[BaseModel]) -> bool:
     """区分"输出被截断"和"随便一种 JSON 语法错误"。
 
     EOF 类错误（pydantic 报 "EOF while parsing ... at line L column C"）只会在
@@ -88,7 +154,14 @@ def _looks_like_truncated_json(error: Exception, text: str) -> bool:
     会在同一处再次被截断，三次重试只是白烧三次调用。
     不看 max_tokens 数字本身：token 数和字符数的换算在中文文本上不可靠，
     "解析失败的位置是不是文本末尾"是更直接、不需要猜换算比例的信号。
+
+    但"末尾"本身不够：文本短到连这个 schema 的最短合法实例都编不出来时，
+    不管 EOF 落在哪，都不可能是"生成到一半被砍断"——那需要先生成足够内容
+    才谈得上"半路被砍"。这一步查 _min_plausible_output_length，见它的文档
+    字符串（AutoDL 实测的 2 字符误判就是这里补上的）。
     """
+    if len(text) < _min_plausible_output_length(schema):
+        return False
     errors = getattr(error, "errors", None)
     if not callable(errors):
         return False
@@ -220,7 +293,7 @@ class LLMBackend(ABC):
                 # 回灌错误信息重试有意义，截断重试没有意义——同样的输入会在
                 # 同一处再次被截断，三次重试只是白烧三次调用。直接失败，
                 # 让调用方（比如 X3 批量抽取）决定要不要跳过这条输入。
-                if _looks_like_truncated_json(e, stripped):
+                if _looks_like_truncated_json(e, stripped, schema):
                     raise LLMTruncatedError(
                         f"疑似输出在 max_tokens 上限处被截断（JSON 在文本末尾附近"
                         f"解析失败，不是格式错误，不会重试）。backend={self.backend_id()}, "

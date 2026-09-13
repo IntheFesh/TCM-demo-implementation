@@ -3,6 +3,7 @@
 """
 import json
 import subprocess
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
@@ -722,7 +723,7 @@ def test_looks_like_truncated_json_detects_eof_at_end_of_text():
         Tiny.model_validate_json(text)
         raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
     except ValidationError as e:
-        assert _looks_like_truncated_json(e, text) is True
+        assert _looks_like_truncated_json(e, text, Tiny) is True
 
 
 def test_looks_like_truncated_json_does_not_flag_mid_text_syntax_errors():
@@ -736,7 +737,7 @@ def test_looks_like_truncated_json_does_not_flag_mid_text_syntax_errors():
         Tiny.model_validate_json(text)
         raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
     except ValidationError as e:
-        assert _looks_like_truncated_json(e, text) is False
+        assert _looks_like_truncated_json(e, text, Tiny) is False
 
 
 def test_looks_like_truncated_json_handles_multiline_output():
@@ -750,7 +751,7 @@ def test_looks_like_truncated_json_handles_multiline_output():
         Tiny.model_validate_json(text)
         raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
     except ValidationError as e:
-        assert _looks_like_truncated_json(e, text) is True
+        assert _looks_like_truncated_json(e, text, Tiny) is True
 
 
 def test_looks_like_truncated_json_ignores_non_json_invalid_errors():
@@ -762,7 +763,106 @@ def test_looks_like_truncated_json_ignores_non_json_invalid_errors():
         Tiny.model_validate_json('{"ok": "不是布尔值", "note": "x"}')
         raise AssertionError("这段构造的输入应该校验失败，测试前提不成立")
     except ValidationError as e:
-        assert _looks_like_truncated_json(e, '{"ok": "不是布尔值", "note": "x"}') is False
+        assert _looks_like_truncated_json(e, '{"ok": "不是布尔值", "note": "x"}', Tiny) is False
+
+
+# ---------- 短响应不该被判成截断（AutoDL 实测：2 字符 `{"` 被误判过） ----------
+
+
+def test_looks_like_truncated_json_rejects_output_shorter_than_schema_minimum():
+    """核心回归：长度低于这个 schema 的最短合法实例时，不管 EOF 落在哪，
+    都不能判成截断——2 个字符不可能是"生成到一半被 max_tokens 砍断"，
+    更像网络抖动/限流吐回了几乎空的响应，应该走正常重试。"""
+    from pydantic import ValidationError
+
+    text = '{"'
+    try:
+        Tiny.model_validate_json(text)
+        raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, text, Tiny) is False
+
+
+def test_looks_like_truncated_json_still_detects_truncation_on_a_larger_schema():
+    """长度门槛不是关掉截断判定——超过这个 schema 的最短合法长度、EOF 又在
+    末尾时，仍然要判成截断。"""
+    from pydantic import ValidationError
+
+    class Larger(BaseModel):
+        thought: str = Field(min_length=1)
+        action: str = Field(min_length=1)
+        note: str = Field(min_length=1)
+
+    text = '{"thought": "先看看证素对应哪些证候，这一步的推理稍微长一点", "action": "query_graph", "note": "半路被砍'
+    try:
+        Larger.model_validate_json(text)
+        raise AssertionError("这段构造的输入应该解析失败，测试前提不成立")
+    except ValidationError as e:
+        assert _looks_like_truncated_json(e, text, Larger) is True
+
+
+# ---------- _min_json_length / _min_plausible_output_length：纯函数 ----------
+
+
+def test_min_plausible_output_length_matches_a_hand_built_minimal_instance():
+    """Tiny（ok: bool 必填, note: str min_length=1 必填）的最短合法实例
+    就是 {"ok":true,"note":"a"}，逐字数出来的长度必须跟估算值一致。"""
+    from core.llm import _min_plausible_output_length
+
+    minimal = '{"ok":true,"note":"a"}'
+    assert _min_plausible_output_length(Tiny) == len(minimal)
+    assert Tiny.model_validate_json(minimal)  # 顺带确认这确实是一个合法实例
+
+
+def test_min_json_length_handles_array_enum_optional_and_ref():
+    """跟其他几条纯算长度的测试不一样，这条直接拿一个手写的、能通过校验的
+    最短实例字符串做基准（而不是手算每个字段的贡献再相加）——手算字符串
+    长度这种"人肉数一遍"的活极易在多层嵌套时算错，一个真实、可校验的最短
+    实例才是可信的对照物。"""
+    from core.llm import _min_json_length
+
+    class Item(BaseModel):
+        name: str = Field(min_length=1)
+
+    class Rich(BaseModel):
+        items: list[Item] = Field(min_length=1)
+        status: str  # 无约束的必填字符串，最短取空串
+        source: Literal["classic", "modern"]
+        note: str | None = None  # 有默认值，不在 required 里，不计入下界
+
+    full = Rich.model_json_schema()
+    defs = full.get("$defs", {})
+
+    minimal = '{"items":[{"name":"a"}],"status":"","source":"modern"}'  # "modern" 比 "classic" 短
+    assert Rich.model_validate_json(minimal)  # 确认这真的是一个合法实例（note 可省略）
+    assert _min_json_length(full, defs) == len(minimal)
+    # note 是可选字段（不在 required），漏了它不会让估算值变大
+    assert "note" not in full.get("required", [])
+
+
+def test_min_json_length_object_with_no_required_fields_is_empty_braces():
+    from core.llm import _min_json_length
+
+    class AllOptional(BaseModel):
+        maybe: str | None = None
+
+    full = AllOptional.model_json_schema()
+    assert _min_json_length(full, full.get("$defs", {})) == 2  # "{}"
+
+
+# ---------- 端到端：短垂圾响应走正常重试，不是直接判失败放弃 ----------
+
+
+def test_generate_retries_short_garbage_instead_of_treating_it_as_truncated():
+    """AutoDL 实测场景复现：连续返回几乎空的响应（不是真截断），generate()
+    应该走正常的"回灌错误重试"路径，重试耗尽后报普通 LLMError（可以被上层
+    当成"值得重跑"的失败），不是 LLMTruncatedError（那意味着"重试无意义，
+    直接放弃"）。"""
+    b = ScriptedBackend(['{"', '{"', '{"'])
+    with pytest.raises(LLMError) as ei:
+        b.generate(system="s", user="u", schema=Tiny)
+    assert not isinstance(ei.value, LLMTruncatedError)
+    assert len(b.calls) == 3  # 三次都重试了，不是撞截断直接放弃
 
 
 def test_generate_raises_truncated_error_without_retrying():

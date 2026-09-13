@@ -1106,3 +1106,73 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
       - 1.5a/b README、DEMO 的数字更新——数字要等上面这些重跑；能先做的是
         `eval/RESULTS.md` 把已有的七组数按"数字 + 对照 + caveat"摆好、待重跑
         的标成待重跑，不把旧数当新数。
+
+35. **AutoDL 真实跑 E9 时发现的两个问题：一个误判、一个没有失败容忍——都是
+    单元测试测不出来的那种（离线测试全绿，真实调用才炸）。**
+
+    **问题一：截断判定把"几乎没有输出"误判成"撞上 max_tokens 上限"。**
+    真实日志：`原始返回长度=2 字符（内容是 {"）`、`max_tokens=None`，却抛了
+    `LLMTruncatedError`。`_looks_like_truncated_json` 靠"EOF 错误发生在文本
+    末尾"判定截断，这个信号本身没错，但没有区分两种"EOF 在末尾"：长输出被
+    真的砍断（重试无意义，`generate()` 故意不重试）；和输出短到几乎是空的
+    （API 抖动/限流，**应该重试**）——`{"` 两个字符里 EOF 恰好也在末尾，
+    所以命中了前一条分支，实际上是后一种。
+
+    修法：给截断判定加一个长度下限，但下限不是拍一个数字（比如"200 字符"），
+    是从 schema 现算的——`_min_plausible_output_length(schema)` 递归走
+    `model_json_schema()`（`$ref`/`anyOf`/`oneOf`/`enum`/`object` 的
+    `required` 字段/`array` 的 `minItems`/`string` 的 `minLength`），算出
+    "这个 schema 能生成的最短合法 JSON 大概多长"，返回长度小于这个下限就
+    不判定为截断，走正常重试。**下限只保证不漏判"明显太短"，不保证精确**
+    （比如 `anyOf` 取最小分支、嵌套深度超 8 层就返回一个保守常量）——宁可
+    低估这个下限也不能高估：低估的代价是"个别真截断的输出也被放去重试"
+    （最多浪费一次重试），高估的代价是"个别正常的短输出被误判成截断、
+    直接放弃不重试"，两个代价不对等，所以设计上刻意偏向低估。
+    `tests/test_llm_backend.py` 里除了单元测原逻辑没被破坏，还专门写了一条
+    用 `ReActStep` schema 复现这条真实日志的场景（2 字符输入，断言不再是
+    `LLMTruncatedError`）。
+
+    **问题二：`eval/run_eval.py` 的三个批处理收集器（`collect_ablation_pairs`
+    /`collect_refs_mode_pairs`/`collect_retriever_mode_samples`）没有任何
+    异常捕获，一次真实 LLM 调用失败（`LLMError`）就崩掉整个 E9/E3/E4/E8，
+    前面已经跑完的几十条全部丢失。** E9 全套要跑约 45 分钟、上千次调用，
+    崩一次代价很大。跟条目里 `core.chain.consult_many` 已经修过的坑同一类
+    （当时的教训是"一条主诉挂了不能拖累其余"），但那次修复没有传到
+    `eval/run_eval.py` 自己的批处理入口——这也是本条目本身要写进
+    CLAUDE.md「同一概念的匹配逻辑只能有一处实现」判据的一个反例：教训在
+    `core/chain.py` 修过，没人回头检查 `eval/run_eval.py` 是不是也有同一个
+    坑。
+
+    修法（同一模式，三处）：单条 `(主诉[, 医家/模式])` 的 `consult_fn` 调用
+    失败时，捕获异常、打到 stderr、记一条 `skip_reason="call_failed"` 的
+    结构化跳过条目，继续下一条，不崩。三个收集器的"失败波及范围"不一样，
+    分别处理：
+      - `collect_ablation_pairs`：baseline/ablated 任一次失败，这条主诉整体
+        记一条失败条目。
+      - `collect_refs_mode_pairs`：`own` 失败波及本条主诉的**所有**
+        `ablated_mode`（没有 own 没法跟任何模式配对）；某个 `ablated_mode`
+        单独失败只影响那一个模式，不影响其它模式或其它主诉。
+      - `collect_retriever_mode_samples`：某个检索模式单独失败只影响那个
+        模式（跟已有的 `retrieval_error` 业务信号分开记，两者是不同的事——
+        一个是"这次调用没跑成"，一个是"这台机器上这个模式确实缺数据"，
+        混在一起会让"graph 覆盖率不足"这类结论被调用抖动污染）；一条主诉
+        所有模式全部失败/不可用时补一条 `physician=None` 的兜底记录，不让
+        这条主诉的记录整体消失。
+      `ablation_output_effect`/`retriever_mode_output_effect` 相应地报
+      `n_failed`/`n_failed_queries`（跟"被安全否决跳过"的计数分开，不混成
+      一个数字），从 `change_rate`/`output_difference_rate` 的分母里剔除；
+      `main()` 里失败率超过 20%（`FAILURE_RATE_WARNING_THRESHOLD`，少量
+      API 抖动可以接受，大量失败说明这批结果不可信）时在 stdout 打醒目
+      警告。**不做增量落盘**——跟 `offline/extract_case_triples.py`（X3）的
+      按块号增量落盘不是同一类问题：run_eval 的产出是一份整体报告，半份
+      报告没有意义，失败容忍 + 失败计数就够，没必要为这个脚本再引入一套
+      落盘/`--only-ids` 重跑机制。
+
+    `tests/test_run_eval.py` 用一个"整个调用序列第 N 次抛 `LLMError`、其余
+    调用正常返回"的假后端复现这个场景（4 条主诉），断言：三个收集器都不
+    崩、失败的样本记进 `skip_reason="call_failed"`、`ablation_output_effect`/
+    `retriever_mode_output_effect` 的分母排除了失败样本、失败率超阈值时
+    `_warn_if_failure_rate_high` 打警告（且在阈值处不误报、`n_total=0` 不
+    除零）；另外手写脚本跑了一遍 `main(["--e3", "--e9"])`，用同一个假后端
+    在第 5 次调用（落在 E3 的 own 调用上）失败，确认端到端不崩、报告里
+    `n_failed` 如实反映、stdout 打出了警告。
