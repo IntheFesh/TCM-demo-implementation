@@ -6,6 +6,7 @@
 只测两位就假设"以后加了第三位也一定对"。
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -299,6 +300,116 @@ def test_export_main_prints_skip_reasons_separately(tmp_path, monkeypatch, capsy
              "--out-answer-key", str(tmp_path / "key.json")])
     out = capsys.readouterr().out
     assert "因安全拦截" in out and "因信息不足" in out and "因医家数不等于" in out
+
+
+# ---------- 总纲 1.4a：盲评表加 SDT 抽样 ----------
+
+
+def _fake_sdt_records(n):
+    from types import SimpleNamespace
+
+    return [SimpleNamespace(record_id=f"r{i}", clinical_data=f"病例{i}：胃脘胀痛") for i in range(n)]
+
+
+def test_sample_sdt_queries_is_seeded_and_bounded(monkeypatch):
+    import eval.sdt.data as sdt_data
+
+    monkeypatch.setattr(sdt_data, "load_split", lambda sdt_dir, split: _fake_sdt_records(50))
+    a = me.sample_sdt_queries(Path("/nonexistent"), "Validation", 10, seed=7)
+    b = me.sample_sdt_queries(Path("/nonexistent"), "Validation", 10, seed=7)
+    assert len(a) == 10 and a == b  # 同 seed 同样本
+    assert len(set(a)) == 10  # 不重复抽
+    assert all(q.startswith("病例") for q in a)
+    assert me.sample_sdt_queries(Path("/nonexistent"), "Validation", 10, seed=8) != a
+
+
+def test_sample_sdt_queries_takes_all_when_asking_more_than_available_and_none_when_zero(monkeypatch):
+    import eval.sdt.data as sdt_data
+
+    monkeypatch.setattr(sdt_data, "load_split", lambda sdt_dir, split: _fake_sdt_records(3))
+    assert len(me.sample_sdt_queries(Path("/x"), "Validation", 10, seed=1)) == 3
+    assert me.sample_sdt_queries(Path("/x"), "Validation", 0, seed=1) == []
+    assert me.sample_sdt_queries(Path("/x"), "Validation", -1, seed=1) == []
+
+
+def test_sample_sdt_queries_skips_blank_clinical_data(monkeypatch):
+    import eval.sdt.data as sdt_data
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(sdt_data, "load_split", lambda sdt_dir, split: [
+        SimpleNamespace(record_id="a", clinical_data="  "),
+        SimpleNamespace(record_id="b", clinical_data="胃痛"),
+    ])
+    assert me.sample_sdt_queries(Path("/x"), "Validation", 5, seed=1) == ["胃痛"]
+
+
+def test_export_main_appends_sdt_sample_to_test_queries(tmp_path, monkeypatch, capsys):
+    """--limit 只截测试主诉，SDT 那批由 --sdt-sample 单独控制：1 条测试主诉 +
+    2 条 SDT = 3 条进盲评表。"""
+    import eval.sdt.data as sdt_data
+
+    _pin_physicians(monkeypatch, me, ["ye_tianshi", "wu_jutong"])
+    monkeypatch.setattr(sdt_data, "load_split", lambda sdt_dir, split: _fake_sdt_records(20))
+    queries_path = tmp_path / "queries.txt"
+    queries_path.write_text("主诉一\n主诉二\n", encoding="utf-8")
+    seen = []
+
+    def fake_consult(q):
+        seen.append(q)
+        return _result(physicians=[_pr("ye_tianshi", "甲"), _pr("wu_jutong", "乙")])
+
+    monkeypatch.setattr("core.chain.consult", fake_consult)
+    out_items = tmp_path / "items.json"
+    me.main([
+        "--queries-path", str(queries_path), "--limit", "1",
+        "--sdt-dir", str(tmp_path), "--sdt-sample", "2",
+        "--out-items", str(out_items), "--out-answer-key", str(tmp_path / "key.json"),
+    ])
+    printed = capsys.readouterr().out
+    assert "抽到 2 条主诉（要求 2 条）" in printed
+    assert seen[0] == "主诉一" and len(seen) == 3
+    assert all(q.startswith("病例") for q in seen[1:])
+    assert len(json.loads(out_items.read_text(encoding="utf-8"))) == 3
+
+
+# ---------- 总纲 1.4d：三对两两各跑一次 McNemar ----------
+
+
+def test_pairwise_collect_ratings_runs_every_pair_in_registry_order(monkeypatch):
+    _pin_physicians(monkeypatch, mc, ["ye_tianshi", "wu_jutong", "zhang_xichun"])
+    items = [_item("i0", "A"), _item("i1", "C"), _item("i2", "B")]
+    answer_key = {
+        "i0": {"A": "ye_tianshi", "B": "wu_jutong", "C": "zhang_xichun"},   # 叶 赢
+        "i1": {"A": "ye_tianshi", "B": "wu_jutong", "C": "zhang_xichun"},   # 张 赢
+        "i2": {"A": "zhang_xichun", "B": "wu_jutong", "C": "ye_tianshi"},   # 吴 赢
+    }
+    out = mc.pairwise_collect_ratings(items, answer_key)
+    assert list(out) == ["ye_tianshi__wu_jutong", "ye_tianshi__zhang_xichun", "wu_jutong__zhang_xichun"]
+    ye_wu = out["ye_tianshi__wu_jutong"]
+    assert ye_wu["wins"] == {"ye_tianshi": 1, "wu_jutong": 1}
+    assert ye_wu["other_wins"] == 1  # 张锡纯赢的那条不吞掉
+    assert "p_value" in ye_wu["mcnemar"]
+    assert out["ye_tianshi__zhang_xichun"]["wins"] == {"ye_tianshi": 1, "zhang_xichun": 1}
+    assert out["wu_jutong__zhang_xichun"]["wins"] == {"wu_jutong": 1, "zhang_xichun": 1}
+
+
+def test_collect_main_all_pairs_writes_every_pair(tmp_path, monkeypatch, capsys):
+    _pin_physicians(monkeypatch, mc, ["ye_tianshi", "wu_jutong", "zhang_xichun"])
+    items_path = tmp_path / "items.json"
+    key_path = tmp_path / "key.json"
+    out_path = tmp_path / "out.json"
+    items_path.write_text(json.dumps([_item("i0", "A")]), encoding="utf-8")
+    key_path.write_text(json.dumps({"i0": {"A": "ye_tianshi", "B": "wu_jutong", "C": "zhang_xichun"}}),
+                        encoding="utf-8")
+
+    mc.main([
+        "--items-path", str(items_path), "--answer-key-path", str(key_path),
+        "--out", str(out_path), "--all-pairs",
+    ])
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert set(result) == {"ye_tianshi__wu_jutong", "ye_tianshi__zhang_xichun", "wu_jutong__zhang_xichun"}
+    printed = capsys.readouterr().out
+    assert "[ye_tianshi__wu_jutong]" in printed and "[wu_jutong__zhang_xichun]" in printed
 
 
 def test_collect_main_raises_clear_error_when_items_missing(tmp_path):

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import string
+from itertools import combinations
 from pathlib import Path
 
 from core.physicians import PHYSICIANS, physician_choices_text, resolve_physician_id
@@ -95,6 +96,20 @@ def collect_ratings(
     }
 
 
+def pairwise_collect_ratings(
+    items: list[dict], answer_key: dict, physician_ids: list[str] | None = None
+) -> dict[str, dict]:
+    """总纲 1.4d：三位医家两两各跑一次 collect_ratings（叶×吴、叶×张、吴×张），
+    键是 "a__b"（按注册顺序组合）。不发明三元检验——McNemar 天然是配对二元
+    检验，三方两两比较就是跑三次，见模块文档字符串。每一对里第三位医家赢的
+    题落进那一对的 other_wins，三对合起来看才是完整的胜负图。"""
+    ids = list(physician_ids or PHYSICIANS)
+    return {
+        f"{a}__{b}": collect_ratings(items, answer_key, a, b)
+        for a, b in combinations(ids, 2)
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="V1 附属：收集盲评结果，算胜负和显著性")
     ap.add_argument("--items-path", type=Path, default=DEFAULT_ITEMS_PATH)
@@ -102,6 +117,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT_PATH)
     ap.add_argument("--physician-a", default="ye_tianshi")
     ap.add_argument("--physician-b", default="wu_jutong")
+    ap.add_argument("--all-pairs", action="store_true",
+                    help="注册表里所有医家两两各算一次（总纲 1.4d 三对 McNemar），忽略 --physician-a/-b")
     args = ap.parse_args(argv)
 
     if not args.items_path.exists():
@@ -118,15 +135,20 @@ def main(argv: list[str] | None = None) -> None:
     # CLI 参数是外部输入，过唯一的解析入口（id 或中文名都认）。之前直接拿
     # 字符串去跟答案表里的 id 比，传中文名会静默算成 0 胜——跟 ReAct 那个
     # physician 参数是同一形状的坑（SOURCES.md 第 31 条）。
-    physician_a = resolve_physician_id(args.physician_a)
-    physician_b = resolve_physician_id(args.physician_b)
-    if physician_a is None or physician_b is None:
-        raise SystemExit(
-            f"--physician-a/--physician-b 必须是已注册的医家 id 或中文名"
-            f"（收到 {args.physician_a!r} / {args.physician_b!r}），可用值：{physician_choices_text()}"
-        )
-    result = collect_ratings(items, answer_key, physician_a, physician_b)
-    print(result["note"])
+    if args.all_pairs:
+        result = pairwise_collect_ratings(items, answer_key)
+        for pair_key, pair_result in result.items():
+            print(f"[{pair_key}] {pair_result['note']}")
+    else:
+        physician_a = resolve_physician_id(args.physician_a)
+        physician_b = resolve_physician_id(args.physician_b)
+        if physician_a is None or physician_b is None:
+            raise SystemExit(
+                f"--physician-a/--physician-b 必须是已注册的医家 id 或中文名"
+                f"（收到 {args.physician_a!r} / {args.physician_b!r}），可用值：{physician_choices_text()}"
+            )
+        result = collect_ratings(items, answer_key, physician_a, physician_b)
+        print(result["note"])
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

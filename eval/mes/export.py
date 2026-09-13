@@ -115,6 +115,26 @@ def build_blind_items(
     return items, answer_key, skip_counts
 
 
+def sample_sdt_queries(sdt_dir: Path, split: str, n: int, seed: int) -> list[str]:
+    """总纲 1.4a：盲评表除了 tests/queries.txt 的 10 条测试主诉，再从 TCMEval-SDT
+    抽 n 条 clinical_data 当主诉——SDT 的病例是专家标注的真实临床描述，不是
+    我们自己写的测试主诉，评分人看到的分布更接近真实。
+
+    抽样用独立的 Random(seed)，不跟 build_blind_items 打乱字母那把 rng 共用：
+    共用的话"多抽一条 SDT"会改变后面每条题的字母顺序，同一个 seed 两次导出的
+    答案表就对不上。n<=0 返回空；n 超过可用条数就全取（调用方报出实际条数，
+    不静默）。"""
+    if n <= 0:
+        return []
+    from eval.sdt.data import load_split
+
+    records = load_split(sdt_dir, split)
+    texts = [r.clinical_data.strip() for r in records if r.clinical_data and r.clinical_data.strip()]
+    if n >= len(texts):
+        return texts
+    return random.Random(seed).sample(texts, n)
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="V1 附属：导出盲评表（需要真实 LLM 跑 consult）")
     ap.add_argument("--queries-path", type=Path, default=DEFAULT_QUERIES_PATH)
@@ -122,6 +142,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out-answer-key", type=Path, default=DEFAULT_ANSWER_KEY_PATH)
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--sdt-dir", type=Path, default=None,
+                    help="TCMEval-SDT 目录（见 eval/sdt/README.md）；给了就另外从里面抽 --sdt-sample 条"
+                         " clinical_data 当主诉，跟 --queries-path 的测试主诉一起进盲评表（总纲 1.4a）")
+    ap.add_argument("--sdt-split", default="Validation")
+    ap.add_argument("--sdt-sample", type=int, default=10)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -130,6 +155,12 @@ def main(argv: list[str] | None = None) -> None:
     ]
     if args.limit is not None:
         queries = queries[: args.limit]
+    # --limit 只截测试主诉，SDT 那部分由 --sdt-sample 单独控制——两批各自有
+    # 自己的数量含义（"10 条测试主诉 + SDT 抽 10 条"），不用一个 limit 混着截。
+    if args.sdt_dir is not None:
+        sdt_queries = sample_sdt_queries(args.sdt_dir, args.sdt_split, args.sdt_sample, args.seed)
+        print(f"另从 SDT {args.sdt_split} 抽到 {len(sdt_queries)} 条主诉（要求 {args.sdt_sample} 条）")
+        queries = queries + sdt_queries
 
     if args.dry_run:
         # S1+S2 两次 + 每位医家 S3 一次（配伍禁忌可能重开）的量级估计，
