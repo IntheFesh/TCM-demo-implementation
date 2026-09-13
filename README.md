@@ -505,15 +505,24 @@ GET /api/trajectories/{physician}   # 例如 /api/trajectories/ye_tianshi
 python -m eval.run_eval --queries-path tests/queries.txt
 ```
 
+**七组数字的当前值、对照和 caveat 只维护在 [`eval/RESULTS.md`](eval/RESULTS.md)
+一处**（ε / 分歧度 / E3 / E4 / SDT / E9 / E8 / MES / E2 学派配对），README 和
+DEMO.md 从那里抄，哪一行的代码改了那一行就标"待重跑"。`report.json` 里另有
+`school_pairs`（师承内 vs 跨学派的两两配对，总纲 1.3）和 `react_process.samples`
+（ReAct 前 10 条完整动作序列）两段，排查"某条该进没进"这类问题时看它们，不用
+手写 python -c 去抓。
+
 `eval/mes/`（盲评导出/收集）用于人工判断"这条辨证像不像话"这类自动指标
-测不了的问题：`export.py` 把两位医家对同一条主诉的结果匿名成 A/B（隐去
-`cited_case_ids` 以防暴露医家身份）导出评分表，人工填完 `winner` 之后
-`collect.py` 换回身份、统计胜负、算 McNemar 显著性。
+测不了的问题：`export.py` 把注册表里全部医家对同一条主诉的结果匿名成
+A/B/C（隐去 `cited_case_ids` 以防暴露医家身份，顺序按 seed 打乱）导出评分表，
+人工填完 `winner` 之后 `collect.py` 换回身份、统计胜负、算 McNemar 显著性——
+McNemar 是配对二元检验，三位医家就是三对各跑一次（`--all-pairs`）。
 
 ```bash
-python -m eval.mes.export           # 导出 eval/mes/items.json + answer_key.json
-# ……人工在 items.json 里给每条填 winner: "A"/"B"/"tie"……
-python -m eval.mes.collect          # 统计胜负，写 eval/mes/collected.json
+# 10 条测试主诉 + 从 TCMEval-SDT 抽 10 条专家标注病例（$SDT 见下一节）
+python -m eval.mes.export --sdt-dir $SDT --sdt-sample 10
+# ……人工在 items.json 里给每条填 winner: "A"/"B"/"C"/"tie"……
+python -m eval.mes.collect --all-pairs   # 叶×吴、叶×张、吴×张各一份，写 eval/mes/collected.json
 ```
 
 ## 外部评测：TCMEval-SDT
