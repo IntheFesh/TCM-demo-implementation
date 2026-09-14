@@ -1,79 +1,79 @@
 {
-  "generated_at": "2026-09-12T04:49:00.976947+00:00",
+  "generated_at": "2026-09-13T01:49:27.673516+00:00",
   "n_queries": 10,
   "divergence_vs_epsilon": {
     "n_queries": 10,
     "n_usable": 9,
     "epsilon_online": 0.2409,
-    "n_above_epsilon": 6,
-    "n_within_epsilon": 3,
-    "rate_above_epsilon": 0.667,
+    "n_above_epsilon": 9,
+    "n_within_epsilon": 0,
+    "rate_above_epsilon": 1.0,
     "available": true,
-    "note": "6/9 条查询的用药 Jaccard 距离超过噪声地板 ε=0.2409，判定为真实分歧而非重复采样噪声；3 条在噪声地板以内，不构成分歧。"
+    "note": "9/9 条查询的用药 Jaccard 距离超过噪声地板 ε=0.2409，判定为真实分歧而非重复采样噪声；0 条在噪声地板以内，不构成分歧。"
   },
   "divergence_per_query": [
     {
       "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
-      "herb_jaccard": 0.952,
+      "herb_jaccard": 0.955,
       "epsilon": 0.5099,
-      "net_difference": 0.4421,
+      "net_difference": 0.4451,
       "verdict": "real_divergence"
     },
     {
       "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
-      "herb_jaccard": 0.9,
+      "herb_jaccard": 1.0,
       "epsilon": 0.2146,
-      "net_difference": 0.6854,
+      "net_difference": 0.7854,
       "verdict": "real_divergence"
     },
     {
       "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
-      "herb_jaccard": 0.75,
+      "herb_jaccard": 0.895,
       "epsilon": 0.3212,
-      "net_difference": 0.4288,
+      "net_difference": 0.5738,
       "verdict": "real_divergence"
     },
     {
       "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
-      "herb_jaccard": 0.0,
+      "herb_jaccard": 0.556,
       "epsilon": 0.2,
-      "net_difference": -0.2,
-      "verdict": "within_noise_floor"
+      "net_difference": 0.356,
+      "verdict": "real_divergence"
     },
     {
       "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
-      "herb_jaccard": 0.6,
+      "herb_jaccard": 0.917,
       "epsilon": 0.0,
-      "net_difference": 0.6,
+      "net_difference": 0.917,
       "verdict": "real_divergence"
     },
     {
       "query": "脘腹胀满疼痛，嗳腐吞酸，恶闻食臭，呕吐不消化食物，吐后稍舒，大便臭秽，舌苔厚腻，脉滑。",
-      "herb_jaccard": 0.0,
+      "herb_jaccard": 0.5,
       "epsilon": 0.0,
-      "net_difference": 0.0,
-      "verdict": "within_noise_floor"
+      "net_difference": 0.5,
+      "verdict": "real_divergence"
     },
     {
       "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
-      "herb_jaccard": 1.0,
+      "herb_jaccard": 0.538,
       "epsilon": 0.4704,
-      "net_difference": 0.5296,
+      "net_difference": 0.0676,
       "verdict": "real_divergence"
     },
     {
       "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
-      "herb_jaccard": 0.75,
+      "herb_jaccard": 0.667,
       "epsilon": 0.3969,
-      "net_difference": 0.3531,
+      "net_difference": 0.2701,
       "verdict": "real_divergence"
     },
     {
       "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
-      "herb_jaccard": 0.0,
+      "herb_jaccard": 0.333,
       "epsilon": 0.0555,
-      "net_difference": -0.0555,
-      "verdict": "within_noise_floor"
+      "net_difference": 0.2775,
+      "verdict": "real_divergence"
     },
     {
       "query": "胃脘疼痛数月，近日解黑色柏油样便，头晕心慌，面色苍白，倦怠乏力，舌淡，脉细数。",
@@ -102,7 +102,7 @@
     "n_normal": 9,
     "veto_rate": 0.1,
     "avg_llm_calls_vetoed": 1.0,
-    "avg_llm_calls_normal": 5.33,
+    "avg_llm_calls_normal": 5.22,
     "note": "1/10 条查询触发安全否决，不产出任何方药；被否决和正常完成两组各自的平均调用数并列报出，用来量化否决的成本，不是只报一个否决率数字。"
   },
   "retrieval_mode_comparisons": [],
@@ -111,14 +111,1166 @@
       "label": "swapped",
       "n_total": 28,
       "n_usable": 27,
-      "change_rate": 0.3348,
+      "n_empty_refs": 0,
+      "n_scored": 27,
+      "change_rate": 0.4508,
       "gate_threshold": 0.4,
-      "gate_pass": false,
-      "n_above_paired_epsilon": 11,
-      "n_within_paired_epsilon": 16,
+      "gate_pass": true,
+      "n_above_paired_epsilon": 16,
+      "n_within_paired_epsilon": 11,
       "n_no_paired_epsilon": 0,
-      "rate_above_paired_epsilon": 0.407,
-      "note": "swapped：27/28 条(主诉,医家)样本可用，用药 Jaccard 距离均值（改变率）=0.3348，闸门 ≥0.4（未通过）。按主诉+医家配对跟噪声地板逐条比较（不是减一个全局 ε）：11/27 条超出各自的噪声地板、算真实差异，16/27 条落在噪声地板以内、不算真实差异。"
+      "rate_above_paired_epsilon": 0.593,
+      "n_own_low_discrimination": 0,
+      "n_ablated_low_discrimination": 0,
+      "own_low_discrimination_rate": 0.0,
+      "ablated_low_discrimination_rate": 0.0,
+      "per_pair": [
+        {
+          "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0027-p13-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_refs_scores": [
+            0.772,
+            0.667,
+            0.84
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0023-p0-0",
+            "wu_jutong-0023-p1-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "吴茱萸",
+            "川楝子",
+            "延胡索",
+            "桑叶",
+            "牡丹皮",
+            "甘草",
+            "神曲",
+            "茯苓",
+            "陈皮",
+            "麦芽"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "厚朴",
+            "吴茱萸",
+            "干姜",
+            "枳实",
+            "甘草",
+            "陈皮",
+            "黄连"
+          ],
+          "jaccard": 0.75,
+          "epsilon": 0.5304,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0023-p0-0",
+            "wu_jutong-0023-p1-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_refs_scores": [
+            0.779,
+            0.768,
+            0.785
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "厚朴",
+            "吴茱萸",
+            "干姜",
+            "枳实",
+            "甘草",
+            "陈皮",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "甘草",
+            "生杭芍",
+            "生赭石",
+            "生鸡内金",
+            "生麦芽",
+            "茵陈"
+          ],
+          "jaccard": 0.9286,
+          "epsilon": 0.5641,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_refs_scores": [
+            0.842,
+            0.83,
+            0.807
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0027-p13-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_herbs": [
+            "山楂",
+            "枳壳",
+            "柴胡",
+            "海螵蛸",
+            "甘草",
+            "生杭芍",
+            "生赭石",
+            "生鸡内金",
+            "生麦芽",
+            "香附"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "吴茱萸",
+            "川楝子",
+            "延胡索",
+            "甘草",
+            "砂仁",
+            "茯苓",
+            "陈皮",
+            "香附"
+          ],
+          "jaccard": 0.8824,
+          "epsilon": 0.4352,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0002-p7-0",
+            "ye_tianshi-0010-p11-0",
+            "ye_tianshi-0018-p5-0"
+          ],
+          "own_refs_scores": [
+            0.816,
+            0.751,
+            0.793
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-6",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "人参",
+            "半夏",
+            "生姜",
+            "白香粳米",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "大枣",
+            "桂枝",
+            "甘草",
+            "生姜",
+            "白芍",
+            "饴糖",
+            "黄芪"
+          ],
+          "jaccard": 0.9091,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-6",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.845,
+            0.723,
+            0.751
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_herbs": [
+            "大枣",
+            "桂枝",
+            "甘草",
+            "生姜",
+            "白芍",
+            "饴糖",
+            "黄芪"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "干姜",
+            "甘草",
+            "白术"
+          ],
+          "jaccard": 0.9,
+          "epsilon": 0.6439,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_refs_scores": [
+            0.796,
+            0.614,
+            0.816
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0002-p7-0",
+            "ye_tianshi-0010-p11-0",
+            "ye_tianshi-0018-p5-0"
+          ],
+          "own_herbs": [
+            "大枣",
+            "干姜",
+            "桂枝",
+            "甘草",
+            "白芍",
+            "饴糖",
+            "黄芪"
+          ],
+          "ablated_herbs": [
+            "大枣",
+            "桂枝",
+            "甘草",
+            "生姜",
+            "白芍",
+            "饴糖",
+            "黄芪"
+          ],
+          "jaccard": 0.25,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0004-p3-0",
+            "ye_tianshi-0004-p9-0",
+            "ye_tianshi-0004-p0-0"
+          ],
+          "own_refs_scores": [
+            0.768,
+            0.744,
+            0.785
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0007-p3-1",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "厚朴",
+            "栀子",
+            "淡豆豉",
+            "石菖蒲",
+            "芦根",
+            "黄连"
+          ],
+          "jaccard": 0.8333,
+          "epsilon": 0.2667,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0007-p3-1",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.735,
+            0.709,
+            0.737
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0011-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0011-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_refs_scores": [
+            0.773,
+            0.75,
+            0.805
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0004-p3-0",
+            "ye_tianshi-0004-p9-0",
+            "ye_tianshi-0004-p0-0"
+          ],
+          "own_herbs": [
+            "滑石",
+            "甘草",
+            "生赭石",
+            "生鸡内金",
+            "生麦芽",
+            "竹茹",
+            "茵陈",
+            "通草",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.9333,
+          "epsilon": 0.6968,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0011-p3-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_refs_scores": [
+            0.801,
+            0.738,
+            0.814
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0005-p1-0",
+            "wu_jutong-0003-p0-2",
+            "wu_jutong-0003-p1-0"
+          ],
+          "own_herbs": [
+            "地黄",
+            "沙参",
+            "火麻仁",
+            "玉竹",
+            "甘草",
+            "白芍",
+            "石斛",
+            "麦冬"
+          ],
+          "ablated_herbs": [
+            "冰糖",
+            "地黄",
+            "沙参",
+            "玉竹",
+            "麦冬"
+          ],
+          "jaccard": 0.5556,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0005-p1-0",
+            "wu_jutong-0003-p0-2",
+            "wu_jutong-0003-p1-0"
+          ],
+          "own_refs_scores": [
+            0.742,
+            0.759,
+            0.742
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0007-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_herbs": [
+            "冰糖",
+            "地黄",
+            "沙参",
+            "玉竹",
+            "麦冬"
+          ],
+          "ablated_herbs": [
+            "冰糖",
+            "地黄",
+            "沙参",
+            "玉竹",
+            "麦冬"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0007-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_refs_scores": [
+            0.743,
+            0.636,
+            0.788
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0011-p3-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_herbs": [
+            "地黄",
+            "沙参",
+            "玉竹",
+            "甘草",
+            "生怀山药",
+            "生杭芍",
+            "生赭石",
+            "生鸡内金",
+            "生麦芽",
+            "麦冬"
+          ],
+          "ablated_herbs": [
+            "地黄",
+            "川楝子",
+            "沙参",
+            "玉竹",
+            "甘草",
+            "白芍",
+            "麦冬"
+          ],
+          "jaccard": 0.5833,
+          "epsilon": 0.6,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0015-p8-0",
+            "ye_tianshi-0018-p7-0"
+          ],
+          "own_refs_scores": [
+            0.818,
+            0.796,
+            0.828
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0015-p2-7",
+            "wu_jutong-0008-p2-0"
+          ],
+          "own_herbs": [
+            "人参",
+            "半夏",
+            "生姜",
+            "白香粳米",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "生姜",
+            "茯苓"
+          ],
+          "jaccard": 0.4,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0015-p2-7",
+            "wu_jutong-0008-p2-0"
+          ],
+          "own_refs_scores": [
+            0.698,
+            0.74,
+            0.762
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0020-p0-0",
+            "zhang_xichun-0028-p0-0",
+            "zhang_xichun-0011-p0-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "生姜",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "桂枝",
+            "甘草",
+            "生姜",
+            "白术",
+            "茯苓"
+          ],
+          "jaccard": 0.5,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0020-p0-0",
+            "zhang_xichun-0028-p0-0",
+            "zhang_xichun-0011-p0-0"
+          ],
+          "own_refs_scores": [
+            0.801,
+            0.746,
+            0.815
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0015-p8-0",
+            "ye_tianshi-0018-p7-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "生姜",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "生姜",
+            "茯苓"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹胀满疼痛，嗳腐吞酸，恶闻食臭，呕吐不消化食物，吐后稍舒，大便臭秽，舌苔厚腻，脉滑。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0030-p10-0",
+            "ye_tianshi-0029-p7-0",
+            "ye_tianshi-0031-p2-0"
+          ],
+          "own_refs_scores": [
+            0.788,
+            0.775,
+            0.816
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0006-p1-2",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹胀满疼痛，嗳腐吞酸，恶闻食臭，呕吐不消化食物，吐后稍舒，大便臭秽，舌苔厚腻，脉滑。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0006-p1-2",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_refs_scores": [
+            0.757,
+            0.668,
+            0.761
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0031-p0-0",
+            "zhang_xichun-0002-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹胀满疼痛，嗳腐吞酸，恶闻食臭，呕吐不消化食物，吐后稍舒，大便臭秽，舌苔厚腻，脉滑。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0031-p0-0",
+            "zhang_xichun-0002-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_refs_scores": [
+            0.734,
+            0.679,
+            0.832
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0030-p10-0",
+            "ye_tianshi-0029-p7-0",
+            "ye_tianshi-0031-p2-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0005-p3-0",
+            "ye_tianshi-0030-p20-0"
+          ],
+          "own_refs_scores": [
+            0.773,
+            0.753,
+            0.8
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "丹参",
+            "五灵脂",
+            "延胡索",
+            "桂枝",
+            "砂仁",
+            "茯苓",
+            "蒲黄"
+          ],
+          "ablated_herbs": [
+            "丹参",
+            "九香虫",
+            "五灵脂",
+            "川楝子",
+            "延胡索",
+            "檀香",
+            "砂仁",
+            "蒲黄",
+            "谷芽"
+          ],
+          "jaccard": 0.5455,
+          "epsilon": 0.2222,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.792,
+            0.656,
+            0.727
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0036-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_herbs": [
+            "丹参",
+            "五灵脂",
+            "延胡索",
+            "檀香",
+            "甘草",
+            "白芍",
+            "砂仁",
+            "蒲黄"
+          ],
+          "ablated_herbs": [
+            "丹参",
+            "五灵脂",
+            "川楝子",
+            "延胡索",
+            "檀香",
+            "甘草",
+            "生怀山药",
+            "砂仁",
+            "蒲黄"
+          ],
+          "jaccard": 0.3,
+          "epsilon": 0.5,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0036-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_refs_scores": [
+            0.668,
+            0.586,
+            0.755
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0005-p3-0",
+            "ye_tianshi-0030-p20-0"
+          ],
+          "own_herbs": [
+            "丹参",
+            "五灵脂",
+            "甘草",
+            "生怀山药",
+            "生赭石",
+            "生鸡内金",
+            "砂仁",
+            "蒲黄"
+          ],
+          "ablated_herbs": [
+            "丹参",
+            "乳香",
+            "五灵脂",
+            "延胡索",
+            "没药",
+            "砂仁",
+            "蒲黄",
+            "香附"
+          ],
+          "jaccard": 0.6667,
+          "epsilon": 0.6889,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0008-p15-0",
+            "ye_tianshi-0008-p10-0",
+            "ye_tianshi-0008-p9-0"
+          ],
+          "own_refs_scores": [
+            0.815,
+            0.812,
+            0.834
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0016-p1-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0006-p0-4"
+          ],
+          "own_herbs": [
+            "人参",
+            "广木香",
+            "煨姜",
+            "白术",
+            "益智仁",
+            "砂仁壳",
+            "茯苓",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "山药",
+            "扁豆",
+            "桔梗",
+            "甘草",
+            "白术",
+            "砂仁",
+            "茯苓",
+            "莲子",
+            "薏苡仁"
+          ],
+          "jaccard": 0.875,
+          "epsilon": 0.7056,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0016-p1-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0006-p0-4"
+          ],
+          "own_refs_scores": [
+            0.737,
+            0.685,
+            0.802
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0009-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "山药",
+            "广木香",
+            "甘草",
+            "白术",
+            "白蔻仁",
+            "茯苓",
+            "薏苡仁",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "山药",
+            "扁豆",
+            "桔梗",
+            "甘草",
+            "白术",
+            "砂仁",
+            "茯苓",
+            "莲子",
+            "薏苡仁"
+          ],
+          "jaccard": 0.5714,
+          "epsilon": 0.0667,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0009-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_refs_scores": [
+            0.801,
+            0.676,
+            0.829
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0008-p15-0",
+            "ye_tianshi-0008-p10-0",
+            "ye_tianshi-0008-p9-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "甘草",
+            "生怀山药",
+            "生鸡内金",
+            "白术",
+            "茯苓",
+            "薏苡仁",
+            "谷芽",
+            "陈皮",
+            "麦芽"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "厚朴",
+            "山药",
+            "甘草",
+            "白术",
+            "砂仁",
+            "茯苓",
+            "薏苡仁",
+            "陈皮"
+          ],
+          "jaccard": 0.5385,
+          "epsilon": 0.4185,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0003-p2-0",
+            "ye_tianshi-0004-p2-0",
+            "ye_tianshi-0016-p9-0"
+          ],
+          "own_refs_scores": [
+            0.781,
+            0.725,
+            0.804
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "人参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.25,
+          "epsilon": 0.0833,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.838,
+            0.684,
+            0.731
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0008-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0008-p0-0"
+          ],
+          "own_refs_scores": [
+            0.742,
+            0.613,
+            0.782
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0003-p2-0",
+            "ye_tianshi-0004-p2-0",
+            "ye_tianshi-0016-p9-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0833,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        }
+      ],
+      "note": "swapped：27/28 条(主诉,医家)样本可用。27 条计入 change_rate，用药 Jaccard 距离均值（改变率）=0.4508，闸门 ≥0.4（通过）。按主诉+医家配对跟噪声地板逐条比较（不是减一个全局 ε）：16/27 条超出各自的噪声地板、算真实差异，11/27 条落在噪声地板以内、不算真实差异。 own 侧 0/27（0.0）、消融侧 0/27（0.0） 的检索候选被判定为没有真实区分度、收窄到了 top-1（LOW_DISCRIMINATION_CUTOFF）。"
     }
   ],
   "retriever_mode_effect": null,

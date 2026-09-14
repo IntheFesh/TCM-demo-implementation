@@ -1,50 +1,50 @@
 {
-  "generated_at": "2026-09-12T06:01:51.545463+00:00",
+  "generated_at": "2026-09-13T17:47:04.293222+00:00",
   "n_queries": 10,
   "divergence_vs_epsilon": {
     "n_queries": 10,
     "n_usable": 9,
     "epsilon_online": 0.2409,
-    "n_above_epsilon": 6,
-    "n_within_epsilon": 3,
-    "rate_above_epsilon": 0.667,
+    "n_above_epsilon": 8,
+    "n_within_epsilon": 1,
+    "rate_above_epsilon": 0.889,
     "available": true,
-    "note": "6/9 条查询的用药 Jaccard 距离超过噪声地板 ε=0.2409，判定为真实分歧而非重复采样噪声；3 条在噪声地板以内，不构成分歧。"
+    "note": "8/9 条查询的用药 Jaccard 距离超过噪声地板 ε=0.2409，判定为真实分歧而非重复采样噪声；1 条在噪声地板以内，不构成分歧。"
   },
   "divergence_per_query": [
     {
       "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
-      "herb_jaccard": 1.0,
+      "herb_jaccard": 0.957,
       "epsilon": 0.5099,
-      "net_difference": 0.4901,
+      "net_difference": 0.4471,
       "verdict": "real_divergence"
     },
     {
       "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
-      "herb_jaccard": 0.9,
+      "herb_jaccard": 0.944,
       "epsilon": 0.2146,
-      "net_difference": 0.6854,
+      "net_difference": 0.7294,
       "verdict": "real_divergence"
     },
     {
       "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
-      "herb_jaccard": 0.4,
+      "herb_jaccard": 0.857,
       "epsilon": 0.3212,
-      "net_difference": 0.0788,
+      "net_difference": 0.5358,
       "verdict": "real_divergence"
     },
     {
       "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
-      "herb_jaccard": 0.0,
+      "herb_jaccard": 0.6,
       "epsilon": 0.2,
-      "net_difference": -0.2,
-      "verdict": "within_noise_floor"
+      "net_difference": 0.4,
+      "verdict": "real_divergence"
     },
     {
       "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
-      "herb_jaccard": 0.778,
+      "herb_jaccard": 0.667,
       "epsilon": 0.0,
-      "net_difference": 0.778,
+      "net_difference": 0.667,
       "verdict": "real_divergence"
     },
     {
@@ -56,24 +56,24 @@
     },
     {
       "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
-      "herb_jaccard": 1.0,
+      "herb_jaccard": 0.688,
       "epsilon": 0.4704,
-      "net_difference": 0.5296,
+      "net_difference": 0.2176,
       "verdict": "real_divergence"
     },
     {
       "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
-      "herb_jaccard": 0.857,
+      "herb_jaccard": 0.786,
       "epsilon": 0.3969,
-      "net_difference": 0.4601,
+      "net_difference": 0.3891,
       "verdict": "real_divergence"
     },
     {
       "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
-      "herb_jaccard": 0.0,
+      "herb_jaccard": 0.643,
       "epsilon": 0.0555,
-      "net_difference": -0.0555,
-      "verdict": "within_noise_floor"
+      "net_difference": 0.5875,
+      "verdict": "real_divergence"
     },
     {
       "query": "胃脘疼痛数月，近日解黑色柏油样便，头晕心慌，面色苍白，倦怠乏力，舌淡，脉细数。",
@@ -83,6 +83,15 @@
       "verdict": "unusable"
     }
   ],
+  "school_pairs": {
+    "n_comparable": 9,
+    "n_skipped": 1,
+    "n_cross_school_gt_lineage": 5,
+    "lineage_mean": 0.453,
+    "cross_school_mean": 0.584,
+    "holds_on_majority": true,
+    "note": "9 条主诉可比较（另 1 条不计入）：其中 5 条跨学派分歧 > 师承内分歧（5/9），师承内均值 0.453 vs 跨学派均值 0.584。判据「多数主诉成立」：成立（只报出，不作硬闸门；两位医家同为温病学派、第三位衷中参西派，学派分组来自 core/physicians.py 的 school 字段）。"
+  },
   "hallucination": {
     "with_reference_cases": {
       "n": 27,
@@ -102,7 +111,7 @@
     "n_normal": 9,
     "veto_rate": 0.1,
     "avg_llm_calls_vetoed": 1.0,
-    "avg_llm_calls_normal": 5.22,
+    "avg_llm_calls_normal": 5.44,
     "note": "1/10 条查询触发安全否决，不产出任何方药；被否决和正常完成两组各自的平均调用数并列报出，用来量化否决的成本，不是只报一个否决率数字。"
   },
   "retrieval_mode_comparisons": [],
@@ -111,14 +120,1187 @@
       "label": "react_on",
       "n_total": 28,
       "n_usable": 27,
-      "change_rate": 0.2503,
+      "n_failed": 0,
+      "n_empty_refs": 0,
+      "n_scored": 27,
+      "change_rate": 0.4628,
       "gate_threshold": 0.4,
-      "gate_pass": false,
-      "n_above_paired_epsilon": 7,
-      "n_within_paired_epsilon": 20,
+      "gate_pass": true,
+      "n_above_paired_epsilon": 17,
+      "n_within_paired_epsilon": 10,
       "n_no_paired_epsilon": 0,
-      "rate_above_paired_epsilon": 0.259,
-      "note": "react_on：27/28 条(主诉,医家)样本可用，用药 Jaccard 距离均值（改变率）=0.2503，闸门 ≥0.4（未通过）。按主诉+医家配对跟噪声地板逐条比较（不是减一个全局 ε）：7/27 条超出各自的噪声地板、算真实差异，20/27 条落在噪声地板以内、不算真实差异。"
+      "rate_above_paired_epsilon": 0.63,
+      "n_own_low_discrimination": 0,
+      "n_ablated_low_discrimination": 0,
+      "own_low_discrimination_rate": 0.0,
+      "ablated_low_discrimination_rate": 0.0,
+      "per_pair": [
+        {
+          "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0027-p13-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_refs_scores": [
+            0.772,
+            0.667,
+            0.84
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0027-p13-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_herbs": [
+            "人参",
+            "半夏",
+            "山楂",
+            "干姜",
+            "延胡索",
+            "甘草",
+            "神曲",
+            "金铃子",
+            "陈皮",
+            "香附",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "丹皮",
+            "半夏",
+            "延胡索",
+            "桑叶",
+            "甘草",
+            "茯苓",
+            "金铃子",
+            "陈皮"
+          ],
+          "jaccard": 0.6667,
+          "epsilon": 0.5304,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0023-p0-0",
+            "wu_jutong-0023-p1-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_refs_scores": [
+            0.779,
+            0.768,
+            0.785
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0023-p0-0",
+            "wu_jutong-0023-p1-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "厚朴",
+            "吴茱萸",
+            "枳实",
+            "生姜",
+            "神曲",
+            "陈皮",
+            "麦芽",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "厚朴",
+            "吴茱萸",
+            "木香",
+            "枳实",
+            "甘草",
+            "生姜",
+            "茯苓",
+            "陈皮",
+            "香附",
+            "黄连"
+          ],
+          "jaccard": 0.4615,
+          "epsilon": 0.5641,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_refs_scores": [
+            0.842,
+            0.83,
+            0.807
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_herbs": [
+            "山楂",
+            "枳壳",
+            "柴胡",
+            "甘草",
+            "生赭石",
+            "生鸡内金",
+            "生麦芽",
+            "白芍",
+            "神曲",
+            "香附"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "川楝子",
+            "延胡索",
+            "海螵蛸",
+            "瓦楞子",
+            "甘草",
+            "生怀山药",
+            "生杭芍",
+            "生赭石",
+            "生鸡内金",
+            "生麦芽",
+            "茵陈",
+            "陈皮"
+          ],
+          "jaccard": 0.7895,
+          "epsilon": 0.4352,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0002-p7-0",
+            "ye_tianshi-0010-p11-0",
+            "ye_tianshi-0018-p5-0"
+          ],
+          "own_refs_scores": [
+            0.816,
+            0.751,
+            0.793
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0002-p7-0",
+            "ye_tianshi-0010-p11-0",
+            "ye_tianshi-0018-p5-0"
+          ],
+          "own_herbs": [
+            "人参",
+            "半夏",
+            "生姜",
+            "粳米",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "人参",
+            "桂枝",
+            "煨姜",
+            "甘草",
+            "白术",
+            "茯苓",
+            "附子"
+          ],
+          "jaccard": 0.8,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-6",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.845,
+            0.723,
+            0.751
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-6",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "大枣",
+            "桂枝",
+            "甘草",
+            "生姜",
+            "白芍",
+            "饴糖",
+            "黄芪"
+          ],
+          "ablated_herbs": [
+            "大枣",
+            "桂枝",
+            "甘草",
+            "生姜",
+            "白芍",
+            "饴糖",
+            "黄芪"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.6439,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_refs_scores": [
+            0.796,
+            0.614,
+            0.816
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "干姜",
+            "延胡索",
+            "甘草",
+            "生怀山药",
+            "生鸡内金",
+            "白术",
+            "白芍",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "大枣",
+            "桂枝",
+            "甘草",
+            "生姜",
+            "白芍",
+            "饴糖",
+            "黄芪"
+          ],
+          "jaccard": 0.8571,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0004-p3-0",
+            "ye_tianshi-0004-p9-0",
+            "ye_tianshi-0004-p0-0"
+          ],
+          "own_refs_scores": [
+            0.768,
+            0.744,
+            0.785
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0004-p3-0",
+            "ye_tianshi-0004-p9-0",
+            "ye_tianshi-0004-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.2667,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0007-p3-1",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.735,
+            0.709,
+            0.737
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0007-p3-1",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "厚朴",
+            "甘草",
+            "茯苓",
+            "薏苡仁",
+            "藿香",
+            "陈皮",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "杏仁",
+            "枳实",
+            "滑石",
+            "生苡仁",
+            "白蔻仁",
+            "通草",
+            "陈皮",
+            "黄芩"
+          ],
+          "jaccard": 0.8,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0011-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_refs_scores": [
+            0.773,
+            0.75,
+            0.805
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0008-p0-0",
+            "zhang_xichun-0011-p0-0",
+            "zhang_xichun-0025-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "厚朴",
+            "甘草",
+            "生鸡内金",
+            "生麦芽",
+            "苍术",
+            "茵陈",
+            "陈皮"
+          ],
+          "jaccard": 0.9231,
+          "epsilon": 0.6968,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0011-p3-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_refs_scores": [
+            0.801,
+            0.738,
+            0.814
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0011-p3-0",
+            "ye_tianshi-0002-p7-0"
+          ],
+          "own_herbs": [
+            "冰糖",
+            "地黄",
+            "沙参",
+            "玉竹",
+            "麦冬"
+          ],
+          "ablated_herbs": [
+            "冰糖",
+            "地黄",
+            "沙参",
+            "玉竹",
+            "麦冬"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0005-p1-0",
+            "wu_jutong-0003-p0-2",
+            "wu_jutong-0003-p1-0"
+          ],
+          "own_refs_scores": [
+            0.742,
+            0.759,
+            0.742
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0005-p1-0",
+            "wu_jutong-0003-p0-2",
+            "wu_jutong-0003-p1-0"
+          ],
+          "own_herbs": [
+            "冰糖",
+            "地黄",
+            "沙参",
+            "玉竹",
+            "麦冬"
+          ],
+          "ablated_herbs": [
+            "地黄",
+            "杭白芍",
+            "沙参",
+            "火麻仁",
+            "玉竹",
+            "甘草",
+            "麦冬"
+          ],
+          "jaccard": 0.5,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0007-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_refs_scores": [
+            0.743,
+            0.636,
+            0.788
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0007-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_herbs": [
+            "冰糖",
+            "地黄",
+            "沙参",
+            "玉竹",
+            "生怀山药",
+            "生赭石",
+            "生鸡内金",
+            "生麦芽",
+            "麦冬"
+          ],
+          "ablated_herbs": [
+            "地黄",
+            "沙参",
+            "玉竹",
+            "甘草",
+            "生怀山药",
+            "生杭芍",
+            "生鸡内金",
+            "生麦芽",
+            "麦冬"
+          ],
+          "jaccard": 0.3636,
+          "epsilon": 0.6,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0015-p8-0",
+            "ye_tianshi-0018-p7-0"
+          ],
+          "own_refs_scores": [
+            0.818,
+            0.796,
+            0.828
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0002-p15-0",
+            "ye_tianshi-0015-p8-0",
+            "ye_tianshi-0018-p7-0"
+          ],
+          "own_herbs": [
+            "人参",
+            "半夏",
+            "姜汁",
+            "白香粳米",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "人参",
+            "半夏",
+            "姜汁",
+            "白香粳米",
+            "茯苓"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0015-p2-7",
+            "wu_jutong-0008-p2-0"
+          ],
+          "own_refs_scores": [
+            0.698,
+            0.74,
+            0.762
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0015-p2-7",
+            "wu_jutong-0008-p2-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "旋复花",
+            "生姜",
+            "茯苓",
+            "薏苡仁",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "生姜",
+            "茯苓"
+          ],
+          "jaccard": 0.5,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胸脘痞闷，呕吐清水痰涎，头晕目眩，心下悸动，口不渴，舌苔白滑，脉弦滑。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0020-p0-0",
+            "zhang_xichun-0028-p0-0",
+            "zhang_xichun-0011-p0-0"
+          ],
+          "own_refs_scores": [
+            0.801,
+            0.746,
+            0.815
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0020-p0-0",
+            "zhang_xichun-0028-p0-0",
+            "zhang_xichun-0011-p0-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "生姜",
+            "茯苓"
+          ],
+          "ablated_herbs": [
+            "桂枝",
+            "甘草",
+            "白术",
+            "茯苓"
+          ],
+          "jaccard": 0.8333,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹胀满疼痛，嗳腐吞酸，恶闻食臭，呕吐不消化食物，吐后稍舒，大便臭秽，舌苔厚腻，脉滑。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0030-p10-0",
+            "ye_tianshi-0029-p7-0",
+            "ye_tianshi-0031-p2-0"
+          ],
+          "own_refs_scores": [
+            0.788,
+            0.775,
+            0.816
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0030-p10-0",
+            "ye_tianshi-0029-p7-0",
+            "ye_tianshi-0031-p2-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹胀满疼痛，嗳腐吞酸，恶闻食臭，呕吐不消化食物，吐后稍舒，大便臭秽，舌苔厚腻，脉滑。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0006-p1-2",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_refs_scores": [
+            0.757,
+            0.668,
+            0.761
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0006-p1-2",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0007-p3-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "脘腹胀满疼痛，嗳腐吞酸，恶闻食臭，呕吐不消化食物，吐后稍舒，大便臭秽，舌苔厚腻，脉滑。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0031-p0-0",
+            "zhang_xichun-0002-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_refs_scores": [
+            0.734,
+            0.679,
+            0.832
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0031-p0-0",
+            "zhang_xichun-0002-p0-0",
+            "zhang_xichun-0006-p0-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "山楂",
+            "神曲",
+            "茯苓",
+            "莱菔子",
+            "连翘",
+            "陈皮"
+          ],
+          "jaccard": 0.0,
+          "epsilon": 0.0,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0005-p3-0",
+            "ye_tianshi-0030-p20-0"
+          ],
+          "own_refs_scores": [
+            0.773,
+            0.753,
+            0.8
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0030-p0-0",
+            "ye_tianshi-0005-p3-0",
+            "ye_tianshi-0030-p20-0"
+          ],
+          "own_herbs": [
+            "丹参",
+            "五灵脂",
+            "半夏",
+            "延胡索",
+            "桂枝",
+            "生姜",
+            "砂仁",
+            "茯苓",
+            "蒲黄"
+          ],
+          "ablated_herbs": [
+            "半夏",
+            "南山楂",
+            "延胡索",
+            "桂枝木",
+            "生姜",
+            "茯苓",
+            "香附",
+            "高良姜"
+          ],
+          "jaccard": 0.6923,
+          "epsilon": 0.2222,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.792,
+            0.656,
+            0.727
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "丹参",
+            "五灵脂",
+            "川楝子",
+            "延胡索",
+            "檀香",
+            "甘草",
+            "白术",
+            "砂仁",
+            "蒲黄"
+          ],
+          "ablated_herbs": [
+            "丹参",
+            "五灵脂",
+            "川楝子",
+            "延胡索",
+            "檀香",
+            "甘草",
+            "砂仁",
+            "蒲黄",
+            "赤芍"
+          ],
+          "jaccard": 0.2,
+          "epsilon": 0.5,
+          "verdict": "within_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "胃脘刺痛，痛处固定不移，拒按，入夜尤甚，病已三年，面色晦暗，舌质紫暗有瘀点，脉涩。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0036-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_refs_scores": [
+            0.668,
+            0.586,
+            0.755
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0036-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_herbs": [
+            "三七",
+            "丹参",
+            "五灵脂",
+            "延胡索",
+            "檀香",
+            "甘草",
+            "生怀山药",
+            "生赭石",
+            "生鸡内金",
+            "砂仁",
+            "蒲黄"
+          ],
+          "ablated_herbs": [
+            "丹参",
+            "当归",
+            "生明乳香",
+            "生明没药"
+          ],
+          "jaccard": 0.9286,
+          "epsilon": 0.6889,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0008-p15-0",
+            "ye_tianshi-0008-p10-0",
+            "ye_tianshi-0008-p9-0"
+          ],
+          "own_refs_scores": [
+            0.815,
+            0.812,
+            0.834
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0008-p15-0",
+            "ye_tianshi-0008-p10-0",
+            "ye_tianshi-0008-p9-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "厚朴",
+            "山药",
+            "扁豆",
+            "木香",
+            "甘草",
+            "白术",
+            "砂仁",
+            "苍术",
+            "茯苓",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "人参",
+            "煨姜",
+            "白术",
+            "益智仁",
+            "茯苓",
+            "陈皮"
+          ],
+          "jaccard": 0.7857,
+          "epsilon": 0.7056,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0016-p1-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0006-p0-4"
+          ],
+          "own_refs_scores": [
+            0.737,
+            0.685,
+            0.802
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0016-p1-0",
+            "wu_jutong-0005-p0-0",
+            "wu_jutong-0006-p0-4"
+          ],
+          "own_herbs": [
+            "党参",
+            "山药",
+            "扁豆",
+            "桔梗",
+            "甘草",
+            "白术",
+            "砂仁",
+            "茯苓",
+            "薏苡仁",
+            "陈皮"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "广木香",
+            "生苡仁",
+            "白术",
+            "白蔻仁",
+            "茯苓",
+            "藿香梗",
+            "陈皮"
+          ],
+          "jaccard": 0.7143,
+          "epsilon": 0.0667,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "食少腹胀，食后尤甚，大便溏薄，稍进油腻则次数增多，倦怠乏力，面色萎黄，舌淡苔白，脉缓弱。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0009-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_refs_scores": [
+            0.801,
+            0.676,
+            0.829
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0009-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0021-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "扁豆",
+            "甘草",
+            "生怀山药",
+            "生鸡内金",
+            "白术",
+            "茯苓",
+            "陈皮",
+            "麦芽"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "建神曲",
+            "甘草",
+            "生怀山药",
+            "生鸡内金",
+            "生麦芽",
+            "白术",
+            "茯苓"
+          ],
+          "jaccard": 0.4545,
+          "epsilon": 0.4185,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
+          "physician": "ye_tianshi",
+          "own_refs_ids": [
+            "ye_tianshi-0003-p2-0",
+            "ye_tianshi-0004-p2-0",
+            "ye_tianshi-0016-p9-0"
+          ],
+          "own_refs_scores": [
+            0.781,
+            0.725,
+            0.804
+          ],
+          "ablated_refs_ids": [
+            "ye_tianshi-0003-p2-0",
+            "ye_tianshi-0004-p2-0",
+            "ye_tianshi-0016-p9-0"
+          ],
+          "own_herbs": [
+            "半夏",
+            "山楂",
+            "干姜",
+            "枳实",
+            "神曲",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.6,
+          "epsilon": 0.0833,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
+          "physician": "wu_jutong",
+          "own_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_refs_scores": [
+            0.838,
+            0.684,
+            0.731
+          ],
+          "ablated_refs_ids": [
+            "wu_jutong-0007-p3-0",
+            "wu_jutong-0023-p3-0",
+            "wu_jutong-0005-p1-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "生姜",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.125,
+          "epsilon": 0.0,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        },
+        {
+          "query": "心下痞满，按之不痛，干噫食臭，肠鸣下利，兼见口苦，舌苔薄黄而腻，脉弦数。",
+          "physician": "zhang_xichun",
+          "own_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0008-p0-0"
+          ],
+          "own_refs_scores": [
+            0.742,
+            0.613,
+            0.782
+          ],
+          "ablated_refs_ids": [
+            "zhang_xichun-0021-p0-0",
+            "zhang_xichun-0029-p0-0",
+            "zhang_xichun-0008-p0-0"
+          ],
+          "own_herbs": [
+            "党参",
+            "半夏",
+            "大枣",
+            "干姜",
+            "甘草",
+            "生姜",
+            "黄芩",
+            "黄连"
+          ],
+          "ablated_herbs": [
+            "党参",
+            "半夏",
+            "干姜",
+            "甘草",
+            "生怀山药",
+            "生杭芍",
+            "生鸡内金",
+            "生麦芽",
+            "黄芩",
+            "黄连"
+          ],
+          "jaccard": 0.5,
+          "epsilon": 0.0833,
+          "verdict": "above_epsilon",
+          "own_low_discrimination": false,
+          "ablated_low_discrimination": false
+        }
+      ],
+      "note": "react_on：27/28 条(主诉,医家)样本可用。27 条计入 change_rate，用药 Jaccard 距离均值（改变率）=0.4628，闸门 ≥0.4（通过）。按主诉+医家配对跟噪声地板逐条比较（不是减一个全局 ε）：17/27 条超出各自的噪声地板、算真实差异，10/27 条落在噪声地板以内、不算真实差异。 own 侧 0/27（0.0）、消融侧 0/27（0.0） 的检索候选被判定为没有真实区分度、收窄到了 top-1（LOW_DISCRIMINATION_CUTOFF）。"
     }
   ],
   "retriever_mode_effect": null,
@@ -131,12 +1313,433 @@
       "n": 27
     },
     "terminated_by_distribution": {
-      "ask_user": 2,
-      "max_steps": 23,
+      "max_steps": 25,
       "finish": 2
     },
     "terminated_by_caveat": "terminated_by 的分布对 prompt 措辞敏感（SOURCES.md 第 12 条）：去掉prompt 里的剩余步数计数后，max_steps 收尾的比例从 0/5 涨到 4/8——这个分布会随 prompt 微调而变化，不是模型能力的稳定特征，引用这份分布时要连带说明当时的 prompt 版本，不能当成跟 prompt 无关的固定指标。",
-    "note": "27 条 (主诉,医家) 样本开了 ReAct：步数 mean=5.0 p50=5.0 p95=5.0；terminated_by 分布：{'ask_user': 2, 'max_steps': 23, 'finish': 2}。terminated_by 的分布对 prompt 措辞敏感（SOURCES.md 第 12 条）：去掉prompt 里的剩余步数计数后，max_steps 收尾的比例从 0/5 涨到 4/8——这个分布会随 prompt 微调而变化，不是模型能力的稳定特征，引用这份分布时要连带说明当时的 prompt 版本，不能当成跟 prompt 无关的固定指标。"
+    "samples": [
+      {
+        "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+        "physician": "ye_tianshi",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃脘胀痛 嗳气泛酸 情志不畅 纳差', 'physician': 'ye_tianshi', 'k",
+            "thought_head": "这是第一步。患者症状指向肝胃气滞，但我要先看叶天士本人遇到「胃脘胀痛、嗳气泛酸、情志不畅而发」这类病例实际怎么辨证用药，这是最终开方真正要依据的。先做医案检索。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"ye_tianshi-0030-p20-0\", \"score\": 0.726, \"visit_index\": 0,"
+          },
+          {
+            "step": 2,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '肝胃不和'}",
+            "thought_head": "已从医案层看到叶天士处理类似'情志不适即发'的胃脘痛，多用平肝木、安胃土、辛以通之的思路。现在需要核对标准层：'肝胃不和'或'肝气犯胃'证在国标里要求的主症是否齐备，以确认证型命名。",
+            "observation_head": "{\"found\": false, \"query\": \"肝胃不和\", \"candidates\": [{\"code\": \"SP-01\", \"name\": \"肝胃不和证\"}, {\"code\": \"TB-12"
+          },
+          {
+            "step": 3,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '嗳气', 'physician': 'ye_tianshi', 'limit': 10}",
+            "thought_head": "第1步医案检索已找到叶天士处理类似症状的先例，其中 ye_tianshi-0030-p0-0 明确记载「情志不适即发」「胃脘常痛」，与本案「每因情志不畅而发」高度吻合，是核心先例。第2步 lookup",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（ye_tianshi）的医案三元组里没有匹配项，已查 29247"
+          },
+          {
+            "step": 4,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': 'SP-01'}",
+            "thought_head": "第2步查「肝胃不和」返回 found=false，只给了候选编码。我需要用候选里的 code 重查一次，确认标准里肝胃不和证的主症是否与患者（胃脘胀痛、食后加重、嗳气泛酸、情志不畅而发、纳差）齐备，这",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"SP-01\", \"name\": \"肝胃不和证\", \"is_category\": false, \"parent\": nul"
+          },
+          {
+            "step": 5,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '情志', 'physician': 'ye_tianshi', 'limit': 10}",
+            "thought_head": "还剩最后一步。标准层已确认 SP-01 肝胃不和证的主症（胃脘胀满或疼痛、两胁胀满）与次症（情志不畅加重、嗳气频作）基本齐备，证素肝、胃、气滞也吻合。但叶天士的医案里对这类「肝木乘土」的胃脘痛，实际用",
+            "observation_head": "{\"available\": true, \"total_matched\": 2, \"triples\": [{\"case_id\": \"ye_tianshi-0029-p10-1\", \"physician\""
+          }
+        ]
+      },
+      {
+        "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+        "physician": "wu_jutong",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃脘胀痛 嗳气泛酸 情志不畅 纳差', 'physician': 'wu_jutong', 'k'",
+            "thought_head": "这是第一步。患者症状指向肝胃气滞，我需要先查吴鞠通本人的医案，看他遇到「胃脘胀痛、嗳气泛酸、情志不畅而发」这类肝胃同病实际怎么处理、用什么方药，这是最终开方的依据。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"wu_jutong-0023-p0-0\", \"score\": 0.754, \"visit_index\": 0, \""
+          },
+          {
+            "step": 2,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '肝胃不和'}",
+            "thought_head": "已从医案库检索到吴鞠通处理吞酸嗳气、情志相关胃脘症状的先例，其中 wu_jutong-0023-p0-0 用苦辛通法（小枳实、淡吴萸、半夏、云连、广皮、浓朴等），与本案肝胃气滞、嗳气泛酸高度相关。下一",
+            "observation_head": "{\"found\": false, \"query\": \"肝胃不和\", \"candidates\": [{\"code\": \"SP-01\", \"name\": \"肝胃不和证\"}, {\"code\": \"TB-12"
+          },
+          {
+            "step": 3,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': 'SP-01'}",
+            "thought_head": "第2步查「肝胃不和」返回 found=false，但给出了候选编码 SP-01、TB-122、TB-123。我需要用其中一个 code 重查标准定义，核对主症是否齐备。选 SP-01（脾肺系/内科常见",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"SP-01\", \"name\": \"肝胃不和证\", \"is_category\": false, \"parent\": nul"
+          },
+          {
+            "step": 4,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '嗳气', 'physician': 'wu_jutong', 'limit': 10}",
+            "thought_head": "标准层已确认肝胃不和证（SP-01）的主症是胃脘胀满或疼痛、两胁胀满，次症含每因情志不畅而发作或加重、嗳气频作。患者有胃脘胀痛、情志不畅而发、嗳气泛酸，但缺「两胁胀满」这一主症。需查医案图谱确认吴鞠通",
+            "observation_head": "{\"available\": true, \"total_matched\": 6, \"triples\": [{\"case_id\": \"wu_jutong-0023-p0-0\", \"physician\": "
+          },
+          {
+            "step": 5,
+            "action": "check_residual",
+            "action_input_summary": "{'symptoms': ['胃脘胀痛', '食后加重', '嗳气泛酸', '每因情志不畅而发', '纳差'], 'el",
+            "thought_head": "已查医案层（吴鞠通治吞酸嗳气用苦辛通法，如小枳实、吴萸、半夏、云连、广皮、川朴等）与标准层（SP-01肝胃不和证主症为胃脘胀满或疼痛、两胁胀满，次症含每因情志不畅而发作或加重、嗳气频作）。患者胃脘胀痛",
+            "observation_head": "{\"explained\": [\"胃脘胀痛\", \"食后加重\", \"嗳气泛酸\", \"每因情志不畅而发\", \"纳差\"], \"unexplained\": [], \"off_graph\": [], \"cover"
+          }
+        ]
+      },
+      {
+        "query": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+        "physician": "zhang_xichun",
+        "terminated_by": "finish",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃脘胀痛 嗳气泛酸 情志不畅 纳差', 'physician': 'zhang_xichun', ",
+            "thought_head": "这是第一步。患者症状指向肝胃气滞，但我要先看张锡纯本人遇到「胃脘胀痛」「嗳气泛酸」这类症状实际怎么辨证用药，这是最终开方的依据。先做医案检索。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"zhang_xichun-0007-p0-0\", \"score\": 0.721, \"visit_index\": 0"
+          },
+          {
+            "step": 2,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '肝胃不和证'}",
+            "thought_head": "已查到张锡纯处理类似肝胃气机不降的医案，多例用生赭石、生麦芽、茵陈、生鸡内金等降胃理冲、舒肝之品。现在需要核对标准层：我想给的证型是「肝胃不和证」（或肝气犯胃），确认标准里主症是否齐备（胃脘胀痛、嗳气",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"SP-01\", \"name\": \"肝胃不和证\", \"is_category\": false, \"parent\": nul"
+          },
+          {
+            "step": 3,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '嗳气', 'physician': 'zhang_xichun', 'limit': 10}",
+            "thought_head": "标准层已确认肝胃不和证的主症是胃脘胀满或疼痛、两胁胀满，次症含每因情志不畅而发作或加重、嗳气频作。患者有胃脘胀痛、情志不畅而发、嗳气泛酸，但缺「两胁胀满」这一主症。张锡纯医案里类似病例多从「肝木乘土、",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（zhang_xichun）的医案三元组里没有匹配项，已查 450"
+          },
+          {
+            "step": 4,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '呃逆', 'physician': 'zhang_xichun', 'limit': 10}",
+            "thought_head": "第3步查「嗳气」在张锡纯医案三元组里没有匹配项，说明三元组抽取时可能用了别的措辞（如「呃逆」「呃欲呕逆」）。我改用「呃逆」再查一次医案图，确认张锡纯对这类胃气上逆症状的实际处理关系；同时这也补足医案层",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（zhang_xichun）的医案三元组里没有匹配项，已查 450"
+          },
+          {
+            "step": 5,
+            "action": "finish",
+            "action_input_summary": "{}",
+            "thought_head": "只剩一步。前几步已确认：标准层「肝胃不和证」的主症（胃脘胀满或疼痛）与次症（每因情志不畅而发作或加重、嗳气频作）患者基本齐备，病位肝胃、病性气滞与我的证素分析一致；医案层已检索到张锡纯治肝胃气滞、胃气",
+            "observation_head": "（模型判断证据已足够，结束取证）"
+          }
+        ]
+      },
+      {
+        "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+        "physician": "ye_tianshi",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃中隐痛 喜温喜按 得食稍缓 四肢不温 大便溏薄', 'physician': 'ye_tians",
+            "thought_head": "这是第一步。患者症状指向脾胃虚寒、中焦阳虚，但我要先看叶天士本人遇到类似症状（胃痛喜温喜按、便溏、四肢不温）实际是怎么辨证用药的，这是最终开方的依据。先做医案检索。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"ye_tianshi-0010-p3-0\", \"score\": 0.672, \"visit_index\": 0, "
+          },
+          {
+            "step": 2,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '脾胃阳虚证'}",
+            "thought_head": "已从医案层看到叶天士处理类似中焦虚寒的案例（如用淡附子、淡干姜、人参、茯苓的温中法）。现在需要核对标准层，确认「脾胃阳虚」或「中焦虚寒」这类证型在国标里的主症要求，看患者症状是否齐备。",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"TB-138\", \"name\": \"脾胃阳虚证\", \"is_category\": false, \"parent\": nu"
+          },
+          {
+            "step": 3,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '喜温喜按', 'physician': 'ye_tianshi', 'limit': 10}",
+            "thought_head": "标准层已确认「脾胃阳虚证」主症基本齐备（喜暖喜按、手足不温、食少乏力、大便薄），但叶天士医案里对这类中阳不足、胃痛喜温喜按的病例，实际用方与术语未必叫「脾胃阳虚」。第1步检索到的先例里，ye_tian",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（ye_tianshi）的医案三元组里没有匹配项，已查 29247"
+          },
+          {
+            "step": 4,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃痛 得食稍缓 喜温 四肢不温 神疲 便溏', 'physician': 'ye_tianshi'",
+            "thought_head": "第1步的医案检索返回的多是肝犯脾胃、肝脾不和、肝厥犯胃等证，与本例纯虚寒的胃中隐痛、喜温喜按、得食稍缓、四肢不温、大便溏薄并不完全吻合；第3步查「喜温喜按」在叶天士医案三元组里无匹配。我需要换一个更贴",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"ye_tianshi-0029-p4-0\", \"score\": 0.77, \"visit_index\": 0, \""
+          },
+          {
+            "step": 5,
+            "action": "check_residual",
+            "action_input_summary": "{'symptoms': ['胃中隐痛', '喜温喜按', '空腹尤甚', '得食稍缓', '神疲乏力', '四肢不温'",
+            "thought_head": "只剩最后一步，需要确认脾胃阳虚证的主症在患者身上是否齐备，并核对标准层证素构成，以便给出最终证型。患者有胃中隐痛、喜温喜按、空腹尤甚、得食稍缓、神疲乏力、四肢不温、大便溏薄，与TB-138脾胃阳虚证主",
+            "observation_head": "{\"explained\": [\"喜温喜按\", \"神疲乏力\", \"四肢不温\", \"大便溏薄\"], \"unexplained\": [], \"off_graph\": [\"胃中隐痛\", \"空腹尤甚\", \"得食"
+          }
+        ]
+      },
+      {
+        "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+        "physician": "wu_jutong",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃中隐痛 喜温喜按 得食稍缓 四肢不温 大便溏薄', 'physician': 'wu_juton",
+            "thought_head": "这是第一步。患者症状高度指向脾胃虚寒、中焦阳虚。在给出证型前，先查吴鞠通本人的医案，看他遇到胃痛喜温喜按、便溏这类症状实际用什么方药，这是最终开方的依据。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"wu_jutong-0018-p0-1\", \"score\": 0.649, \"visit_index\": 1, \""
+          },
+          {
+            "step": 2,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃痛 喜按 得食稍缓 神疲 四肢不温 便溏 中阳不足', 'physician': 'wu_jut",
+            "thought_head": "第1步的相似医案检索返回的多是食膈、呕吐、便闭等案，与本案「胃中隐痛、喜温喜按、得食稍缓、四肢不温、便溏」的虚寒性胃痛并不直接对应，score 也偏低。我需要换一个更贴近本案核心症状组合的检索词，找吴",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"wu_jutong-0016-p1-0\", \"score\": 0.696, \"visit_index\": 0, \""
+          },
+          {
+            "step": 3,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '中阳不足 胃痛 喜温喜按 得食则缓 四肢不温 便溏 温中', 'physician': 'wu_j",
+            "thought_head": "前两次医案检索返回的多是呕吐、便闭、食膈等案例，与本案「胃中隐痛、喜温喜按、得食稍缓、神疲乏力、四肢不温、便溏」的虚寒性胃痛并不完全对应。吴鞠通对中焦虚寒、阳虚便溏类证常用附子、干姜、茯苓、苍术、广皮",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"wu_jutong-0016-p1-0\", \"score\": 0.693, \"visit_index\": 0, \""
+          },
+          {
+            "step": 4,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '脾胃阳虚证'}",
+            "thought_head": "已查三次医案，检索到的多是便溏、呕吐、痞塞等案，没有直接对应「胃中隐痛喜温喜按得食稍缓」的温中先例。我需要核对标准层：这个病例的证素组合（胃+脾，阳虚+气虚）在国标里对应哪个证候，主症是否齐备。",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"TB-138\", \"name\": \"脾胃阳虚证\", \"is_category\": false, \"parent\": nu"
+          },
+          {
+            "step": 5,
+            "action": "check_residual",
+            "action_input_summary": "{'symptoms': ['胃中隐痛', '喜温喜按', '空腹尤甚', '得食稍缓', '神疲乏力', '四肢不温'",
+            "thought_head": "已查医案与标准。标准「脾胃阳虚证」主症含喜暖喜按、手足不温、食少乏力、大便薄，与本例胃中隐痛、喜温喜按、四肢不温、神疲乏力、便溏高度吻合，病位在胃、性属阳虚气虚。吴鞠通医案中治中阳不足、便溏、四肢不温",
+            "observation_head": "{\"explained\": [\"喜温喜按\", \"神疲乏力\", \"四肢不温\", \"大便溏薄\"], \"unexplained\": [], \"off_graph\": [\"胃中隐痛\", \"空腹尤甚\", \"得食"
+          }
+        ]
+      },
+      {
+        "query": "胃中隐痛，喜温喜按，空腹尤甚，得食稍缓，神疲乏力，四肢不温，大便溏薄，舌淡苔白，脉细弱。",
+        "physician": "zhang_xichun",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃中隐痛 喜温喜按 四肢不温 大便溏薄', 'physician': 'zhang_xichun'",
+            "thought_head": "这是第一步。患者症状指向脾胃虚寒/阳虚，但张锡纯的用药风格需要从医案层取证。先查这位医家遇到'胃中隐痛'或类似症状实际怎么处理，这是最终开方真正要依据的。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"zhang_xichun-0008-p0-0\", \"score\": 0.661, \"visit_index\": 0"
+          },
+          {
+            "step": 2,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃痛 喜温喜按 得食稍缓 脾胃虚寒 温补', 'physician': 'zhang_xichun",
+            "thought_head": "第1步的医案检索返回的多是胃气不降、肝胃不和、呕吐便结的案例，与本案「胃中隐痛、喜温喜按、空腹尤甚、得食稍缓、四肢不温、大便溏薄」的虚寒性胃痛并不贴合。张锡纯对这类虚寒胃痛、脾阳虚的辨治，我需要换关键",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"zhang_xichun-0034-p0-0\", \"score\": 0.672, \"visit_index\": 0"
+          },
+          {
+            "step": 3,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '脾胃虚寒 胃痛 温补 干姜 白术 山药 四肢不温', 'physician': 'zhang_xi",
+            "thought_head": "前两步检索到的医案多是胃气不降、肝胃不和、呕吐便结等证，与本例『胃中隐痛、喜温喜按、得食稍缓、四肢不温、大便溏薄』的虚寒证并不贴合。张锡纯治脾胃虚寒自有其用药风格（如理饮汤、敦复汤一类温补之剂），我需",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"zhang_xichun-0034-p0-1\", \"score\": 0.651, \"visit_index\": 1"
+          },
+          {
+            "step": 4,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '脾胃虚寒证'}",
+            "thought_head": "已查过三轮医案，张锡纯治脾胃虚寒、温补脾胃的用药风格已见端倪（生怀山药、白术、干姜、龙眼肉、生箭芪等）。现在需要核对标准层：我想给的证型「脾胃虚寒证」在国标里要求的主症是否齐备，确认证型名称与依据。",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"SP-04\", \"name\": \"脾胃虚寒证\", \"is_category\": false, \"parent\": nul"
+          },
+          {
+            "step": 5,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '胃痛', 'physician': 'zhang_xichun', 'limit': 10}",
+            "thought_head": "标准层已确认「脾胃虚寒证」主症（胃脘隐痛、喜温喜按）齐备，次症疲乏、手足不温、便溏也都有，证型可以定。但张锡纯的用药风格不是教科书理中丸，我需要再取证他实际处理「脾胃虚寒/温补脾胃」时用什么药。第3步",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（zhang_xichun）的医案三元组里没有匹配项，已查 450"
+          }
+        ]
+      },
+      {
+        "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+        "physician": "ye_tianshi",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '脘腹痞满 口苦 口黏 纳呆 恶心 身重 困倦 小便短黄', 'physician': 'ye_ti",
+            "thought_head": "这是第一步。患者症状指向中焦湿热（脾湿胃热），但我要先看叶天士本人遇到类似症状（脘腹痞满、口苦、口黏、纳呆、恶心、身重、困倦、小便短黄）实际怎么辨证用药，而不是直接套国标。先做医案检索取证。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"ye_tianshi-0004-p0-0\", \"score\": 0.716, \"visit_index\": 0, "
+          },
+          {
+            "step": 2,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '湿热中阻证'}",
+            "thought_head": "已从医案层看到叶天士处理痞满恶心类症多用泻心法、平肝安胃、培土泄木等思路，其中 ye_tianshi-0015-p2-0 的『中痞恶心』用泻心法（半夏、黄芩、黄连、干姜、枳实、杏仁）与本例湿热中阻最接",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"TB-110\", \"name\": \"湿热中阻证\", \"is_category\": false, \"parent\": nu"
+          },
+          {
+            "step": 3,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '湿热中阻 脘痞 口苦 口黏 身重 小便黄 泻心汤', 'physician': 'ye_tians",
+            "thought_head": "第1步医案检索返回的案例多为肝胃不和/肝木乘土类，与本例湿热中阻的证素（湿、热）不完全吻合，需要更精准地找叶天士处理「湿热中阻/湿热痞满」类医案，看他的实际用药风格。同时第2步标准已确认湿热中阻证的主",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"ye_tianshi-0015-p4-1\", \"score\": 0.626, \"visit_index\": 1, "
+          },
+          {
+            "step": 4,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '脘痞', 'physician': 'ye_tianshi', 'limit': 10}",
+            "thought_head": "已查到标准证候「湿热中阻证」的主症包含脘痞腹胀、纳呆恶心、小便黄，与本例脘腹痞满、纳呆、恶心、小便短黄相符，病位胃、病性湿热也吻合。但患者还有口黏、身重、困倦等湿困表现，且叶天士医案中痞满恶心多用泻心",
+            "observation_head": "{\"available\": true, \"total_matched\": 427, \"triples\": [{\"case_id\": \"ye_tianshi-0003-p0-1\", \"physician"
+          },
+          {
+            "step": 5,
+            "action": "check_residual",
+            "action_input_summary": "{'symptoms': ['脘腹痞满', '口苦', '口黏', '纳呆', '恶心', '身重', '困倦', '小",
+            "thought_head": "还剩最后一步。前面已查过医案层（search_cases 两次）、标准层（湿热中阻证 TB-110）、医案图谱层（脘痞）。标准证型「湿热中阻证」主症里患者有脘痞腹胀、纳呆恶心、小便黄，但缺胃脘灼痛、吐",
+            "observation_head": "{\"explained\": [\"脘腹痞满\", \"口苦\", \"口黏\", \"纳呆\", \"恶心\", \"身重\", \"困倦\", \"小便短黄\"], \"unexplained\": [], \"off_graph\": "
+          }
+        ]
+      },
+      {
+        "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+        "physician": "wu_jutong",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '脘腹痞满 口苦 口黏 纳呆 恶心 身重 困倦 小便短黄', 'physician': 'wu_ju",
+            "thought_head": "这是第一步。患者症状提示中焦湿热（脾、胃、湿、热），但需要先看吴鞠通本人遇到类似症状（脘腹痞满、口苦、口黏、纳呆、恶心、身重、困倦、小便短黄）实际怎么辨证用药，这是最终开方的依据。先做医案检索。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"wu_jutong-0018-p0-9\", \"score\": 0.662, \"visit_index\": 9, \""
+          },
+          {
+            "step": 2,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '脘腹痞满', 'physician': 'wu_jutong', 'limit': 10}",
+            "thought_head": "已检索到吴鞠通相似医案，但返回的证型字段多为空，需要进一步确认这位医家对「湿阻中焦/湿热中阻」类证候的实际处理思路。先查医案图谱，看吴鞠通遇到「脘腹痞满」「口苦」「口黏」这类症状时实际用了什么治法与方",
+            "observation_head": "{\"available\": true, \"total_matched\": 1, \"triples\": [{\"case_id\": \"wu_jutong-0023-p3-6\", \"physician\": "
+          },
+          {
+            "step": 3,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '湿热中阻'}",
+            "thought_head": "已从医案层看到吴鞠通处理类似湿热中阻、三焦不利的案例（如通宣三焦、和中治痹），但还需核对标准层：我想给的证型「湿热中阻」或「脾胃湿热」在国标里要求的主症是否齐备。患者有脘腹痞满、口苦、口黏、纳呆、恶心",
+            "observation_head": "{\"found\": false, \"query\": \"湿热中阻\", \"candidates\": [{\"code\": \"TB-110\", \"name\": \"湿热中阻证\"}, {\"code\": \"TB-1"
+          },
+          {
+            "step": 4,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': 'TB-110'}",
+            "thought_head": "第3步查「湿热中阻」返回两个候选编码 TB-110 和 TB-145，需要确认标准定义的主症是否与患者症状（脘腹痞满、口苦、口黏、纳呆、恶心、身重、困倦、小便短黄）齐备。用 TB-110 重查一次，核",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"TB-110\", \"name\": \"湿热中阻证\", \"is_category\": false, \"parent\": nu"
+          },
+          {
+            "step": 5,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '恶心', 'physician': 'wu_jutong', 'limit': 10}",
+            "thought_head": "还剩最后一步。已确认标准 TB-110 湿热中阻证的主症（脘痞腹胀、纳呆恶心、小便黄）与患者高度吻合，病位胃、病性湿热。但患者还有明显的脾虚湿困表现（身重、困倦、口黏），且吴鞠通医案中「脘中闷」用和中",
+            "observation_head": "{\"available\": true, \"total_matched\": 1, \"triples\": [{\"case_id\": \"wu_jutong-0018-p0-9\", \"physician\": "
+          }
+        ]
+      },
+      {
+        "query": "脘腹痞满，口苦口黏，纳呆恶心，身重困倦，小便短黄，舌红苔黄腻，脉滑数。",
+        "physician": "zhang_xichun",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '脘腹痞满 口苦 口黏 纳呆 恶心 身重 困倦 小便短黄', 'physician': 'zhang",
+            "thought_head": "这是第一步。患者症状指向脾胃湿热，但我要先看张锡纯本人遇到类似症状（脘腹痞满、口苦、口黏、纳呆、恶心、身重、困倦、小便短黄）实际是怎么辨证用药的，这是最终开方的依据。先做医案检索。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"zhang_xichun-0008-p0-0\", \"score\": 0.678, \"visit_index\": 0"
+          },
+          {
+            "step": 2,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '脘腹痞满', 'physician': 'zhang_xichun', 'limit': 10",
+            "thought_head": "已检索到张锡纯相似医案，但返回的证型字段为空，我需要进一步确认张锡纯对「湿热中阻/中焦湿热」这类证候的实际处理思路和用药。先查医案三元组图，看张锡纯遇到「脘腹痞满」「口苦」「身重」等具体症状时实际用了",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（zhang_xichun）的医案三元组里没有匹配项，已查 450"
+          },
+          {
+            "step": 3,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '脾胃湿热'}",
+            "thought_head": "医案检索已找到相似先例（如0008案：口苦、恶心、胸膈烦闷，用降胃理冲、滋阴清火之法），但医案三元组里没有'脘腹痞满'的直接匹配。现在需要核对标准层：我想给的证型是'脾胃湿热'（湿+热困阻中焦），要确",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"SP-03\", \"name\": \"脾胃湿热证\", \"is_category\": false, \"parent\": nul"
+          },
+          {
+            "step": 4,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '口苦', 'physician': 'zhang_xichun', 'limit': 10}",
+            "thought_head": "标准层已确认脾胃湿热证的主症（脘腹痞满、口苦）与次症（纳呆、恶心、小便短黄）患者基本齐备，证型方向明确。但张锡纯的用药风格与国标不同，我需要看他医案里对「湿热中阻/脾胃湿热」类证实际用什么药。第1步检",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（zhang_xichun）的医案三元组里没有匹配项，已查 450"
+          },
+          {
+            "step": 5,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '湿热', 'physician': 'zhang_xichun', 'limit': 10}",
+            "thought_head": "还剩最后一步。标准层已确认脾胃湿热证的主症（脘腹痞满、口苦）与次症（纳呆、恶心、小便短黄）患者基本齐备，证素脾、胃、湿、热也吻合。但张锡纯医案三元组里查不到「脘腹痞满」「口苦」，说明他的医案术语与国标",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（zhang_xichun）的医案三元组里没有匹配项，已查 450"
+          }
+        ]
+      },
+      {
+        "query": "胃脘灼痛，饥不欲食，口燥咽干，大便干结，形体消瘦，舌红少津少苔，脉细数。",
+        "physician": "ye_tianshi",
+        "terminated_by": "max_steps",
+        "steps": [
+          {
+            "step": 1,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃脘灼痛 饥不欲食 口燥咽干 大便干结 形体消瘦', 'physician': 'ye_tians",
+            "thought_head": "这是第一步。患者症状指向胃阴虚（胃脘灼痛、饥不欲食、口燥咽干、便干、消瘦）。我需要先查叶天士医案里遇到类似症状实际怎么处理，这是最终开方依据。用 search_cases 检索相似医案。",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"ye_tianshi-0002-p12-0\", \"score\": 0.666, \"visit_index\": 0,"
+          },
+          {
+            "step": 2,
+            "action": "query_case_graph",
+            "action_input_summary": "{'symptom': '胃脘灼痛', 'physician': 'ye_tianshi', 'limit': 10}",
+            "thought_head": "已检索到叶天士医案，但返回的案例多为脘痛、饮证、纳胀等，与胃阴虚灼痛不完全对应。我需要更精确地查叶天士对'胃脘灼痛''饥不欲食'这类胃阴虚症状的实际处理，以及他常用的养胃阴药物组合。同时应核对标准层'",
+            "observation_head": "{\"available\": true, \"total_matched\": 0, \"triples\": [], \"note\": \"该医家（ye_tianshi）的医案三元组里没有匹配项，已查 29247"
+          },
+          {
+            "step": 3,
+            "action": "search_cases",
+            "action_input_summary": "{'query': '胃阴亏虚 胃脘灼痛 不饥不食 口渴咽干 大便干结 形瘦', 'physician': 'ye_ti",
+            "thought_head": "第1步的医案检索返回的都是些脘痛、饮证、纳胀的案子，跟本例阴虚胃燥的灼痛、饥不欲食、口燥咽干、便结、消瘦并不贴合；第2步按「胃脘灼痛」查医案三元组为空。我需要换关键词，用叶天士更可能用的术语（如「胃脘",
+            "observation_head": "{\"available\": true, \"cases\": [{\"case_id\": \"ye_tianshi-0030-p11-0\", \"score\": 0.679, \"visit_index\": 0,"
+          },
+          {
+            "step": 4,
+            "action": "lookup_standard",
+            "action_input_summary": "{'query': '胃阴虚证'}",
+            "thought_head": "前几步检索到的医案多是胃阳虚、饮邪、肝胃不和之类，与本例阴虚胃燥方向不符。叶天士治胃阴亏虚的经典思路是甘凉濡润（如沙参、麦冬、石斛、扁豆、粳米、甘草之类），第3步已见 ye_tianshi-0000-",
+            "observation_head": "{\"found\": true, \"definition\": {\"code\": \"SP-09\", \"name\": \"胃阴虚证\", \"is_category\": false, \"parent\": null"
+          },
+          {
+            "step": 5,
+            "action": "check_residual",
+            "action_input_summary": "{'symptoms': ['胃脘灼痛', '饥不欲食', '口燥咽干', '大便干结', '形体消瘦'], 'elem",
+            "thought_head": "还剩最后一步。前面已确认：标准层「胃阴虚证」（SP-09）主症为胃脘隐痛、嘈杂善饥、口干唇燥，次症含饥不欲食、大便干结——本例胃脘灼痛、饥不欲食、口燥咽干、大便干结、形瘦基本吻合，病位胃、病性阴虚。医",
+            "observation_head": "{\"explained\": [\"胃脘灼痛\", \"饥不欲食\", \"口燥咽干\", \"大便干结\", \"形体消瘦\"], \"unexplained\": [], \"off_graph\": [], \"coverag"
+          }
+        ]
+      }
+    ],
+    "note": "27 条 (主诉,医家) 样本开了 ReAct：步数 mean=5.0 p50=5.0 p95=5.0；terminated_by 分布：{'max_steps': 25, 'finish': 2}。terminated_by 的分布对 prompt 措辞敏感（SOURCES.md 第 12 条）：去掉prompt 里的剩余步数计数后，max_steps 收尾的比例从 0/5 涨到 4/8——这个分布会随 prompt 微调而变化，不是模型能力的稳定特征，引用这份分布时要连带说明当时的 prompt 版本，不能当成跟 prompt 无关的固定指标。"
   },
   "failed_queries": []
 }
