@@ -56,6 +56,13 @@ INSUFFICIENT_COMPLAINT = "胸闷气短"
 FOLLOWUP_COMPLAINT = "胃脘胀痛"
 FOLLOWUP_PRESENT = ["纳差", "腹胀", "嗳气"]
 
+# 患者模式导诊那条（DEMO.md 第 5 个演示点）：出病名 + 科室 + 红旗症状，**不出方药**。
+# 它**不在 tests/queries.txt 里**——那 10 条都是脾胃门的辨证主诉，而导诊要演示的是
+# 「胸痹 → 心内科 → 红旗」这条另一个门类的路径。回放的索引是
+# sha256(送进模型的 system 文本)，system 文本里含主诉原文，所以**没录过的主诉在
+# replay 下必然未命中**：这条不加进录制清单，演示到第 5 点就会当场 LLMError。
+TRIAGE_COMPLAINT = "胸闷胸痛，冷汗"
+
 # 每条主诉的预估调用数，用来在 --dry-run 里报预算。实测量级，不是精确值：
 #   不开 ReAct：S1 1 + S2 1 + 每位医家 S3 1 + 残差 1
 #   开 ReAct：每位医家多出 MAX_STEPS 量级的工具调用 + 一次收束
@@ -95,13 +102,19 @@ def _queries(path: Path = DEFAULT_QUERIES_PATH) -> list[str]:
 def build_plan(queries: list[str] | None = None) -> list[Scenario]:
     """录制清单。queries 不传就读 tests/queries.txt 全部 10 条（含第 10 条
     黑便——那条会被安全否决拦在 S2 之前，0 次调用，录它是为了证明拦截路径在
-    回放下照样拦）。"""
+    回放下照样拦）。
+
+    **清单要跟 DEMO.md 的演示点一一对得上**：回放按主诉原文的哈希索引，
+    演示时打的字跟录的字差一个标点都是未命中。`triage` 那条就是为了 DEMO 第 5 点
+    （患者模式导诊）加的——它不在 queries.txt 里，不显式加进来就录不到。
+    """
     queries = queries if queries is not None else _queries()
     plan = [Scenario(f"react_off_{i}", q, use_react=False)
             for i, q in enumerate(queries, start=1)]
     plan += [Scenario(f"react_on_{i}", q, use_react=True)
              for i, q in enumerate(queries, start=1)]
     plan.append(Scenario("insufficient", INSUFFICIENT_COMPLAINT, use_react=False))
+    plan.append(Scenario("triage", TRIAGE_COMPLAINT, use_react=False))
     plan.append(Scenario("followup", FOLLOWUP_COMPLAINT, use_react=False,
                          followup_present=tuple(FOLLOWUP_PRESENT)))
     return plan

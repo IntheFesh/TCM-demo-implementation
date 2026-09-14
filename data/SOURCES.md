@@ -2181,3 +2181,68 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     README 核对），全套 1983 → 2001 全绿、ruff 干净、`--check` 两份文档退出码 0。
     `core/schemas.py` 的 `= Field(min_length=1)` 仍是 **31 处**
     （`grep -c "= Field(min_length=1" core/schemas.py`，没动 schema）。
+
+46. **非法转义序列的告警：修掉一处，顺手发现「靠 filterwarnings 拦这一类」有个
+    缓存盲区；R6-3 重写演示脚本时又查出两个演示点在 replay 下根本跑不了。**
+
+    **一、`\|` 那处（`scripts/collect_results.py` 的 `metric_rows` 文档字符串）。**
+    全项目扫了一遍，**确实只有这一处**：不 import、直接读源文件 `compile()`，
+    结果只有它一条。加 `r` 前缀修掉——先确认过那段 docstring 里除了 `\|` 和 `\w`
+    没有任何想当转义用的内容（`\n` 是源文件里真实的换行，raw string 不影响它）。
+
+    **二、「加一条 filterwarnings 让它变 error」有个盲区，必须说破。**
+    问「pytest 报的那 1 个 warning 是不是它」——**不是**，那 1 条是 starlette 的
+    `anyio.abc.BlockingPortal` DeprecationWarning。非法转义那条**当时根本没出现**，
+    因为 **CPython 把 `.py` 编译成 `.pyc` 之后不会再编译第二次**：`__pycache__` 是热的
+    时候 `import` 不触发编译，告警就不会被抛出来，filterwarnings 再严也等不到它。
+    实测：清 `__pycache__` 之前 pytest 报 "1 warning"，清掉之后才报 2 条。
+    **一条只在冷缓存下才会触发的闸门，等于没有闸门。**
+
+    所以做成两层：
+    - `pytest.ini` 的 `filterwarnings` 把 `SyntaxWarning` 和「invalid escape sequence」
+      这一类 DeprecationWarning 变成 error（用一个真的含 `\|` 的临时测试文件验过，
+      pytest 在 collection 阶段就红）；
+    - `tests/test_source_hygiene.py` **不走 import、直接读源文件 compile()**，
+      跟缓存状态无关。也用临时文件验过它真的会红，不是空转（另有一条测试断言
+      扫到的文件数 > 50，防止扫描器自己扫到 0 个文件永远绿）。
+
+    **三、`filterwarnings` 里不写 `default`。** 第一版写了，结果把 pytest 自己的
+    默认过滤器全重置成「都显示」，连平时被 Python 默认忽略的 ResourceWarning 也冒出来，
+    输出一下子变吵——**吵到没人看的输出等于没有输出**。改成只追加两条 `error`，
+    pytest 的默认行为不动。
+
+    **四、那条 ResourceWarning 是真的，顺手修了。** `core/retrieval_hybrid.py` 里
+    `jieba.load_userdict(str(path))` —— jieba 收到路径字符串时自己 `open` 但**不 close**，
+    留一个悬空的文件描述符。它一直没被看见，正是因为 ResourceWarning 默认被忽略。
+    jieba 也接受 file-like，所以改成自己 `with path.open("rb")` 把生命周期拿回来。
+    （`_ensure_jieba` 是惰性单例，实际只泄漏一个 fd，但这类东西不该留着。）
+
+    **五、R6-3 重写演示脚本，查出两个演示点在 replay 下根本跑不了。**
+    回放的索引是 `(schema 名, sha256(送进模型的 system 文本))`，而 system 文本里含
+    **主诉原文**和**检索到的参考医案**：
+
+    - **第 5 点（患者模式导诊）用的主诉 `胸闷胸痛，冷汗` 不在录制清单里。**
+      `tests/queries.txt` 那 10 条全是脾胃门的辨证主诉，而导诊要演示的是
+      「胸痹 → 心内科 → 红旗」这条另一个门类的路径。不显式加进
+      `build_plan()` 就录不到，演示到第 5 点会当场 `LLMError`。已加成 `triage` 场景
+      （录制预估 272 → **278** 次调用），并有两条测试钉住：一条查 **DEMO 让人粘贴的
+      每一条主诉都在清单里**（方向只查 DEMO → 清单，反向没道理：`insufficient`
+      那条是为覆盖回放路径录的，不是给演示用的），一条钉住导诊那条**不在**
+      queries.txt 里、必须显式加。
+    - **第 7 点（现场切检索模式做消融）在 replay 下必然未命中**：换模式 → 参考医案变
+      → system 文本变 → 哈希变。录制清单只录了默认模式，把四种模式都录一遍要 4 倍
+      调用量，为一个演示点不值。所以 DEMO 里给三个替代方案，其中零成本的那个是
+      **直接报 `report_e8.json` 里的 0.437**——那个数本身就说明「换检索模式输出真的会变」。
+
+    **六、「5 分钟」这个目标只在 replay 下成立，DEMO 里写明了。** `api` 后端一次问诊
+    实测 230–290s（claude_cli；触发 M2 重开方时 500s+），光第 1 点就四五分钟，
+    7 个点不可能塞进 5 分钟。所以 DEMO 里每一点都标了「需不需要一次新调用」，
+    并给出 `api` 下的做法（提前 15–20 分钟把要展示的视角各提交一次、开好标签页）。
+    每步的分钟数标明是**动作时间估算**（讲 + 点），不是墙钟实测——唯一实测过的等待
+    就是那个 230–290s。`FAST_MODE` 的 14 次调用 → 8 次在 README 的开关表里有；
+    **耗时 247s → 113s 是项目方在真机上测的，仓库里没有文件可核，DEMO 里带 ⏳ 标注**。
+
+    本轮新增测试 4 条（源码告警扫描 2 条 + 录制清单与 DEMO 的对应关系 2 条），
+    全套 2001 → 2005 全绿、ruff 干净、`--check` 两份文档退出码 0、冷缓存下
+    pytest 只剩 starlette 那 1 条第三方告警。`core/schemas.py` 的
+    `= Field(min_length=1)` 仍是 **31 处**（没动 schema）。

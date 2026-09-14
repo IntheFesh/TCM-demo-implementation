@@ -757,3 +757,44 @@ def test_end_to_end_react_on_and_off_do_not_share_fixtures(tmp_path, monkeypatch
     monkeypatch.setattr(llm_mod, "_llm_singleton", ReplayBackend(tmp_path))
     with pytest.raises(LLMError, match="回放未命中"):
         chain.consult("纳差乏力", use_react=True)
+
+
+# ---------- R6-3：录制清单必须盖住 DEMO 让人粘贴的每一条主诉 ----------
+
+
+def test_every_complaint_demo_tells_you_to_paste_is_in_the_record_plan():
+    """**回放按主诉原文的哈希索引，演示时打的字跟录的字差一个标点都是未命中**
+    （`ReplayBackend` 会抛 LLMError，不会静默退回真实 API）。所以 DEMO.md 那个
+    「复制粘贴用」代码块里的每一条，都必须在录制清单里。
+
+    方向只查 DEMO → 清单，不查反向：清单里有些场景（`insufficient` 那条）是为了
+    覆盖回放路径录的，不是给演示用的，要求它们出现在 DEMO 里没有道理。
+
+    `triage`（患者模式导诊）那条就是这条测试的由来——它不在 tests/queries.txt 里，
+    漏加进清单就会在演示到第 5 点时当场 LLMError。
+    """
+    import re
+    from pathlib import Path
+
+    import scripts.record_fixtures as rf
+
+    demo = (Path(__file__).resolve().parent.parent / "DEMO.md").read_text(encoding="utf-8")
+    block = re.search(r"```\n(A: .+?)\n```", demo, re.S)
+    assert block, "DEMO.md 里找不到「复制粘贴用」的主诉代码块"
+    pasted = [line.split(": ", 1)[1].strip()
+              for line in block.group(1).splitlines() if ": " in line]
+    assert len(pasted) == 3, pasted
+    recorded = {s.complaint for s in rf.build_plan()}
+    for complaint in pasted:
+        assert complaint in recorded, f"DEMO 让人粘贴 {complaint!r}，但录制清单里没有它"
+
+
+def test_triage_complaint_is_not_in_queries_txt_and_must_be_added_explicitly():
+    """导诊那条不在 tests/queries.txt 里（那 10 条都是脾胃门的辨证主诉），
+    所以 build_plan 必须显式把它加进去——这条测试钉住「显式」这件事，
+    哪天有人把它塞进 queries.txt 或者删掉这个场景，都会红。"""
+    import scripts.record_fixtures as rf
+
+    assert rf.TRIAGE_COMPLAINT not in rf._queries()
+    assert rf.TRIAGE_COMPLAINT in {s.complaint for s in rf.build_plan()}
+    assert "triage" in {s.name for s in rf.build_plan()}

@@ -158,7 +158,13 @@ class HybridRetriever(DenseRetriever):
             # 同时 load_userdict 会一起改同一棵 trie。
             with _JIEBA_GLOBAL_LOCK:
                 if JIEBA_DICT_PATH.exists():
-                    jieba.load_userdict(str(JIEBA_DICT_PATH))
+                    # **自己开文件、自己关。** jieba 的 load_userdict 收到路径字符串时
+                    # 会自己 open 但不 close，留一个悬空的文件描述符（Python 的
+                    # ResourceWarning 默认被忽略，所以这个泄漏一直没被看见——是这一轮
+                    # 给 pytest 加告警过滤时才冒出来的）。它也接受 file-like，
+                    # 那就用 with 把生命周期拿回来。
+                    with JIEBA_DICT_PATH.open("rb") as fh:
+                        jieba.load_userdict(fh)
             self._jieba_ready = True
 
     def _tokenize(self, text: str) -> list[str]:
