@@ -383,17 +383,32 @@ def test_dry_run_does_not_call_consult(tmp_path, monkeypatch, capsys):
 
 def test_main_writes_epsilon_json(tmp_path, monkeypatch):
     """monkeypatch 的假返回字典要带上 n_call_failures/n_attempts——这两个
-    字段是本轮加的失败容忍机制新增的（main() 现在无条件读取它们去判断要不要
-    打失败率警告），不是原来就有的可选字段，缺了会 KeyError（真实实现里
-    estimate_epsilon_online/estimate_epsilon_s2 现在总是带这两个键）。"""
+    字段是失败容忍机制加的（main() 现在无条件读取它们去判断要不要打失败率
+    警告），不是原来就有的可选字段，缺了会 KeyError（真实实现里
+    estimate_epsilon_online/estimate_epsilon_s2 现在总是带这两个键）。
+
+    R1 起还要带 layers（君臣/佐使两层的结果对象）：main() 现在无条件把它摘出来
+    平铺成 epsilon.json 顶层的 epsilon_core/epsilon_adjunct。这里刻意用
+    `online.pop("layers")` 的严格取法、不给默认值——假返回值必须跟着真实实现的
+    形状走（跟 tests/test_chain.py::FakeLLM 要跟着后端接口补方法是同一条约定），
+    给默认值会让"实现忘了产出分层"这种问题在测试里静默通过。"""
     queries_path = tmp_path / "queries.txt"
     queries_path.write_text("主诉一\n", encoding="utf-8")
     out_path = tmp_path / "epsilon.json"
 
+    def _layer(mean: float) -> dict:
+        return {"mean": mean, "p50": mean, "p95": mean, "by_physician": {}, "per_query": [],
+                "n_queries": 1, "n_queries_used": 1, "n_repeats": 2, "llm_calls": 4,
+                "n_call_failures": 0, "n_attempts": 2,
+                "mean_herbs_per_formula": 5.0, "n_formulas_counted": 2,
+                "role_fill_rate": 0.95, "n_herb_items": 20, "n_unroled": 1}
+
     monkeypatch.setattr(ee, "estimate_epsilon_online", lambda q, n_repeats: {
         "mean": 0.1, "p50": 0.1, "p95": 0.1, "by_physician": {}, "per_query": [],
         "n_queries": 1, "n_queries_used": 1, "n_repeats": n_repeats, "llm_calls": 4,
-        "n_call_failures": 0, "n_attempts": len(q) * n_repeats})
+        "n_call_failures": 0, "n_attempts": len(q) * n_repeats,
+        "mean_herbs_per_formula": 8.0, "n_formulas_counted": 2,
+        "layers": {"core": _layer(0.05), "adjunct": _layer(0.3)}})
     monkeypatch.setattr(ee, "estimate_epsilon_s2", lambda q, n_repeats: {
         "mean": 0.05, "p50": 0.05, "p95": 0.05, "per_query": [],
         "n_queries": 1, "n_queries_used": 1, "n_repeats": n_repeats, "llm_calls": 4,
@@ -404,6 +419,137 @@ def test_main_writes_epsilon_json(tmp_path, monkeypatch):
 
     data = json.loads(out_path.read_text(encoding="utf-8"))
     assert data["epsilon_online"]["mean"] == 0.1
+    # 分层跟 epsilon_online 平级、不嵌在它里面，且 online 里不再留一份 layers
+    assert data["epsilon_core"]["mean"] == 0.05
+    assert data["epsilon_adjunct"]["mean"] == 0.3
+    assert "layers" not in data["epsilon_online"]
     assert data["epsilon_s2"]["mean"] == 0.05
     assert data["epsilon_extract"]["available"] is False
     assert "model" in data and "backend" in data and "generated_at" in data
+
+
+# ---------- R1：分层 ε（君臣 / 佐使）----------
+#
+# 这一段的核心陷阱是空集：分层的空集含义是"这张方的药没标 role"，跟整方层的
+# 空集（"这位医家真的没开方"）相反。两个空集算 Jaccard 距离是 0.0（
+# core/setstats.py 把"双方都没提到任何东西"定义为一致），照整方那套算下去
+# epsilon_core 会被一堆未标注的方压成 0——一个凭空好看的假数字。
+
+def _s3_roled(specs):
+    """specs: (药名, role)。role 传 None 就是没标注。"""
+    from core.schemas import FormulaCandidate, HerbItem
+
+    return S3Syndrome(
+        syndrome="x", reasoning="x", treatment_principle="x", cited_case_ids=["a"],
+        formula_candidates=[FormulaCandidate(
+            name="某方", source="composed", confidence="high", rationale="x",
+            herb_items=[HerbItem(name=n, role=r) for n, r in specs],
+        )],
+    )
+
+
+def _roled_consult(runs: list[list[tuple[str, str | None]]]):
+    """每次重复返回 runs 里的下一张方（单医家）。"""
+    it = iter(runs)
+
+    def consult_fn(complaint):
+        return {"rejected": False, "insufficient": False, "manifest": {"llm_calls": 3},
+                "results": [{"physician": "ye_tianshi", "s3": _s3_roled(next(it))}]}
+    return consult_fn
+
+
+def test_epsilon_layers_separate_stable_core_from_varying_adjunct():
+    """实测形状：君臣骨架三次全在、佐使三次全不同。分层必须把这件事分开——
+    epsilon_core=0、epsilon_adjunct=1，整方那个数落在两者之间。"""
+    runs = [
+        [("半夏", "君"), ("茯苓", "臣"), ("神曲", "佐")],
+        [("半夏", "君"), ("茯苓", "臣"), ("黄连", "佐")],
+        [("半夏", "君"), ("茯苓", "臣"), ("桑叶", "佐")],
+    ]
+    r = ee.estimate_epsilon_online(["主诉甲"], n_repeats=3, consult_fn=_roled_consult(runs))
+    layers = r.pop("layers")
+    assert layers["core"]["mean"] == 0.0
+    assert layers["adjunct"]["mean"] == 1.0
+    assert layers["core"]["mean"] < r["mean"] < layers["adjunct"]["mean"]
+    # 平均药味数按归一去重后的集合大小算：整方 3、君臣 2、佐使 1
+    assert r["mean_herbs_per_formula"] == 3.0
+    assert layers["core"]["mean_herbs_per_formula"] == 2.0
+    assert layers["adjunct"]["mean_herbs_per_formula"] == 1.0
+
+
+def test_epsilon_layer_is_none_not_zero_when_nothing_is_roled():
+    """**这条是分层最容易骗人的地方**：全部没标 role 时两层都是空集，如果照整方
+    那套算下去会得出 mean=0.0（"完全一致"）。必须是 None（没数据）。"""
+    runs = [[("半夏", None), ("茯苓", None)], [("黄连", None), ("桑叶", None)]]
+    r = ee.estimate_epsilon_online(["主诉甲"], n_repeats=2, consult_fn=_roled_consult(runs))
+    layers = r.pop("layers")
+    assert layers["core"]["mean"] is None
+    assert layers["adjunct"]["mean"] is None
+    assert layers["core"]["role_fill_rate"] == 0.0
+    assert layers["core"]["n_unroled"] == 4 and layers["core"]["n_herb_items"] == 4
+    # 整方层照旧有数：没标 role 不影响它
+    assert r["mean"] == 1.0
+
+
+def test_epsilon_layer_skips_only_the_unroled_repeats():
+    """一次重复标了 role、另两次没标：分层只拿标了的那些算，标了的只剩一次
+    就出不了数（少于两次重复没有"两两"可言）——不能把没标的那两次当成空集
+    参与进来凑出一个 0。"""
+    runs = [
+        [("半夏", "君"), ("神曲", "佐")],
+        [("半夏", None), ("神曲", None)],
+        [("半夏", None), ("神曲", None)],
+    ]
+    r = ee.estimate_epsilon_online(["主诉甲"], n_repeats=3, consult_fn=_roled_consult(runs))
+    layers = r.pop("layers")
+    assert layers["core"]["mean"] is None      # 只有 1 次有效，估不出噪声
+    assert layers["core"]["n_formulas_counted"] == 1
+    assert layers["core"]["role_fill_rate"] == round(2 / 6, 4)
+
+
+def test_epsilon_layers_record_the_same_skip_reason_as_the_online_layer():
+    """整条主诉被拦截/信息不足时，三层记的是同一条跳过原因——分层不是另一次
+    采样，它跟整方层看的是同一批 consult() 结果。"""
+    def rejected(complaint):
+        return {"rejected": True, "insufficient": False, "manifest": {"llm_calls": 1},
+                "results": []}
+
+    r = ee.estimate_epsilon_online(["危重主诉"], n_repeats=2, consult_fn=rejected)
+    layers = r.pop("layers")
+    for record in (r["per_query"][0], layers["core"]["per_query"][0],
+                   layers["adjunct"]["per_query"][0]):
+        assert record["skipped"] is True
+        assert record["reason"] == "全部重复被安全否决拦截"
+
+
+def test_report_layers_states_whether_the_acceptance_relation_holds(capsys):
+    """验收关系 epsilon_core < epsilon_online < epsilon_adjunct 只报出、不当闸门
+    （不成立本身是留给下一轮的信息，不是拿来调参凑的）。"""
+    def _layer(mean, fill=0.97):
+        return {"mean": mean, "p50": mean, "p95": mean, "mean_herbs_per_formula": 4.0,
+                "n_formulas_counted": 3, "role_fill_rate": fill,
+                "n_herb_items": 30, "n_unroled": 1}
+
+    online = {"mean": 0.4, "mean_herbs_per_formula": 9.0, "n_formulas_counted": 3}
+    ee._report_layers(online, {"core": _layer(0.05), "adjunct": _layer(0.8)})
+    out = capsys.readouterr().out
+    assert "0.05 < 0.4 < 0.8 → 成立" in out
+    assert "role 填充率 97.0%" in out
+
+    ee._report_layers(online, {"core": _layer(0.6), "adjunct": _layer(0.2)})
+    out = capsys.readouterr().out
+    assert "→ 不成立" in out
+    assert "不成立不改参数去凑" in out
+
+
+def test_report_layers_says_undeterminable_instead_of_guessing(capsys):
+    """某一层没有可比样本（mean 是 None）时不能拿 0 去比——要说"无法判定"，
+    并指出是哪一层缺数。"""
+    empty = {"mean": None, "p50": None, "p95": None, "mean_herbs_per_formula": None,
+             "n_formulas_counted": 0, "role_fill_rate": None,
+             "n_herb_items": 0, "n_unroled": 0}
+    ee._report_layers({"mean": 0.4, "mean_herbs_per_formula": 9.0, "n_formulas_counted": 3},
+                      {"core": dict(empty), "adjunct": dict(empty)})
+    out = capsys.readouterr().out
+    assert "验收关系无法判定：core、adjunct 没有数" in out
+    assert "role 填充率 未知（没有任何药材条目）" in out

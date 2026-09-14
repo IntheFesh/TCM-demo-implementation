@@ -1889,8 +1889,52 @@ function closeEvidence() {
   document.getElementById("evidence-panel").classList.remove("open");
 }
 
-function renderDivergence(divergence) {
-  const banner = document.getElementById("divergence-banner");
+// R1 分层：君臣（核心判断）/ 佐使（加减）各自的文案。每一层都跟**自己那一层的**
+// ε 比，不跟 ε_online 比——整方的地板拿来卡君臣层会低估一致性、卡佐使层会高估
+// 发散（CLAUDE.md「任何数字都必须带对照」，对照要对上是同一层的）。
+const LAYER_LABELS = { core: "君臣", adjunct: "佐使" };
+
+function layerText(divergence, key) {
+  const j = divergence[key + "_jaccard"];
+  const eps = divergence["epsilon_" + key];
+  const label = LAYER_LABELS[key];
+  if (j === null || j === undefined) {
+    // null 不是 0：0 的意思是"两边完全相同"，null 是"没数据"（至少一位医家
+    // 这一层没有标注 role 的药）。把它显示成 0 会凭空报出一个"完全一致"。
+    return `${label} 不适用（至少一位医家这一层没有标注 role 的药）`;
+  }
+  if (eps === null || eps === undefined) {
+    return `${label} ${j}（ε_${key} 未测，此数暂无参照）`;
+  }
+  return `${label} ${j}（ε_${key}=${eps}，${j <= eps ? "在抖动范围内" : "已超出"}）`;
+}
+
+function physicianNameMap(divergence) {
+  // divergence 的数据字段一律按 id 存（n_unroled、western_drug_overlap.by_physician），
+  // 展示层要中文名——CLAUDE.md「数据文件里存 id，展示层用中文名」。名字从 pairs
+  // 里取（每对都带 name_a/name_b，两位医家时那一对就覆盖了全部），查不到就退回
+  // id 原样显示，不编一个名字出来。
+  const map = {};
+  for (const p of divergence.pairs || []) {
+    if (p.a) map[p.a] = p.name_a || p.a;
+    if (p.b) map[p.b] = p.name_b || p.b;
+  }
+  return map;
+}
+
+function layerVerdict(divergence) {
+  const c = divergence.core_jaccard, a = divergence.adjunct_jaccard;
+  const ec = divergence.epsilon_core, ea = divergence.epsilon_adjunct;
+  // 四个数缺任何一个就不给结论：这句话的全部意义在于"哪一层超出了自己的地板"，
+  // 缺了地板就只是在比两个没有参照的数。
+  if ([c, a, ec, ea].some((v) => v === null || v === undefined)) return "";
+  if (c <= ec && a > ea) return "；核心判断一致、加减用药不同";
+  if (c > ec && a > ea) return "；核心判断与加减用药都有分歧";
+  if (c > ec && a <= ea) return "；核心判断有分歧、加减用药一致";
+  return "；核心判断与加减用药都在抖动范围内";
+}
+
+function divergenceBannerText(divergence) {
   if (divergence && divergence.herb_jaccard !== null && divergence.herb_jaccard !== undefined) {
     const j = divergence.herb_jaccard;
     const eps = divergence.epsilon_online;
@@ -1930,14 +1974,36 @@ function renderDivergence(divergence) {
         : "";
       text += `\n两两配对：${pairText}${means}`;
     }
-    banner.textContent = text;
-    banner.classList.add("show");
-  } else if (divergence && divergence.same === false) {
-    banner.textContent = "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";
-    banner.classList.add("show");
-  } else {
-    banner.classList.remove("show");
+    // R1 第三行：分层。整方那个数（herb_jaccard）说不清 0.53 里有多少是核心
+    // 判断不一致、多少只是佐使加减不同——这一行就是把它拆开。
+    if ("core_jaccard" in divergence || "adjunct_jaccard" in divergence) {
+      const unroled = divergence.n_unroled || {};
+      const names = physicianNameMap(divergence);
+      const unroledText = Object.keys(unroled).length
+        ? `　未标注 role：${Object.entries(unroled)
+            .map(([p, n]) => `${names[p] || p} ${n} 味`)
+            .join("　")}`
+        : "";
+      text += `\n分层：${layerText(divergence, "core")}　`
+        + `${layerText(divergence, "adjunct")}${layerVerdict(divergence)}${unroledText}`;
+    }
+    return text;
   }
+  if (divergence && divergence.same === false) {
+    return "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";
+  }
+  return null;
+}
+
+function renderDivergence(divergence) {
+  const banner = document.getElementById("divergence-banner");
+  const text = divergenceBannerText(divergence);
+  if (text === null) {
+    banner.classList.remove("show");
+    return;
+  }
+  banner.textContent = text;
+  banner.classList.add("show");
 }
 
 function refListHtml(refs) {

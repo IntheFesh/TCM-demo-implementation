@@ -633,6 +633,23 @@ class _S3Base(BaseModel):
         data.setdefault("selected", 0)
         return data
 
+    @property
+    def selected_herb_items(self) -> list["HerbItem"]:
+        """这次真正开出的那张方的逐味药条目，已剔除向后兼容合成的占位符。
+
+        `.herbs` 是这同一份条目压平之后的药名列表（且西药已拆走），需要 `role` /
+        `dose` / `decoction` 的消费方读这个 property，不要自己去
+        `formula_candidates[selected]` 里翻——占位符该不该算一味药这件事只能有
+        一处判断（R1 的分层 Jaccard 就踩在这上面：占位符若漏过滤，一张"没给任何
+        药材"的方会被报成"有 1 味药、role 未标注"，n_unroled 凭空多一味）。
+
+        西药**不在这里剔**：这个 property 的语义是"这张方的条目原样"，谁要剔谁
+        自己剔（core/herbs.py 的分层剔、`.herbs` 由 _derive_flat_fields 剔）——
+        在这里剔掉的话 M2 的剂量/煎法安全检查就看不到西药条目了。
+        """
+        cand = self.formula_candidates[self.selected]
+        return [i for i in cand.herb_items if i.name != _LEGACY_HERB_PLACEHOLDER]
+
     @model_validator(mode="after")
     def _derive_flat_fields(self) -> "_S3Base":
         n = len(self.formula_candidates)

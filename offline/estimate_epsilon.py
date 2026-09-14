@@ -41,7 +41,7 @@ from pathlib import Path
 
 from core.batch import classify_llm_failure, warn_if_failure_rate_high
 from core.chain import consult, infer_elements, normalize
-from core.herbs import normalized_herb_set
+from core.herbs import normalized_herb_set, role_partitioned_herb_sets
 from core.llm import get_llm
 from core.physicians import PHYSICIANS
 from core.safety import check_safety
@@ -56,6 +56,10 @@ DEFAULT_N_SAMPLES = 10
 # 固定种子：epsilon_extract 的抽样要可复现（同一份 cases.json 重跑应当抽到同样
 # 10 条），不是为了"随机好看"而随机。
 SAMPLE_SEED = 20260907
+# R1 分层：整方 / 君臣 / 佐使。"herbs" 这一层就是 R1 之前的 epsilon_online，
+# 字段和数值一个都没变——分层是新增的两层，不是把原来那个数改了（E3/E4/E9 的
+# 历史数字都靠 epsilon_online 可比）。
+EPSILON_LAYERS = ("herbs", "core", "adjunct")
 
 
 def _empty_stats() -> dict:
@@ -86,17 +90,36 @@ def estimate_epsilon_online(
     计数，跟"被安全否决"、"信息不足"两种业务性跳过原因分开报——一个是
     consult() 没跑成，一个是 consult() 跑成了、结果如实是"拒答/信息不足"，
     混在一起会让"这条主诉的噪声数据够不够"这件事看不清楚。
+
+    ## R1：三层一起算（返回值里多一个 layers 子对象）
+
+    返回的 dict 就是 R1 之前的那个 epsilon_online，**字段和数值一个都没变**，
+    只多了一个 `layers` 键，里面是君臣层（core）和佐使层（adjunct）两个形状
+    完全一样的结果对象——`main()` 把它摘出来平铺成 epsilon.json 顶层的
+    `epsilon_core` / `epsilon_adjunct`。三层共用同一批 `consult()` 调用（一次
+    跑出的方，切三种集合看），不是跑三遍，所以三层的 `llm_calls` 是同一个数、
+    不是三份开销。
     """
     consult_fn = consult_fn or (lambda c: consult(c, use_react=False, ask_fn=None))
 
-    all_distances: list[float] = []
-    by_physician_distances: dict[str, list[float]] = {}
-    per_query: list[dict] = []
+    # {层: [距离…]} / {层: {医家: [距离…]}} / {层: [每条主诉一条记录]}
+    # 三层的累积结构刻意完全一样：分开写三套平行代码，以后改一处忘另两处
+    # 是这个项目撞过好几次的坑。
+    all_distances: dict[str, list[float]] = {k: [] for k in EPSILON_LAYERS}
+    by_physician_distances: dict[str, dict[str, list[float]]] = {k: {} for k in EPSILON_LAYERS}
+    per_query: dict[str, list[dict]] = {k: [] for k in EPSILON_LAYERS}
+    # 平均药味数：R1-3 的佐使克制约束会让药味数下降。如果 ε 降了而药味数
+    # 大幅下降（9 味 → 5 味），那是"药少了所以碰巧一样"的假改善，不是真的
+    # 稳定了——没有这个对照数，ε 单独下降这件事读不出真假。
+    set_sizes: dict[str, list[int]] = {k: [] for k in EPSILON_LAYERS}
+    # 分层那两个 ε 的可信度全看 role 填充率：没标 role 的药不进任何一层。
+    n_herb_items = 0
+    n_unroled = 0
     llm_calls = 0
     n_call_failures_total = 0
 
     for complaint in queries:
-        herb_sets_by_physician: dict[str, list[set]] = {}
+        sets_by_layer: dict[str, dict[str, list[set | None]]] = {k: {} for k in EPSILON_LAYERS}
         n_rejected = 0
         n_insufficient = 0
         n_call_failures = 0
@@ -119,57 +142,98 @@ def estimate_epsilon_online(
                 n_insufficient += 1
                 continue
             for r in outcome["results"]:
-                herbs = normalized_herb_set(r["s3"].herbs)
-                herb_sets_by_physician.setdefault(r["physician"], []).append(herbs)
+                parts = role_partitioned_herb_sets(r["s3"].selected_herb_items)
+                n_herb_items += parts["n_items"]
+                n_unroled += parts["n_unroled"]
+                # 分层的空集**不参与 Jaccard**：传 None 让 pairwise_jaccard_stats
+                # 跳过（它本来就有这个约定）。空的君臣层含义是"这张方的药没标
+                # role"，不是"这张方没有君臣药"——两个空集算出来的距离是 0.0
+                # （"双方都没提到任何东西"视为一致，见 core/setstats.py），
+                # 那会让 epsilon_core 被一堆未标注的方压成 0，一个假的好数字。
+                # 整方层（herbs）不这么处理：那里的空集是"这位医家真的没开方"，
+                # 是真实信息，R1 之前就是这么算的，不动。
+                layer_sets: dict[str, set | None] = {
+                    "herbs": normalized_herb_set(r["s3"].herbs),
+                    "core": parts["core"] or None,
+                    "adjunct": parts["adjunct"] or None,
+                }
+                for layer, st in layer_sets.items():
+                    sets_by_layer[layer].setdefault(r["physician"], []).append(st)
+                    if st is not None:
+                        set_sizes[layer].append(len(st))
 
         n_call_failures_total += n_call_failures
         n_completed = n_repeats - n_call_failures  # 真正跑完的重复次数，不是 n_repeats
+        skip_reason = None
         if n_completed == 0:
-            per_query.append({
-                "query": complaint, "skipped": True, "reason": "全部重复调用失败",
-                "n_call_failures": n_call_failures,
-            })
-            continue
-        if n_rejected == n_completed:
-            per_query.append({
-                "query": complaint, "skipped": True, "reason": "全部重复被安全否决拦截",
-                "n_call_failures": n_call_failures,
-            })
-            continue
-        if n_insufficient == n_completed:
-            per_query.append({
-                "query": complaint, "skipped": True, "reason": "全部重复信息不足未产出结论",
-                "n_call_failures": n_call_failures,
-            })
+            skip_reason = "全部重复调用失败"
+        elif n_rejected == n_completed:
+            skip_reason = "全部重复被安全否决拦截"
+        elif n_insufficient == n_completed:
+            skip_reason = "全部重复信息不足未产出结论"
+        if skip_reason:
+            # 跳过的原因跟分层无关（整条主诉没跑出结论），三层记同一条
+            for layer in EPSILON_LAYERS:
+                per_query[layer].append({
+                    "query": complaint, "skipped": True, "reason": skip_reason,
+                    "n_call_failures": n_call_failures,
+                })
             continue
 
-        q_record: dict = {
-            "query": complaint, "skipped": False,
-            "n_rejected": n_rejected, "n_insufficient": n_insufficient,
-            "n_call_failures": n_call_failures, "n_completed": n_completed,
-            "by_physician": {},
+        for layer in EPSILON_LAYERS:
+            q_record: dict = {
+                "query": complaint, "skipped": False,
+                "n_rejected": n_rejected, "n_insufficient": n_insufficient,
+                "n_call_failures": n_call_failures, "n_completed": n_completed,
+                "by_physician": {},
+            }
+            for physician, sets_ in sets_by_layer[layer].items():
+                stats = pairwise_jaccard_stats(sets_)
+                q_record["by_physician"][physician] = stats
+                if stats:
+                    all_distances[layer].extend(stats["values"])
+                    by_physician_distances[layer].setdefault(physician, []).extend(stats["values"])
+            per_query[layer].append(q_record)
+
+    role_fill_rate = (1 - n_unroled / n_herb_items) if n_herb_items else None
+    by_layer: dict[str, dict] = {}
+    for layer in EPSILON_LAYERS:
+        overall = aggregate_stats(all_distances[layer]) or _empty_stats()
+        sizes = set_sizes[layer]
+        by_layer[layer] = {
+            **overall,
+            "by_physician": {
+                p: (aggregate_stats(d) or _empty_stats())
+                for p, d in by_physician_distances[layer].items()
+            },
+            "per_query": per_query[layer],
+            "n_queries": len(queries),
+            "n_queries_used": sum(1 for q in per_query[layer] if not q["skipped"]),
+            "n_repeats": n_repeats,
+            "n_call_failures": n_call_failures_total,
+            "n_attempts": len(queries) * n_repeats,
+            # 三层是同一批 consult() 调用切出来的，这个数是那一批的总调用数，
+            # 不是"这一层额外花了这么多"
+            "llm_calls": llm_calls,
+            # 归一去重之后的集合大小，不是 herb_items 的条数——同一味药写两次
+            # 不该算两味，而且这样它跟 ε 数的是同一个集合
+            "mean_herbs_per_formula": round(sum(sizes) / len(sizes), 2) if sizes else None,
+            "n_formulas_counted": len(sizes),
         }
-        for physician, sets_ in herb_sets_by_physician.items():
-            stats = pairwise_jaccard_stats(sets_)
-            q_record["by_physician"][physician] = stats
-            if stats:
-                all_distances.extend(stats["values"])
-                by_physician_distances.setdefault(physician, []).extend(stats["values"])
-        per_query.append(q_record)
+    for layer in ("core", "adjunct"):
+        # role 填充率只挂在分层这两个结果上：epsilon_core/epsilon_adjunct 可信到
+        # 什么程度全看它，读 JSON 的人应当在同一个对象里就看到，不用去别处找。
+        # 判据跟 scripts/verify_role_fill.py 的闸门是同一个量（那个脚本负责在
+        # 真机上先把这个率验到 90% 以上，分层指标才算可用）。
+        by_layer[layer].update({
+            "role_fill_rate": round(role_fill_rate, 4) if role_fill_rate is not None else None,
+            "n_herb_items": n_herb_items,
+            "n_unroled": n_unroled,
+        })
 
-    overall = aggregate_stats(all_distances) or _empty_stats()
-    by_physician = {p: (aggregate_stats(d) or _empty_stats()) for p, d in by_physician_distances.items()}
-    return {
-        **overall,
-        "by_physician": by_physician,
-        "per_query": per_query,
-        "n_queries": len(queries),
-        "n_queries_used": sum(1 for q in per_query if not q["skipped"]),
-        "n_repeats": n_repeats,
-        "n_call_failures": n_call_failures_total,
-        "n_attempts": len(queries) * n_repeats,
-        "llm_calls": llm_calls,
-    }
+    online = by_layer["herbs"]
+    online["layers"] = {"core": by_layer["core"], "adjunct": by_layer["adjunct"]}
+    return online
 
 
 def estimate_epsilon_s2(queries: list[str], n_repeats: int = DEFAULT_N_REPEATS) -> dict:
@@ -345,6 +409,44 @@ def _estimate_call_counts(n_queries: int, n_repeats: int, n_samples: int,
     return {"online": online, "s2": s2, "extract": extract, "total": online + s2 + extract}
 
 
+def _report_layers(online: dict, layers: dict) -> None:
+    """把君臣层/佐使层的数跟整方层并排打出来，并**如实报出观察到的关系**。
+
+    R1 的验收判据是 epsilon_core < epsilon_online < epsilon_adjunct（核心判断
+    比整方稳、佐使加减比整方散）。这里只报关系成不成立，不拿它当闸门、更不
+    调参去凑：这个关系不成立本身就是一条要留给下一轮的信息（比如 role 标注
+    质量不够、或者模型的"君臣"判断本身也在抖）。
+
+    role 填充率一并打出来：填充率低的时候分层那两个数只覆盖了一部分用药，
+    读的人必须同时看到这个率，不然会把"只有三成药参与了比较"读成全貌。
+    """
+    core, adjunct = layers["core"], layers["adjunct"]
+    fill = core["role_fill_rate"]
+    print(f"  role 填充率 {'未知（没有任何药材条目）' if fill is None else f'{fill:.1%}'}"
+          f"（{core['n_herb_items'] - core['n_unroled']}/{core['n_herb_items']} 味标了 role；"
+          f"低于 90% 时下面两个分层的数只覆盖了一部分用药，不能当全貌读）")
+    for label, layer in (("epsilon_core（君臣）", core), ("epsilon_adjunct（佐使）", adjunct)):
+        print(f"  {label:<22} mean={layer['mean']} p50={layer['p50']} p95={layer['p95']}  "
+              f"平均药味数={layer['mean_herbs_per_formula']}"
+              f"（{layer['n_formulas_counted']} 张方）")
+    print(f"  {'epsilon_online（整方）':<22} mean={online['mean']}  "
+          f"平均药味数={online['mean_herbs_per_formula']}"
+          f"（{online['n_formulas_counted']} 张方）")
+
+    vals = (core["mean"], online["mean"], adjunct["mean"])
+    if any(v is None for v in vals):
+        missing = [n for n, v in zip(("core", "online", "adjunct"), vals) if v is None]
+        print(f"  验收关系无法判定：{'、'.join(missing)} 没有数（这一层没有可比样本）")
+        return
+    c, o, a = vals
+    holds = c < o < a
+    print(f"  验收关系 epsilon_core < epsilon_online < epsilon_adjunct："
+          f"{c} < {o} < {a} → {'成立' if holds else '不成立'}")
+    if not holds:
+        print("  （不成立不改参数去凑——如实留给下一轮；先看 role 填充率和"
+              "平均药味数这两个对照数是不是解释了它）")
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="估算三层噪声地板，写 eval/epsilon.json")
     ap.add_argument("--queries-path", type=Path, default=DEFAULT_QUERIES_PATH)
@@ -386,6 +488,8 @@ def main(argv: list[str] | None = None) -> None:
           f"用了 {online['n_queries_used']}/{online['n_queries']} 条主诉、{online['llm_calls']} 次调用"
           f"（{online['n_call_failures']} 次重复调用失败）")
     warn_if_failure_rate_high("epsilon_online", online["n_call_failures"], online["n_attempts"])
+    layers = online.pop("layers")  # 摘出来平铺到 epsilon.json 顶层，见 _report_layers
+    _report_layers(online, layers)
 
     print("\n=== epsilon_s2 ===")
     s2 = estimate_epsilon_s2(queries, n_repeats=args.n_repeats)
@@ -421,6 +525,11 @@ def main(argv: list[str] | None = None) -> None:
     llm = get_llm()
     out = {
         "epsilon_online": online,
+        # 分层的两个 ε 跟 epsilon_online 平级，不藏在它里面：三层是并列的三个
+        # 对照基准（core/chain.py 的 load_epsilon_layer_means 按这个形状读），
+        # 嵌一层只会让读 JSON 的人多绕一道。
+        "epsilon_core": layers["core"],
+        "epsilon_adjunct": layers["adjunct"],
         "epsilon_s2": s2,
         "epsilon_extract": extract,
         "model": llm.model_name(),

@@ -50,9 +50,25 @@ from core.schemas import (
 EPSILON_PATH = Path(__file__).resolve().parent.parent / "eval" / "epsilon.json"
 
 
+def _read_epsilon_file() -> dict | None:
+    """eval/epsilon.json 的**唯一**读取点。下面三个 load_* 都从这里取，不各自
+    open 一次——三层 ε（online / core / adjunct）是同一份文件里的并列字段，
+    读文件这件事重复三遍，以后加第四层就会有一处忘了改。
+
+    文件不存在/坏了都返回 None，不抛异常：demo 在没跑过 ε 估算时也要能用。
+    """
+    if not EPSILON_PATH.exists():
+        return None
+    try:
+        return json.loads(EPSILON_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def load_epsilon_online_detail() -> dict | None:
-    """跟 load_epsilon_online 读的是同一份文件——文件读取/解析只在这里做一次，
-    load_epsilon_online 是对它取 .mean 的薄封装，不是另一份独立实现
+    """跟 load_epsilon_online 读的是同一份文件——文件读取/解析只在
+    _read_epsilon_file 做一次，load_epsilon_online 是对它取 .mean 的薄封装，
+    不是另一份独立实现
     （tests/test_dedup_contracts.py::test_epsilon_loader_is_defined_only_in_chain
     钉住"ε 的加载器只能在 core/chain.py 里"这条约束）。
 
@@ -60,18 +76,32 @@ def load_epsilon_online_detail() -> dict | None:
     单独一个 mean 标量不够用——这里把完整的 epsilon_online 子对象
     （含 per_query/by_physician）交出去，调用方自己从里面挑要用的字段。
     """
-    if not EPSILON_PATH.exists():
-        return None
-    try:
-        data = json.loads(EPSILON_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data.get("epsilon_online")
+    data = _read_epsilon_file()
+    return data.get("epsilon_online") if data else None
 
 
 def load_epsilon_online() -> float | None:
     detail = load_epsilon_online_detail()
     return detail.get("mean") if detail else None
+
+
+def load_epsilon_layer_means() -> dict:
+    """君臣层 / 佐使层各自的噪声地板均值：{"core": float|None, "adjunct": float|None}。
+
+    分层分歧度（core_jaccard / adjunct_jaccard）跟 herb_jaccard 一样是"没有对照
+    就没有意义"的数——CLAUDE.md「任何数字都必须带对照」。前端要把
+    core_jaccard 跟 ε_core 并排显示，不能拿 ε_online（整方的地板）去判断君臣层
+    那个数超没超出抖动范围：实测佐使层的抖动明显大于整方、君臣层明显小于整方，
+    用同一个地板卡三层会把君臣层的一致性低估、佐使层的发散高估。
+
+    还没跑过 offline/estimate_epsilon.py（或跑的是 R1 之前的旧版本、文件里没有
+    这两个字段）时两个值都是 None，前端如实展示"未测"。
+    """
+    data = _read_epsilon_file() or {}
+    return {
+        layer: ((data.get(f"epsilon_{layer}") or {}).get("mean"))
+        for layer in ("core", "adjunct")
+    }
 
 
 class SafetyVeto(Exception):
@@ -314,6 +344,26 @@ def _birth_year(years: str | None) -> int | None:
         return None
     head = years.strip().split("-")[0].strip()
     return int(head) if head.isdigit() else None
+
+
+def _layered_jaccard(sets: list[set]) -> float | None:
+    """君臣层 / 佐使层的 n 方交并比。
+
+    用跟 `herb_jaccard` 同一个 n 方公式（`set.intersection` / `set.union`），好让
+    三个数放在一起可比——但**空集的处理刻意不同，这两处回答的不是同一个问题**：
+    `herb_jaccard` 只要有一位医家开了药就出数，那里的空集含义是"这位医家真的没
+    开方"；分层这里要求**每一位医家在这一层都有药**才出数，因为分层的空集含义是
+    "这位医家的药没标 role"，不是"他没开这一类药"。把没标注当成"零条重叠"算下去
+    会得出 core_jaccard=1.0，被读成"核心用药毫无重叠"，而事实只是没标注——
+    这正是 R1-1 那道 role 填充率闸门要先过的原因。
+
+    所以返回 None 而不是 0.0：**0.0 的意思是"完全相同"，跟"没数据"是两回事**
+    （divergence["layer_note"] 把这句话也写给前端和读 JSON 的人）。
+    """
+    if len(sets) < 2 or not all(sets):
+        return None
+    inter, union = set.intersection(*sets), set.union(*sets)
+    return round(1.0 - len(inter) / len(union), 3)
 
 
 def pairwise_divergence(results: list[dict]) -> dict:
@@ -959,6 +1009,21 @@ def consult(
         herb_jaccard = None
         shared_herbs = []
 
+    # R1 分层：君臣（核心判断）和佐使（加减）各算一个 Jaccard，跟上面那个
+    # herb_jaccard 并列。**上面那段一个字没动**：E3/E4/E9 的历史数字都基于
+    # herb_jaccard，改了就不可比（tests/test_role_layers.py 里有一条测试钉住
+    # "加不加 role 标注，herb_jaccard 都是同一个数"）。分层是新增的两个数，
+    # 回答的是 herb_jaccard 回答不了的问题：0.53 这个数里有多少是核心判断
+    # 不一致、有多少只是佐使加减不同。
+    role_parts = [
+        _herbs.role_partitioned_herb_sets(r["s3"].selected_herb_items)
+        for r in results
+    ]
+    core_sets = [p["core"] for p in role_parts]
+    adjunct_sets = [p["adjunct"] for p in role_parts]
+    core_jaccard = _layered_jaccard(core_sets)
+    adjunct_jaccard = _layered_jaccard(adjunct_sets)
+
     tp_same = len(set(r["s3"].treatment_principle for r in results)) <= 1
 
     # 西药单独报，不混进 herb_jaccard 这个主指标：只有张锡纯会用西药，把它算进
@@ -1002,6 +1067,25 @@ def consult(
         # 0=用药完全一致，1=毫无重叠（n 方交并比，见上）
         "herb_jaccard": round(herb_jaccard, 3) if herb_jaccard is not None else None,
         "shared_herbs": shared_herbs,
+        # R1 分层：君臣 = 这个证的核心判断，佐使 = 针对兼夹症状的加减。两个数
+        # 分开报才能区分"核心判断一致、只是加减用药不同"（合理的用药灵活性）和
+        # "连君臣都对不上"（真分歧）。None = 这一层没数据，见 layer_note。
+        "core_jaccard": core_jaccard,
+        "adjunct_jaccard": adjunct_jaccard,
+        "shared_core_herbs": sorted(set.intersection(*core_sets)) if core_jaccard is not None else [],
+        "shared_adjunct_herbs": (
+            sorted(set.intersection(*adjunct_sets)) if adjunct_jaccard is not None else []
+        ),
+        # 按医家报"有几味药没标 role"——分层的数可信到什么程度全看这个：
+        # 没标注的药既不在君臣层也不在佐使层（只在 herb_jaccard 里），
+        # 这个数大就说明分层指标只覆盖了一部分用药，不能当全貌读。
+        "n_unroled": {r["physician"]: p["n_unroled"] for r, p in zip(results, role_parts)},
+        "layer_note": (
+            "core_jaccard/adjunct_jaccard 为 null 表示这一层没有可比数据"
+            "（至少一位医家在这一层没有标注 role 的药），不是 0——"
+            "0 的意思是「两边完全相同」，跟「没数据」是两回事。"
+            "role 未标注的药不进任何一层，只计入 n_unroled，但仍照旧计入 herb_jaccard。"
+        ),
         **pairwise,
         "treatment_principle_same": tp_same,
         # None = 两位医家都没开西药，这个维度不适用（不是"完全一致"）
@@ -1010,6 +1094,10 @@ def consult(
         # 抖多少"。None = 还没跑过 offline/estimate_epsilon.py，前端要如实展示
         # "未测"，不能假装这个数已经有对照（CLAUDE.md「任何数字都必须带对照」）。
         "epsilon_online": load_epsilon_online(),
+        # 分层的数同样必须带自己的对照基准：ε_online 是整方的地板，拿它去卡
+        # 君臣层会低估一致性、卡佐使层会高估发散（实测佐使层抖动大于整方、
+        # 君臣层小于整方）。None = 还没跑过带分层的 estimate_epsilon。
+        **{f"epsilon_{k}": v for k, v in load_epsilon_layer_means().items()},
     }
 
     return {

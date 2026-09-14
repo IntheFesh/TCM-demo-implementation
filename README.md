@@ -300,7 +300,7 @@ compound 父子节点）+ 两位医家的结论对照 + 分歧度。
 | `offline/build_graph.py` | 从 `data/standard/syndromes.jsonl` 建知识图谱骨架（symptom/element/syndrome 三类节点，`python -m offline.build_graph`），并打印语料库门类覆盖检查 |
 | `offline/graph_stats.py` | 给图里的 indicates 边算并写回医家级四层收缩权重，打印节点/边分布、λ1 分布等统计（`python -m offline.graph_stats`）——**λ 相关的数字务必看下面"知识图谱权重"一节的 λ2 说明再解读** |
 | `offline/build_jieba_dict.py` | K3a：生成 BM25 检索用的中医术语自定义词典 `data/jieba_dict.txt` |
-| `offline/estimate_epsilon.py` | E：估计噪声地板 ε（`epsilon_online`/`epsilon_s2`/`epsilon_extract`），写 `eval/epsilon.json`，供前端"分歧度"和 V1 的显著性判断做对照基准 |
+| `offline/estimate_epsilon.py` | E：估计噪声地板 ε（`epsilon_online`/`epsilon_core`/`epsilon_adjunct`/`epsilon_s2`/`epsilon_extract`），写 `eval/epsilon.json`，供前端"分歧度"和 V1 的显著性判断做对照基准。`epsilon_core`/`epsilon_adjunct` 是 R1 加的君臣/佐使分层地板（见「分歧度的三层」一节），跟 `epsilon_online` 是同一批调用切出来的，不额外花钱 |
 | `offline/extract_case_triples.py` | X3：从每一诊原文用真实 LLM 抽取三元组（`{case_id,physician,s,p,o,source_span}`），写 `data/case_triples.jsonl`，`core/tools.py` 的 `query_case_graph` 工具消费这份数据 |
 | `offline/build_element_index.py` | K3b：从 `cases.json` 的症状字段建证素索引 `data/element_index.json`，供检索的 `mode="graph"` 和 `core/transition.py` 用 |
 | `offline/quota.py` | 附属：审计 `cases.json` 是否达到 `data/SOURCES.md` 里写明的样本量门槛（总案例 60、带复诊序列 50） |
@@ -495,6 +495,37 @@ GET /api/trajectories/{physician}   # 例如 /api/trajectories/ye_tianshi
 > 张锡纯本人还没注册进 `core/physicians.py`（见 HANDOFF 步骤 3），
 > 所以现在真实链路上这个字段恒为空，上面这套是为他进来那天准备的。
 
+## 分歧度的三层（整方 / 君臣 / 佐使）
+
+`divergence` 里的药物 Jaccard 距离现在有三个，各自带**自己那一层**的噪声地板：
+
+| 字段 | 含义 | 对照基准 |
+|---|---|---|
+| `herb_jaccard` | 整方用药（R1 之前唯一的那个数，算法一个字没改，E3/E4/E9 的历史数字靠它可比） | `epsilon_online` |
+| `core_jaccard` | 只算 `role` 为君/臣 的药——这个证的**核心判断** | `epsilon_core` |
+| `adjunct_jaccard` | 只算 `role` 为佐/使 的药——针对兼夹症状的**加减** | `epsilon_adjunct` |
+
+分三层是因为整方那一个数说不清"0.53 里多少是核心判断不一致、多少只是加减不同"。
+实测同一条主诉重复跑三次，君臣骨架三次全在、变的全是佐使，两者混成一个数就看不见
+这件事。**不要拿 `epsilon_online` 去卡分层的数**：佐使层的抖动明显大于整方、君臣层
+明显小于整方，用同一个地板卡三层会把核心的一致性低估、把加减的发散高估。
+
+`role` 没标注的药**不进任何一层**（只留在 `herb_jaccard` 里），按医家计入
+`n_unroled`；某一层至少有一位医家没有标注 role 的药时，那一层的值是 `null` 而不是
+`0`——**`0` 的意思是"两边完全相同"，跟"没数据"是两回事**。所以分层的数能不能当
+全貌读，取决于 role 填充率：
+
+```bash
+python -m scripts.verify_role_fill          # 退出码 0 = 填充率 >= 90%
+```
+
+这个闸门要先过，分层的两个数才有意义（顺带报 `function_in_formula` / `dose` 的
+填充率和平均药味数）。退出码 1 = 填充率不够（先改 `prompts/v1/s3_syndrome.yaml`），
+2 = 没测出来（全部调用失败或全被安全否决，连闸门都判不了）。
+
+平均药味数（`mean_herbs_per_formula`，三层各一个）是配套的对照数：如果 ε 降了
+但药味数大幅下降（9 味 → 5 味），那是"药少了所以碰巧一样"的假改善，不是真的稳定。
+
 ## 评测汇总（V1，需要真实 LLM，不进 pytest）
 
 `eval/run_eval.py` 把 divergence（分歧度 vs ε 噪声地板）、幻觉率（按有无
@@ -505,8 +536,8 @@ GET /api/trajectories/{physician}   # 例如 /api/trajectories/ye_tianshi
 python -m eval.run_eval --queries-path tests/queries.txt
 ```
 
-**七组数字的当前值、对照和 caveat 只维护在 [`eval/RESULTS.md`](eval/RESULTS.md)
-一处**（ε / 分歧度 / E3 / E4 / SDT / E9 / E8 / MES / E2 学派配对），README 和
+**这几组数字的当前值、对照和 caveat 只维护在 [`eval/RESULTS.md`](eval/RESULTS.md)
+一处**（ε_online / ε_core / ε_adjunct / 分歧度 / E3 / E4 / SDT / E9 / E8 / MES / E2 学派配对），README 和
 DEMO.md 从那里抄，哪一行的代码改了那一行就标"待重跑"。`report.json` 里另有
 `school_pairs`（师承内 vs 跨学派的两两配对，总纲 1.3）和 `react_process.samples`
 （ReAct 前 10 条完整动作序列）两段，排查"某条该进没进"这类问题时看它们，不用

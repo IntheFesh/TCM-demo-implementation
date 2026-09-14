@@ -111,6 +111,54 @@ def normalized_herb_set(herbs: list[str] | None) -> set[str]:
     return {h for h in (normalize_herb(x) for x in (herbs or [])) if h}
 
 
+# ---------- 君臣佐使分层（R1 降 ε 用）----------
+#
+# 君臣 = 这个证的核心判断，佐使 = 针对兼夹症状的加减。分层比对的目的是把
+# "核心判断不一致"和"加减用药不同"分开报：实测同一条主诉重复跑三次，叶天士
+# 的君臣骨架（半夏/延胡索/炙甘草/茯苓）三次全在，变的全是佐使（神曲/黄连/
+# 桑叶青皮），而主诉里根本没有食积、热象、肺卫的症状——把两者混成一个数，
+# 这个"核心稳定、加减发散"的事实就看不见了，只能看到一个 0.53 说不清含义。
+CORE_ROLES = ("君", "臣")
+ADJUNCT_ROLES = ("佐", "使")
+
+
+def role_partitioned_herb_sets(herb_items) -> dict:
+    """把一张方的逐味药条目按君臣/佐使切成两个可比对集合。
+
+    入参是 `HerbItem` 形状的条目列表（只用到 `.name` 和 `.role`），不是扁平药名
+    列表——`role` 只存在于条目上，`core.schemas._S3Base._derive_flat_fields` 把
+    条目压成 `.herbs` 时就把它丢了。S3 结论那边取条目请走
+    `s3.selected_herb_items`（占位符过滤只在 core/schemas.py 做一处）。
+
+    归一走 `normalize_herb`，跟 `normalized_herb_set` 同一把尺子——分层的数要跟
+    `herb_jaccard` 放在一起读，两边"怎么把一张方变成集合"必须是同一个定义。
+    西药也照 `herb_jaccard` 的做法剔掉（`split_western_drugs` 的同一条理由：
+    只有张锡纯用西药，算进去会把跨学派分歧系统性推高，而那个推高是假的）。
+
+    `role=None` 的药**不进任何一层**，只计进 `n_unroled`：硬塞进某一类会让指标
+    的含义变得不可解释（"这个 core_jaccard 里有几味药其实不知道是不是君臣"）。
+    这些药并没有从统计里消失——`herb_jaccard` 不看 role，照旧把它们算在内。
+    """
+    core: set[str] = set()
+    adjunct: set[str] = set()
+    n_unroled = 0
+    n_items = 0
+    for item in herb_items or []:
+        if is_western_drug(item.name):
+            continue
+        name = normalize_herb(item.name)
+        if not name:
+            continue
+        n_items += 1
+        if item.role in CORE_ROLES:
+            core.add(name)
+        elif item.role in ADJUNCT_ROLES:
+            adjunct.add(name)
+        else:
+            n_unroled += 1
+    return {"core": core, "adjunct": adjunct, "n_unroled": n_unroled, "n_items": n_items}
+
+
 # ---------- 西药识别（A2 张锡纯「衷中参西」用）----------
 #
 # 跟 HERB_ALIASES 回答的不是同一个问题，所以是另一张表、不合并：

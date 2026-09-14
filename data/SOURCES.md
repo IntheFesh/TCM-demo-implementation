@@ -1363,3 +1363,110 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     每位已注册医家都有 adapter 目录。闸门本身的判断逻辑在沙盒里测了
     （`tests/test_verify_local_backend.py`，假后端模拟"第 N 次才成功"），
     不然"闸门写错导致永远绿"只能在 AutoDL 上撞到。
+
+38. **降 ε 的第一轮（R1）：分歧度切成三层，`role` 填充率是这三个数能不能用
+    的前置闸门。** 起点是实测诊断——同一条主诉（胃脘胀痛，情志不畅而发）
+    重复跑三次，叶天士三次的用药是：
+
+    ```
+    第1次: 党参 半夏 延胡索 炙甘草 神曲 茯苓 金铃子 陈皮 香附
+    第2次: 半夏 吴茱萸 川楝子 干姜 延胡索 炙甘草 茯苓 黄连
+    第3次: 半夏 吴茱萸 川楝子 延胡索 桑叶 炙甘草 茯苓 陈皮 青皮 香附
+    ```
+
+    君臣骨架（半夏、延胡索、炙甘草、茯苓）三次全在；变的是佐使——神曲、
+    黄连、桑叶青皮，而这条主诉里根本没有食积、热象、肺卫的症状。也就是说
+    `ε_online = 0.241` 这个数里有相当一部分是"被参考医案带进来的无依据加减"，
+    不是辨证抖动，**而整方一个 Jaccard 数把这件事完全盖住了**：读到 0.241
+    的人看不出核心判断其实是稳的。
+
+    所以这一轮做的是给指标加分辨率，不是把数字压小：
+
+    - `core_jaccard`（只算 role 为君/臣）、`adjunct_jaccard`（只算佐/使）跟
+      原来的 `herb_jaccard` 并列，`epsilon_core`/`epsilon_adjunct` 跟
+      `epsilon_online` 并列（`eval/epsilon.json` 顶层三个并列字段，
+      `core/chain.py::load_epsilon_layer_means` 按这个形状读）。三层是**同一批
+      `consult()` 调用**切出来的三种集合，不是跑三遍，不多花一次调用。
+    - **`herb_jaccard` 的算法一个字没动**：E3/E4/E9 的历史数字都基于它。
+      `tests/test_role_layers.py::test_herb_jaccard_is_unchanged_by_role_annotation`
+      钉住"同样的药、只是标不标 role，这个数必须一模一样"，另一条钉住它仍是
+      n 方交并比（用 n 方值 0.75 ≠ 两两均值 0.667 的输入区分）。
+    - **刻意没有降 temperature。** 那会同时压掉合理的用药灵活性——ε 会好看，
+      但问题是被掩盖不是被解决，而且"两位医家用药风格不同"这件事本身就靠
+      这点灵活性才表达得出来。改的是 prompt 里"加药要有依据"这一条
+      （`prompts/v1/s3_syndrome.yaml` 的 role 那段下面四行），君臣药一个字
+      没限制。
+    - **没有碰检索层和参考医案的呈现结构**（`_format_case_block` 和 `$refs`
+      在 prompt 里的位置都是原样）。改的是"怎么用参考医案里的药"，不是
+      "怎么把参考医案摆给模型看"——后者是 V5 P0 用 E3/E4 消融闸门换来的。
+
+    **这一轮真正容易做错的地方是空集。** 分层的空集含义跟整方层相反：整方层
+    的空集是"这位医家真的没开方"（真实信息，照旧参与计算），分层的空集是
+    "这位医家的药没标 role"（不可比）。两个空集算 Jaccard 距离是 `0.0`
+    （`core/setstats.py` 把"双方都没提到任何东西"定义为一致），照整方层那套
+    算下去会得出 `core_jaccard = 0.0` 并被读成"核心用药完全一致"，
+    `epsilon_core` 也会被一堆未标注的方压成 0——一个凭空好看的假数字。所以
+    分层这一层：一位医家没标就返回 `None`（不是 0、也不是 1），
+    `offline/estimate_epsilon.py` 往 `pairwise_jaccard_stats` 传 `None` 占位
+    让它跳过，`n_unroled` 按医家报出来解释为什么是 `None`，前端显示
+    "不适用（至少一位医家这一层没有标注 role 的药）"而不是一个数。
+    **`0` 的意思是"两边完全相同"，跟"没数据"是两回事**——这句话同时写进了
+    `divergence["layer_note"]`，给读 JSON 的人。
+
+    由此 `role` 填充率成了硬前置：`scripts/verify_role_fill.py`（退出码
+    0 = ≥90%、1 = 不够、2 = 没测出来）。**填充率不到九成时分层的两个数只是
+    在拿一部分药说话，不能拿它去验收 R1-3 的克制约束**——脚本的失败输出里写
+    了这条依赖和去哪儿改。`function_in_formula` / `dose` 两个 M1 加的字段
+    顺带报填充率：它们到今天一次都没在真实产出上核过（M1 那句"role 填得完整"
+    来自一次调用的印象，不是统计）。这个脚本的闸门逻辑本身在沙盒里测了
+    （`tests/test_verify_role_fill.py`，含"正好 90% 算过"的边界和三个退出码），
+    理由同条目 37：闸门写错导致永远绿，只能在真机上撞到。
+
+    **平均药味数是配套的对照数，不是附赠品。** `mean_herbs_per_formula`
+    三层各报一个（按归一去重后的集合大小算，跟 ε 数的是同一个集合）。没有它，
+    "ε 降了"分不清真假：药味数从 9 味掉到 5 味而 ε 降了，那是"药少了所以碰巧
+    一样"的假改善。`_report_layers` 把验收关系
+    `epsilon_core < epsilon_online < epsilon_adjunct` 成不成立如实打出来，
+    **不成立也不调参去凑**——那本身是一条要留给下一轮的信息。
+
+    **前端这一层是单独测的，不是"后端字段对了就认为前端也对"。** M5 的教训
+    （`to_graph()` 的 JSON 测试全绿、`growGraph()` 的 `nodesByLayer` 漏了新
+    layer）在这一轮的形态是：分层字段全对，但横幅把 `null` 显示成 `0`，就会
+    凭空报出"核心用药完全一致"。所以把拼文案从写 DOM 里拆出来
+    （`divergenceBannerText` 纯函数），用 node 跑 `index.html` 里真实上线的
+    那份 `<script>` 测（`tests/test_divergence_frontend.py` 11 条，含
+    "null 不能显示成 0"、"R1 之前的 payload 不能凭空多一行"、"前两行原样"）。
+    这一轮没有动 cytoscape 图层，所以不需要 Playwright；`n_unroled` 数据层按
+    id 存、展示层查 `pairs` 里的中文名（查不到就原样显示 id，不编名字）。
+
+    **沙盒能验到的最后一步：把上面那三次真实用药按君臣骨架手工标上 role，
+    喂进 `estimate_epsilon_online`**（假 `consult_fn`，不是真实调用——role 是我
+    标的不是模型标的，所以这组数只证明"分层的算法真的把信号分开了"，不是
+    "真机上 ε 会是这些值"）：
+
+    ```
+    role 填充率 100.0%（27/27）
+    epsilon_core（君臣）    mean=0.0     平均药味数=4.0
+    epsilon_adjunct（佐使）  mean=0.8426  平均药味数=5.0
+    epsilon_online（整方）   mean=0.5769  平均药味数=9.0
+    验收关系 epsilon_core < epsilon_online < epsilon_adjunct：成立
+    ```
+
+    这条主诉单独看整方是 0.5769，远高于 10 条主诉汇总的 0.241——它是最坏的那条，
+    两个数不是同一个口径，别混着引。真机的三层数要等上机跑
+    `python -m offline.estimate_epsilon --n-repeats 3`。
+
+    **顺带发现一处归一缺口，这一轮刻意没改：** `金铃子` 和 `川楝子` 是同一味药
+    （前者见第 1 次、后者见第 2/3 次），`normalize_herb` 现在把它们算成两味；
+    `元胡` / `延胡索` 同理。这会同时推高 `herb_jaccard` 和 ε。没有顺手补进
+    `HERB_ALIASES` 的理由是：归一表一动，`herb_jaccard` 和 ε 的历史数字（E3/E4/
+    E9/E2）就全部不可比了，那是一个要跟"什么时候重跑全套评测"一起决定的事，
+    不该夹在降 ε 这一轮里悄悄改掉。留给下一轮。
+
+    本轮新增测试 55 条（分层 20 + 脚本 18 + 前端 11 + `estimate_epsilon` 分层 6），
+    全套 1670 → 1725 全绿、ruff 干净。新增的测试在改之前跑过一遍确认是红的
+    （`git stash` 掉 `core/ offline/ web/ prompts/` 后 24 红，
+    `tests/test_role_layers.py` 因为 `core/herbs.py` 还没有 `CORE_ROLES`
+    直接 import 失败——那也是"改之前是红的"，只是红在 collect 阶段）。
+    `core/schemas.py` 的 `= Field(min_length=1)` 仍是 31 处（这一轮只新增了一个
+    `selected_herb_items` property，没有动任何字段声明）。
