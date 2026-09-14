@@ -1085,7 +1085,9 @@ def test_results_md_gives_every_numbered_row_a_backend_cell():
 
     text = (_Path(__file__).resolve().parent.parent / "eval" / "RESULTS.md").read_text(
         encoding="utf-8")
-    rows = [line for line in text.splitlines() if _re.match(r"^\| [\w-]+ \| ", line)]
+    # 只认编号行（`| 3 | …` / `| 3-local | …`）。文件里还有别的说明性表格
+    # （凭据核对表、ε 逐条地板表），它们没有"后端"这一列也不该有。
+    rows = [line for line in text.splitlines() if _re.match(r"^\| \d+(?:-\w+)? \| ", line)]
     assert len(rows) >= 11        # 11 个指标 + 并列示例；少了说明表被改动过，来看一眼
     for row in rows:
         cells = [c.strip() for c in row.strip("|").split("|")]

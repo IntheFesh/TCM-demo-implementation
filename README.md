@@ -351,6 +351,8 @@ python -m offline.graph_stats
 
 - 本机没有 `cases.json` 时，图里根本没有 `case` 节点，`count_support()` 无边可数；
 - **挂入真实医案之后 λ1 仍然接近 0**——实测 839 条医案里只有 91 条标了证型，
+  （这次测量时的语料是 839 条，现在是 941 诊次；**λ1 没有在新语料上重测**，
+  引用这个数时要带上这句）
   这 91 条中 **0 条**能匹配国标证候名；症状端 1433 种表述与国标 93 个症状节点
   字面重合仅 8 种。这是清代医案与现代国标术语体系的差异，不是实现缺陷。
 
@@ -553,12 +555,30 @@ python -m scripts.verify_role_fill          # 退出码 0 = 填充率 >= 90%
 python -m eval.run_eval --queries-path tests/queries.txt
 ```
 
-**这几组数字的当前值、对照和 caveat 只维护在 [`eval/RESULTS.md`](eval/RESULTS.md)
-一处**（ε_online / ε_core / ε_adjunct / 分歧度 / E3 / E4 / SDT / E9 / E8 / MES / E2 学派配对），README 和
-DEMO.md 从那里抄，哪一行的代码改了那一行就标"待重跑"。`report.json` 里另有
-`school_pairs`（师承内 vs 跨学派的两两配对，总纲 1.3）和 `react_process.samples`
-（ReAct 前 10 条完整动作序列）两段，排查"某条该进没进"这类问题时看它们，不用
-手写 python -c 去抓。
+**这几组数字的当前值、对照、caveat 和凭据只维护在
+[`eval/RESULTS.md`](eval/RESULTS.md) 一处**（ε_online / ε_core / ε_adjunct / 分歧度 /
+E3 / E4 / E8 / E9 / SDT / 参考医案利用率 / E2 学派配对 / MES），README 和 DEMO.md 从那里
+抄，哪一行的代码改了那一行就标"待重跑"。`report.json` 里另有 `school_pairs`
+（师承内 vs 跨学派的两两配对，总纲 1.3）和 `react_process.samples`（ReAct 前 10 条完整
+动作序列）两段，排查"某条该进没进"这类问题时看它们，不用手写 python -c 去抓。
+
+**手抄的数会漂，所以 RESULTS.md 里每个数都带「凭据」列，并且有脚本核：**
+
+```bash
+python -m scripts.collect_results           # 打出各 report 文件里**实际**是什么数
+python -m scripts.collect_results --check   # 核对 RESULTS.md 没抄错；不一致退出码 1
+```
+
+凭据记号的格式是 `` `文件名:键=值` ``，`--check` 逐个去文件里取真值比较，并要求同一
+行的正文里也出现这个数（凭据和正文不许各说一套）。**没有凭据记号的行会被单独列出来**
+——那不是错误，是"这个数在本仓库里没有文件可核"这个事实。`tests/` 里有一条测试直接
+对着仓库真实文件跑这个核对，所以谁改了带凭据的数，pytest 就红。
+
+> ⚠ **仓库里那四份 `eval/report_e{3,4,8,9}.json` 是修复前那一轮**（2026-09-12）。
+> 机读出来它们的 `change_rate` 正好是 RESULTS.md 里「修复前 / 旧检索」那一列的值
+> （0.3348 / 0.3514 / 0.366 / 0.2503），不是「当前值」那一列的。当前值、E2 的
+> lineage/cross、ε 的分层值都是 AutoDL 上跑出来的真数，但那一轮的 report 文件还没提交
+> 进来，所以本仓库里核不了——RESULTS.md 对这几行如实标着「无文件凭据」。
 
 ### SDT 失分分析与过拟合护栏
 
