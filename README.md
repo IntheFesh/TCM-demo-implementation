@@ -543,6 +543,21 @@ DEMO.md 从那里抄，哪一行的代码改了那一行就标"待重跑"。`rep
 （ReAct 前 10 条完整动作序列）两段，排查"某条该进没进"这类问题时看它们，不用
 手写 python -c 去抓。
 
+### SDT 失分分析与过拟合护栏
+
+```bash
+# 零 LLM 调用：对已有提交文件重新聚合（逐条得分、多选率 vs 少选率及两者的边际
+# 代价、失分最多的 10 条、按病机/证型分组）
+python -m eval.sdt.run --sdt-dir $SDT --split Test --error-analysis out/sdt_chain_v2.txt
+```
+
+Test 集已经跑过 3 次完整 + 1 次局部（台账 `eval/sdt/test_run_log.jsonl`，每次跑
+自动追加）。`--split Test` 时会打醒目提醒并报出已跑过几次——**再反复在 Test 上调
+prompt 就是在测试集上过拟合**，会让这个外部可比的分数失去意义。规矩是：prompt
+改动先在 Train（200 条）上验证方向，Validation 做中间验证（满分上限 48.9998/50，
+官方金标准带 BOM），Test 只在最终定型后跑一次。细节与「拿到分析结果之后怎么改
+prompt」的决策表见 [`eval/sdt/README.md`](eval/sdt/README.md)。
+
 `eval/mes/`（盲评导出/收集）用于人工判断"这条辨证像不像话"这类自动指标
 测不了的问题：`export.py` 把注册表里全部医家对同一条主诉的结果匿名成
 A/B/C（隐去 `cited_case_ids` 以防暴露医家身份，顺序按 seed 打乱）导出评分表，

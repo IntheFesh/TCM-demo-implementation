@@ -5,6 +5,13 @@ cases.json
 extract_warnings.json
 *.jsonl
 !data/standard/*.jsonl
+# R2-3 Test 跑次台账。**必须显式开例外**：上面那条 *.jsonl 是整体忽略，只给
+# data/standard/ 开了口子——这个坑已经踩过三次（data/standard/syndromes.jsonl
+# 差点被静默吞掉、M4 的 data/diseases.jsonl 落在例外之外），这个文件是第四次。
+# 它不放 data/standard/ 是因为它不是人工整理的静态参考表，而是"Test 集被跑过
+# 几次"的运行台账，必须跟它记录的那份 SDT 代码放在一起；过拟合护栏靠它说话，
+# 不进版本控制就等于没有台账（换台机器、换个人就归零了）。
+!eval/sdt/test_run_log.jsonl
 data/graph.json
 # K3a 生成物：offline/build_jieba_dict.py 的产物，随 cases.json 变化，不入版本控制
 data/jieba_dict.txt

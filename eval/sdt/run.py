@@ -6,6 +6,19 @@
 成本（每条记录的调用数）：baseline 3 次（摘录/选项/小结），chain 5 次（多 S1+S2）。
 Validation 50 条 => baseline 150 次、chain 250 次。两组都要跑才有对照，
 所以一个 split 是 400 次调用——这个规模只该在能连 DeepSeek 的机器上跑。
+
+**失分分析（R2-1）：零 LLM 调用，对已有提交文件重新聚合。**
+
+    python -m eval.sdt.run --sdt-dir $SDT --split Test \
+        --error-analysis out/sdt_chain_v2.txt
+
+带了 --error-analysis 就只做聚合：不构造 solver、不碰 get_llm、不写提交文件。
+逐条四项得分、多选率 vs 少选率及两者的边际代价、完全对/部分对/完全错分布、
+失分最多的 10 条、按病机/证型分组的得分——见 eval/sdt/error_analysis.py。
+
+**过拟合护栏（R2-3）：--split Test 时会打醒目提醒并报出本项目已经跑过几次**
+（台账 eval/sdt/test_run_log.jsonl，每次跑 Test 追加一条）。prompt 改动先在
+Train 上验证方向，Test 只在最终定型后跑一次。
 """
 from __future__ import annotations
 
@@ -17,8 +30,35 @@ from pathlib import Path
 
 from core.batch import classify_llm_failure, warn_if_failure_rate_high
 from core.safety import safety_bypassed
+from eval.sdt import runlog
 from eval.sdt.adapter import SOLVERS, SdtAnswer
 from eval.sdt.data import load_split, write_submission
+
+
+def _run_error_analysis(args) -> None:
+    """R2-1 模式。**这个函数里不许出现任何 LLM 调用**——它的全部价值就是零成本
+    地把已经算出来的分拆开看（tests/test_sdt_error_analysis.py 有一条测试用
+    "一调用就抛异常"的假后端钉住这一点）。"""
+    from eval.sdt.error_analysis import analyze, print_report
+
+    analysis = analyze(args.sdt_dir, args.split, args.error_analysis,
+                       diagnose_bom=args.diagnose_bom)
+    print_report(analysis)
+
+    # 算分也是一次 Test 暴露的凭据（虽然零调用、不构成新的暴露），记进台账让
+    # 分数跟那次跑对得上——run 事件发生时分还没算出来。
+    # 台账记官方口径那个分（可跟论文比）；Train 那条路没有官方总分时退回我们
+    # 逐条加权算的数，并在台账里标明是哪一种——两个口径混在一栏里会让以后
+    # 对比几次跑的人不知道自己在比什么。
+    official = analysis["official_total"]
+    entry = runlog.log_scored(
+        args.split, args.error_analysis,
+        official if official is not None else analysis["weighted_total"],
+        score_kind="official_automated_score" if official is not None else "weighted_from_breakdown",
+    )
+    if entry:
+        print(f"已记入 Test 跑次台账 {runlog.LOG_PATH_DISPLAY}（scored 事件，"
+              f"零 LLM 调用、不计入暴露次数）。")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -26,7 +66,19 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--sdt-dir", type=Path, required=True)
     ap.add_argument("--split", default="Validation", choices=["Train", "Validation", "Test"])
     ap.add_argument("--solver", default="chain", choices=sorted(SOLVERS))
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="提交文件写到哪（跑分模式必填；--error-analysis 模式不需要）")
+    ap.add_argument(
+        "--error-analysis", type=Path, default=None, metavar="SUBMISSION",
+        help="R2-1 失分分析模式：对这份已有的提交文件重新聚合，**不发起任何 LLM "
+             "调用**。取路径而不是做成 flag 是刻意的——这样在结构上就不可能"
+             "一边分析一边又去跑 solver。",
+    )
+    ap.add_argument(
+        "--diagnose-bom", action="store_true",
+        help="失分分析时剥掉官方金标准的 BOM（只影响 Validation）。默认不剥，"
+             "跟官方 evaluate.py 一致；剥掉算出来的是诊断值，不可跟论文比。",
+    )
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 条，先看质量")
     ap.add_argument(
         "--only-ids", default="",
@@ -41,6 +93,21 @@ def main(argv: list[str] | None = None) -> None:
              "不传这个开关时回落到环境变量 EVAL_MODE（同样默认关）。",
     )
     args = ap.parse_args(argv)
+
+    if args.error_analysis is not None:
+        # **在构造 solver / import get_llm 之前就 return**：这个模式的全部价值
+        # 在于"零成本"，任何一次调用都会破坏它。
+        return _run_error_analysis(args)
+
+    if args.out is None:
+        ap.error("--out 是跑分模式的必填参数（只做失分分析请用 --error-analysis）")
+
+    if args.split == "Test":
+        # 过拟合护栏：把"已经跑过几次"摆在人眼前。只提醒、不拦——真到了最终
+        # 定型那一次，拦住就没法跑了；判断该不该跑是人的事，这里负责让人
+        # 在有信息的情况下判断。
+        print(runlog.test_split_warning(runlog.read_log()))
+        print()
 
     records = load_split(args.sdt_dir, args.split)
     # 不在这里 attach_gold：solver 只读 clinical_data 和选项，金标准谁也不看，
@@ -137,6 +204,20 @@ def main(argv: list[str] | None = None) -> None:
             f"本次总分不能跟一次完整无失败的跑直接比较：{call_failed}"
         )
     warn_if_failure_rate_high("SDT", len(call_failed), len(records))
+
+    # 台账只记 Test（log_run 内部判断）：Train/Validation 本来就该反复跑。
+    # --only-ids / --limit 跑的不是完整 50 条，标成 partial，跟完整跑分开数。
+    logged = runlog.log_run(
+        args.split, solver.name, args.out, len(records),
+        partial=bool(args.only_ids or args.limit),
+        ignore_safety_veto=bypass_effective,
+        model=manifest["model"], backend=manifest["backend"],
+    )
+    if logged:
+        print(f"\n已记入 Test 跑次台账 {runlog.LOG_PATH_DISPLAY}："
+              f"第 {runlog.count_test_runs(runlog.read_log())['total']} 次"
+              f"（commit {logged['git_commit']}，prompt {logged['prompt_version']}）。"
+              f"分数由 --error-analysis 或 eval/sdt/score.py 算出后另记一条。")
 
 
 if __name__ == "__main__":

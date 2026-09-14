@@ -44,22 +44,89 @@ def load_official_scorer(sdt_dir: Path):
     return module
 
 
-def _task_breakdown(scorer, gold: dict[str, list[str]], submitted: dict[str, list[str]]) -> dict:
-    """分项明细，用的是官方脚本里的四个计分函数本身。"""
-    totals = [0.0, 0.0, 0.0, 0.0]
+def _letters(field: str) -> list[str]:
+    """把选项字段切成**干净的**字母列表：空串给 `[]` 而不是 `[""]`。
+
+    只用于集合运算（谁选了、谁漏了、反事实要保留哪几个字母）——`""` 在集合里
+    没有意义。**打分时不用这个**：那里一律把 `field.split(";")` 原样交给官方的
+    score_proportional，连尾随分隔符带出来的空元素都照传，这样算出来的分项
+    才跟 automated_score 逐位可比。两处刻意不统一，理由写在 per_record_scores
+    里（一个回答"哪些字母参与集合运算"，一个回答"官方那把尺子怎么量"）。
+    """
+    return [x for x in (field or "").split(";") if x.strip()]
+
+
+def per_record_scores(scorer, gold: dict[str, list[str]],
+                      submitted: dict[str, list[str]]) -> list[dict]:
+    """**逐条**四项得分 + Task2/3 的选择数对比 + 两个反事实得分。
+
+    计分一律调官方脚本里的函数，不自己实现——包括反事实：R2-1 要回答"多选和
+    少选各值多少分"，那两个数必须跟总分同一把尺子算出来，自己按推测的公式
+    算一遍只会得到一个看起来合理、实际跟官方分不可比的数。
+
+    两个反事实（只对 Task2/3 这两个多选项有意义）：
+      `score_if_wrong_dropped`  把选了但不在金标准里的字母去掉 = 只保留交集。
+                                它减去实际得分 = **多选的代价**。
+      `score_if_missed_added`   把漏选的金标准字母补上 = 取并集。
+                                它减去实际得分 = **少选的代价**。
+    两者都不是"作弊后的分"，是用来定位失分来源的边际量：哪一边能捞回的分多，
+    prompt 就该往那一边改。
+
+    `automated_score` 只给一个加权总分，看不出任何这些——这个函数存在的理由。
+    """
+    rows: list[dict] = []
     for rid, sub in submitted.items():
         ref = gold.get(rid)
         if ref is None:
-            continue
+            continue  # 金标准里没有这条（Validation 首条被 BOM 粘住时就是这样）
+        scores = [0.0, 0.0, 0.0, 0.0]
         if sub[0]:
-            totals[0] += scorer.clinical_info_extraction_eval(sub[0], ref[0].split(";"))
-        if sub[1]:
-            totals[1] += scorer.score_proportional(sub[1].split(";"), ref[1].split(";"), 1)
-        if sub[2]:
-            totals[2] += scorer.score_proportional(sub[2].split(";"), ref[2].split(";"), 1)
+            scores[0] = scorer.clinical_info_extraction_eval(sub[0], ref[0].split(";"))
         if sub[3]:
-            totals[3] += scorer.rouge_l(sub[3], ref[3])
-    return {f"task{i + 1}": totals[i] for i in range(4)}
+            scores[3] = scorer.rouge_l(sub[3], ref[3])
+        # 多选项的明细放在 choices 下面，不跟 task2/task3 这两个**标量得分**
+        # 抢同一个键名——抢了之后 row["task2"] 到底是分数还是明细，取决于哪一行
+        # 先跑，那种 bug 只会在读的时候炸。
+        row: dict = {"record_id": rid, "choices": {}}
+        for idx, task in ((1, "task2"), (2, "task3")):
+            # 打分用官方口径：原样 split，参照集也原样 split。反事实跟实际得分
+            # 必须共用同一个参照集，否则两个数不在同一把尺子上、相减没有意义。
+            gold_ref = ref[idx].split(";")
+            if sub[idx]:
+                scores[idx] = scorer.score_proportional(sub[idx].split(";"), gold_ref, 1)
+            chosen, gold_letters = _letters(sub[idx]), _letters(ref[idx])
+            chosen_set, gold_set = set(chosen), set(gold_letters)
+            wrong, missed = sorted(chosen_set - gold_set), sorted(gold_set - chosen_set)
+            kept, union = sorted(chosen_set & gold_set), sorted(chosen_set | gold_set)
+            row["choices"][task] = {
+                "chosen": chosen, "gold": gold_letters,
+                "n_chosen": len(chosen_set), "n_gold": len(gold_set),
+                "wrong": wrong, "missed": missed,
+                "score": scores[idx],
+                # 反事实：去掉错选之后、补上漏选之后，各能拿多少分
+                "score_if_wrong_dropped": (
+                    scorer.score_proportional(kept, gold_ref, 1) if kept else 0.0
+                ),
+                "score_if_missed_added": (
+                    scorer.score_proportional(union, gold_ref, 1) if union else 0.0
+                ),
+            }
+        row.update({f"task{i + 1}": scores[i] for i in range(4)})
+        # 每条记录四项加权和的满分是 1.0，所以 loss 就是 1 − weighted
+        row["weighted"] = sum(w * scores[i] for i, w in enumerate(TASK_WEIGHTS))
+        row["loss"] = 1.0 - row["weighted"]
+        rows.append(row)
+    return rows
+
+
+def _task_breakdown(scorer, gold: dict[str, list[str]], submitted: dict[str, list[str]]) -> dict:
+    """分项明细，用的是官方脚本里的四个计分函数本身。
+
+    从 per_record_scores 求和而不是自己再循环一遍：同一套分项得分有两处实现的
+    话，逐条明细和总分迟早对不上（CLAUDE.md「同一概念只能有一处实现」）。
+    """
+    rows = per_record_scores(scorer, gold, submitted)
+    return {f"task{i + 1}": sum(r[f"task{i + 1}"] for r in rows) for i in range(4)}
 
 
 def _read_submission(path: Path) -> dict[str, list[str]]:

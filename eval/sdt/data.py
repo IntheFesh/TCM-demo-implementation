@@ -107,6 +107,36 @@ def read_gold(sdt_dir: Path, split: str, strip_bom: bool = False) -> dict[str, l
     return out
 
 
+def load_gold_fields(sdt_dir: Path, split: str,
+                     strip_bom: bool = False) -> tuple[dict[str, list[str]], str]:
+    """`{病案ID: [Task1..Task4 原文]}` + 一句"这份金标准是从哪来的"。
+
+    两个来源，**优先官方口径**：`Results/{split}_data_result.txt` 存在就读它
+    （官方 evaluate.py 计分读的就是这个文件，连 BOM 行为都一致）；不存在时
+    （Train 的金标准直接写在 JSON 里、官方没给 Results 文件）从 split JSON
+    现拼。
+
+    要把来源一起交出去、而不是悄悄换一个：Train 那条路算不出
+    `automated_score`（官方脚本要的是 Results 文件），报出来的分只能是我们按
+    官方计分函数逐条加权算的。两者数值口径一致但凭据不同，读数的人必须知道
+    自己看的是哪一种——R2-3 要求 prompt 改动先在 Train 上验证方向，这条路
+    就是给那个流程用的。
+    """
+    path = Path(sdt_dir) / "Results" / f"{split}_data_result.txt"
+    if path.exists():
+        return read_gold(sdt_dir, split, strip_bom=strip_bom), f"Results/{path.name}（官方口径）"
+    gold = {
+        r.record_id: [
+            LIST_SEP.join(r.gold_clinical_information),
+            LIST_SEP.join(r.gold_pathogenesis_answers),
+            LIST_SEP.join(r.gold_syndrome_answers),
+            r.gold_summary,
+        ]
+        for r in load_split(sdt_dir, split)
+    }
+    return gold, f"data/{split}_TCM_Data_v1.json 内嵌字段（无 Results 文件）"
+
+
 def attach_gold(records: list[SdtRecord], gold: dict[str, list[str]]) -> int:
     """把 Results/*.txt 里的金标准补进 Validation/Test 的记录。返回补上的条数。"""
     n = 0
