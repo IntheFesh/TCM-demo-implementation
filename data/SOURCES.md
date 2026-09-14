@@ -2319,3 +2319,68 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     本轮新增测试 21 条，全套 2005 → 2026 全绿、ruff 干净、`--check` 两份文档退出码 0。
     `core/schemas.py` 的 `= Field(min_length=1)` **31 处**（用
     `grep -c "= Field(min_length=1" core/schemas.py` 数）。
+
+48. **AutoDL 段 0 的两条失败：根因是 `DenseRetriever._encode_lock` 是**类属性**
+    （进程级），不是每实例一把。污染源是 `tests/test_api_stream.py` 的 live server。**
+
+    **一、先复现，再动手。** 沙盒全绿、AutoDL 红，差别不在"装没装 sentence-transformers"
+    （两边都装了），在**有没有 `cases.json`**。`tests/test_api_stream.py` 起真实 uvicorn，
+    lifespan 的 `_warmup()` 会 `get_retriever()._ensure_encoded()`：
+    - 沙盒没有 `cases.json`，预热几毫秒就跳过（那个文件里原本就写着这句注释）；
+    - AutoDL 有 941 条 + 真实 bge 模型，预热线程要跑几十秒，**而且超时后不杀、
+      留在后台继续**（`api/main.py` 的注释白纸黑字写着「预热线程超时后不杀（也杀不了），
+      在后台继续；**首个问诊会在 `_encode_lock` 上等它**」）。
+
+    收集序：`test_api_stream.py` 第 5，`test_concurrency_init.py` 第 11。预热线程持着
+    **类属性**的 `_encode_lock` 时，后者那些**用自己实例**的测试全被挡住。
+
+    在沙盒里用一个排在最前面的合成测试（后台线程持锁 30 秒）复现，**两条失败逐字
+    一样**：`entered.wait(5)` 返回 False，`constructed` 多一份
+    `'BAAI/bge-small-zh-v1.5'`。
+
+    **二、"多了一份"是第二重效应，不是独立的 bug。** 第一条测试挂在
+    `assert entered.wait(5)` 时，它的 `t_load` daemon 线程还活着、还在等锁；等它拿到锁
+    再跑 `_load()`，monkeypatch 已经还原、**下一条测试的假模块已经装上**——于是它把
+    构造记进了**下一条测试**的 `constructed` 列表。所以两条失败是同一个根因的两种表现，
+    修第一个第二个自然消失。
+
+    **三、根因：锁的作用域错了。** `_encode_lock` 保护的是 `self._model` /
+    `self._embeddings`——per-instance 的状态，锁就该是 per-instance。类属性让**一个实例的
+    编码挡住另一个实例的编码**，而这件事没有任何正当理由：挡住"建出两个检索器"靠的是
+    `core.retrieval` 模块级的 `_retriever_lock`，两件事本来就是分开的。
+    （旧注释里那句「`_encode_lock` 是类属性，只能让两次加载排队，挡不住加载两次」
+    正说明它从来不是被依赖的保证，只是个副作用。）改成在 `__init__` 里建。
+
+    **没有加 sleep、没有放宽断言**——`entered.wait(5)` 改成 `wait(30)` 确实能变绿，
+    但那是把"锁根本拿不到"伪装成"再等等就好了"，超时给多久都没用。
+
+    **四、两条回归测试钉住它**（把锁改回类属性，两条都红，验过）：
+    - `test_encode_lock_is_per_instance_not_shared_across_the_class`：两个实例的锁
+      不是同一个对象，且类上没有这个属性；
+    - `test_one_retrievers_encoding_does_not_block_another_instance`：**行为判据**，
+      比"是不是同一个对象"更硬——A 正在编码（持着自己的锁）时 B 必须能自己编码完。
+      B 的语料故意只放 1 条，因为假模型只在 `len(texts) > 1` 时卡 gate，这样"B 卡住"
+      就只剩一个可能的原因：它在等 A 的锁。
+
+    **五、隔离夹具（autouse，只管那一个文件，形状照 `_pin_two_physicians`）。**
+    重置模块级 `_retriever_singleton`、teardown 时 join 掉这条测试起的残留线程
+    （**不让一条测试的线程活到下一条里写别人的夹具**）、进来时断言
+    `sys.modules` 里没有上一条测试留下的**假** sentence_transformers。
+
+    三个细节值得记：
+    - 判据是**假模块身上的标记**（`mod._tcm_fake`），不是"跟进来时是不是同一个对象"：
+      真模块会在测试中途被惰性 import 进来，那是正常的；有害的只有假的活到下一条。
+    - **只在 setup 断言，不在 teardown 断言**：实测 monkeypatch 的还原发生在本夹具
+      teardown **之后**，所以"跑完还在"是正常的。每条测试进来都查一次，一条也漏不掉。
+    - 残留线程只 join **不 assert**：teardown 里 assert 会盖住测试本身的失败原因，
+      而这个夹具的职责是隔离，不是检测。
+    - jieba 的全局 trie **这里不用管**，写清楚了为什么：那个文件只走 dense 一路，
+      不碰 bm25，`_ensure_jieba` 根本不会被调到。
+
+    **六、验证方式（"只验全量绿"不够）**：正常顺序全量绿；把复现用的污染测试加进去
+    再跑全量，也绿（**这才是修没修好的判据**）；**随机文件顺序跑了 6 轮**
+    （seed 3/11/99/123 等），每轮 2028 passed。反向验证：把锁改回类属性，
+    那两条新测试立刻红。
+
+    本轮新增测试 2 条，全套 2026 → 2028 全绿、ruff 干净、`--check` 退出码 0。
+    `core/schemas.py` 的 `= Field(min_length=1)` 仍是 **31 处**（没动 schema）。

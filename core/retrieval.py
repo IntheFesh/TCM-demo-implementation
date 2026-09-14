@@ -271,11 +271,19 @@ class DenseRetriever(Retriever):
 
         self._model = None  # 惰性加载，避免 import 阶段就下载/加载模型
         self._embeddings = None  # 惰性编码，随 _model 一起初始化
+        # **每个实例一把锁，不是类属性。** 这把锁保护的是 self._model /
+        # self._embeddings——per-instance 的状态，锁的作用域就该是 per-instance。
+        # 原来它是类属性（进程级），后果是**一个实例的编码会挡住另一个实例的编码**：
+        # api/main.py 的预热线程在单例上编码 941 条语料要几十秒，这段时间里任何
+        # 别的 DenseRetriever 实例调 _ensure_encoded 都得干等——AutoDL 上
+        # tests/test_concurrency_init.py 那两条就是这么挂的（预热线程起自
+        # tests/test_api_stream.py 的 live server，收集序在前）。
+        # 挡住"同一个实例被并发编码两次"靠的是这把锁；挡住"建出两个实例"靠的是
+        # core.retrieval 模块级的 _retriever_lock，两件事分开。
+        self._encode_lock = threading.Lock()
 
     def case_count(self, physician: str) -> int | None:
         return sum(1 for c in self._cases if c.physician == physician)
-
-    _encode_lock = threading.Lock()
 
     def _ensure_encoded(self) -> None:
         # 冷启动时两个并发请求会各加载一份模型（几百 MB × 2）。
@@ -362,8 +370,9 @@ class DenseRetriever(Retriever):
 _retriever_singleton: Retriever | None = None
 # 建单例要读整份 cases.json 并逐条 model_validate，几百毫秒；没有这把锁时两个
 # 冷启动并发请求会各建一份 HybridRetriever，输的那份被在途请求引用着、之后又
-# 各自加载一份几百 MB 的模型——DenseRetriever 那把 _encode_lock 是类属性，只能
-# 让两次加载排队，挡不住加载两次。
+# 各自加载一份几百 MB 的模型。**挡住这件事的只有这把锁**——DenseRetriever 的
+# _encode_lock 是每实例一把（保护的是那个实例的 _model/_embeddings），
+# 两个实例之间本来就不该互相排队。
 _retriever_lock = threading.Lock()
 
 
