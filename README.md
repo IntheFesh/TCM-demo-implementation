@@ -35,7 +35,19 @@
   /api/prescription/export`），导出的是**建议稿**，不是可以直接执行的
   医嘱——必须经执业医师在表格里审核、修改并签发，系统不代替这道签发
   流程，每次导出都记入审计日志（见「定位」「审计」两节）
-- 只覆盖脾胃门（呕吐、痞满、肿胀、痰饮等相关证候），不是全科辨证系统
+- 只覆盖脾胃门（呕吐、痞满、肿胀、痰饮等相关证候），不是全科辨证系统。
+  **肿瘤科医案（如《王云启治癌验案录》）不在当前范围内**：实测 337 条标准证候
+  里跟肿瘤/积聚沾边的是 **0 条**（`python -m offline.assess_case_scope --input <文件>`
+  可复现这个数）。要收这批数据就得先扩证候表、改定位表述、核安全否决的危重词表
+  是否覆盖肿瘤急症——那是一个产品决定，不是加几条数据
+- **李可医案含十八反配伍（海藻甘草同用），系统的安全层会拦截这类处方。这批数据
+  在训练时被排除**——否则会教模型开反药，而输出侧安全检查（`check_incompatible`）
+  又会拦住它，形成自相矛盾：训练出来的模型在自己的安全层面前跑不通。
+  排除**只发生在训练导出那一环**（`offline/export_sft.py` 默认排除，
+  `--include-incompatible` 才带上），医案本身不删——它是真实的、有价值的，
+  将来研究"名家为什么敢用反药"要用到。打标记走
+  `python -m offline.tag_incompatible_cases --input <文件>`（判定复用
+  `core.safety_output.check_incompatible`，全项目唯一实现）
 - 安全拦截的关键词表是最小 demo 范围（见 `core/safety.py`），**没有经过医学生
   审核**，可能漏报（关键词没覆盖到的危重表述）或误报（子串命中过宽）
 - 样本量仅各 30 案（共 60 案），不足以支撑统计结论，仅够验证系统管线；带复诊
@@ -304,6 +316,11 @@ compound 父子节点）+ 两位医家的结论对照 + 分歧度。
 | `offline/extract_case_triples.py` | X3：从每一诊原文用真实 LLM 抽取三元组（`{case_id,physician,s,p,o,source_span}`），写 `data/case_triples.jsonl`，`core/tools.py` 的 `query_case_graph` 工具消费这份数据 |
 | `offline/build_element_index.py` | K3b：从 `cases.json` 的症状字段建证素索引 `data/element_index.json`，供检索的 `mode="graph"` 和 `core/transition.py` 用 |
 | `offline/quota.py` | 附属：审计 `cases.json` 是否达到 `data/SOURCES.md` 里写明的样本量门槛（总案例 60、带复诊序列 50） |
+| `offline/extract_materia_medica.py` | 阶段二：本草三元组（性味/归经/功效/用量）。`--crosscheck` 把「用量」跟 `DOSE_LIMITS` 对一遍：一致 / 不一致 / 表外 / **表里有但没抽到（覆盖率）** / 解析不了五类，**只报不改表** |
+| `offline/extract_formulary.py` | 阶段二：方剂三元组（组成/君臣佐使/加减法） |
+| `offline/tag_incompatible_cases.py` | 给任意医案文件（`.json` 数组 / `.jsonl`）打「含十八反十九畏」标记，训练导出默认排除这类样本 |
+| `offline/assess_case_scope.py` | 接新一批医案**之前**量它在现有 337 条标准证候表里的覆盖率，未覆盖的列出来（零 LLM 调用；只报数不自动判决） |
+| `offline/docx_to_text.py` | `.docx` 医案 → UTF-8 txt（段落之间空行，下游按空行切块；含表格，医案 docx 偶尔用表格排药物剂量） |
 
 ## 知识图谱权重（进阶功能，非 consult 主流程必需）
 
@@ -728,6 +745,43 @@ devtools 照样能看到。
 
 **researcher**（默认）：跟改造前的行为逐字节一致，包括 `manifest` 这类
 只对开发/评测有意义的技术元数据。
+
+## 药理层数据源（阶段二，抽取前的准备）
+
+抽取引擎已经写好（`offline/extract_reference_triples.py`，两个入口
+`extract_materia_medica.py` / `extract_formulary.py`），这一节是**跑抽取之前的
+两步准备**。都是零 LLM 调用，但它们决定了那几百次调用会不会白花。
+
+```bash
+bash scripts/fetch_pharmacology_sources.sh --dry-run   # 看清单：4 本教材 + 2 本古籍
+bash scripts/fetch_pharmacology_sources.sh             # 下载 + 校验字节数
+python -m scripts.verify_pharmacology_chunks           # 切块统计 + 打印前 3 块原文
+```
+
+| 源 | 用途 | `--source` | 编码 |
+|---|---|---|---|
+| 《中药学》 | 性味归经功效用量 | modern | UTF-8 |
+| 《临床中药学》 | 临床用量、配伍 | modern | UTF-8 |
+| 《中药炮制学》 | 炮制方法与目的 | modern | UTF-8 |
+| 《方剂学》 | 方剂组成、君臣佐使、加减法 | modern | UTF-8 |
+| 《神农本草经》 | 古籍本草 | classic | GB18030 → 转 UTF-8 |
+| 《本草备要》 | 古籍本草 | classic | GB18030 → 转 UTF-8 |
+
+**下载脚本必须校验字节数。** 367 那本曾经下到一个少约 10% 的残缺文件，而切粗段的
+统计数字**碰巧没变**（案数、门类分布都在合理范围），差点带着残缺原文往下走。
+所以规矩是：比字节数，不对就退出，不看"统计像不像话"。表里 `expected_bytes=0`
+的行还没有基准值，第一次下载成功后把 `wc -c` 的结果填回脚本里。
+另外脚本里的 URL 也没在真机上核对过（沙盒没网络），404 时按注释里给的 GitHub API
+命令找真实路径。
+
+**编码写死在表里，不靠猜。** GB18030 的中文字节序列有相当概率能被 UTF-8 解码成
+乱码而**不抛异常**——"试着按 UTF-8 读一遍看会不会报错"会得到静默的乱码语料。
+
+**切块验证的三个阈值**（块数 < 50 / 中位数 > 3000 字 / 单块 > 10000 字）各有依据，
+写在 `scripts/verify_pharmacology_chunks.py` 里；最后那个的硬依据是引擎的
+`MAX_TOKENS=16384`——按中文约 1 token/字算，一万字的块注定顶到上限被判截断，
+那次调用是纯浪费。**但阈值只能排除明显切错**，"切出来的是不是一味药 / 一张方"
+只有人看原文才判得出来，所以这个脚本会把每个源的前 3 块原文打出来。
 
 ## 录制回放（演示模式，`LLM_MODE=replay`）
 

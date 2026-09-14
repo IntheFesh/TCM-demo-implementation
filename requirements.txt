@@ -15,6 +15,12 @@ rank-bm25>=0.2
 jieba>=0.42
 pytest>=8.0
 
+# 只有把 .docx 医案转成 txt 时才需要（offline/docx_to_text.py）：用户提供的
+# 《王云启治癌验案录》《李可医案》是 docx，而抽取链路只读 txt。
+# **包名是 python-docx，import 名是 docx**——`pip install docx` 会装到一个
+# 同名的废弃包上，然后 import 成功但 API 完全不同。
+python-docx
+
 # 只有跑 TCMEval-SDT 评测时才需要：官方 evaluate.py 顶层 import 了 pandas，
 # 脚本里并没有实际用到它，但不装就 import 不进来、评测跑不了。这是评测环境的
 # 隐式依赖，不是本项目的依赖——记在这里是为了下次不用再踩一遍。

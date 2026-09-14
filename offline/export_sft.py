@@ -47,12 +47,27 @@ def filter_public_domain(cases: list[CaseRecord]) -> list[CaseRecord]:
     return kept
 
 
-def filter_incompatible_pairs(cases: list[CaseRecord]) -> list[CaseRecord]:
+def filter_incompatible_pairs(cases: list[CaseRecord],
+                             include: bool = False) -> list[CaseRecord]:
     """总纲 2.5：处方含十八反十九畏配伍的医案（李可医案那类敢用反药的名家）
     不进训练集——系统的安全层会拦这类配伍，进了训练集等于教模型开反药，
     跟 M2 的检查直接冲突。判定在抽取边界上做好（CaseRecord.has_incompatible_
     pair，core.safety_output.check_incompatible 唯一实现），这里只按标记过滤。
-    过滤掉的条数打到 stderr，不静默——README 里要说明这个取舍，数字得有。"""
+    过滤掉的条数打到 stderr，不静默——README 里要说明这个取舍，数字得有。
+
+    include=True（CLI 的 --include-incompatible）把它们带上。**默认是排除**：
+    一个要显式打开的开关，才能保证"没人主动要求"时训练集里不会混进反药样本。
+    打开时照样把条数和药对打出来并明确警告——带上它们是一个研究选择
+    （比如专门研究"名家为什么敢用反药"），不是一个可以顺手做的默认动作。"""
+    if include:
+        tagged = [c.case_id for c in cases if c.has_incompatible_pair]
+        if tagged:
+            print(f"[export_sft] **--include-incompatible：把 {len(tagged)} 条含十八反十九畏"
+                  f"配伍的医案也导出了**（默认是排除的）。这些样本会教模型开反药，"
+                  f"而输出侧 check_incompatible 又会拦住它——训练出来的模型在自己的"
+                  f"安全层面前跑不通。只有在明确知道自己在做什么时才用这个开关："
+                  f"{tagged[:10]}{'…' if len(tagged) > 10 else ''}", file=sys.stderr)
+        return list(cases)
     kept = [c for c in cases if not c.has_incompatible_pair]
     excluded = [c.case_id for c in cases if c.has_incompatible_pair]
     if excluded:
@@ -292,11 +307,15 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--triples-path", type=Path, default=TRIPLES_PATH, help="chain 格式用的医案三元组")
     ap.add_argument("--out", type=Path, default=None, help="默认 sft.jsonl（alpaca）/ sft_chain.jsonl（chain）")
     ap.add_argument("--heldout-ratio", type=float, default=DEFAULT_HELDOUT_RATIO)
+    ap.add_argument("--include-incompatible", action="store_true",
+                    help="把含十八反十九畏配伍的医案也导出（默认排除，见 "
+                         "filter_incompatible_pairs 的文档字符串）。这些样本会教模型"
+                         "开反药，而输出侧安全检查又会拦住它，自相矛盾。")
     args = ap.parse_args(argv)
 
     cases = load_cases(args.cases_path)
     cases = filter_public_domain(cases)
-    cases = filter_incompatible_pairs(cases)
+    cases = filter_incompatible_pairs(cases, include=args.include_incompatible)
 
     if args.format == "chain":
         out_path = args.out or CHAIN_OUT_PATH
