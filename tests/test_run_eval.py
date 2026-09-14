@@ -1009,6 +1009,101 @@ def test_divergence_per_query_detail_missing_query_tag_does_not_guess():
     assert out[0]["query"] is None
 
 
+# ---------- R5-4：后端标签（训练后要并列报，不覆盖） ----------
+
+
+def _with_manifest(**manifest):
+    r = _consult_result()
+    r["manifest"] = {"llm_calls": 6, **manifest}
+    return r
+
+
+def test_backend_tags_lifts_model_and_backend_from_the_manifests():
+    tags = re.backend_tags([_with_manifest(model="deepseek-chat", backend="deepseek"),
+                            _with_manifest(model="deepseek-chat", backend="deepseek")])
+    assert tags["models"] == ["deepseek-chat"] and tags["backends"] == ["deepseek"]
+    assert tags["mixed"] is False
+    assert "deepseek-chat" in tags["note"]
+
+
+def test_backend_tags_shouts_when_one_report_mixes_two_models():
+    """一份报告里混两个后端，每个汇总数字都变成跨模型的平均——既不能跟论文比也不能
+    跟自己之前的数比。正确做法是各跑一次、两份报告并列。"""
+    tags = re.backend_tags([_with_manifest(model="deepseek-chat", backend="deepseek"),
+                            _with_manifest(model="tcm-local", backend="local")])
+    assert tags["mixed"] is True
+    assert "混了多个后端" in tags["note"] and "并列" in tags["note"]
+
+
+def test_backend_tags_treats_a_manifest_without_model_as_unlabeled_not_as_none():
+    """有 manifest 但没有 model/backend 键时报"未知"，不报"后端是 None"——
+    把 None 当成后端名字打出去，读的人会以为那是某个真实后端。"""
+    tags = re.backend_tags([_consult_result()])       # manifest 里只有 llm_calls
+    assert tags["models"] == [] and tags["backends"] == []
+    assert "未知" in tags["note"]
+
+
+def test_backend_tags_says_unknown_when_there_is_no_manifest():
+    """没有后端标签的数字不能跟任何别的数字比。这里报"未知"，不报一个默认值——
+    默认成 deepseek 就等于把别人跑的数标成我们的。"""
+    tags = re.backend_tags([])
+    assert tags["models"] == [] and "未知" in tags["note"]
+
+
+def test_backend_tags_surfaces_replay_and_comparability_warnings():
+    """回放出来的数字看起来和实时跑的一模一样，所以 replayed_from 必须进报告
+    （R3 的"不许伪装成实时调用"）。"""
+    tags = re.backend_tags([_with_manifest(
+        model="deepseek-chat", backend="replay",
+        replayed_from={"recorded_at": "2026-09-13T00:00:00Z", "n_batches": 1},
+        comparability_warning="后端：replay（回放录制），非实时调用。")])
+    assert tags["replayed_from"] and "回放录制结果" in tags["note"]
+    assert "非实时调用" in tags["note"]
+
+
+def test_backend_tags_records_the_lora_dir():
+    tags = re.backend_tags([_with_manifest(model="tcm-local", backend="local",
+                                           lora_dir="/root/lora/qwen2.5-1.5b")])
+    assert tags["lora_dirs"] == ["/root/lora/qwen2.5-1.5b"]
+
+
+def test_report_and_markdown_carry_the_backend_line(monkeypatch):
+    """后端标签要在报告最前面：报告里每一个数字都归那一行管。"""
+    monkeypatch.setattr(re, "load_epsilon_online", lambda: None)
+    report = re.build_report([_with_manifest(model="deepseek-chat", backend="deepseek")])
+    assert report["backend"]["backends"] == ["deepseek"]
+    assert "**后端**：" in re.render_markdown(report)
+    json.dumps(report)
+
+
+def test_results_md_gives_every_numbered_row_a_backend_cell():
+    """eval/RESULTS.md 里每个数字都必须能说出"这是谁跑的"。第三列就是后端列，
+    空着的行等于一个来源不明的数字——而来源不明的数字没法跟训练后的本地模型
+    并列。这条测试钉住的是那一列不会在后续编辑里被悄悄删掉。"""
+    import re as _re
+    from pathlib import Path as _Path
+
+    text = (_Path(__file__).resolve().parent.parent / "eval" / "RESULTS.md").read_text(
+        encoding="utf-8")
+    rows = [line for line in text.splitlines() if _re.match(r"^\| [\w-]+ \| ", line)]
+    assert len(rows) >= 11        # 11 个指标 + 并列示例；少了说明表被改动过，来看一眼
+    for row in rows:
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        assert len(cells) >= 3, row
+        assert cells[2], f"这一行没有后端标签：{row}"
+
+
+def test_results_md_says_parallel_rows_not_overwrite():
+    """R5-4 的口径：训练后加行，不改行。这句话必须留在文件里——它是那张表将来
+    怎么长的唯一说明。"""
+    from pathlib import Path as _Path
+
+    text = (_Path(__file__).resolve().parent.parent / "eval" / "RESULTS.md").read_text(
+        encoding="utf-8")
+    assert "并列，不覆盖" in text
+    assert "3-local" in text          # 并列加行的编号约定要有例子
+
+
 # ---------- build_report / render_markdown ----------
 
 

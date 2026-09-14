@@ -1,0 +1,26 @@
+# 阶段五 LoRA 训练的依赖。**故意不放进 requirements.txt**：主依赖装完要能跑
+# 测试和 API（沙盒、CI、只做推理的部署机都只装主依赖），而 torch + transformers
+# 那一套有好几个 G，装在不需要训练的机器上纯浪费，而且 torch 的 CUDA 版本一旦
+# 跟机器不匹配还会把一个能跑的环境搞坏。训练机上：
+#
+#     pip install -r requirements.txt -r requirements-train.txt
+#
+# torch 不写在这里的版本号里：CUDA 版本要按显卡选，写死一个版本号在别的卡上
+# 一定是错的。**先按 pytorch.org 的指令装好 torch，再装这个文件。**
+#
+# ⚠ 没在真机核对过（沙盒没有 GPU，按 R4 的教训如实标注而不是假装验过）：
+# RTX 5090 是 Blackwell 架构，算力标识比 4090 新一档，需要的 CUDA / torch 版本
+# 也更新——装之前先在训练机上跑一次
+#     python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_capability())"
+# 拿到真实的算力号和可用性再决定装哪个 torch。`cuda.is_available()` 是 False
+# 或者报 "no kernel image is available" 就是 torch 跟这张卡不匹配，不是本项目
+# 的代码问题，换 torch 轮子而不是改代码。
+
+transformers>=4.44
+peft>=0.12
+accelerate>=0.33
+datasets>=2.20
+
+# 不用 trl：SFTTrainer 能省几十行，但多一个依赖、而且它对样本格式有自己的一套
+# 约定。scripts/train_lora.py 直接用 transformers.Trainer + 自己 tokenize，
+# 训练循环是标准的，没有需要 trl 才能做到的东西。

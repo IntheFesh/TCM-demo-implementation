@@ -35,6 +35,12 @@ from core.physicians import PHYSICIANS
 ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_QUERIES_PATH = ROOT / "tests" / "queries.txt"
 DEFAULT_ITEMS_PATH = ROOT / "eval" / "mes" / "items.json"
+# 答案表里放后端标签用的保留键。item_id 一律是 "item-%03d"，不会跟它撞。
+# **为什么放答案表不放评分表**：评分表是盲的，给评分人看的；后端标签是读数的人
+# 才需要的东西，跟答案表（letter → 医家）一起看才有意义。R5-4：MES 是 RESULTS.md
+# 的第 8 行指标，它的胜负数也必须能说出"这是谁跑出来的"，否则训练后本地模型再评
+# 一次，两份胜负数并列时分不出是模型变了还是评分人变了。
+BACKEND_KEY = "_backend"
 DEFAULT_ANSWER_KEY_PATH = ROOT / "eval" / "mes" / "answer_key.json"
 
 # 固定种子只是为了"同一批 consult 结果重新导出一次，A/B/... 顺序不变"这个
@@ -53,6 +59,20 @@ def _s3_view(s3) -> dict:
         "treatment_principle": s3.treatment_principle,
         "formula": s3.formula,
         "herbs": s3.herbs,
+    }
+
+
+def backend_of(answer_key: dict) -> dict:
+    """答案表里存的后端标签。老的答案表（R5-4 之前导的）没有这一项，这时返回一个
+    **明确写着"未标"**的块——不返回空字典、也不猜一个 deepseek：一份来源不明的
+    胜负数就该看起来来源不明，猜一个默认值等于把别人跑的数标成我们的。"""
+    tags = answer_key.get(BACKEND_KEY)
+    if isinstance(tags, dict) and tags:
+        return tags
+    return {
+        "models": [], "backends": [], "mixed": False,
+        "note": ("⚠ 这份答案表没有后端标签（R5-4 之前导出的）。这批胜负数**来源不明**，"
+                 "不能跟别的后端的 MES 结果并列比较——重新导一次盲评表才有标签。"),
     }
 
 
@@ -112,6 +132,12 @@ def build_blind_items(
         items.append(item)
         answer_key[item_id] = key_entry
 
+    # 后端标签复用 eval.run_eval.backend_tags（唯一实现，不在这里另写一套从
+    # manifest 抬字段的逻辑）。函数里 import：eval.run_eval 顶层会拉起 core.chain
+    # 那一串，模块顶层 import 会让 export 的测试跟着变重。
+    from eval.run_eval import backend_tags
+
+    answer_key[BACKEND_KEY] = backend_tags(consult_results)
     return items, answer_key, skip_counts
 
 
@@ -184,6 +210,7 @@ def main(argv: list[str] | None = None) -> None:
     args.out_items.parent.mkdir(parents=True, exist_ok=True)
     args.out_items.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
     args.out_answer_key.write_text(json.dumps(answer_key, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"后端：{answer_key[BACKEND_KEY]['note']}")
     print(
         f"共 {len(queries)} 条查询，{len(items)} 条进入盲评表（{len(PHYSICIANS)} 位医家并排）。"
         f"跳过：因安全拦截 {skip_counts['rejected']} 条，因信息不足 {skip_counts['insufficient']} 条，"

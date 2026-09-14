@@ -15,19 +15,19 @@
 - 沙盒（写代码的环境）没有 cases.json / embedding 模型 / 网络，**本文件里除了明确
   标着「沙盒模拟」的 #10/#11，没有任何一个数是沙盒里算出来的**。
 
-| # | 指标 | 当前值 | 对照 | 闸门 | 状态 |
-|---|---|---|---|---|---|
-| 1 | ε_online（噪声地板） | mean 0.241 / p50 0.000 / p95 0.857，**按证型分层** | 它本身就是别的指标的对照物；分层意味着全局一刀切会系统性判错（`eval/run_eval.py::divergence_per_query_detail` 因此逐条配对） | — | ❌ **待重跑**：R1 改了 S3 prompt，这个数是改之前的。`python -m offline.estimate_epsilon --n-repeats 3` 一次同时产出 #10/#11 的分层地板 |
-| 2 | 分歧度 vs ε | 6/9 条主诉的用药 Jaccard 距离超过配对 ε，判为真实分歧；3 条在噪声内；1 条被安全否决不可用 | 逐条 ε（`report_e3.md` 的明细表），不是减一个全局 0.241 | — | ❌ **待重跑**：判定用的 ε 来自 #1，同一轮一起重跑 |
-| 3 | E3 own vs swapped（换掉参考医案，结论变不变） | **0.451** | 修复前 0.335（同一批 10 条主诉、同一模型） | ≥ 0.4 | ✅ AutoDL 实测（R1 改了 S3 prompt；两臂用的是同一份 prompt，改变率的内部对照仍成立，下次跑 run_eval 会一起刷新） |
-| 4 | E4 own vs none（有没有参考医案，结论变不变） | **0.497** | 修复前 0.351 | ≥ 0.4 | ✅ AutoDL 实测（R1 改了 S3 prompt；两臂用的是同一份 prompt，改变率的内部对照仍成立，下次跑 run_eval 会一起刷新） |
-| 5 | SDT Test（TCMEval-SDT，chain 注入证素分析） | chain **22.833** | baseline 22.068（同模型、不注入）；修复前 chain 21.702（曾低于 baseline）。安全代价：关安全否决 27.729，差 4.90 分，被拦的 10/50 条全部是真危重 | chain > baseline | ✅ AutoDL 实测。**Test 已跑过 3 次完整 + 1 次局部**（台账 `eval/sdt/test_run_log.jsonl`）——再调 prompt 请先在 Train 上验证方向，失分分析用 `--error-analysis`（零调用） |
-| 6 | E9 react off vs on（开 ReAct 输出变不变） | 0.332 | 闸门 0.4；条目 30/31 修复前 ReAct 的医案层工具 9 次调用全空，这个数测的是"查了 9 次空"的 ReAct | ≥ 0.4 | ❌ **待重跑**：先过 `scripts/verify_react_tools.py` 两道闸门（医案层占比 > 35% 且返回非空率 > 50%）再重跑，否则重跑没有意义 |
-| 7 | E8 四种检索模式输出差异率 | 0.366（旧） | 检索层之后改过三次（`_case_to_text` 用 raw_excerpt、融合准入、BM25 保底），旧数作废 | 报出，不设闸门 | **待重跑**：`python -m eval.run_eval --e8`，graph 模式的覆盖率 caveat 从数据现算 |
-| 8 | MES 盲评（人评） | 未做 | 三对两两 McNemar（`eval/mes/collect.py --all-pairs`） | 20 条评完、三对 p 值 | **待做**：导出要真实 LLM，评分要人 |
-| 9 | E2 师承内 vs 跨学派（1.3 新增） | 无数据 | `school_pairs`：lineage_mean vs cross_school_mean 并列，判据"跨学派 > 师承内在多数主诉上成立"只报出不硬卡 | — | **待 AutoDL**：沙盒只用合成用药集合验证了计算本身 |
-| 10 | ε_core（君臣层噪声地板，R1 新增） | 无真机数据；沙盒模拟 mean 0.0 | ε_online（整方地板）——判据是 ε_core < ε_online < ε_adjunct，`_report_layers` 如实报成不成立，不调参去凑 | — | **待 AutoDL**：沙盒模拟喂的是诊断报告里那三次真实用药 + 我手工标的 role，只证明算法把信号分开了（0.0 < 0.5769 < 0.8426），不是真机值 |
-| 11 | ε_adjunct（佐使层噪声地板，R1 新增） | 无真机数据；沙盒模拟 mean 0.8426 | 同 #10；平均药味数（整方 9.0 / 君臣 4.0 / 佐使 5.0）是配套对照，用来辨「药少了所以碰巧一样」的假改善 | — | **待 AutoDL**：同 #10。先过 `python -m scripts.verify_role_fill`（role 填充率 ≥ 90%）这两行才有意义 |
+| # | 指标 | 后端 | 当前值 | 对照 | 闸门 | 状态 |
+|---|---|---|---|---|---|---|
+| 1 | ε_online（噪声地板） | deepseek-chat | mean 0.241 / p50 0.000 / p95 0.857，**按证型分层** | 它本身就是别的指标的对照物；分层意味着全局一刀切会系统性判错（`eval/run_eval.py::divergence_per_query_detail` 因此逐条配对） | — | ❌ **待重跑**：R1 改了 S3 prompt，这个数是改之前的。`python -m offline.estimate_epsilon --n-repeats 3` 一次同时产出 #10/#11 的分层地板 |
+| 2 | 分歧度 vs ε | deepseek-chat | 6/9 条主诉的用药 Jaccard 距离超过配对 ε，判为真实分歧；3 条在噪声内；1 条被安全否决不可用 | 逐条 ε（`report_e3.md` 的明细表），不是减一个全局 0.241 | — | ❌ **待重跑**：判定用的 ε 来自 #1，同一轮一起重跑 |
+| 3 | E3 own vs swapped（换掉参考医案，结论变不变） | deepseek-chat | **0.451** | 修复前 0.335（同一批 10 条主诉、同一模型） | ≥ 0.4 | ✅ AutoDL 实测（R1 改了 S3 prompt；两臂用的是同一份 prompt，改变率的内部对照仍成立，下次跑 run_eval 会一起刷新） |
+| 4 | E4 own vs none（有没有参考医案，结论变不变） | deepseek-chat | **0.497** | 修复前 0.351 | ≥ 0.4 | ✅ AutoDL 实测（R1 改了 S3 prompt；两臂用的是同一份 prompt，改变率的内部对照仍成立，下次跑 run_eval 会一起刷新） |
+| 5 | SDT Test（TCMEval-SDT，chain 注入证素分析） | deepseek-chat | chain **22.833** | baseline 22.068（同模型、不注入）；修复前 chain 21.702（曾低于 baseline）。安全代价：关安全否决 27.729，差 4.90 分，被拦的 10/50 条全部是真危重 | chain > baseline | ✅ AutoDL 实测。**Test 已跑过 3 次完整 + 1 次局部**（台账 `eval/sdt/test_run_log.jsonl`）——再调 prompt 请先在 Train 上验证方向，失分分析用 `--error-analysis`（零调用） |
+| 6 | E9 react off vs on（开 ReAct 输出变不变） | deepseek-chat | 0.332 | 闸门 0.4；条目 30/31 修复前 ReAct 的医案层工具 9 次调用全空，这个数测的是"查了 9 次空"的 ReAct | ≥ 0.4 | ❌ **待重跑**：先过 `scripts/verify_react_tools.py` 两道闸门（医案层占比 > 35% 且返回非空率 > 50%）再重跑，否则重跑没有意义 |
+| 7 | E8 四种检索模式输出差异率 | deepseek-chat | 0.366（旧） | 检索层之后改过三次（`_case_to_text` 用 raw_excerpt、融合准入、BM25 保底），旧数作废 | 报出，不设闸门 | **待重跑**：`python -m eval.run_eval --e8`，graph 模式的覆盖率 caveat 从数据现算 |
+| 8 | MES 盲评（人评） | —（未做） | 未做 | 三对两两 McNemar（`eval/mes/collect.py --all-pairs`） | 20 条评完、三对 p 值 | **待做**：导出要真实 LLM，评分要人 |
+| 9 | E2 师承内 vs 跨学派（1.3 新增） | —（待 AutoDL） | 无数据 | `school_pairs`：lineage_mean vs cross_school_mean 并列，判据"跨学派 > 师承内在多数主诉上成立"只报出不硬卡 | — | **待 AutoDL**：沙盒只用合成用药集合验证了计算本身 |
+| 10 | ε_core（君臣层噪声地板，R1 新增） | 沙盒（无 LLM，合成用药集合） | 无真机数据；沙盒模拟 mean 0.0 | ε_online（整方地板）——判据是 ε_core < ε_online < ε_adjunct，`_report_layers` 如实报成不成立，不调参去凑 | — | **待 AutoDL**：沙盒模拟喂的是诊断报告里那三次真实用药 + 我手工标的 role，只证明算法把信号分开了（0.0 < 0.5769 < 0.8426），不是真机值 |
+| 11 | ε_adjunct（佐使层噪声地板，R1 新增） | 沙盒（无 LLM，合成用药集合） | 无真机数据；沙盒模拟 mean 0.8426 | 同 #10；平均药味数（整方 9.0 / 君臣 4.0 / 佐使 5.0）是配套对照，用来辨「药少了所以碰巧一样」的假改善 | — | **待 AutoDL**：同 #10。先过 `python -m scripts.verify_role_fill`（role 填充率 ≥ 90%）这两行才有意义 |
 
 ## 每组的 caveat（不是脚注，是数字的一部分）
 
@@ -43,8 +43,10 @@
 5. **E8 旧数作废**不是因为数错了，是因为它测的检索层已经不存在了。
 6. **MES 是唯一不依赖自动指标的证据**，也是训练（阶段五）的靶子——三个前提
    （E3 ≥ 40% ✅、SDT 有基线 ✅、MES 显示哪个维度弱 ⏳）现在满足两个。
-7. **模型不同数字不可比**：以上全部是 DeepSeek 后端。将来训练后的模型重跑这整张表，
-   必须并列报并带上 `manifest.comparability_warning`。
+7. **模型不同数字不可比**：以上全部是 DeepSeek 后端（「后端」列写明了，未做/沙盒模拟
+   的行没有冒充成 DeepSeek 跑的）。将来训练后的本地模型重跑这整张表，按下面
+   「同一指标、两个后端」那一节**并列**加行，不覆盖，并带上
+   `manifest.comparability_warning`。
 
 8. **「被拦的 10/50」是真值**（20%），已定案：官方 `Test_TCM_Data_v1.json` 过
    现在的 `core.safety.check_safety` 现算就是 10 条。`data/SOURCES.md` 第 14 条
@@ -62,3 +64,42 @@
 
 哪一行的代码改了，就把那一行标成"待重跑"，重跑前不更新数字。README 和 DEMO.md
 里的数字从这里抄，不各自维护一份（两份会分叉）。
+
+## 同一指标、两个后端：并列，不覆盖（R5-4）
+
+阶段五训完 LoRA 之后，同一个指标会有两个值：DeepSeek 跑的和本地模型跑的。
+**规矩是加行，不是改行。**
+
+上面那张表的「后端」列就是为这件事加的。本地模型的数按同样格式追加成新行，
+编号沿用原指标号加后缀（`3-local`、`5-local`），原行一个字不动：
+
+| # | 指标 | 后端 | 当前值 | 对照 | 闸门 | 状态 |
+|---|---|---|---|---|---|---|
+| 3 | E3 own vs swapped | deepseek-chat | 0.451 | 修复前 0.335 | ≥ 0.4 | ✅ AutoDL 实测 |
+| 3-local | E3 own vs swapped | tcm-local（Qwen2.5-1.5B + LoRA） | 待跑 | **同一行的 deepseek-chat 值 0.451** | ≥ 0.4 | 待训练 |
+
+为什么不能覆盖：
+1. **覆盖掉的那个数就是这个新数唯一的对照。** 项目纪律是「任何数字都必须带对照」
+   ——训练后的 E3 拿什么比？只能跟训练前同一批主诉、同一套代码、另一个模型的
+   0.451 比。把 0.451 改掉，新的 0.451→0.4x 就成了一个没有基准的数。
+2. **两个数不是同一次测量的修正，是两次不同的实验。** 覆盖适用于「上次算错了」，
+   这里是「换了模型重测一次」——两者都是真值。
+3. **本地模型一定会有几项更差。** 1.5B 打不过 DeepSeek 是预期，不是失败；
+   并列摆着才能说清「差多少换来了什么」（自部署、零 API 成本、可按医家定制）。
+   只留一份数就只能在「报一个更差的数」和「不报」之间选，两个都是错的。
+
+怎么保证每个数都带后端标签：
+
+- `eval/run_eval.py` 的报告里第一项就是 `backend`（`backend_tags()` 从每条结果
+  自带的 `manifest` 抬上来，不读 `LLM_MODEL` 环境变量——那个变量在 claude_cli /
+  replay 后端下还是 `deepseek-chat`）。`report.md` 顶部有一行 `**后端**：…`。
+  **一份报告里混了两个后端会在那一行大声报出来**（`mixed: true`）：混着跑出来的
+  每个汇总数字都是跨模型的平均，谁都比不了。
+- `eval/sdt/run.py` 的提交元数据里有 `backend`（R2 就有了）；
+  `offline/estimate_epsilon.py` 写的 `eval/epsilon.json` 里有 `model` / `backend` /
+  `comparability_warning`。
+- 回放（`LLM_MODE=replay`）跑出来的数，`replayed_from` 非 None，报告顶部会写明
+  **不是实时调用**。回放的数字跟实时的数字长得一模一样，不标就等于伪装。
+- `scripts/train_lora.py` 最后打的那张 train/heldout loss 对照表**不是**这张表的
+  行：loss 不是靶子，它只回答「哪个基座在 heldout 上更低」。训完要按上面的口径
+  重跑 ε/E3/E4/E8/E9/SDT/MES，才有资格往这张表里加行。

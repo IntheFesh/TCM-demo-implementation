@@ -1015,6 +1015,62 @@ def school_pair_summary(consult_results: list[dict]) -> dict:
     }
 
 
+def backend_tags(consult_results: list[dict]) -> dict:
+    """这一批数字是**哪个后端、哪个模型**跑出来的。从每条结果自带的 manifest 里抬
+    上来，不从 LLM_MODEL 环境变量读（那个变量在 claude_cli / replay 后端下还是
+    deepseek-chat，照抄就等于把别的模型跑的结果标成 DeepSeek 跑的）。
+
+    **一份报告里不该混两个后端。** 训练完之后本地模型要重跑这整张表，正确做法是
+    跑两次、两份报告并列，不是一次跑里一半 DeepSeek 一半本地——那样出来的每个
+    汇总数字都是两个模型的平均，既不能跟论文比也不能跟自己之前比。所以这里把
+    `mixed` 和 `note` 一起交出去，混了就在报告顶部写明。
+
+    `replayed_from` 非 None 意味着这批数字是回放录制的结果，不是实时调用（R3）。
+    它必须跟着进报告：一个回放出来的数字看起来和实时跑的一模一样，那句「这是我们
+    系统跑出来的」就变成了假的。
+    """
+    # 只认真的带了 model/backend 的 manifest。有 manifest 但里面没有这两个键
+    # （老结果、测试里构造的最小结果）算"未标"，不算"后端是 None"——
+    # 报一个 None 出去，读的人会以为那是某个真实后端的名字。
+    manifests = [m for m in (r.get("manifest") or {} for r in consult_results
+                             if isinstance(r, dict))
+                 if m.get("model") or m.get("backend")]
+
+    def distinct(key: str) -> list:
+        seen: list = []
+        for m in manifests:
+            v = m.get(key)
+            if v not in seen:
+                seen.append(v)
+        return seen
+
+    models, backends = distinct("model"), distinct("backend")
+    replayed = [v for v in distinct("replayed_from") if v]
+    warnings = [v for v in distinct("comparability_warning") if v]
+    mixed = len(models) > 1 or len(backends) > 1
+    if not manifests:
+        note = ("⚠ 这批结果里没有 manifest，**后端和模型未知**。没有后端标签的数字"
+                "不能跟任何别的数字比——先确认 consult 结果带上 manifest 再报数。")
+    elif mixed:
+        note = (f"⚠⚠ 这一份报告混了多个后端/模型（模型 {models}，后端 {backends}）。"
+                "每个汇总数字都变成了跨模型的平均，既不能跟论文比也不能跟自己之前的"
+                "数比。正确做法是每个后端各跑一次、两份报告**并列**，不是混在一次跑里。")
+    else:
+        note = f"模型 {models[0]}，后端 {backends[0]}。"
+        if replayed:
+            note += "**这批数字是回放录制结果，不是实时调用**（LLM_MODE=replay）。"
+        if warnings:
+            note += " ".join(warnings)
+    return {
+        "models": models, "backends": backends,
+        "lora_dirs": distinct("lora_dir"),
+        "replayed_from": replayed,
+        "comparability_warnings": warnings,
+        "mixed": mixed,
+        "note": note,
+    }
+
+
 def build_report(
     consult_results: list[dict],
     retrieval_comparisons: list[dict] | None = None,
@@ -1029,6 +1085,10 @@ def build_report(
     epsilon_detail = load_epsilon_online_detail()
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        # 后端标签放在最前面：报告里每一个数字都归这一行管。没有它，
+        # 「E3 0.451」这个数不知道是谁跑的，跟训练后本地模型的 0.4x 并列时
+        # 分不出是模型变了还是代码变了。
+        "backend": backend_tags(consult_results),
         "n_queries": len(consult_results),
         "divergence_vs_epsilon": divergence_vs_epsilon(consult_results, load_epsilon_online()),
         # 逐条明细：跟上面的汇总并列存在，不是取代它——见
@@ -1056,6 +1116,8 @@ def build_report(
 def render_markdown(report: dict) -> str:
     lines = [
         f"# V1 评测汇总（{report['generated_at']}）",
+        "",
+        f"**后端**：{report.get('backend', {}).get('note', '未知（旧版报告没有这一行）')}",
         "",
         f"共 {report['n_queries']} 条查询。以下每项数字旁边都带着它的对照基准"
         "（CLAUDE.md：任何数字都必须带对照）。",

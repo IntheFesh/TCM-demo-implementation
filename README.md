@@ -911,6 +911,92 @@ python -m scripts.verify_local_backend        # 退出码 0 = 真的接上了
 > **本地模型跑出来的数字不可与 DeepSeek 的直接比较**，
 > `manifest.comparability_warning` 会把后端、权重路径、LoRA 状态一路带进报告。
 
+## 训练准备（阶段五 M15/M16，代码和数据就绪，还没训）
+
+**训练的三个前提，两个满足**：E3 ≥ 40%（✅ 0.451）、SDT 有基线（✅ chain 22.833 /
+baseline 22.068）、MES 盲评指出哪个维度弱（⏳ 要人评）。第三条没满足就**没有靶子**
+——那时候训出来的模型，不知道该拿什么判断它变好了没有。所以现在只准备代码和数据。
+
+```bash
+# 1) 导出六层链路训练数据（三源合并）
+python -m offline.export_sft --format chain --sdt-dir $SDT --out sft_chain.jsonl
+
+# 2) 看训练计划：样本数、每位医家分到多少、输出目录、第一条样本渲染成什么样
+python -m scripts.train_lora --dry-run
+
+# 3) 真训（训练机上先 pip install -r requirements-train.txt）
+python -m scripts.train_lora --out-dir /root/autodl-tmp/lora
+```
+
+### 训练数据的三个来源，每步依据都能追到原文
+
+| 来源 | 填目标链路的哪几步 | 依据原文 | 出处标签 |
+|---|---|---|---|
+| 医案（`cases.json` + `data/case_triples.jsonl`） | 证型→治法 / 治法→方剂 / 方剂→药材（另有 症状→病机 / 病机→证型） | 三元组的 `source_span` | `case:{case_id}` |
+| TCMEval-SDT **Train**（`--sdt-dir`） | 症状→病机 / 病机→证型 | 官方金标准里专家撰写的辨证说明 | `sdt:{病案ID}` |
+| 药理层（`data/materia_medica.jsonl`、`data/formulary.jsonl`） | 给 方剂→药材 / 治法→方剂 **补依据** | 本草/教材的 `source_span` | `materia_medica:{书名}`、`formulary:{书名}` |
+| 教材证候表（`data/standard/syndromes.jsonl`） | 症状→证素 / 证素→病名 / 病名→证型 | 证机概要原文 | `standard:{证候编码}` |
+
+第四行是**补上来的**：前三个来源一个都填不出目标链路的前三步（`CaseRecord` 既没有
+证素字段也没有病名字段，SDT 的两个任务是病机和证型），不接教材证候表，"六步链路"
+只能是五步。它已经在版本控制里，带 `disease` / `location` / `nature` / 证机概要原文。
+
+**每步两个出处字段，不是一个**：`source` 是**输出**的出处，`rationale_source` 是
+**依据文本**的出处。方名是医案里的，但"为什么这个治法用这张方"的原文依据来自
+《方剂学》——合成一个字段就必然有一半在撒谎。`rationale` 拿不到就是 `null`，不编。
+
+**教材前三步只接受证型名的精确命中。** 匹配复用 `core.tools.lookup_standard`
+（唯一实现），但它最后一档"按名称部分匹配到唯一一条"在这里被拒绝：「湿热」能匹配上
+「湿热布散三焦证」，一条错配会把另一个病的证素和病名写进样本，而依据是教材原文、
+看起来完全正常。命中数和没命中的原因分布都在导出统计里。
+
+### 划分与泄漏防护
+
+- 医案按 `case_group_id` 切 train/heldout（`sha1` 定侧，不用随机——同一份
+  `cases.json` 任何时候切出来都一样）。同一病人的所有诊次同侧：复诊跟初诊内容
+  高度重复，分到两侧 heldout 就废了。
+- **SDT 用它自带的 Train/Validation/Test，不重切**，而且只导 Train：另两个是评测集。
+- 导出时报两个不同的泄漏数：`case_group_id` 交集（现在的切法结构上保证为 0，这一项
+  是"将来有人改成按 case_id 切"的报警器），以及 **heldout 里 `input` 跟 train 逐字
+  相同的样本数**——这一项现在就会非零（同一粗段两个病人共享原文）。**不自动去重**：
+  去哪一侧是个取舍，代码替人决定会让"gap 是多少"变成一个来历不明的数。
+
+### 训练脚本
+
+- **两个基座都能跑**，基座是参数不是常量：`qwen2.5-1.5b`（通用）与
+  `zhongjing-2-1.8b`（已在中医语料上继续预训练）。默认两个都训——**对照是免费的**，
+  而"先验中医知识有没有用"只能靠这个对照回答。⚠ 后者的仓库 id 没在真机核对过，
+  404 就用 `--base-model` 传真实 id（脚本会把这个提醒打出来）。
+- **按医家训独立 adapter**：`--physician ye_tianshi`（中文名也认，走
+  `resolve_physician_id`）。`physician_id` 为 `null` 的样本（SDT 那批）是**两位医家
+  共用**，不是"没有医家所以丢掉"。
+- 输出布局 `<out-dir>/<基座>/<physician_id>/`，最后一级正是
+  `core/llm.py::_resolve_lora_path` 找的 `$LORA_DIR/<physician_id>`；脚本把每个基座
+  对应的 `export LORA_DIR=…` 原样打出来。有一条测试直接拿推理侧那个函数验这个布局。
+- **必须报 train/heldout gap**，而且 heldout loss 带它自己的基线：**训练前**同一批
+  heldout 上的 loss（LoRA 的 B 矩阵初始化为 0，训练前的 peft 模型数值上就是基座，
+  这个基线是免费的）。gap 超过 20% 打**过拟合警告**——那条线是约定不是实测值，
+  所以警告是"去看下游指标"而不是"训练失败了"。heldout 为空时报的是"**不知道**"，
+  不是"没问题"。
+- **训练目标里不含出处 id。** 每步的 `source`（`case:ye_tianshi-0012-p3-0` 这类）
+  不进训练目标：教模型背医案 id，它推理时就会凭记忆编一个出来，而那正是"每条结论
+  必须引用真实医案 id"要防的事。依据原文进目标（那是要教的），id 不进（那是检索层
+  该给的）。
+- 训练依赖在 `requirements-train.txt`，**不在** `requirements.txt`：torch 那一套
+  有好几个 G，装在只做推理的机器上纯浪费，CUDA 版本不匹配还会把能跑的环境搞坏。
+
+### 训练之后：并列，不覆盖
+
+本地模型重跑 ε/E3/E4/E8/E9/SDT/MES，结果**追加**到 `eval/RESULTS.md`（编号加
+`-local` 后缀），DeepSeek 那组数一个字不动。理由和机制写在那个文件的
+「同一指标、两个后端」一节：覆盖掉的那个数就是新数唯一的对照。
+
+每个数字都带后端标签：`eval/run_eval.py` 的报告第一项是 `backend`（从每条结果自带的
+`manifest` 抬上来，不读 `LLM_MODEL` 环境变量——那个变量在 claude_cli / replay 后端下
+还是 `deepseek-chat`），`report.md` 顶部一行 `**后端**：…`，**一份报告里混了两个
+后端会大声报出来**；`eval/sdt/run.py`、`eval/epsilon.json` 早就有；盲评的
+`answer_key.json` 里加了 `_backend`，`eval/mes/collect.py` 把它写进结果。
+
 ## 处方安全
 
 `core/safety_output.py::assess_formula_safety(syndrome, herb_items)`

@@ -407,9 +407,19 @@ def test_collect_main_all_pairs_writes_every_pair(tmp_path, monkeypatch, capsys)
         "--out", str(out_path), "--all-pairs",
     ])
     result = json.loads(out_path.read_text(encoding="utf-8"))
-    assert set(result) == {"ye_tianshi__wu_jutong", "ye_tianshi__zhang_xichun", "wu_jutong__zhang_xichun"}
+    # 契约变更（R5-4）：输出里多一个保留键 "_backend"。MES 是 RESULTS.md 第 8 行的
+    # 指标，它的胜负数也必须能说出"这是谁跑出来的"——训练后本地模型再评一次，
+    # 两份胜负数并列时否则分不出是模型变了还是评分人变了。原来这里断言的是
+    # "键集合恰好等于三对"，改成"三对都在 + 多的那个是后端标签"。
+    assert {"ye_tianshi__wu_jutong", "ye_tianshi__zhang_xichun",
+            "wu_jutong__zhang_xichun"} <= set(result)
+    assert set(result) - {"ye_tianshi__wu_jutong", "ye_tianshi__zhang_xichun",
+                          "wu_jutong__zhang_xichun"} == {"_backend"}
+    # 这份答案表是测试现造的、没有后端标签，所以标签块要明确写"未标"而不是猜一个
+    assert "来源不明" in result["_backend"]["note"]
     printed = capsys.readouterr().out
     assert "[ye_tianshi__wu_jutong]" in printed and "[wu_jutong__zhang_xichun]" in printed
+    assert "后端：" in printed
 
 
 def test_collect_main_raises_clear_error_when_items_missing(tmp_path):
@@ -467,3 +477,43 @@ def test_collect_main_rejects_unregistered_physician_with_choices(tmp_path, monk
             "--items-path", str(items_path), "--answer-key-path", str(key_path),
             "--out", str(tmp_path / "out.json"), "--physician-a", "华佗",
         ])
+
+
+# ---------- R5-4：盲评的后端标签（MES 的胜负数也要能说出是谁跑的） ----------
+
+
+def test_answer_key_carries_the_backend_tag_but_items_stay_blind(monkeypatch):
+    """后端标签放答案表不放评分表：评分表是盲的、给评分人看的；后端是读数的人
+    才需要的东西。"""
+    _pin_physicians(monkeypatch, me, ["ye_tianshi", "wu_jutong"])
+    results = [_result(physicians=[_pr("ye_tianshi", "甲证"), _pr("wu_jutong", "乙证")])]
+    results[0]["manifest"] = {"model": "deepseek-chat", "backend": "deepseek"}
+    items, key, _ = me.build_blind_items(["q1"], results, seed=1)
+    assert key[me.BACKEND_KEY]["backends"] == ["deepseek"]
+    assert all(me.BACKEND_KEY not in item for item in items)
+
+
+def test_backend_key_never_collides_with_an_item_id(monkeypatch):
+    """item_id 一律是 item-%03d，保留键是 "_backend"——collect_ratings 只按
+    item_id 查答案表，所以这个保留键不会被当成一条题。"""
+    _pin_physicians(monkeypatch, me, ["ye_tianshi", "wu_jutong"])
+    results = [_result(physicians=[_pr("ye_tianshi", "甲"), _pr("wu_jutong", "乙")])]
+    items, key, _ = me.build_blind_items(["q1"], results, seed=1)
+    assert me.BACKEND_KEY.startswith("_")
+    assert all(not item["item_id"].startswith("_") for item in items)
+    # 统计不受保留键影响
+    items[0]["winner"] = "A"
+    stats = mc.collect_ratings(items, key, "ye_tianshi", "wu_jutong")
+    assert stats["n_rated"] == 1 and stats["n_missing_answer_key"] == 0
+
+
+def test_backend_of_says_unlabeled_for_an_old_answer_key():
+    """R5-4 之前导的答案表没有这一项。这时要明确写"来源不明"，不猜一个 deepseek
+    ——猜一个默认值等于把别人跑的数标成我们的。"""
+    tags = me.backend_of({"item-000": {"A": "ye_tianshi"}})
+    assert tags["models"] == [] and "来源不明" in tags["note"]
+
+
+def test_backend_of_returns_the_stored_tag_when_present():
+    stored = {"models": ["tcm-local"], "backends": ["local"], "mixed": False, "note": "x"}
+    assert me.backend_of({me.BACKEND_KEY: stored}) is stored

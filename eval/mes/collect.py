@@ -151,6 +151,14 @@ def main(argv: list[str] | None = None) -> None:
         print(result["note"])
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    # 后端标签跟胜负数一起写出去。键名和读法在 eval/mes/export.py 一处定义
+    # （BACKEND_KEY / backend_of），不在这里另写一遍。"a__b" 和 "n_total" 这些
+    # 键都不会跟 "_backend" 撞。
+    from eval.mes.export import BACKEND_KEY, backend_of
+
+    backend = backend_of(answer_key)
+    print(f"后端：{backend['note']}")
+    result[BACKEND_KEY] = backend
     args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已写出 {args.out}")
 
