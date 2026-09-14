@@ -2246,3 +2246,76 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     全套 2001 → 2005 全绿、ruff 干净、`--check` 两份文档退出码 0、冷缓存下
     pytest 只剩 starlette 那 1 条第三方告警。`core/schemas.py` 的
     `= Field(min_length=1)` 仍是 **31 处**（没动 schema）。
+
+47. **R7：上机前的全局自检（14 条逐条核）、上机剧本 `scripts/run_onsite.sh`、
+    失败预案 `docs/onsite_troubleshooting.md`。不写新功能。**
+
+    **自检里两条值得单独记，因为它们的结论不是简单的「✅」：**
+
+    **(a) `min_length` 那条铁律：`git diff 974c8c7 HEAD -- core/schemas.py` 里有
+    三条 `-` 的 `min_length=1` 行，逐条核过，没有一条是放松。**
+    - `p: str = Field(min_length=1)` ×2 → 换成 `CaseTriplePredicate`（六个合法值的
+      `Literal`），值集合变小，是**收紧**（X3 那轮，第 44 条记过）；
+    - `cited_case_ids: list[str] = Field(min_length=1)` ×1 → **被移走了，不是被删**：
+      M1 把 S3 拆成 `_S3Base` + `S3Syndrome` / `S3SyndromeUnreferenced` 两个子类，
+      这个字段连同约束原样搬进了 `S3Syndrome`（diff 里有对应的 `+` 行）。
+    **只看 `-` 行数会把「移动」误判成「放松」**，所以这条自检必须逐条看上下文，
+    不能只数增减。当前 31 处。
+
+    **(b) 「case 层边用含 case_id 的 edge_key」这条，答案是「没有，而且不需要」。**
+    `offline/build_graph.py:242` 建 case 层边时没传 `edge_key`——但那条边的 `src`
+    **就是** `case_id`，`(src, dst)` 本身已经唯一，默认 key 不会撞。真正必须显式
+    传 key 的是 `indicates`（症状→证素）：同一对节点会被多条证候定义各写一次
+    （「纳呆 提示 胃」SP-02/SP-03/SP-05 都写了），不区分 key 后写的会**静默盖掉**
+    先写的，`via_syndrome` 和 `is_cardinal` 一起丢——所以那里用的是
+    `edge_key=f"indicates::{code}"`，`tests/test_graph_store.py` 有测试钉住。
+    自检清单把这条写成「case 层要带 case_id」是**把判据记反了**：判据是
+    「同一对节点间有没有多条同类型但来源不同的边」，不是「哪一层」。
+
+    **另外三条结论跟清单的措辞有出入，如实记下来：**
+    - 「eval/ 未被 core/ api/ import」——core/ 和 api/ **干净**；但
+      `offline/export_sft.py` 有一处**函数内** `from eval.sdt.data import load_split`
+      （复用 SDT 格式解析的唯一实现）。offline/ 是构建期脚本、不在产品路径上，
+      而且是惰性 import，判为不违反，但清单里那句话的字面范围要写清楚。
+    - 「三种后端」——实际是**五种**：`api` / `local` / `local_inproc` / `claude_cli` /
+      `replay`（`core/llm.py::get_backend` 按 `LLM_MODE` 分派，默认 `api`）。
+      对外文档讲三种是简化，自检时要按五种核。
+    - 「六个开关各只读一处 environ」——六个**判定函数**各只有一处读
+      （`core/react.py:53`、`core/safety.py:183`、`core/followup.py:64`、
+      `core/retrieval_hybrid.py:255`、`core/retrieval.py:199`、`core/llm.py:656`）。
+      `USE_REACT` 另有 12 处出现在 `scripts/record_fixtures.py` /
+      `scripts/verify_replay.py` 里，那是**写**环境变量（录制/回放要把开关真的设进
+      环境，理由写在那两个脚本的文档字符串里），不是另开一处读。
+
+    **上机剧本 `scripts/run_onsite.sh`：八段，分段可续跑。**
+    段序按「依赖 + 成本」排，零调用的段 0/1 先跑（**免费的问题先发现掉**），
+    最贵的段 7（全套评测重跑）放最后。`--dry-run` 先打全表和预估
+    （合计 **2255 次调用**），`--from N` 续跑，`--only N` 单跑，`--yes` 跳过卡点。
+    三条设计写在文件头：**一段失败不影响后面的段**（`run_segment` 末尾无条件
+    `return 0`，不 `set -e` 掉整个脚本）、段末打时间戳和退出码、
+    **段 3 和段 5 两处人工卡点必须停下来等人确认**（role 填充率不过就停、
+    抽取质量要人逐条看——闸门没过就往下跑，后面几百次调用全部白花）。
+
+    **预估调用数尽量取实测值而不是拍脑袋**：段 4 的 **215** 次是
+    `eval/epsilon.json` 里三段 `llm_calls` 之和（那次实测 1347s），段 6 的 **278**
+    次是 `record_fixtures --dry-run` 现打的。**两条测试钉住这两个数跟来源一致**，
+    哪天来源变了剧本会红。均价 ¥0.0055/次是从 README 里 record_fixtures 那条
+    「约 272 次 ¥1.5」反推的——**量级估算，不是账单**，用途是让人开跑前决定跑到哪一段。
+
+    **失败预案 `docs/onsite_troubleshooting.md`：第 0 条就是「静默很久是正常的」。**
+    上一轮因为看不到进度以为卡死，杀了三个正常运行的进程，浪费一小时和几百次调用。
+    判据写死成「**看日志文件的 mtime，不要用 `ps` / `kill` 去『确认』它还活着**」，
+    并给了三个已知会长时间安静的地方（run_eval 基线阶段无逐条输出、
+    estimate_epsilon 实测 1347s、vLLM 加载权重）。其余条目里两个阈值
+    （截断判据 **100 字符**、失败率警戒线 **20%**）**有测试钉住它们跟代码里的常量一致**
+    ——预案和代码各写各的数，是这类文档最常见的腐烂方式。
+
+    **bash 脚本也写了测试**（21 条）：段号连续、段序「零调用在前最贵在后」、
+    人工卡点恰好在段 3 和段 5、`--dry-run` 真的什么都不跑、未知参数退出码 2、
+    以及**剧本里 `python -m` 的每个模块和 `bash` 的每个脚本都真的存在**——
+    上机剧本写错一个模块路径，代价是在真机上跑到那一段才发现，而那时候前面几段的
+    钱已经花了。
+
+    本轮新增测试 21 条，全套 2005 → 2026 全绿、ruff 干净、`--check` 两份文档退出码 0。
+    `core/schemas.py` 的 `= Field(min_length=1)` **31 处**（用
+    `grep -c "= Field(min_length=1" core/schemas.py` 数）。
