@@ -51,10 +51,18 @@ def _fake_rejected_outcome() -> dict:
 
 
 def test_health():
+    """R3 起 /health 多了一个 demo_mode 字段（实时后端下是 None），所以这里从
+    "整个响应体逐字段相等"改成"status 必须是 ok、demo_mode 在实时后端下必须是
+    None"。**这是有意的契约变更**：前端要在页面加载时就知道这是不是演示模式，
+    不能等到跑完一次问诊才被告知"刚才那个不是现场跑的"，而这个端点是页面加载时
+    唯一会问的地方。断言从"等于这个字典"改成"这两条性质"，测的东西反而更准——
+    原来那条会被任何一个新字段弄红，而新字段本身不是回归。"""
     client = TestClient(api_main.app)
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["demo_mode"] is None  # 实时后端：不显示演示模式那行小字
 
 
 def test_root_redirects_to_app():

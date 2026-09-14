@@ -297,6 +297,20 @@ class LLMBackend(ABC):
         医家的结果里（见 core/chain.py::run_physician 的 "lora" 字段）。"""
         return None
 
+    def replay_info(self) -> dict | None:
+        """这一次的输出是不是回放的录制结果；None = 实时调用。
+
+        非 None 时至少带 recorded_at / model / git_commit（见
+        core/llm_replay.py::ReplayBackend.replay_info），manifest 原样带上，
+        前端据此显示那行"演示模式"小字。跟 lora_for/lora_dir 同一个理由做成
+        基类方法：调用方不该知道有几种后端，`llm.replay_info()` 要无条件可写。
+
+        **这个方法存在的意义是不许伪装成实时调用。** 回放的结果如果在 manifest
+        里看起来跟实时跑的一样，"这是我们系统跑出来的"这句话就变成了假的——
+        跟 model_name() 禁止伪装成别的模型是同一条纪律。
+        """
+        return None
+
     def generate(
         self,
         system: str,
@@ -894,6 +908,12 @@ def get_backend() -> LLMBackend:
         return VLLMInProcessBackend()
     if mode == "claude_cli":
         return ClaudeCLIBackend()
+    if mode == "replay":
+        # 惰性 import：core/llm_replay.py 要拿 cases_sha256（在 core.chain 里），
+        # 模块级 import 会形成 llm → llm_replay → chain → llm 的环。
+        from core.llm_replay import ReplayBackend
+
+        return ReplayBackend()
     return OpenAICompatBackend()
 
 

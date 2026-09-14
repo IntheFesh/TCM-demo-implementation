@@ -23,6 +23,7 @@ from core.audit import append_audit
 from core.chain import consult, explained_symptoms
 from core.diseases import get_disease, triage_advice
 from core.herbs import is_western_drug, strip_dose_and_parens
+from core.llm import get_llm
 from core.physicians import PHYSICIANS, resolve_physician_id
 from core.prescription import compute_herb_diffs, format_pharmacy_text
 from core.safety_output import assess_formula_safety
@@ -127,12 +128,43 @@ class ConsultRequest(BaseModel):
     role: Role = "researcher"
 
 
+def demo_mode_info() -> dict | None:
+    """这台服务是不是在回放录制好的推理；None = 实时调用。
+
+    **全项目唯一一处组装这个字段的地方**：/health、问诊响应、SSE 的 done 事件
+    三个消费方都从这里取。散成三份的话，改一处漏两处，而漏掉的那两处就是
+    "页面上没有那行小字"——这一条是诚实性要求，不能靠"记得三处都改"。
+
+    刻意**不放进 manifest**：manifest 只下发给 researcher 角色
+    （`_filter_response_by_role` 把它 pop 掉了），而演示给谁看就是给
+    patient/doctor/student 看的——挂在 manifest 上等于对真正的观众隐身。
+    """
+    info = get_llm().replay_info()
+    if not info:
+        return None
+    return {
+        "recorded_at": info["recorded_at"],
+        "model": info["model"],
+        "n_fixtures": info["n_fixtures"],
+        # 一句现成的话，前端直接显示，不在前端拼措辞——措辞是诚实性的一部分，
+        # 不该有两个版本
+        "notice": (f"演示模式：结果来自 {info['recorded_at'][:10]} 录制的真实推理"
+                   f"（{info['model']}），非实时调用"),
+    }
+
+
 @app.get("/health")
 async def health() -> dict:
     """async def 而不是 def：同步端点跑在 anyio 的线程池里（默认 40 个槽），
     几十条并发问诊把槽占满时，存活探针也跟着排队、超时，编排器会把一个其实
     还活着的进程重启掉。这个端点不做任何 IO，直接在事件循环上答。"""
-    return {"status": "ok"}
+    # demo_mode 非 None = 这台服务在回放录制好的推理（LLM_MODE=replay）。
+    # **放在 /health 而不是只放在问诊响应里**：前端一加载就该看到那行小字，
+    # 不该等到跑完一次问诊才告诉访问者"刚才那个不是现场跑的"。
+    # 这个端点不做 IO 的性质没变——replay_info() 读的是已经装载好的 fixture
+    # 元信息（fixtures 惰性加载，健康探针不会触发扫目录：探针在服务起来后
+    # 第一次被调时若还没装载，装载的是几百个小 JSON，一次性的）。
+    return {"status": "ok", "demo_mode": demo_mode_info()}
 
 
 @app.get("/")
@@ -305,6 +337,9 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         "divergence": None,
         "graph": {"nodes": [], "edges": [], "dropped_edges": 0},
         "manifest": outcome.get("manifest"),
+        # 非 None = 这次结果是回放的录制推理。跟 manifest 分开放：manifest 只
+        # 给 researcher，而这行提示要给所有角色看（见 demo_mode_info 的注释）。
+        "demo_mode": demo_mode_info(),
     }
 
     if outcome["rejected"]:

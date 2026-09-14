@@ -133,7 +133,7 @@ def test_lifespan_stops_waiting_for_a_stuck_warmup_and_serves(monkeypatch):
     try:
         with TestClient(api_main.app) as client:
             assert started.is_set()
-            assert client.get("/health").json() == {"status": "ok"}
+            assert client.get("/health").json()["status"] == "ok"
         assert time.monotonic() - t0 < 5, "lifespan 没有在超时后放行"
     finally:
         gate.set()
@@ -143,7 +143,7 @@ def test_lifespan_runs_warmup_exactly_once(monkeypatch):
     calls = []
     monkeypatch.setattr(api_main, "_warmup", lambda: calls.append(1))
     with TestClient(api_main.app) as client:
-        assert client.get("/health").json() == {"status": "ok"}
+        assert client.get("/health").json()["status"] == "ok"
     assert calls == [1]
 
 

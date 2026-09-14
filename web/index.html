@@ -615,6 +615,22 @@
     flex-wrap: wrap;
   }
   #gb-cy .gb-search-hit { border-width: 3px !important; }
+  /* R3 演示模式提示。放在 header 下面、所有角色都看得见的位置：这行字是诚实性
+     要求，不是可选的装饰——挂在只有 researcher 拿得到的 manifest 上等于对真正
+     的观众隐身。颜色用醒目但不刺眼的琥珀色，字号小，不抢演示的主角。 */
+  #demo-mode-banner {
+    display: none;
+    margin: 0 auto 10px;
+    max-width: 1040px;
+    padding: 6px 12px;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    border-radius: 6px;
+    color: #92400e;
+    font-size: 12px;
+    text-align: center;
+  }
+  #demo-mode-banner.show { display: block; }
 </style>
 </head>
 <body>
@@ -628,6 +644,8 @@
        内容跟着角色换，位置本身不该因为角色不同而消失或新增。 -->
   <div class="disclaimer" id="disclaimer-text">教学与研究用途，非诊断工具，不能替代执业医师</div>
 </header>
+
+<div id="demo-mode-banner"></div>
 
 <div id="tab-bar">
   <button class="tab-btn active" id="tab-btn-consult" data-tab="consult">问诊</button>
@@ -1995,6 +2013,45 @@ function divergenceBannerText(divergence) {
   return null;
 }
 
+// R3 演示模式那行小字。文案由服务端给（api/main.py::demo_mode_info 的 notice），
+// 前端不自己拼措辞——措辞是诚实性的一部分，不该有两个版本；服务端漏给 notice
+// 时才用这里的兜底句，兜底句也必须说清"非实时调用"这件事。
+function demoModeText(demoMode) {
+  if (!demoMode) return null;
+  if (demoMode.notice) return demoMode.notice;
+  const date = (demoMode.recorded_at || "").slice(0, 10) || "未记录日期";
+  const model = demoMode.model || "未记录模型";
+  return `演示模式：结果来自 ${date} 录制的真实推理（${model}），非实时调用`;
+}
+
+function renderDemoMode(demoMode) {
+  const banner = document.getElementById("demo-mode-banner");
+  if (!banner) return;
+  const text = demoModeText(demoMode);
+  if (text === null) {
+    // 实时调用：不显示这行字（也不显示"这是实时调用"——没有人需要被告知默认行为）
+    banner.textContent = "";
+    banner.classList.remove("show");
+    return;
+  }
+  banner.textContent = text;
+  banner.classList.add("show");
+}
+
+// 页面一加载就问一次：访问者应该在点第一次问诊**之前**就知道这是演示模式，
+// 不是跑完才被告知"刚才那个不是现场跑的"。/health 拿不到就静默跳过——
+// 这行提示的缺失不该让整个页面起不来，而问诊响应里还会再带一次（每次都带）。
+async function initDemoModeBanner() {
+  try {
+    const resp = await fetch("/health");
+    if (!resp.ok) return;
+    renderDemoMode((await resp.json()).demo_mode);
+  } catch (e) {
+    // 网络不通时 fetch 会抛——演示模式的意义之一就是断网可用，所以这里
+    // 只是拿不到提示，不是错误
+  }
+}
+
 function renderDivergence(divergence) {
   const banner = document.getElementById("divergence-banner");
   const text = divergenceBannerText(divergence);
@@ -2646,6 +2703,8 @@ function renderConsultResult(data) {
     if (r.color) PHYSICIAN_COLORS[r.physician] = r.color;
     PHYSICIAN_NAMES[r.physician] = r.physician_name;
   }
+  // 每次问诊都刷新一次：页面加载时那次 /health 可能失败，而这一条是必须出现的
+  renderDemoMode(data.demo_mode);
   const m = data.manifest;
   document.getElementById("manifest-footer").textContent = m
     ? `${m.model}　prompt ${m.prompt_version}　语料 ${m.cases_sha256 || "?"}　${m.llm_calls} 次调用　${(m.elapsed_ms / 1000).toFixed(1)}s`
@@ -2863,6 +2922,7 @@ async function submitConsult() {
   }
 }
 
+initDemoModeBanner();
 document.getElementById("submit-btn").addEventListener("click", submitConsult);
 document.getElementById("need-input-submit").addEventListener("click", submitNeedInputAnswer);
 document.getElementById("need-input-answer").addEventListener("keydown", (e) => {

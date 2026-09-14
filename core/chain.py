@@ -647,13 +647,24 @@ def run_physician(
     }
 
 
+def cases_sha256() -> str | None:
+    """cases.json 的 sha256 前 12 位，文件不存在时 None。
+
+    抽成函数是因为现在有第三个消费方：manifest（下面）、`offline/estimate_epsilon.py`
+    的 epsilon.json，以及 R3 的 fixture 元信息（`core/llm_replay.py`）。同一段
+    "这份语料是哪一版"的计算散在三处，改一处（比如换成全长 hash）就会有两处
+    对不上——而这个值的全部用途就是跨文件比对。
+    """
+    cp = Path(__file__).resolve().parent.parent / "cases.json"
+    if not cp.exists():
+        return None
+    return hashlib.sha256(cp.read_bytes()).hexdigest()[:12]
+
+
 def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
-    cases_sha = None
-    cp = Path(__file__).resolve().parent.parent / "cases.json"
-    if cp.exists():
-        cases_sha = hashlib.sha256(cp.read_bytes()).hexdigest()[:12]
+    cases_sha = cases_sha256()
 
     # model 从后端问，不从 LLM_MODEL 环境变量读：claude_cli 后端下那个变量
     # 还是 deepseek-chat，照抄就等于把 Claude 跑的结果标成 DeepSeek 跑的。
@@ -669,6 +680,10 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) ->
         # （run_physician 的 "lora" 字段）——adapter 是按医家切的，整次问诊
         # 一个值说不清楚。
         "lora_dir": llm.lora_dir(),
+        # None = 实时调用；非 None = 这一次是回放录制好的推理（LLM_MODE=replay）。
+        # **不许伪装成实时调用**：前端那行"演示模式"小字就从这里取，
+        # comparability_warning 也会跟着说明"非实时调用"。
+        "replayed_from": llm.replay_info(),
         "prompt_version": "v1",
         "use_react": use_react,
         "cases_sha256": cases_sha,

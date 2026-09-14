@@ -729,6 +729,53 @@ devtools 照样能看到。
 **researcher**（默认）：跟改造前的行为逐字节一致，包括 `manifest` 这类
 只对开发/评测有意义的技术元数据。
 
+## 录制回放（演示模式，`LLM_MODE=replay`）
+
+作品提交、网站上线之后，一次问诊约 20 次调用（三位医家 + ReAct），访问者点几下
+就能烧光余额；`.env` 里的 key 跟着部署走容易泄露；API 抖动或断网时演示直接挂。
+**录制回放解决的就是这三件事**：零成本、零延迟、断网可用、每次结果完全一致。
+（本地模型是长期方案，但它要 GPU 常驻，见下一节。）
+
+```bash
+python -m scripts.record_fixtures --dry-run   # 先看清单和预估调用数（约 272 次，¥1.5）
+python -m scripts.record_fixtures             # 真录一次（需要真实 key）
+python -m scripts.verify_replay               # 退出码 0 = 回放跟录制逐字节一致
+LLM_MODE=replay uvicorn api.main:app --port 8000   # 演示
+```
+
+**索引是 `(schema 名, sha256(送进模型的 system 文本))`**，不是"第 N 次调用"——
+按次序索引的话链路一变（加一步工具调用、ReAct 多走一步）整份 fixture 全体错位，
+而且错位之后看不出是哪一条的问题。按内容索引则是"哪条没录到就报哪条"。
+
+**未命中抛 `LLMError`，不返回空、不退回真实 API。** 静默退化会让「这是录制的
+结果」这个声称变成假的，而且演示到一半悄悄开始发真实请求还会烧钱。错误消息里给
+schema 名、prompt 前 100 字、sha12、fixtures 目录、已装载条数，以及**当前环境里
+有哪个变量的取值在录制时从未出现过**（实测最常见的未命中原因不是忘了录，而是
+`USE_REACT` / `RETRIEVER_MODE` 这类变量跟录制时不一样，链路走了另一条路）。
+
+### 诚实标注不是可选项
+
+- manifest：`backend` 是 `"replay"`（不伪装成实时调用），`model` 是
+  `replay(deepseek-chat)`，另带 `replayed_from`（录制时间 / 模型 / commit /
+  fixture 条数），`comparability_warning` 写明「本次结果来自 X 录制的推理
+  （模型 Y），非实时调用」。
+- 前端：header 下面一行小字「**演示模式：结果来自 2026-09-14 录制的真实推理
+  （deepseek-chat），非实时调用**」。这行字**不挂在 manifest 上**——manifest 只
+  下发给 researcher 角色，而演示给谁看就是给 patient/doctor/student 看的，挂在
+  manifest 上等于对真正的观众隐身。它走一个独立的 `demo_mode` 字段，所有角色都
+  拿得到，`/health` 也报，所以页面一加载就能显示、不必等跑完一次问诊。
+
+### 三条要知道的边界
+
+- **开 ReAct 和不开 ReAct 的 fixture 不共用**（prompt 模板不同），录制清单刻意
+  各录一遍。
+- **三种角色不需要各录一遍**：role 只在响应层裁剪字段，没有一次 LLM 调用跟它
+  有关。`verify_replay` 会真的三种角色各跑一遍来证明这件事，不是嘴上说说。
+- **追问路径的回放有固有限制**：访问者的回答文本变了 → 下游 prompt 变了 →
+  未命中。对外演示建议 `FAST_MODE=1`（追问 0 轮）。
+
+fixture 目录的说明见 [`fixtures/README.md`](fixtures/README.md)。
+
 ## 本地模型部署（vLLM）
 
 两种模式，取舍不同，**都是可用实现**（不是占位）：

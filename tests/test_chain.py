@@ -58,6 +58,12 @@ class FakeLLM:
     def lora_dir(self) -> str | None:
         return None
 
+    # R3 录制回放那一轮新加的：manifest 记"这次是不是回放的录制结果"，
+    # 所以 _build_manifest 会无条件问后端。假后端跟真后端的默认实现保持一致
+    # ——None = 实时调用（core/llm.py::LLMBackend.replay_info 的默认返回值）。
+    def replay_info(self) -> dict | None:
+        return None
+
     def generate(self, system: str, user: str, schema, temperature: float = 0.0, **kwargs):
         self.calls.append(schema.__name__)
         if schema is S1Normalize:
