@@ -19,10 +19,6 @@
 # 每个源的 expected_bytes 由第一次成功下载后 `wc -c` 得到，填进下面的表；
 # 还没实测过的填 0 = **跳过校验但大声警告**（不是静默放过，见 verify_bytes）。
 #
-# 上游仓库是活的（会修订错字、补内容），字节数变了不一定是下载出错。所以对不上
-# 时的处置是"停下来让人看"，不是"自动接受新值"——自动接受等于把这道闸门关掉。
-# 确认上游真的改了之后，手工更新表里的数字并在 data/SOURCES.md 记一笔。
-#
 # ============================================================
 # AutoDL 的代理规律
 # ============================================================
@@ -37,7 +33,8 @@
 # 编码：古籍 GB18030，教材 UTF-8
 # ============================================================
 # 两类源的编码不同，抽取引擎只吃 UTF-8（extract_reference_triples.py 的
-# --input 写死了 encoding="utf-8"），所以古籍下载后要转码，教材原样保留。
+# --input 写死了 encoding="utf-8"）：**只有两本古籍要转码**，四本教材已经是
+# UTF-8 的 markdown、原样保留。
 # **不要"统一按 UTF-8 读一遍看会不会报错"来猜编码**：GB18030 的中文字节序列
 # 有相当概率能被 UTF-8 解码成乱码而不抛异常，猜出来的结果是静默的乱码语料。
 # 每个源的编码写死在表里，来源是实测（古籍仓库 xiaopangxia/TCM-Ancient-Books
@@ -67,29 +64,39 @@ done
 # 分开存（古籍说"细辛，味辛温"，药典说"辛、温，归心肺肾经，1~3g"，术语和精度
 # 都不同，混在一起会重演 λ1 那个"证型 0/116 对不上"的教训）。
 #
-# ⚠ **URL 和 expected_bytes 都没在真机上核对过**（这台沙盒没有网络），
-# 两件事都要在第一次跑的时候确认：
+# **URL 和 expected_bytes 都已由项目方在有网络的机器上实测校正**（第一版六条
+# 全错：教材路径是 十四五教材/xxx.md 不是 books/xxx.txt、古籍编号是三位补零）。
+# 详情与教训见 data/SOURCES.md 第 42 条。
 #
-#   1. **URL 可能 404。** 古籍仓库的文件名带一个编号前缀，而且编号是按书排的
-#      （已知 367-临证指南医案、361-吴鞠通医案、584-医学衷中参西录），
-#      神农本草经/本草备要 的编号**是我按顺序猜的**，很可能不对。教材仓库
-#      （PanckooAI/TCM_Datasets）的目录层级同理没核对过。404 时这样找真实路径：
-#        curl -s https://api.github.com/repos/xiaopangxia/TCM-Ancient-Books/git/trees/master \
-#          | grep -o '"path":"[^"]*本草[^"]*"'
-#      找到之后改这一行的 URL。**不要因为 404 就把这个源删掉**——六个源的分工
-#      写在表的最后一列，少一个就少一类知识。
-#   2. **expected_bytes=0 = 还没有基准，本次跳过校验但会大声警告**（不是静默
-#      放过，见 verify_bytes）。第一次下载成功后把 `wc -c` 的结果填回表里，
-#      下次跑才真的有这道闸门。**不要为了让脚本跑过去就把校验删掉。**
+# expected_bytes 是**上游原始文件**的字节数（古籍是 GB18030 原文，不是转成
+# UTF-8 之后的大小）：这道检查要回答的是"下载完整了没有"，而 GB18030→UTF-8
+# 中文会从 2 字节变 3 字节，记转换后的大小等于每次都要多记一个派生量。
+# 所以校验在转码**之前**做。
+#
+# 上游仓库是活的（会修订错字、补内容），字节数变了不一定是下载出错。所以对不上
+# 时的处置是"停下来让人看"，不是"自动接受新值"——自动接受等于把这道闸门关掉。
+# 确认上游真的改了之后，手工更新表里的数字并在 data/SOURCES.md 记一笔。
+#
+# 每行第 6 列是**推荐的切块模式**（真实抽取时传给 --chunk-by）：教材是
+# markdown 层级标题排版，必须用 heading；古籍是空行分段的纯文本，用 blank-line。
+# 这一列不是装饰——切错了会打开一个防幻觉的洞，见
+# offline/extract_reference_triples.split_blocks 的文档字符串。
 SOURCES=(
-  # 现代教材（十四五规划教材，UTF-8）
-  "中药学.txt|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/books/%E4%B8%AD%E8%8D%AF%E5%AD%A6.txt|utf-8|modern|0|性味归经功效用量"
-  "临床中药学.txt|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/books/%E4%B8%B4%E5%BA%8A%E4%B8%AD%E8%8D%AF%E5%AD%A6.txt|utf-8|modern|0|临床用量、配伍"
-  "中药炮制学.txt|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/books/%E4%B8%AD%E8%8D%AF%E7%82%AE%E5%88%B6%E5%AD%A6.txt|utf-8|modern|0|炮制方法与目的"
-  "方剂学.txt|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/books/%E6%96%B9%E5%89%82%E5%AD%A6.txt|utf-8|modern|0|方剂组成、君臣佐使、加减法"
-  # 古籍（GB18030，下载后转 UTF-8）
-  "神农本草经.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/1-%E7%A5%9E%E5%86%9C%E6%9C%AC%E8%8D%89%E7%BB%8F.txt|gb18030|classic|0|古籍本草"
-  "本草备要.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/9-%E6%9C%AC%E8%8D%89%E5%A4%87%E8%A6%81.txt|gb18030|classic|0|古籍本草"
+  # 现代教材（十四五规划教材）。**是 .md 不是 .txt**，路径是 十四五教材/xxx.md
+  # 不是 books/xxx.txt——第一版六条 URL 全猜错，由项目方在有网络的机器上实测
+  # 校正（见 data/SOURCES.md 第 42 条）。已经是 UTF-8，不需要 iconv。
+  # 同一批文件 offline/build_syndrome_textbook.py 已经在解析（中医内科学.md），
+  # 排版是「# 第N节 病名 / # N.证型名」层级标题 + 逐行标注字段，所以切块用
+  # heading 模式，见下面 chunk_by 那一列。
+  "中药学.md|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/%E5%8D%81%E5%9B%9B%E4%BA%94%E6%95%99%E6%9D%90/%E4%B8%AD%E8%8D%AF%E5%AD%A6.md|utf-8|modern|1542065|heading|性味归经功效用量"
+  "临床中药学.md|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/%E5%8D%81%E5%9B%9B%E4%BA%94%E6%95%99%E6%9D%90/%E4%B8%B4%E5%BA%8A%E4%B8%AD%E8%8D%AF%E5%AD%A6.md|utf-8|modern|951968|heading|临床用量、配伍"
+  "中药炮制学.md|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/%E5%8D%81%E5%9B%9B%E4%BA%94%E6%95%99%E6%9D%90/%E4%B8%AD%E8%8D%AF%E7%82%AE%E5%88%B6%E5%AD%A6.md|utf-8|modern|1436809|heading|炮制方法与目的"
+  "方剂学.md|https://raw.githubusercontent.com/PanckooAI/TCM_Datasets/main/%E5%8D%81%E5%9B%9B%E4%BA%94%E6%95%99%E6%9D%90/%E6%96%B9%E5%89%82%E5%AD%A6.md|utf-8|modern|1098496|heading|方剂组成、君臣佐使、加减法"
+  # 古籍（GB18030，下载后转 UTF-8）。编号是**三位补零**（仓库里 704 个文件
+  # 全是 NNN-书名.txt，从 000 开始）；第一版猜的 1- 和 9- 都是 404。
+  # 本地文件名保留编号前缀，跟 README 3.1 里 367/361/584 那三本一个写法。
+  "000-神农本草经.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/000-%E7%A5%9E%E5%86%9C%E6%9C%AC%E8%8D%89%E7%BB%8F.txt|gb18030|classic|180115|blank-line|古籍本草"
+  "018-本草备要.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/018-%E6%9C%AC%E8%8D%89%E5%A4%87%E8%A6%81.txt|gb18030|classic|293521|blank-line|古籍本草"
 )
 
 command -v curl >/dev/null 2>&1 || { echo "没有 curl，装了再跑。" >&2; exit 2; }
@@ -149,19 +156,20 @@ echo "源数量：${#SOURCES[@]}（4 本现代教材 UTF-8 + 2 本古籍 GB18030
 echo
 
 if [ "$DRY_RUN" = "1" ]; then
-  printf '%-20s %-10s %-9s %-12s %s\n' 文件 编码 source 期望字节 用途
+  printf '%-22s %-9s %-8s %-10s %-11s %s\n' 文件 编码 source 期望字节 切块模式 用途
   for row in "${SOURCES[@]}"; do
-    IFS='|' read -r name url enc src bytes purpose <<< "$row"
-    printf '%-20s %-10s %-9s %-12s %s\n' "$name" "$enc" "$src" \
-      "$([ "$bytes" = "0" ] && echo 未实测 || echo "$bytes")" "$purpose"
+    IFS='|' read -r name url enc src bytes chunk purpose <<< "$row"
+    printf '%-22s %-9s %-8s %-10s %-11s %s\n' "$name" "$enc" "$src" \
+      "$([ "$bytes" = "0" ] && echo 未实测 || echo "$bytes")" "$chunk" "$purpose"
     echo "  $url"
   done
   echo
   echo "--dry-run：不下载。去掉这个参数真下。"
   echo
-  echo "⚠ URL 和期望字节数都没在真机上核对过（沙盒没网络）："
-  echo "  · 404 的话按脚本注释里给的 GitHub API 命令找真实路径再改 URL"
-  echo "  · 「未实测」= 本次跳过字节校验但会警告；下载成功后把 wc -c 的值填回 SOURCES 表"
+  echo "URL 和期望字节数已由项目方在有网络的机器上实测校正（见 data/SOURCES.md 第 42 条）。"
+  echo "期望字节数是**上游原文**的大小：古籍落盘后（转成 UTF-8）会变大，那是转码不是缺失。"
+  echo "切块模式那一列真实抽取时要传给 --chunk-by：教材必须 heading，"
+  echo "按空行切会把一味药切成五六块、其中"用量"那块里根本没有药名。"
   exit 0
 fi
 
@@ -170,7 +178,7 @@ trap proxy_off EXIT
 
 failed=()
 for row in "${SOURCES[@]}"; do
-  IFS='|' read -r name url enc src bytes purpose <<< "$row"
+  IFS='|' read -r name url enc src bytes chunk purpose <<< "$row"
   out="$DEST/$name"
   echo "[$src] $name（$purpose）"
   tmp="$out.download"
@@ -182,9 +190,14 @@ for row in "${SOURCES[@]}"; do
     failed+=("$name（下载失败）")
     continue
   fi
-  # 转码在校验之前还是之后？**之前**：expected_bytes 记的是最终落盘文件
-  # （UTF-8）的字节数，因为下游只读这个文件。GB18030 原文的字节数是中间量，
-  # 记它反而要求以后每次都记两个数。
+  # **先校验字节数，再转码**：expected_bytes 记的是上游原始文件的大小
+  # （古籍是 GB18030 原文），这道检查要回答的是"下载完整了没有"。转码之后
+  # 中文从 2 字节变 3 字节，拿转换后的大小去比那个数会每次都不符。
+  if ! verify_bytes "$tmp" "$bytes" "$name"; then
+    failed+=("$name（字节数不符）")
+    rm -f "$tmp"
+    continue
+  fi
   if [ "$enc" = "gb18030" ]; then
     if ! iconv -f GB18030 -t UTF-8 "$tmp" -o "$tmp.utf8" 2>/dev/null; then
       echo "  ✗ GB18030 转 UTF-8 失败——原文编码可能不是 GB18030，人工确认后再改表" >&2
@@ -193,10 +206,10 @@ for row in "${SOURCES[@]}"; do
       continue
     fi
     mv "$tmp.utf8" "$tmp"
-    echo "  已从 GB18030 转成 UTF-8（抽取引擎只读 UTF-8）"
+    echo "  已从 GB18030 转成 UTF-8（抽取引擎只读 UTF-8）；"\
+         "落盘后的字节数会大于上面那个数，那是转码带来的，不是下载缺失"
   fi
   mv "$tmp" "$out"
-  verify_bytes "$out" "$bytes" "$name" || failed+=("$name（字节数不符）")
 done
 
 echo

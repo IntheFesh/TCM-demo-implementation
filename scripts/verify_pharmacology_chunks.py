@@ -29,19 +29,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BOOKS_DIR = ROOT / "books"
 
-# 六个源：文件名 -> (source 标签, kind, 用途)。跟
+# 六个源：文件名 -> (source 标签, kind, 推荐切块模式, 用途)。跟
 # scripts/fetch_pharmacology_sources.sh 的 SOURCES 表一一对应；那边负责下载，
 # 这边负责验切块。**两处都列一遍是刻意的**：下载脚本是 bash、这里是 Python，
 # 强行共用一份表要引入一个中间文件，而这张表一年动不了一次，代价不划算。
-# 加/删源时两处都要改——下面 test_pharmacology_chunks.py 有一条测试比对两张表，
-# 漏改一处会红。
-EXPECTED_SOURCES: dict[str, tuple[str, str, str]] = {
-    "中药学.txt": ("modern", "materia_medica", "性味归经功效用量"),
-    "临床中药学.txt": ("modern", "materia_medica", "临床用量、配伍"),
-    "中药炮制学.txt": ("modern", "materia_medica", "炮制方法与目的"),
-    "方剂学.txt": ("modern", "formulary", "方剂组成、君臣佐使、加减法"),
-    "神农本草经.txt": ("classic", "materia_medica", "古籍本草"),
-    "本草备要.txt": ("classic", "materia_medica", "古籍本草"),
+# 加/删源时两处都要改——tests/test_pharmacology_prep.py 有一条测试逐字段比对
+# 两张表（文件名、source、切块模式），漏改一处会红。
+#
+# **教材是 .md（markdown）不是 .txt**，而且推荐切块模式是 heading 不是
+# blank-line：一味药的条目是「# 药名」加下面若干段（性味/归经/功效/用法用量），
+# 按空行切会把一味药切成五六块、其中"用量"那块里根本没有药名。见
+# offline/extract_reference_triples.split_blocks 的文档字符串（那里写了为什么
+# 这不是"效果好不好"而是防幻觉的前提）。
+EXPECTED_SOURCES: dict[str, tuple[str, str, str, str]] = {
+    "中药学.md": ("modern", "materia_medica", "heading", "性味归经功效用量"),
+    "临床中药学.md": ("modern", "materia_medica", "heading", "临床用量、配伍"),
+    "中药炮制学.md": ("modern", "materia_medica", "heading", "炮制方法与目的"),
+    "方剂学.md": ("modern", "formulary", "heading", "方剂组成、君臣佐使、加减法"),
+    "000-神农本草经.txt": ("classic", "materia_medica", "blank-line", "古籍本草"),
+    "018-本草备要.txt": ("classic", "materia_medica", "blank-line", "古籍本草"),
 }
 
 # ---- 三个异常阈值，以及每个数的依据 ----
@@ -110,18 +116,33 @@ def _preview(block: str, limit: int) -> str:
     return body + ("…" if len(block) > limit else "")
 
 
-def report_source(path: Path, label: tuple[str, str, str], chunk_by: str,
-                  show: int, preview_chars: int) -> list[str]:
+def compare_modes(text: str) -> dict[str, dict]:
+    """三种切法各切一遍，只报统计不报原文。用来回答"这个源该用哪种切法"——
+    同一份原文在三种切法下的块数/中位数差一个数量级时，选哪种就很明显了。"""
+    return {mode: {k: v for k, v in chunk_stats(text, mode).items() if k != "blocks"}
+            for mode in ("blank-line", "line", "heading")}
+
+
+def report_source(path: Path, label: tuple[str, str, str, str], chunk_by: str,
+                  show: int, preview_chars: int, compare: bool = False) -> list[str]:
     """打印一个源的切块统计 + 前 N 块原文，返回问题清单。
 
     **原文必须打出来。** 统计数字能说"切成了 800 块、中位数 400 字"，说不了
     "切出来的是不是一味药"——那只有人看原文才判得出来。这个脚本的主要产出
     其实就是这几段原文，阈值检查只是顺手能自动化的那部分。
     """
-    source, kind, purpose = label
+    source, kind, recommended, purpose = label
     text = path.read_text(encoding="utf-8")
-    stats = chunk_stats(text, chunk_by)
+    effective = chunk_by or recommended
+    stats = chunk_stats(text, effective)
     print(f"=== {path.name}　[{source} / {kind}]　{purpose} ===")
+    print(f"切块模式：{effective}"
+          + ("" if chunk_by is None else f"（命令行指定；这个源推荐 {recommended}）"))
+    if chunk_by is not None and chunk_by != recommended:
+        # 不拦，但要说：推荐值是按这个源的真实排版定的（见 EXPECTED_SOURCES 注释）
+        print(f"  ⚠ 用的不是推荐模式（推荐 {recommended}）。"
+              "教材用 blank-line 会把一味药切成五六块、其中「用量」那块没有药名——"
+              "那种块抽出来的 s 是模型猜的，而 s 不过 source_span 核验。")
     print(f"全文 {stats['n_chars']} 字　切成 {stats['n_blocks']} 块"
           f"（= 真实抽取的调用数）")
     print(f"每块字数：中位数 {stats['median_chars']}　均值 {stats['mean_chars']}　"
@@ -141,6 +162,13 @@ def report_source(path: Path, label: tuple[str, str, str], chunk_by: str,
             for line in _preview(block, preview_chars).splitlines():
                 print(f"    {line}")
         print()
+    if compare:
+        print("三种切法对比（同一份原文，只看统计）：")
+        for mode, st in compare_modes(text).items():
+            mark = "　← 推荐" if mode == recommended else ""
+            print(f"  {mode:<11} {st['n_blocks']:>6} 块　中位数 {st['median_chars']:>7}"
+                  f"　最长 {st['max_chars']:>7}{mark}")
+        print()
     if stats["blocks"] and stats["max_chars"] > BLOCK_MAX_CHARS:
         longest = stats["blocks"][stats["longest_index"]]
         print(f"最长那块的开头（第 {stats['longest_index']} 块，{len(longest)} 字，"
@@ -156,20 +184,29 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--books-dir", type=Path, default=DEFAULT_BOOKS_DIR)
     ap.add_argument("--file", type=Path, default=None,
                     help="只验这一个文件（不在六源清单里的也能验，标签按 unknown 处理）")
-    ap.add_argument("--chunk-by", default="blank-line", choices=("blank-line", "line"),
-                    help="跟真实抽取传的 --chunk-by 保持一致，否则验的不是同一个切法")
+    ap.add_argument("--chunk-by", default=None,
+                    choices=("blank-line", "line", "heading"),
+                    help="不传 = 用每个源在 EXPECTED_SOURCES 里的推荐模式（教材 heading、"
+                         "古籍 blank-line）。传了就对所有源用同一个值，并在不等于推荐值时"
+                         "警告——真实抽取要传跟这里一致的 --chunk-by，否则验的不是同一个切法")
+    ap.add_argument("--compare-modes", action="store_true",
+                    help="每个源额外报三种切法的块数/中位数对比，用来确认推荐模式选对了")
     ap.add_argument("--show", type=int, default=DEFAULT_SHOW, help="每个源打印前几块原文")
     ap.add_argument("--preview-chars", type=int, default=400, help="每块原文打印前多少字")
     args = ap.parse_args(argv)
 
     print("**零 LLM 调用**：只切块 + 统计 + 打印原文。一块 = 真实抽取的一次调用，"
           "所以这一步过不了就不要去跑抽取。")
-    print(f"chunk_by={args.chunk_by}（真实抽取要传同样的值）")
+    print("切块模式：" + (f"命令行指定 {args.chunk_by}（对所有源生效）"
+                         if args.chunk_by else "按每个源的推荐值（教材 heading、古籍 blank-line）")
+          + "——真实抽取要传跟这里一致的 --chunk-by")
     print()
 
     if args.file is not None:
+        # 不在六源清单里的文件（docx 转出来的医案 txt 之类）默认按 blank-line，
+        # 并标明它不在清单里——不猜它该用哪种切法。
         targets = [(args.file, EXPECTED_SOURCES.get(
-            args.file.name, ("unknown", "unknown", "（不在六源清单里）")))]
+            args.file.name, ("unknown", "unknown", "blank-line", "（不在六源清单里）")))]
     else:
         targets = [(args.books_dir / name, label)
                    for name, label in EXPECTED_SOURCES.items()]
@@ -192,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
     problems_by_source: dict[str, list[str]] = {}
     for path, label in present:
         problems_by_source[path.name] = report_source(
-            path, label, args.chunk_by, args.show, args.preview_chars)
+            path, label, args.chunk_by, args.show, args.preview_chars,
+            compare=args.compare_modes)
 
     print("=" * 70)
     failed = {k: v for k, v in problems_by_source.items() if v}
@@ -206,7 +244,8 @@ def main(argv: list[str] | None = None) -> int:
     for name, problems in failed.items():
         for p in problems:
             print(f"  {name}：{p}", file=sys.stderr)
-    print("处置：换 --chunk-by（有的古籍 txt 一条一行）、或先手工把条目切细、"
+    print("处置：换 --chunk-by（教材用 heading、有的古籍 txt 一条一行用 line）、"
+          "或先手工把条目切细、"
           "或确认下载是否残缺（字节数校验见 fetch_pharmacology_sources.sh）。"
           "**不要带着切错的块去跑抽取**——一块一次调用，几百次调用会全部作废。",
           file=sys.stderr)

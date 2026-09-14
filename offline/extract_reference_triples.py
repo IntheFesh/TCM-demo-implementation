@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -57,7 +58,11 @@ MAX_TOKENS = 16384
 MIN_BLOCK_CHARS = 8
 
 SOURCES = ("classic", "modern")
-CHUNK_MODES = ("blank-line", "line")
+CHUNK_MODES = ("blank-line", "line", "heading")
+# markdown 的 ATX 标题（# ～ ######）。十四五教材那批源是 .md（OCR 转出来的
+# markdown），排版是「# 第N节 病名 / # N.证型名」这种层级标题 + 逐行标注的
+# 字段，见 offline/build_syndrome_textbook.py 对同一批文件的解析规则。
+_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
 
 OnProgress = Callable[[int, int, dict], None]
 OnBlockDone = Callable[[int, list[BaseModel], "str | None"], None]
@@ -93,12 +98,38 @@ KINDS: dict[str, ReferenceKind] = {
 
 
 def split_blocks(text: str, chunk_by: str = "blank-line", min_chars: int = MIN_BLOCK_CHARS) -> list[str]:
-    """把整本原文切成一次调用一块。blank-line：空行为界（教材/本草的条目通常
-    一味药/一张方一段）；line：一行一块（有的古籍 txt 每条一行）。短于
-    min_chars 的块丢掉。纯函数，跟模型无关，方便单测。"""
+    """把整本原文切成一次调用一块。短于 min_chars 的块丢掉。纯函数，好单测。
+
+    三种切法，对应三种真实排版：
+
+      blank-line  空行为界。古籍本草的条目通常一味药一段。
+      line        一行一块。有的古籍 txt 每条一条一行、通篇没有空行。
+      heading     **markdown 标题为界**（一个标题到下一个标题之间算一块）。
+                  十四五教材那批源是 .md，一味药的条目由「# 药名」加下面若干
+                  个段落（性味/归经/功效/应用/用法用量）组成——**按空行切会把
+                  一味药切成五六块，而其中「9～30g，水煎服」这种块里根本没有
+                  药名**。那种块喂给模型，它要么抽不出、要么给一个猜的 `s`：
+                  而 `s` 只有 `min_length=1` 约束、**不过 source_span 逐字
+                  核验**（核验只管 o 的出处），所以一个猜错的药名会一路写进
+                  data/materia_medica.jsonl 而没有任何一道闸门拦得住。
+                  切块粒度在这里不是"效果好不好"的问题，是防幻觉的前提。
+
+    heading 模式把标题行本身留在块里（药名就在那一行），第一个标题之前的内容
+    （前言、目录）单独成一块——不丢掉它，是因为"丢了什么"应该由 min_chars 和
+    切块验证脚本来判断，不该由切块函数偷偷决定。
+    """
     if chunk_by not in CHUNK_MODES:
         raise ValueError(f"chunk_by 必须是 {CHUNK_MODES} 之一，收到 {chunk_by!r}")
-    if chunk_by == "line":
+    if chunk_by == "heading":
+        raw_blocks, current = [], []
+        for line in text.splitlines():
+            if _HEADING_RE.match(line) and current:
+                raw_blocks.append("\n".join(current))
+                current = []
+            current.append(line)
+        if current:
+            raw_blocks.append("\n".join(current))
+    elif chunk_by == "line":
         raw_blocks = text.splitlines()
     else:
         raw_blocks, current = [], []

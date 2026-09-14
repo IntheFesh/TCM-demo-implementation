@@ -25,14 +25,42 @@ ROOT = Path(__file__).resolve().parent.parent
 def test_fetch_script_lists_all_six_sources_with_encoding_and_source_tag():
     """六个源、各自的编码和 source 标签都要在脚本里写死——编码靠猜会得到
     静默的乱码语料（GB18030 的中文字节序列有相当概率能被 UTF-8 解码成乱码
-    而不抛异常）。"""
+    而不抛异常）。
+
+    **教材是 .md 不是 .txt**（路径 十四五教材/xxx.md），古籍编号是三位补零
+    ——第一版六条 URL 全猜错，由项目方实测校正，见 data/SOURCES.md 第 42 条。
+    """
     text = (ROOT / "scripts" / "fetch_pharmacology_sources.sh").read_text(encoding="utf-8")
-    for name in ("中药学.txt", "临床中药学.txt", "中药炮制学.txt", "方剂学.txt",
-                 "神农本草经.txt", "本草备要.txt"):
+    for name in ("中药学.md", "临床中药学.md", "中药炮制学.md", "方剂学.md",
+                 "000-神农本草经.txt", "018-本草备要.txt"):
         assert name in text, f"{name} 不在下载脚本的源表里"
-    # 四本教材 UTF-8、两本古籍 GB18030
+    # 四本教材 UTF-8 + heading 切块、两本古籍 GB18030 + blank-line
     assert text.count("|utf-8|modern|") == 4
     assert text.count("|gb18030|classic|") == 2
+    assert text.count("|heading|") == 4
+    assert text.count("|blank-line|") == 2
+    # 教材路径在 十四五教材/ 下（URL 编码后的形式），不是 books/
+    assert text.count("%E5%8D%81%E5%9B%9B%E4%BA%94%E6%95%99%E6%9D%90/") == 4
+    assert "/books/" not in text
+
+
+def test_fetch_script_has_real_expected_byte_counts_not_zero():
+    """六个源的 expected_bytes 都已实测，不再是 0（0 = 跳过校验）。
+    写死在测试里，是为了让"有人为了让脚本跑过去把它改回 0"这件事变红。"""
+    text = (ROOT / "scripts" / "fetch_pharmacology_sources.sh").read_text(encoding="utf-8")
+    for byte_count in ("1542065", "951968", "1436809", "1098496", "180115", "293521"):
+        assert f"|{byte_count}|" in text, f"expected_bytes {byte_count} 不在源表里"
+
+
+def test_fetch_script_verifies_bytes_before_transcoding():
+    """**校验必须在转码之前。** expected_bytes 记的是上游原始文件的大小
+    （古籍是 GB18030 原文），而 GB18030→UTF-8 中文会从 2 字节变 3 字节——
+    拿转换后的大小去比那个数会每次都不符，这道闸门就变成了永远报错。"""
+    text = (ROOT / "scripts" / "fetch_pharmacology_sources.sh").read_text(encoding="utf-8")
+    verify_at = text.index('if ! verify_bytes "$tmp"')
+    iconv_at = text.index('if ! iconv -f GB18030')
+    assert verify_at < iconv_at, "字节校验跑在转码之后了"
+    assert "上游原始文件" in text
 
 
 def test_fetch_script_verifies_byte_count_and_refuses_to_continue():
@@ -67,13 +95,18 @@ def test_fetch_script_dry_run_downloads_nothing(tmp_path):
 
 def test_fetch_script_and_chunk_verifier_list_the_same_six_sources():
     """下载脚本（bash）和切块验证（Python）各有一张源表，加/删源时两处都要改。
-    这条比对两张表，漏改一处就红——刻意不强行共用一份表（要引入一个中间文件，
-    而这张表一年动不了一次），但不能让它们静默分叉。"""
+    这条**逐字段**比对两张表（文件名、source、推荐切块模式），漏改一处就红——
+    刻意不强行共用一份表（要引入一个中间文件，而这张表一年动不了一次），
+    但不能让它们静默分叉。"""
     text = (ROOT / "scripts" / "fetch_pharmacology_sources.sh").read_text(encoding="utf-8")
-    for name, (source, _kind, _purpose) in vpc.EXPECTED_SOURCES.items():
-        assert f'"{name}|' in text, f"{name} 在切块验证的表里但不在下载脚本里"
-        assert f"|{source}|" in text
-    assert len(vpc.EXPECTED_SOURCES) == 6
+    rows = {line.split("|")[0].strip('" ') : line.split("|")
+            for line in text.splitlines() if line.strip().startswith('"') and "|http" in line}
+    assert len(rows) == 6 and len(vpc.EXPECTED_SOURCES) == 6
+    for name, (source, _kind, chunk_by, _purpose) in vpc.EXPECTED_SOURCES.items():
+        assert name in rows, f"{name} 在切块验证的表里但不在下载脚本里"
+        fields = rows[name]
+        assert fields[3] == source, f"{name} 的 source 两边不一致"
+        assert fields[5] == chunk_by, f"{name} 的推荐切块模式两边不一致"
 
 
 # ---------- R4-2：切块验证 ----------
@@ -156,9 +189,9 @@ def test_normal_corpus_passes_all_three():
 def test_report_prints_the_raw_text_of_the_first_blocks(tmp_path, capsys):
     """**原文必须打出来。** 统计数字说不了"切出来的是不是一味药"，那只有人看
     原文才判得出来——这个脚本的主要产出其实就是这几段原文。"""
-    path = tmp_path / "中药学.txt"
+    path = tmp_path / "中药学.md"
     path.write_text(_normal_corpus(60), encoding="utf-8")
-    problems = vpc.report_source(path, ("modern", "materia_medica", "性味归经"),
+    problems = vpc.report_source(path, ("modern", "materia_medica", "blank-line", "性味归经"),
                                 "blank-line", show=2, preview_chars=200)
     out = capsys.readouterr().out
     assert problems == []
@@ -170,9 +203,10 @@ def test_report_prints_the_raw_text_of_the_first_blocks(tmp_path, capsys):
 
 def test_report_also_prints_the_longest_block_when_it_is_too_long(tmp_path, capsys):
     """最长那块超阈值时要把它的开头打出来——判断"它是不是整章"要看内容。"""
-    path = tmp_path / "方剂学.txt"
+    path = tmp_path / "方剂学.md"
     path.write_text("第一章 解表剂\n" + "方剂内容" * 5000, encoding="utf-8")
-    vpc.report_source(path, ("modern", "formulary", "方剂"), "blank-line", 1, 120)
+    vpc.report_source(path, ("modern", "formulary", "blank-line", "方剂"),
+                      "blank-line", 1, 120)
     out = capsys.readouterr().out
     assert "最长那块的开头" in out and "第一章 解表剂" in out
 
@@ -184,16 +218,19 @@ def test_main_returns_2_when_nothing_is_downloaded(tmp_path, capsys):
 
 
 def test_main_returns_0_and_1_and_reports_skipped_sources(tmp_path, capsys):
-    (tmp_path / "中药学.txt").write_text(_normal_corpus(60), encoding="utf-8")
-    assert vpc.main(["--books-dir", str(tmp_path), "--show", "0"]) == 0
+    # 教材推荐 heading，所以这里显式传 blank-line（合成语料是空行分段的）
+    (tmp_path / "中药学.md").write_text(_normal_corpus(60), encoding="utf-8")
+    assert vpc.main(["--books-dir", str(tmp_path), "--show", "0",
+                     "--chunk-by", "blank-line"]) == 0
     out = capsys.readouterr().out
     # 缺源不算失败，但必须如实报出来——不然"全过了"会被读成"六个源都在"
     assert "本次跳过（不算失败，但它们没有被验过）" in out
     assert "缺 5 个没验" in out
     assert "阈值只能排除明显切错" in out      # 不夸大这道检查的效力
 
-    (tmp_path / "神农本草经.txt").write_text("药，味辛温。\n" * 200, encoding="utf-8")
-    assert vpc.main(["--books-dir", str(tmp_path), "--show", "0"]) == 1
+    (tmp_path / "000-神农本草经.txt").write_text("药，味辛温。\n" * 200, encoding="utf-8")
+    assert vpc.main(["--books-dir", str(tmp_path), "--show", "0",
+                     "--chunk-by", "blank-line"]) == 1
     assert "不要带着切错的块去跑抽取" in capsys.readouterr().err
 
 
@@ -577,3 +614,123 @@ def test_all_new_scripts_run_as_modules():
         proc = subprocess.run([sys.executable, "-m", module, "--help"],
                               capture_output=True, text=True, cwd=ROOT, timeout=90)
         assert proc.returncode == 0, f"{module}: {proc.stderr}"
+
+
+# ---------- R4 收尾：markdown 的切块粒度（这一轮最重要的发现） ----------
+#
+# 教材是 .md（OCR 转出来的 markdown），一味药的条目是「# 药名」加下面若干段
+# （性味/归经/功效/用法用量）。按空行切会把一味药切成五六块，而其中
+# 「【用法用量】煎服，9～30g」那块里**根本没有药名**。
+#
+# 这不是"效果好不好"的问题：s6 prompt 要求 s 是"原文里这一条目的药材正名"，
+# 而 s 只有 min_length=1 约束、**不过 source_span 逐字核验**（核验只管 o 的
+# 出处）。所以一个没有药名的块会让模型给一个猜的 s，然后一路写进
+# data/materia_medica.jsonl，没有任何一道闸门拦得住。切块粒度是防幻觉的前提。
+
+MARKDOWN_TEXTBOOK = """# 第一章 解表药
+
+本章讨论解表药的分类与应用，这段前言要够长才不会被 min_chars 丢掉。
+
+# 麻黄
+
+【性味】辛、微苦，温。
+
+【归经】归肺、膀胱经。
+
+【用法用量】煎服，2～10g。
+
+# 桂枝
+
+【性味】辛、甘，温。
+
+【用法用量】煎服，3～10g。
+"""
+
+
+def test_heading_mode_keeps_one_herb_per_block():
+    from offline.extract_reference_triples import split_blocks
+
+    blocks = split_blocks(MARKDOWN_TEXTBOOK, "heading")
+    assert len(blocks) == 3            # 章前言 + 麻黄 + 桂枝
+    herb_block = next(b for b in blocks if b.startswith("# 麻黄"))
+    # 一味药的全部字段在同一块里，药名也在
+    assert "【性味】" in herb_block and "【用法用量】" in herb_block
+    assert "桂枝" not in herb_block     # 没有粘上下一味药
+
+
+def test_blank_line_mode_separates_the_dose_from_the_herb_name():
+    """**这条是 heading 模式存在的理由。** 按空行切之后，「用法用量」那一块里
+    没有任何药名——模型只能猜一个 s，而 s 不过 source_span 核验。"""
+    from offline.extract_reference_triples import split_blocks
+
+    blocks = split_blocks(MARKDOWN_TEXTBOOK, "blank-line")
+    dose_blocks = [b for b in blocks if "用法用量" in b]
+    assert dose_blocks, "合成语料里应该有用量块"
+    for b in dose_blocks:
+        assert "麻黄" not in b and "桂枝" not in b, "这一块里居然有药名，样例造错了"
+    # 药名那一行（"# 麻黄"）短于 MIN_BLOCK_CHARS，直接被丢掉了——连"另一块里
+    # 有药名"都谈不上
+    from offline.extract_reference_triples import MIN_BLOCK_CHARS
+
+    assert len("# 麻黄") < MIN_BLOCK_CHARS
+    assert not any(b.strip() == "# 麻黄" for b in blocks)
+
+
+def test_heading_mode_keeps_the_preamble_instead_of_dropping_it():
+    """第一个标题之前的内容单独成一块，不丢掉——"丢了什么"该由 min_chars 和
+    切块验证脚本判断，不该由切块函数偷偷决定。"""
+    from offline.extract_reference_triples import split_blocks
+
+    text = "没有标题的前言，长度足够不被丢掉。\n\n# 麻黄\n\n【性味】辛温。"
+    blocks = split_blocks(text, "heading")
+    assert len(blocks) == 2 and blocks[0].startswith("没有标题的前言")
+
+
+def test_heading_mode_is_registered_in_chunk_modes_and_cli():
+    """三种切法都要能从命令行传——EXPECTED_SOURCES 里记的推荐值必须是合法值。"""
+    from offline.extract_reference_triples import CHUNK_MODES
+
+    assert set(CHUNK_MODES) == {"blank-line", "line", "heading"}
+    for _name, (_src, _kind, chunk_by, _purpose) in vpc.EXPECTED_SOURCES.items():
+        assert chunk_by in CHUNK_MODES
+
+
+def test_verifier_uses_the_per_source_recommended_mode_by_default(tmp_path, capsys):
+    """不传 --chunk-by 时按每个源的推荐值跑：教材 heading、古籍 blank-line。
+    传一个全局值只是为了对比，不该是默认——默认值搞错会让验证验的是另一个
+    切法，而真实抽取用的是推荐那个。"""
+    (tmp_path / "中药学.md").write_text(MARKDOWN_TEXTBOOK, encoding="utf-8")
+    vpc.main(["--books-dir", str(tmp_path), "--show", "0"])
+    out = capsys.readouterr().out
+    assert "切块模式：heading" in out
+    assert "按每个源的推荐值" in out
+
+
+def test_verifier_warns_when_told_to_use_a_non_recommended_mode(tmp_path, capsys):
+    """显式传了非推荐模式不拦，但要说清代价——不是"随便哪个都行"。"""
+    (tmp_path / "中药学.md").write_text(MARKDOWN_TEXTBOOK, encoding="utf-8")
+    vpc.main(["--books-dir", str(tmp_path), "--show", "0", "--chunk-by", "blank-line"])
+    out = capsys.readouterr().out
+    assert "用的不是推荐模式" in out
+    assert "s 不过 source_span 核验" in out
+
+
+def test_compare_modes_reports_all_three_side_by_side(tmp_path, capsys):
+    """三种切法的块数/中位数并排——差一个数量级时选哪种就很明显了。"""
+    (tmp_path / "中药学.md").write_text(MARKDOWN_TEXTBOOK, encoding="utf-8")
+    vpc.main(["--books-dir", str(tmp_path), "--show", "0", "--compare-modes"])
+    out = capsys.readouterr().out
+    assert "三种切法对比" in out
+    for mode in ("blank-line", "line", "heading"):
+        assert mode in out
+    assert "← 推荐" in out
+
+
+def test_compare_modes_is_a_pure_function_without_the_block_text():
+    """对比只看统计，不带原文——带上原文会让输出刷屏，而要看原文有 --show。"""
+    result = vpc.compare_modes(MARKDOWN_TEXTBOOK)
+    assert set(result) == {"blank-line", "line", "heading"}
+    for stats in result.values():
+        assert "blocks" not in stats
+        assert stats["n_blocks"] > 0
+    assert result["heading"]["n_blocks"] < result["blank-line"]["n_blocks"]
