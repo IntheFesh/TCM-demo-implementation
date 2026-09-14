@@ -154,13 +154,23 @@ def test_record_segment_estimate_matches_the_record_plan():
 # ---------- 失败预案 ----------
 
 
-def test_troubleshooting_first_entry_is_the_silence_is_normal_one():
-    """**「静默很久是正常的」必须在最前面。** 上一轮因为误判卡死，杀了三个正常
-    运行的进程，浪费一小时和几百次调用——这条排第二都嫌晚。"""
+def test_troubleshooting_first_entry_is_about_silence_and_says_it_is_no_longer_normal():
+    """**关于"静默"的那一条必须在最前面**——两次代价都出在这上面：一次误判卡死
+    杀了三个正常进程，一次反过来（DeepSeek 真挂死 46 分钟没人发现）。
+
+    **R9 起断言反过来了**：原来这条钉的是"静默很久**是正常的**"，因为当时长任务
+    真的不出声；现在所有长任务都有进度条和心跳（`core/progress.py`），"静默"就
+    等于真卡住，文档第 0 条据此改写。这是有意的契约变更——判据仍然是"第一条讲
+    静默"，只是结论从"正常"变成"不正常"，断言跟着反。（不改它也会碰巧过：新标题里
+    "静默"和"正常"两个词都在——那种"碰巧还绿"正是必须显式处理这条的理由。）"""
     text = DOC.read_text(encoding="utf-8")
     headings = re.findall(r"^## (.+)$", text, re.M)
     assert headings, "文档里没有二级标题"
-    assert "静默" in headings[0] and "正常" in headings[0], headings[0]
+    assert "静默" in headings[0], headings[0]
+    assert "不再是正常" in headings[0], headings[0]
+    section = text[text.index(headings[0]):text.index("## 1. ")]
+    assert "心跳" in section, "第 0 条必须讲心跳——没有它就没有新判据"
+    assert "连心跳都没有" in section
 
 
 def test_troubleshooting_says_not_to_ps_or_kill():

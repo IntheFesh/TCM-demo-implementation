@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.progress import Progress  # noqa: E402
 from offline import extract_formulary, extract_materia_medica  # noqa: E402
 from offline.local_corpora import non_pharmacology_corpora  # noqa: E402
 from offline.pharmacology_sources import EXPECTED_SOURCES, book_title  # noqa: E402
@@ -98,6 +99,10 @@ def run_all(books_dir: Path, limit_blocks: int | None = None, dry_run: bool = Fa
         print_local_corpora_accounting()
 
     failures: dict[str, str] = {}
+    # 源级进度（六个源）；**源内每一块的进度由引擎自己的进度条打**
+    # （offline/extract_reference_triples.py 里那一个），两层各管一层，
+    # 不在这里另算一遍块数。--dry-run 时不打（它本来就是几行就完）。
+    bar = None if dry_run else Progress(total=len(present), label="药理层抽取（按源）", unit="源")
     for name in present:
         _source, kind, _chunk_by, purpose = EXPECTED_SOURCES[name]
         argv = build_argv(name, books_dir / name, limit_blocks, dry_run, no_prefilter, crosscheck)
@@ -105,9 +110,15 @@ def run_all(books_dir: Path, limit_blocks: int | None = None, dry_run: bool = Fa
         print(f"=== {name}　[{kind}]　{purpose}　→ {' '.join(argv[2:])} ===")
         try:
             ENTRY_MAINS[kind](argv)
+            if bar is not None:
+                bar.advance(note=name)
         except (Exception, SystemExit) as e:  # noqa: BLE001 - 一个源挂了不影响别的源，见模块文档
             failures[name] = f"{type(e).__name__}: {e}"
             print(f"  ✗ {name} 没跑完：{failures[name]}", file=sys.stderr)
+            if bar is not None:
+                bar.note(f"{name} 没跑完：{type(e).__name__}")
+    if bar is not None:
+        bar.close(f"{len(present) - len(failures)}/{len(present)} 个源跑完")
 
     print()
     print("=" * 70)

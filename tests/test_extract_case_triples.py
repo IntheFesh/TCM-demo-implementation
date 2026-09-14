@@ -655,7 +655,11 @@ def test_main_warns_about_failed_cases_and_suggests_only_ids(tmp_path, monkeypat
 def test_main_prints_progress_for_a_batch_crossing_the_report_boundary(tmp_path, monkeypatch, capsys):
     """941 条这种长跑批次最需要的就是这行输出——这里用 PROGRESS_EVERY + 1 条
     医案确认真的打了两次进度（一次在整数倍处、一次是收尾），不是只在全部
-    跑完后才输出一次汇总。"""
+    跑完后才输出一次汇总。
+
+    **R9 起这行走 stderr**（`core/progress.py`：进度是给人看的旁白，stdout 要留给
+    结构化输出）。判据一个字没变——还是"整数倍处和收尾各打一次 `进度 N/总数`"，
+    只是从 capsys 的 out 换成 err。"""
     n = ect.PROGRESS_EVERY + 1
     cases_path = _write_cases_json(tmp_path, [
         {"case_id": str(i), "case_group_id": str(i), "physician": "ye_tianshi",
@@ -665,7 +669,8 @@ def test_main_prints_progress_for_a_batch_crossing_the_report_boundary(tmp_path,
 
     monkeypatch.setattr(ect, "get_llm", lambda: FakeLLM(CaseTripleExtraction(triples=[])))
     ect.main(["--cases-path", str(cases_path), "--out", str(tmp_path / "out.jsonl")])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.err          # R9：进度走 stderr，见上面 docstring
     assert f"进度 {ect.PROGRESS_EVERY}/{n}" in out
     assert f"进度 {n}/{n}" in out
 

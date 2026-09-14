@@ -1155,16 +1155,24 @@ def consult_many(queries: list[str], consult_fn=None) -> tuple[list[dict | None]
     run_batch 的文档记过同一个坑（insufficient 分支 AttributeError 整批挂掉），
     教训没有传到后来的两个批处理入口——所以抽成一处，两边都调它。
     """
+    from core.progress import Progress
+
     fn = consult_fn or consult
     results: list[dict | None] = []
     failures: list[dict] = []
+    # 一条主诉十几次 LLM 调用、几十秒；这个循环是 E1/E2 和 MES 导出的主干，
+    # 原来从头到尾只在失败时才出声（R9：静默和卡死不能长得一样）。
+    bar = Progress(total=len(queries), label="consult 批量", unit="条")
     for i, complaint in enumerate(queries, 1):
         try:
             results.append(fn(complaint))
+            bar.advance(note=f"第 {i} 条「{complaint[:12]}」")
         except Exception as e:  # noqa: BLE001 - 一条主诉的失败不能把整批已完成的结果一起丢掉
             print(f"[consult_many] 第 {i} 条失败：{type(e).__name__}: {e}", file=sys.stderr)
+            bar.note(f"第 {i} 条失败：{type(e).__name__}")
             results.append(None)
             failures.append({"index": i, "query": complaint, "error": f"{type(e).__name__}: {e}"})
+    bar.close(f"{len(queries) - len(failures)} 条成功，{len(failures)} 条失败")
     return results, failures
 
 

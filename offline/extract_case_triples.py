@@ -42,6 +42,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
+from core.progress import Progress
 from core.llm import LLMError, LLMTruncatedError, get_llm, load_prompt, render
 from core.schemas import CaseRecord, CaseTripleExtraction, CaseTripleRecord
 
@@ -293,18 +294,26 @@ def main(argv: list[str] | None = None) -> None:
     # 不动旧数据，不能让一次失败的重试把之前成功的结果抹掉。
     by_case_id = _load_existing_rows(args.out)
 
+    # 粒度到**每一条医案**（= 每一次 LLM 调用）；下面 _on_progress 那行是统计
+    # （每 PROGRESS_EVERY 条 + 落盘），两者互补，见 extract_reference_triples 同一处注释。
+    bar = Progress(total=len(cases), label="S5 医案三元组", unit="条")
+
     def _on_case_done(case: CaseRecord, records: list[CaseTripleRecord], failure: str | None) -> None:
+        bar.advance(note=f"{case.case_id}" + ("" if failure is None else f"（{failure}）"))
         if failure is None:
             by_case_id[case.case_id] = [r.model_dump() for r in records]
 
     def _on_progress(done: int, total: int, snapshot: dict) -> None:
-        print(f"进度 {done}/{total}：抽出 {snapshot['triples_extracted']} 条三元组，"
-              f"跳过 {snapshot['cases_no_text']} 条无 excerpt，"
-              f"{snapshot['cases_truncated']} 条疑似截断，"
-              f"{snapshot['cases_failed']} 条调用失败")
+        bar.note(f"进度 {done}/{total}：已抽出 {snapshot['triples_extracted']} 条三元组，"
+                 f"跳过 {snapshot['cases_no_text']} 条无 excerpt，"
+                 f"{snapshot['cases_truncated']} 条疑似截断，"
+                 f"{snapshot['cases_failed']} 条调用失败（已落盘）")
         _write_rows(args.out, by_case_id)  # 每 PROGRESS_EVERY 条落盘一次
 
-    records, stats = extract_all(cases, on_progress=_on_progress, on_case_done=_on_case_done)
+    try:
+        records, stats = extract_all(cases, on_progress=_on_progress, on_case_done=_on_case_done)
+    finally:
+        bar.close()
 
     print(f"读入 {stats['cases']} 条医案（{stats['cases_no_text']} 条没有 raw_excerpt，已跳过，不退回整段 raw）")
     print(f"S5 调用 {stats['llm_calls']} 次，抽出 {stats['triples_extracted']} 条三元组通过核验，"

@@ -93,7 +93,9 @@ seg_0() {
   ruff check . || return 1
   python -m scripts.collect_results --check || return 1
   echo "--- 环境变量（期望：没有上次调试留下的残留）---"
-  env | grep -E "RETRIEVER_MODE|USE_REACT|EVAL_MODE|FAST_MODE|LLM_MODE|LORA_DIR" || echo "（干净）"
+  # LLM_TIMEOUT_SECONDS/LLM_TIMEOUT/LLM_MAX_TOKENS 也要看：R8 段 6 卡死 46 分钟之后
+  # 第一件要排除的就是"超时被谁设成了一个大数"，而原来这条 grep 看不见它们。
+  env | grep -E "RETRIEVER_MODE|USE_REACT|EVAL_MODE|FAST_MODE|LLM_MODE|LORA_DIR|LLM_TIMEOUT|LLM_MAX_TOKENS" || echo "（干净）"
   echo "--- 数据文件 ---"
   for f in cases.json data/graph.json data/element_index.json data/case_triples.jsonl; do
     [ -e "$f" ] && echo "  ✓ $f" || echo "  ✗ $f 缺失（后面依赖它的段会失败）"

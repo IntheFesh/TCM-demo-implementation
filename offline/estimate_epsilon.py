@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 
 from core.batch import classify_llm_failure, warn_if_failure_rate_high
+from core.progress import Progress
 from core.chain import consult, infer_elements, normalize
 from core.herbs import normalized_herb_set, role_partitioned_herb_sets
 from core.llm import get_llm
@@ -117,6 +118,9 @@ def estimate_epsilon_online(
     n_unroled = 0
     llm_calls = 0
     n_call_failures_total = 0
+    # 粒度 = **每一次重复**（一条主诉重复 n_repeats 次，每次一整轮 consult）。
+    # 原来这里只有三行阶段级输出，一条主诉跑三遍中间几分钟没声音。
+    bar = Progress(total=len(queries) * n_repeats, label="ε_online（逐条重复）", unit="轮")
 
     for complaint in queries:
         sets_by_layer: dict[str, dict[str, list[set | None]]] = {k: {} for k in EPSILON_LAYERS}
@@ -124,11 +128,13 @@ def estimate_epsilon_online(
         n_insufficient = 0
         n_call_failures = 0
 
-        for _ in range(n_repeats):
+        for repeat in range(n_repeats):
             try:
                 outcome = consult_fn(complaint)
+                bar.advance(note=f"「{complaint[:12]}」第 {repeat + 1}/{n_repeats} 遍")
             except Exception as e:  # noqa: BLE001 - 单次重复失败不能拖累这条主诉的其它重复/其它主诉
                 n_call_failures += 1
+                bar.note(f"「{complaint[:14]}」一次重复失败：{classify_llm_failure(e)}")
                 print(
                     f"[estimate_epsilon_online]「{complaint}」一次重复调用失败："
                     f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
@@ -220,6 +226,7 @@ def estimate_epsilon_online(
             "mean_herbs_per_formula": round(sum(sizes) / len(sizes), 2) if sizes else None,
             "n_formulas_counted": len(sizes),
         }
+    bar.close(f"{llm_calls} 次调用")
     for layer in ("core", "adjunct"):
         # role 填充率只挂在分层这两个结果上：epsilon_core/epsilon_adjunct 可信到
         # 什么程度全看它，读 JSON 的人应当在同一个对象里就看到，不用去别处找。
@@ -254,6 +261,8 @@ def estimate_epsilon_s2(queries: list[str], n_repeats: int = DEFAULT_N_REPEATS) 
     per_query: list[dict] = []
     llm_calls = 0
     n_call_failures_total = 0
+    # 粒度 = 每一次 S2 重复（S1 每条只跑一次，不进这个分母）
+    s2_bar = Progress(total=len(queries) * n_repeats, label="ε_s2（逐条重复）", unit="轮")
 
     for complaint in queries:
         try:
@@ -271,11 +280,13 @@ def estimate_epsilon_s2(queries: list[str], n_repeats: int = DEFAULT_N_REPEATS) 
 
         elem_sets = []
         n_call_failures = 0
-        for _ in range(n_repeats):
+        for repeat in range(n_repeats):
             try:
                 s2 = infer_elements(s1)
+                s2_bar.advance(note=f"「{complaint[:12]}」S2 第 {repeat + 1}/{n_repeats} 遍")
             except Exception as e:  # noqa: BLE001 - 单次 S2 重复失败不能拖累这条主诉的其它重复
                 n_call_failures += 1
+                s2_bar.note(f"「{complaint[:14]}」一次 S2 重复失败：{classify_llm_failure(e)}")
                 print(
                     f"[estimate_epsilon_s2]「{complaint}」一次 S2 重复失败："
                     f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
@@ -301,6 +312,7 @@ def estimate_epsilon_s2(queries: list[str], n_repeats: int = DEFAULT_N_REPEATS) 
         if stats:
             all_distances.extend(stats["values"])
 
+    s2_bar.close(f"{llm_calls} 次调用")
     overall = aggregate_stats(all_distances) or _empty_stats()
     return {
         **overall,
@@ -356,15 +368,17 @@ def estimate_epsilon_extract(
     llm_calls = 0
     n_extraction_failures = 0
 
+    extract_bar = Progress(total=len(sample) * n_repeats, label="ε_extract（逐条重复）", unit="轮")
     for c in sample:
         segment = {
             "seg_id": c["case_id"], "text": c["raw_excerpt"],
             "head_hints": [], "follow_hints": [],
         }
         symptom_sets = []
-        for _ in range(n_repeats):
+        for repeat in range(n_repeats):
             try:
                 result = extract_segment(segment)
+                extract_bar.advance(note=f"{c['case_id']} 第 {repeat + 1}/{n_repeats} 遍")
             except Exception as e:  # noqa: BLE001 - 单条抽取失败（LLMError 等）不该让
                 # 整个噪声估算停下；失败的这一次不计入这条 case 的重复，
                 # n_extraction_failures 记下来，报告里如实标注不是静默吞掉。
@@ -387,6 +401,7 @@ def estimate_epsilon_extract(
         if stats:
             all_distances.extend(stats["values"])
 
+    extract_bar.close(f"{llm_calls} 次调用")
     overall = aggregate_stats(all_distances) or _empty_stats()
     return {
         "available": True,

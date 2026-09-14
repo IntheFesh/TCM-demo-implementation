@@ -97,6 +97,41 @@ Validation 做中间验证（满分上限 **48.9998/50**，官方金标准带 BO
 报告里的后端标签从 `manifest` 抬上来，不读 `LLM_MODEL` 环境变量（那个变量在
 `claude_cli` / `replay` 后端下还是 `deepseek-chat`）。
 
+## 超时与进度（R9）
+
+**一次 LLM 调用挂住不返回，重试逻辑永远不会触发。** R8 段 6 录制在真机上卡了
+46 分钟（`wchan=do_poll`、socket 还在、最后一份 fixture 写于 46 分钟前），而客户端
+**已经**设了 `timeout=120`——问题不是"没设超时"，是 **httpx 的 read 超时管的是
+单次 socket 读，不是整个响应的期限**：中间任何一跳（CDN / 网关 / 反代）每隔几十秒
+吐一个字节，每次读都不超时，请求可以挂到天荒地老。`MAX_ATTEMPTS=3` 的前提是
+"这次调用返回了（成功或失败）"，挂住时它根本没机会跑。
+
+所以超时是两层（`core/llm.py` 的 `CallTimeouts`）：
+
+| 层 | 值（云端 API） | 管什么 |
+|---|---|---|
+| connect / read / write / pool **分别设** | 15 / 120 / 30 / 15 秒 | 各相位自己的上限——连接慢到 15 秒以上一定是网络坏了，等 120 秒没有意义 |
+| **墙钟兜底** | 180 秒 | 整次调用的期限。超了抛 `LLMCallTimeout`（继承 `TimeoutError`）→ 走既有重试 → 三次都超时才 `LLMError` |
+
+值的依据：单次 S3 调用实测 6~8 秒、ReAct 单步 2~3 秒、药理层抽一块 10~20 秒、
+S0 抽多病人粗段最慢 60 秒量级。120 秒远超正常值、远低于"挂死"。
+
+**按后端区分**：本地 vLLM server 600/900 秒（首个请求要等预热），进程内 vLLM
+1800 秒（第一次调用在进程内加载权重，几分钟是正常的）。`LLM_TIMEOUT_SECONDS`
+覆盖所有后端（旧名 `LLM_TIMEOUT` 仍然认）。
+
+墙钟兜底的实现是"工作线程 + `join(deadline)`"：blocking 的 socket 读没法从外面
+取消，所以超时后不等它（daemon 线程），只把它丢在后台自己去死，并顺手断掉连接池
+（`abort_in_flight()`）让重试不排在同一个坏连接后面。**顺带解决"杀不掉"**：主线程
+这会儿卡在 `join()` 而不是 C 层的 read 里，Ctrl-C 立刻生效。
+
+**进度条**（`core/progress.py`，零第三方依赖）：所有长任务统一用它，打 **stderr**
+（stdout 可能是结构化输出）。TTY 下 `\r` 原地刷新，非 TTY（`| tee`、`nohup`、CI）
+每 15 秒或每 N 项打一整行。**一项都没完成也有心跳**（默认 30 秒），由后台守护线程
+负责——主线程正卡在那次调用里，它自己没机会打。所以从 R9 起，**"静默"不再等于
+"正常"**：超过心跳间隔还没有下一行就是真卡住了（`docs/onsite_troubleshooting.md`
+第 0 条据此改写）。
+
 ## 已知混杂与局限
 
 **12 条，一条都不省。** 这是这个项目最有价值的部分之一：一个说不清自己局限的
@@ -219,7 +254,7 @@ cp .env.example .env
 | `LLM_BASE_URL` | 默认 `https://api.deepseek.com` |
 | `LLM_MODEL` | 默认 `deepseek-chat` |
 | `LLM_MODE` 取 `claude_cli` | 走本机 `claude` CLI，**仅用于没有 API 网络时的冒烟**：模型不是 deepseek-chat、单次约 $0.06（DeepSeek 约 $0.0007），跑出来的分数不可与他人比较。`manifest.comparability_warning` 会把这一点一路带进报告 |
-| `LLM_TIMEOUT` | 单次 API 调用超时秒数，默认 120（SDK 自带重试已关，重试统一由 `generate()` 负责） |
+| `LLM_TIMEOUT_SECONDS` | 单次调用的读超时秒数（旧名 `LLM_TIMEOUT` 仍然认）。不设时按后端取默认值：云端 API 读 120 秒 / 墙钟 180 秒，本地 vLLM server 600/900，进程内 vLLM 1800（首次调用要加载权重）。四个 HTTP 相位（connect/read/write/pool）**分别设**，另有一层墙钟兜底——理由见下面「超时」一节。SDK 自带重试已关，重试统一由 `generate()` 负责 |
 | `LLM_MAX_TOKENS` | 单次输出上限，默认 8192（DeepSeek 默认 4096，S0 抽多病人粗段会被截断） |
 | `CLAUDE_CLI_MODEL` / `CLAUDE_CLI_TIMEOUT` | `claude_cli` 模式下的模型名与超时，默认 `claude-sonnet-5` / 180 |
 | `USE_REACT` | `1` 打开 ReAct 取证（默认关，见「ReAct 取证模式」一节） |

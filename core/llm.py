@@ -5,9 +5,11 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 from typing import TypeVar
@@ -213,6 +215,73 @@ def _looks_like_truncated_json(error: Exception, text: str, schema: type[BaseMod
     return False
 
 
+class LLMCallTimeout(TimeoutError):
+    """一次 `_complete` 超过墙钟上限还没返回。**故意继承 TimeoutError**：
+    `generate()` 的传输类 `except Exception` 会接住它走既有重试路径，而
+    `core/batch.py` 的 `classify_llm_failure` 按异常类型归类时它落在超时那一类。"""
+
+
+@dataclass(frozen=True)
+class CallTimeouts:
+    """一次 LLM 调用的四个 HTTP 相位超时 + 一个墙钟兜底。
+
+    **四个相位分别设，不是一个总超时**：openai SDK 收到一个 float 时会把它
+    铺给四个相位（connect/read/write/pool 都等于那个数），于是"连不上"要等和
+    "读不出来"一样久——连接建立本来是秒级的事，等 120 秒没有意义。
+
+    `deadline` 是这一层最要紧的东西，理由是 R8 段 6 那次实测：客户端**已经**
+    设了 `timeout=120`，进程还是卡了 46 分钟（wchan=do_poll、socket 还在）。
+    因为 **httpx 的 read 超时是"单次 socket 读"的上限，不是整个响应的期限**：
+    中间任何一跳（CDN、网关、反代）只要每隔几十秒吐一个字节/一个保活帧，
+    每次读都没超时，整个请求可以挂到天荒地老。`deadline` 从外面给整次调用
+    封一个墙钟上限，超了就抛 LLMCallTimeout 走重试——**这才是"重试逻辑永远
+    不会触发"那个洞真正的补法**。
+
+    值的依据（实测，写在这里免得下次有人直接调大）：
+      单次 S3 调用 6~8 秒；ReAct 单步 2~3 秒；药理层抽一块 10~20 秒；
+      S0 抽多病人粗段最慢到 60 秒量级（max_tokens=8192）。
+    """
+
+    connect: float
+    read: float
+    write: float
+    pool: float
+    deadline: float
+
+    def httpx_timeout(self):
+        """惰性 import httpx：没装 openai/httpx 的机器也要能 import core.llm
+        （tests/test_local_backend.py 有一条钉这个）。"""
+        import httpx
+
+        return httpx.Timeout(connect=self.connect, read=self.read,
+                             write=self.write, pool=self.pool)
+
+    def with_seconds(self, seconds: float) -> CallTimeouts:
+        """`LLM_TIMEOUT_SECONDS` 只给一个数时怎么摊：它说的是"一次调用最长等多久"
+        ——所以它直接改 read 和 deadline（deadline 留 1.5 倍余量给重定向/重连这类
+        同一次调用里的多段网络交互），connect/write 不跟着放大（连接和发请求慢到
+        30 秒以上一定是网络坏了，等更久没有意义）。"""
+        return CallTimeouts(
+            connect=min(self.connect, seconds), read=seconds,
+            write=min(self.write, seconds), pool=min(self.pool, seconds),
+            deadline=max(seconds * 1.5, seconds + 10),
+        )
+
+
+# 云端 API（DeepSeek）：读 120 秒远超正常值（最慢的 S0 在 60 秒量级）、远低于
+# "挂死"；连接 15 秒、发请求 30 秒（prompt 最大几十 KB）；墙钟 180 秒。
+API_TIMEOUTS = CallTimeouts(connect=15.0, read=120.0, write=30.0, pool=15.0, deadline=180.0)
+# 本地 vLLM server：权重是 server 自己启动时加载的（scripts/start_vllm.sh），
+# 但**首个请求**要等它把 CUDA graph / 预热做完，实测几十秒到几分钟；排队时
+# 单个请求也可能等很久。读 600 秒、墙钟 900 秒。
+LOCAL_SERVER_TIMEOUTS = CallTimeouts(connect=10.0, read=600.0, write=30.0, pool=10.0, deadline=900.0)
+# 进程内 vLLM：**第一次调用会在进程内加载权重**（VLLMInProcessBackend._engine
+# 是惰性的），1.5B 模型实测几分钟、更大的更久。墙钟给 1800 秒——比它慢就是真卡住。
+# 这里没有 HTTP，四个相位的值用不上，填同一个数只是为了 dataclass 完整。
+INPROC_TIMEOUTS = CallTimeouts(connect=1800.0, read=1800.0, write=1800.0, pool=1800.0,
+                               deadline=1800.0)
+
+
 class LLMBackend(ABC):
     """后端基类。**重试/校验/错误回灌只在这里实现一份**，子类只实现 `_complete`
     这个"单次原始调用"。
@@ -223,12 +292,84 @@ class LLMBackend(ABC):
     """
 
     MAX_ATTEMPTS = 3  # 首次 + 最多 2 次重试
+    # 这个后端的超时。子类覆盖（本地模型要长得多）；`LLM_TIMEOUT_SECONDS`
+    # （旧名 `LLM_TIMEOUT` 仍然认）覆盖所有后端。
+    TIMEOUTS: CallTimeouts = API_TIMEOUTS
     # 传输类错误（超时、429、连接断）两次重试之间的等待秒数，按重试序号取。
     # 只对传输错误退避：校验错误是模型输出格式不对，回灌错误信息立刻重问才有
     # 意义，等一秒不会让它答得更对。之前是零间隔立刻重试，429 会变成三个
     # 连续的 429。测试里把它 monkeypatch 成 (0, 0)，不真等。
     RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0)
     _sleep = staticmethod(time.sleep)  # 留个缝给测试换掉，不真睡
+
+    def timeouts(self) -> CallTimeouts:
+        """本次调用生效的超时。环境变量优先：`LLM_TIMEOUT_SECONDS`，兼容旧名
+        `LLM_TIMEOUT`（README 和 .env.example 里已经写了一轮，不能悄悄失效）。
+        解析不了就用后端默认值并**吼一声**——静默回退到默认值会让人以为自己
+        设的值生效了。"""
+        raw = os.environ.get("LLM_TIMEOUT_SECONDS") or os.environ.get("LLM_TIMEOUT")
+        if not raw:
+            return self.TIMEOUTS
+        try:
+            seconds = float(raw)
+            if seconds <= 0:
+                raise ValueError("必须是正数")
+        except ValueError as e:
+            print(f"[llm] LLM_TIMEOUT_SECONDS={raw!r} 解析不了（{e}），"
+                  f"这次用后端 {self.backend_id()} 的默认值 "
+                  f"{self.TIMEOUTS.read} 秒读超时 / {self.TIMEOUTS.deadline} 秒墙钟",
+                  file=sys.stderr)
+            return self.TIMEOUTS
+        return self.TIMEOUTS.with_seconds(seconds)
+
+    def abort_in_flight(self) -> None:
+        """墙钟超时之后清理这个后端里挂着的东西。默认什么都不做；
+        OpenAICompatBackend 覆盖成"丢掉那个 HTTP 客户端"，好让卡住的那次读
+        随着连接池被回收而死掉，不然重试会排在同一个坏连接后面。"""
+
+    def _complete_within_deadline(
+        self, messages: list[dict], temperature: float, max_tokens: int | None,
+        schema: type[BaseModel] | None, physician: str | None, deadline: float, **kwargs,
+    ) -> str:
+        """在墙钟上限内跑一次 `_complete`，超了抛 LLMCallTimeout。
+
+        **为什么要这一层**（R8 段 6 实测）：HTTP 客户端那边已经设了 120 秒读超时，
+        进程还是卡了 46 分钟——read 超时管的是"单次 socket 读"，对方每隔几十秒
+        吐一个字节就永远不触发。`MAX_ATTEMPTS=3` 的前提是"这次调用返回了"，
+        挂住不返回时重试逻辑根本没机会跑。
+
+        实现是"工作线程 + join(deadline)"：blocking 的 socket 读没法从外面取消，
+        所以超时后**不等它**（daemon 线程，进程退出不会被它拖住），只把它丢在
+        后台自己去死（`abort_in_flight()` 顺手断掉连接池加速这件事）。代价是
+        最坏情况下有几个僵住的线程，换来的是主流程一定能往前走。
+        顺带一个好处：主线程这会儿卡在 `join()` 上而不是卡在 C 层的 read 里，
+        Ctrl-C 立刻生效——上一轮"杀不掉的卡死"也是这个原因。
+        """
+        result: dict[str, object] = {}
+
+        def _run() -> None:
+            try:
+                result["value"] = self._complete(
+                    messages, temperature, max_tokens=max_tokens,
+                    schema=schema, physician=physician, **kwargs,
+                )
+            except BaseException as e:  # noqa: BLE001 - 原样带回主线程再抛
+                result["error"] = e
+
+        worker = threading.Thread(target=_run, name="llm-call", daemon=True)
+        worker.start()
+        worker.join(timeout=deadline)
+        if worker.is_alive():
+            self.abort_in_flight()
+            raise LLMCallTimeout(
+                f"一次 LLM 调用超过 {deadline:.0f} 秒墙钟上限还没返回"
+                f"（backend={self.backend_id()}, model={self.model_name()}）。"
+                "HTTP 读超时管的是单次 socket 读，对方细水长流地吐字节时不会触发，"
+                "所以这里从外面封一个上限。调大用 LLM_TIMEOUT_SECONDS。"
+            )
+        if "error" in result:
+            raise result["error"]  # type: ignore[misc]
+        return str(result.get("value", ""))
 
     @abstractmethod
     def _complete(
@@ -359,9 +500,10 @@ class LLMBackend(ABC):
         last_raw = ""
         for attempt in range(self.MAX_ATTEMPTS):
             try:
-                raw = self._complete(
+                raw = self._complete_within_deadline(
                     messages, temperature, max_tokens=max_tokens,
-                    schema=schema, physician=physician, **kwargs,
+                    schema=schema, physician=physician,
+                    deadline=self.timeouts().deadline, **kwargs,
                 )
             except Exception as e:  # noqa: BLE001 - 传输类错误：超时/非零退出/API 异常
                 # 这一类没有"上一次输出"可回灌——回灌上一轮的陈旧 raw 或空串只会让
@@ -455,10 +597,24 @@ class OpenAICompatBackend(LLMBackend):
                 # SDK 默认读超时 600s 且自带 2 次静默重试：一次挂起的连接最坏阻塞
                 # 3(SDK)×3(generate)×600s，而且 SDK 的重试不计入 llm_calls，
                 # 让"重试只在基类实现一份"这句话不成立。重试统一交给 generate()。
-                timeout=float(os.environ.get("LLM_TIMEOUT", "120")),
+                #
+                # **四个相位分别设**（R8 段 6 之后）：原来这里传的是一个 float，
+                # SDK 会把它铺给四个相位，于是"连不上"要等和"读不出来"一样久。
+                # 每个值的依据见 CallTimeouts 的文档字符串。
+                timeout=self.timeouts().httpx_timeout(),
                 max_retries=0,
             )
         return self._client
+
+    def abort_in_flight(self) -> None:
+        """墙钟超时之后把客户端丢掉：连接池跟着被回收，卡住的那次读会随之出错
+        死掉，重试也不会排在同一个坏连接后面。下次用 client 时惰性重建。"""
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - 清理路径不该盖住真正的超时错误
+                pass
 
     def model_name(self) -> str:
         return os.environ.get("LLM_MODEL", "deepseek-chat")
@@ -524,6 +680,10 @@ class ClaudeCLIBackend(LLMBackend):
 
     DEFAULT_MODEL = "claude-sonnet-5"
     DEFAULT_TIMEOUT = 180  # 实测均值 4-8s，慢的时候到 48s；180s 给足余量
+    # 子进程那边已经有 subprocess 的 timeout（self.timeout），墙钟只是兜底：
+    # 比它多 30 秒，好让 subprocess 自己的超时先触发（那条错误信息更具体）。
+    TIMEOUTS = CallTimeouts(connect=10.0, read=float(DEFAULT_TIMEOUT),
+                            write=10.0, pool=10.0, deadline=DEFAULT_TIMEOUT + 30.0)
 
     # 纯补全不需要任何工具。逐个列出来而不是靠 --restricted：--restricted 只去掉
     # 执行类工具，Read/Glob 之类还在，模型可能真去读文件，那就不是纯补全了。
@@ -705,6 +865,10 @@ class VLLMBackend(OpenAICompatBackend):
       - lora_request：阶段五每位医家一个 adapter，一个 server 进程按请求切换。
     """
 
+    # 本地 server 的首个请求要等预热/CUDA graph，排队时单个请求也可能等很久，
+    # 所以超时比云端长得多（见 LOCAL_SERVER_TIMEOUTS 的依据）。
+    TIMEOUTS = LOCAL_SERVER_TIMEOUTS
+
     def __init__(self) -> None:
         super().__init__()
         self._model_path = os.environ.get("LLM_MODEL_PATH")
@@ -790,6 +954,10 @@ class VLLMInProcessBackend(LLMBackend):
     顶层：沙盒和 CI 都没装 vllm，顶层 import 会让 `core.llm` 整个 import 不了，
     1600 多个测试全崩——而那些测试跟 vLLM 一点关系都没有。
     """
+
+    # **第一次调用会在进程内加载权重**（_engine 是惰性的），所以墙钟上限要能盖住
+    # 加载时间，见 INPROC_TIMEOUTS 的依据。这里没有 HTTP，四个相位的值用不上。
+    TIMEOUTS = INPROC_TIMEOUTS
 
     def __init__(self) -> None:
         self._model_path = os.environ.get("LLM_MODEL_PATH")

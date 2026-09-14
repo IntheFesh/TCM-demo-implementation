@@ -39,6 +39,7 @@ from typing import Callable
 from pydantic import BaseModel
 
 from core.llm import LLMError, LLMTruncatedError, get_llm, load_prompt, render
+from core.progress import Progress
 from core.schemas import (
     FormularyExtraction,
     FormularyRecord,
@@ -394,8 +395,14 @@ def run(argv: list[str] | None, kind_name: str | None, after_write=None) -> None
     print(prefilter_line)
 
     by_block = load_existing_rows(out_path)
+    # 粒度到**每一块**（= 每一次 LLM 调用）。下面 _on_progress 每 PROGRESS_EVERY
+    # 块打的那行是**统计**（抽出多少条、几块截断），跟进度条互补：进度条回答
+    # "还要多久"，统计行回答"抽得怎么样"。统计行走 bar.note()，免得在 TTY 上
+    # 跟进度条抢同一行。
+    bar = Progress(total=len(blocks), label=f"{kind.name} {args.book}", unit="块")
 
     def _on_block_done(block_index: int, records: list[BaseModel], failure: str | None) -> None:
+        bar.advance(note=f"第 {block_index} 块" + ("" if failure is None else f"（{failure}）"))
         if failure is None:
             rows = [r.model_dump() for r in records]
             for row in rows:
@@ -403,14 +410,19 @@ def run(argv: list[str] | None, kind_name: str | None, after_write=None) -> None
             by_block[(args.book, args.source, block_index)] = rows
 
     def _on_progress(done: int, total: int, snapshot: dict) -> None:
-        print(f"进度 {done}/{total}：抽出 {snapshot['triples_extracted']} 条，"
-              f"{snapshot['blocks_truncated']} 块疑似截断，{snapshot['blocks_failed']} 块调用失败")
+        bar.note(f"进度 {done}/{total}：已抽出 {snapshot['triples_extracted']} 条，"
+                 f"{snapshot['blocks_truncated']} 块疑似截断，"
+                 f"{snapshot['blocks_failed']} 块调用失败（已落盘）")
         write_rows(out_path, by_block)
 
-    records, stats = extract_all(
-        kind, blocks, args.source, args.book,
-        on_progress=_on_progress, on_block_done=_on_block_done,
-    )
+    try:
+        records, stats = extract_all(
+            kind, blocks, args.source, args.book,
+            on_progress=_on_progress, on_block_done=_on_block_done,
+        )
+    finally:
+        # 中途 Ctrl-C 也要把进度条收干净（不然心跳线程还在、TTY 上留半行）
+        bar.close()
 
     print(f"{kind.name}：{args.book}（{args.source}）切成 {len(all_blocks)} 块，本次处理 {stats['blocks']} 块，"
           f"调用 {stats['llm_calls']} 次，抽出 {stats['triples_extracted']} 条通过核验，"

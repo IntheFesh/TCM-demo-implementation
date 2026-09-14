@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from core.batch import classify_llm_failure, warn_if_failure_rate_high
+from core.progress import Progress
 from core.safety import safety_bypassed
 from eval.sdt import runlog
 from eval.sdt.adapter import SOLVERS, SdtAnswer
@@ -134,6 +135,9 @@ def main(argv: list[str] | None = None) -> None:
     solver = SOLVERS[args.solver]()
     lines, rejected, call_failed, calls = [], [], [], 0
     t0 = time.time()
+    # R9：原来是每 10 条打一行（`i % 10`），换成统一进度组件——粒度到每一条，
+    # 而且带速度和剩余时间（50 条 × 4 次调用的批次，"还要多久"是真问题）。
+    bar = Progress(total=len(records), label=f"SDT {args.split}（{args.solver}）", unit="条")
     for i, r in enumerate(records, 1):
         # solver.solve() 内部三次 generate() 调用没有异常捕获——core.llm.generate()
         # 重试 3 次仍失败会把 LLMError 一路抛到这里。50 条 × 4 次调用一次抖动就
@@ -141,12 +145,15 @@ def main(argv: list[str] | None = None) -> None:
         # eval/run_eval.py、offline/estimate_epsilon.py 是同一类坑）。
         try:
             answer = solver.solve(r, ignore_safety_veto=bypass_arg)
+            bar.advance(note=f"{r.record_id}")
         except Exception as e:  # noqa: BLE001 - 单条记录失败不能拖累其余记录
             call_failed.append(r.record_id)
             print(
                 f"[eval.sdt.run] 第 {i}/{len(records)} 条（{r.record_id}）调用失败："
                 f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
             )
+            bar.note(f"第 {i}/{len(records)} 条（{r.record_id}）调用失败："
+                     f"{classify_llm_failure(e)}")
             # 官方评分脚本按记录数算总分，提交文件少一行就会跟金标准错位——
             # 必须占位提交一条空答案（跟安全否决同样的空壳，得 0 分），但绝不
             # 写进 answer.safety_rejected：那个字段代表"系统真的拦截了这条"，
@@ -159,8 +166,7 @@ def main(argv: list[str] | None = None) -> None:
         calls += answer.llm_calls
         if answer.safety_rejected:
             rejected.append(r.record_id)
-        if i % 10 == 0:
-            print(f"  {i}/{len(records)}  已用调用 {calls} 次  {time.time() - t0:.0f}s")
+    bar.close(f"已用调用 {calls} 次")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     write_submission(args.out, lines)

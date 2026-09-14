@@ -43,6 +43,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.progress import Progress  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_QUERIES_PATH = ROOT / "tests" / "queries.txt"
 
@@ -123,7 +125,7 @@ def build_plan(queries: list[str] | None = None) -> list[Scenario]:
 RECORD_PLAN = build_plan
 
 
-def run_scenario(scenario: Scenario, recorder) -> dict:
+def run_scenario(scenario: Scenario, recorder, bar=None) -> dict:
     """跑一个场景。**USE_REACT 真的设进环境**，理由见模块文档字符串。
 
     consult() 的 use_react 也显式传：环境变量是给 fixture 元信息用的诚实记录，
@@ -136,6 +138,8 @@ def run_scenario(scenario: Scenario, recorder) -> dict:
     os.environ["USE_REACT"] = "1" if scenario.use_react else "0"
     before = recorder.n_written
     t0 = time.time()
+    if bar is not None:
+        bar.note(f"开始场景 {scenario.name}（预估 {scenario.estimated_calls} 次调用）")
     try:
         outcome = chain.consult(scenario.complaint, use_react=scenario.use_react,
                                ask_fn=scenario.ask_fn())
@@ -214,6 +218,20 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     recorder = RecordingBackend(out_dir=out_dir)
+    # **粒度到单次 LLM 调用**，不是单个场景：一个场景 20 次调用、60~190 秒，
+    # 按场景推进的话中间还是一片静默（R8 段 6 卡死就是在一个场景中间）。
+    # 钩在 recorder._complete 外面而不是改 RecordingBackend：录制器不该知道
+    # 有没有人在看进度（它只负责"调真实后端 + 落盘"）。
+    bar = Progress(total=total, label="录制 fixture", unit="次调用")
+    _inner_complete = recorder._complete
+
+    def _counting_complete(*a, **kw):
+        try:
+            return _inner_complete(*a, **kw)
+        finally:
+            bar.advance()
+
+    recorder._complete = _counting_complete
     # 换掉单例而不是设环境变量：录制要包在**真实后端**外面，而 get_backend()
     # 按 LLM_MODE 返回的是那个真实后端，包装这件事没有对应的环境变量。
     llm_mod._llm_singleton = recorder
@@ -223,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     t0 = time.time()
     for i, scenario in enumerate(plan, start=1):
-        r = run_scenario(scenario, recorder)
+        r = run_scenario(scenario, recorder, bar=bar)
         results.append(r)
         state = ("失败" if r["error"] else
                  "安全否决" if r["rejected"] else
@@ -232,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
               f"新增/覆盖 {r['n_fixtures']:>3} 条 fixture　{r['elapsed_s']:>5}s")
         if r["error"]:
             print(f"      错误：{r['error']}", file=sys.stderr)
+            bar.note(f"场景 {scenario.name} 失败：{r['error']}")
+    bar.close(f"{recorder.n_written} 次写入")
 
     # 写基线：没有它，verify_replay 只能验"没未命中"，验不了"逐字节一致"。
     from core.llm_replay import BASELINE_FILENAME

@@ -62,6 +62,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.batch import classify_llm_failure, warn_if_failure_rate_high
+from core.progress import Progress
 from core.retrieval import MIN_RETRIEVAL_SCORE
 # ε 文件的路径和读法只在 core/chain.py 一处：这里之前有一份逐字相同的拷贝
 from core.chain import EPSILON_PATH, load_epsilon_online, load_epsilon_online_detail
@@ -378,15 +379,22 @@ def collect_ablation_pairs(
     consult_fn = consult_fn or _default_consult_fn()
     isolating_defaults = {"use_react": False, "ask_fn": None}
     pairs: list[dict] = []
+    # 一条主诉要跑两轮（baseline + ablated），每轮十几次 LLM 调用、几十秒——
+    # 原来这个循环从头到尾一声不出，E9 全套 45 分钟里有 45 分钟是静默的。
+    bar = Progress(total=len(queries) * 2, label="消融（baseline+ablated）", unit="轮")
     for query in queries:
         try:
             baseline = consult_fn(query, **{**isolating_defaults, **baseline_kwargs})
+            bar.advance(note=f"「{query[:12]}」baseline")
             ablated = consult_fn(query, **{**isolating_defaults, **ablated_kwargs})
+            bar.advance(note=f"「{query[:12]}」ablated")
         except Exception as e:  # noqa: BLE001 - 单条失败不能拖累其余（core.chain.consult_many 同一模式）
             print(f"[collect_ablation_pairs] 「{query}」调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
+            bar.note(f"「{query[:16]}」调用失败：{classify_llm_failure(e)}")
             pairs.append(_call_failed_pair(query, e))
             continue
         pairs.extend(_herb_pairs_from_outcomes(query, baseline, ablated))
+    bar.close(f"{len(pairs)} 条配对")
     return pairs
 
 
@@ -411,22 +419,31 @@ def collect_refs_mode_pairs(
     """
     consult_fn = consult_fn or _default_consult_fn()
     pairs_by_mode: dict[str, list[dict]] = {m: [] for m in ablated_modes}
+    # **这就是"基线阶段完全静默 5 分钟"那一段**：own 那一轮跑完之前屏幕上一个字
+    # 都没有，三次被误判成卡死。每条主诉 1 + len(ablated_modes) 轮。
+    bar = Progress(total=len(queries) * (1 + len(ablated_modes)),
+                   label=f"E3/E4 消融（own + {'/'.join(ablated_modes)}）", unit="轮")
     for query in queries:
         try:
             baseline = consult_fn(query, refs_mode="own", use_react=False, ask_fn=None)
+            bar.advance(note=f"「{query[:12]}」own")
         except Exception as e:  # noqa: BLE001 - own 失败波及本条查询的所有 ablated_mode，不拖累其它查询
             print(f"[collect_refs_mode_pairs] 「{query}」own 调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
+            bar.note(f"「{query[:16]}」own 调用失败：{classify_llm_failure(e)}——这条主诉所有模式都跳过")
             for mode in ablated_modes:
                 pairs_by_mode[mode].append(_call_failed_pair(query, e))
             continue
         for mode in ablated_modes:
             try:
                 ablated = consult_fn(query, refs_mode=mode, use_react=False, ask_fn=None)
+                bar.advance(note=f"「{query[:12]}」{mode}")
             except Exception as e:  # noqa: BLE001 - 只影响这一个 mode
                 print(f"[collect_refs_mode_pairs] 「{query}」{mode} 调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
+                bar.note(f"「{query[:16]}」{mode} 调用失败：{classify_llm_failure(e)}")
                 pairs_by_mode[mode].append(_call_failed_pair(query, e))
                 continue
             pairs_by_mode[mode].extend(_herb_pairs_from_outcomes(query, baseline, ablated))
+    bar.close("、".join(f"{m} {len(v)} 条" for m, v in pairs_by_mode.items()))
     return pairs_by_mode
 
 
@@ -643,6 +660,8 @@ def collect_retriever_mode_samples(
     """
     consult_fn = consult_fn or _default_consult_fn()
     records: list[dict] = []
+    bar = Progress(total=len(queries) * len(modes),
+                   label=f"E8 检索模式（{'/'.join(modes)}）", unit="轮")
     for query in queries:
         by_mode: dict[str, dict[str, set]] = {}
         unavailable: list[str] = []
@@ -650,11 +669,13 @@ def collect_retriever_mode_samples(
         for mode in modes:
             try:
                 outcome = consult_fn(query, retriever_mode=mode, use_react=False, ask_fn=None)
+                bar.advance(note=f"「{query[:12]}」{mode}")
             except Exception as e:  # noqa: BLE001 - 单个模式失败不拖累其它模式/查询
                 print(
                     f"[collect_retriever_mode_samples] 「{query}」{mode} 调用失败："
                     f"{classify_llm_failure(e)}: {e}", file=sys.stderr,
                 )
+                bar.note(f"「{query[:16]}」{mode} 调用失败：{classify_llm_failure(e)}")
                 failed.append(mode)
                 continue
             if outcome.get("retrieval_error"):
@@ -814,11 +835,14 @@ def collect_react_process_samples(queries: list[str], consult_fn=None) -> list[d
     """
     consult_fn = consult_fn or _default_consult_fn()
     records: list[dict] = []
+    bar = Progress(total=len(queries), label="E9 过程统计（use_react=True）", unit="条")
     for query in queries:
         try:
             outcome = consult_fn(query, use_react=True, ask_fn=None)
+            bar.advance(note=f"「{query[:12]}」")
         except Exception as e:  # noqa: BLE001 - 单条失败不能拖累其余（core.chain.consult_many 同一模式）
             print(f"[collect_react_process_samples] 「{query}」调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
+            bar.note(f"「{query[:16]}」调用失败：{classify_llm_failure(e)}")
             continue
         if outcome["rejected"] or outcome["insufficient"]:
             continue
@@ -831,6 +855,7 @@ def collect_react_process_samples(queries: list[str], consult_fn=None) -> list[d
                 "n_steps": len(trace.steps), "terminated_by": trace.terminated_by,
                 "llm_calls": trace.llm_calls, "steps": trace.steps,
             })
+    bar.close(f"{len(records)} 条 trace")
     return records
 
 
