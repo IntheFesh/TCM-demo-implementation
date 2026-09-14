@@ -41,6 +41,7 @@ from offline.pharmacology_sources import (  # noqa: E402
     format_prefilter_summary,
 )
 from offline.extract_reference_triples import plan_blocks  # noqa: E402
+from offline.local_corpora import non_reference_reason  # noqa: E402
 
 UNKNOWN_SOURCE = "unknown"
 FILTERED_PREVIEW = 5
@@ -124,7 +125,7 @@ def prefilter_counts(text: str, chunk_by: str, source: str) -> tuple[int, int, d
 
 def report_source(path: Path, label: tuple[str, str, str, str], chunk_by: str,
                   show: int, preview_chars: int, compare: bool = False,
-                  prefilter: bool = True) -> list[str]:
+                  prefilter: bool = True, for_extraction: bool = True) -> list[str]:
     """打印一个源的切块统计 + 预过滤结果 + 前 N 块原文，返回问题清单。
 
     **原文必须打出来。** 统计数字能说"切成了 800 块、中位数 400 字"，说不了
@@ -161,8 +162,9 @@ def report_source(path: Path, label: tuple[str, str, str, str], chunk_by: str,
         _all, kept, skipped, counts = plan_blocks(text, effective, source, prefilter=True)
         rule = (f"source={source} 的结构判据" if source in ENTRY_PREDICATES
                 else f"source={source} 没有结构判据，只跳过过短/表格/超长三类")
-        print(f"预过滤（{rule}）：{format_prefilter_summary(len(_all), counts)}"
-              "　← 保留数 = 真实抽取的调用数")
+        tail = ("　← 保留数 = 真实抽取的调用数" if for_extraction
+                else "　← **这份语料不进药理层抽取**，这里只看切块粒度，保留数不是调用数")
+        print(f"预过滤（{rule}）：{format_prefilter_summary(len(_all), counts)}{tail}")
         kept_lengths = [len(b) for _i, b in kept]
         judged = {
             "n_blocks": len(kept),
@@ -248,6 +250,16 @@ def main(argv: list[str] | None = None) -> int:
           + "——真实抽取要传跟这里一致的 --chunk-by")
     print()
 
+    # 本地语料（医案 docx 转出来的 txt、脾胃论）拿这个脚本只为看**段落粒度**，
+    # 它们不进药理层抽取（判断在 offline/local_corpora.py 那一处）。不说这句，
+    # 下面那句「真实抽取预估调用数 937」会被读成"该花 937 次调用"。
+    not_for_extraction = None if args.file is None else non_reference_reason(args.file)
+    if not_for_extraction is not None:
+        print(f"⚠ {not_for_extraction}")
+        print("  所以下面的块数**不是**抽取预估调用数，只用来看这份语料的段落粒度"
+              "（docx 的段落粒度因人而异，见 offline/docx_to_text.py）。")
+        print()
+
     if args.file is not None:
         # 不在六源清单里的文件（docx 转出来的医案 txt 之类）默认按 blank-line，
         # 并标明它不在清单里——不猜它该用哪种切法；源类型（决定预过滤的结构判据）
@@ -282,7 +294,8 @@ def main(argv: list[str] | None = None) -> int:
     for path, label in present:
         problems_by_source[path.name] = report_source(
             path, label, args.chunk_by, args.show, args.preview_chars,
-            compare=args.compare_modes, prefilter=not args.no_prefilter)
+            compare=args.compare_modes, prefilter=not args.no_prefilter,
+            for_extraction=not_for_extraction is None)
         if not args.no_prefilter:
             n_all, n_kept, counts = prefilter_counts(
                 path.read_text(encoding="utf-8"), args.chunk_by or label[2], label[0])
@@ -297,11 +310,16 @@ def main(argv: list[str] | None = None) -> int:
           f"（六源清单共 {len(EXPECTED_SOURCES)} 个，缺 {len(missing)} 个没验）")
     if not args.no_prefilter:
         # 这一行就是剧本段 5 的预估调用数的来源（run_onsite.sh 的 SEGMENTS 表）
-        print(f"合计（{len(present)} 个源）：切 {format_prefilter_summary(total_blocks, total_counts)}"
-              f"　→ 真实抽取预估调用数 {total_kept}")
+        tail = (f"　→ 真实抽取预估调用数 {total_kept}" if not_for_extraction is None
+                else f"　→ 粒度参考 {total_kept} 块（**不进抽取**，不是调用数）")
+        print(f"合计（{len(present)} 个源）：切 {format_prefilter_summary(total_blocks, total_counts)}{tail}")
     if not failed:
-        print("★ 阈值检查全过。**但阈值只能排除明显切错**——请人工看一遍上面打印的"
-              "前几块原文，确认切出来的是一味药 / 一张方，再去跑真实抽取。")
+        if not_for_extraction is None:
+            print("★ 阈值检查全过。**但阈值只能排除明显切错**——请人工看一遍上面打印的"
+                  "前几块原文，确认切出来的是一味药 / 一张方，再去跑真实抽取。")
+        else:
+            print("★ 阈值检查全过。这份语料**不进药理层抽取**（理由见上面那行 ⚠），"
+                  "这里看的是段落粒度：一块应该是一条医案 / 一段正文，不是上万字的一整篇。")
         return 0
     print("✗ 以下源没过阈值检查：", file=sys.stderr)
     for name, problems in failed.items():

@@ -33,15 +33,17 @@ EXPECTED_SOURCES` 再导出同名，调用方不用改。
 一份"这个文件是教材还是古籍"的判断**——抽取引擎的 `--source` 参数、切块验证
 的标签、这里的谓词，读的是同一列。
 
-## 四类跳过，按这个顺序判
+## 五类跳过，按这个顺序判
 
   过短        短于 MIN_ENTRY_CHARS（见那个常数的依据）
-  表格        HTML 表格占比超过 TABLE_RATIO_MAX（药名-页码索引表）
+  表格        HTML 表格占比超过 TABLE_RATIO_MAX（排成 HTML 表的药名-页码索引）
+  索引        正文主要是「药名 + 页码」行（排成纯文本的同一种东西，见
+              INDEX_LINE_RATIO_MAX）
   超长        长于 BLOCK_MAX_CHARS（跟切块验证的阈值是同一个常数，理由在那里）
   无结构标记  该源类型的结构判据不命中
 
-顺序有讲究：先判便宜的、跟源类型无关的三类，最后才判结构——这样 `--dry-run`
-打出来的四个数加起来等于跳过总数，人一眼能看出"被丢的主要是什么"。
+顺序有讲究：先判便宜的、跟源类型无关的四类，最后才判结构——这样 `--dry-run`
+打出来的五个数加起来等于跳过总数，人一眼能看出"被丢的主要是什么"。
 """
 from __future__ import annotations
 
@@ -100,11 +102,22 @@ MIN_ENTRY_CHARS = 30
 # 两群之间在 0.72～0.84 有一个空档，0.8 取在空档里。
 TABLE_RATIO_MAX = 0.8
 
+# INDEX_LINE_RATIO_MAX = 0.5：块里「药名 + 页码」形状的正文行占比。目录页的附药
+# 索引（`# 附药：海金沙藤 196` + `石韦 196 / 冬葵子 196 / 灯心草 197`）跟第 803 块
+# 那个 HTML 索引表是同一种东西，只是没排成表格，所以表格占比那条拦不住它。
+# 实测这两群分得很开：那一块是 1.0，而中药学 15 个**真**附药条目全是 0.0
+# （它们的正文是散文「性味甘，平；归脾、胃经…常用量 3～15g」，行尾没有页码）。
+# 0.5 取在中间，两边都有 0.5 的余量。不足 2 行正文的块不判这一类——一行的巧合
+# 不构成"这是个索引"。
+INDEX_LINE_RATIO_MAX = 0.5
+INDEX_MIN_LINES = 2
+
 SKIP_TOO_SHORT = "过短"
 SKIP_TABLE = "表格"
+SKIP_INDEX = "索引"
 SKIP_TOO_LONG = "超长"
 SKIP_NO_STRUCTURE = "无结构标记"
-SKIP_REASONS = (SKIP_TOO_SHORT, SKIP_TABLE, SKIP_TOO_LONG, SKIP_NO_STRUCTURE)
+SKIP_REASONS = (SKIP_TOO_SHORT, SKIP_TABLE, SKIP_INDEX, SKIP_TOO_LONG, SKIP_NO_STRUCTURE)
 
 # 教材条目的字段标签：`【功效】`「【用法用量】」……四本书各有各的字段名，
 # 判据是"有任何一个"，见模块文档。**必须在行首**：条目的字段标签总是一段的
@@ -133,6 +146,9 @@ _CLASSIC_BODY_RE = re.compile(r"内容：|属性：")
 # 硬把前者去掉锚点拿来用，克/g 会把教材的「9～30g」也判成古籍方药。
 _CLASSIC_DOSE_RE = re.compile(r"[一二三四五六七八九十半两]+(钱|两|分|枚|铢|升|斤)")
 _TABLE_RE = re.compile(r"<table.*?</table>", re.S)
+# 「药名 + 页码」行：一个不含空白的词（药名，至多 14 字）后面跟一个 1~4 位数字，
+# 整行到此为止。判的是**结构**（行尾页码密度），不是"目录""索引"这类词。
+_INDEX_LINE_RE = re.compile(r"^\S{1,14}\s+\d{1,4}\s*$")
 
 
 def is_modern_entry(block: str) -> bool:
@@ -147,11 +163,20 @@ def is_classic_entry(block: str) -> bool:
 
 # 按 EXPECTED_SOURCES 的 source 列取谓词。没有对应谓词的 source（切块验证的
 # `--file` 模式给不在六源清单里的文件标 "unknown"）不做结构判据，只跳过
-# 过短/表格/超长三类——不猜它该长什么样。
+# 过短/表格/索引/超长这四类跟源类型无关的——不猜它该长什么样。
 ENTRY_PREDICATES: dict[str, Callable[[str], bool]] = {
     "modern": is_modern_entry,
     "classic": is_classic_entry,
 }
+
+
+def index_line_ratio(block: str) -> float:
+    """正文行（不含首行标题）里「药名 + 页码」形状的占比。不足 INDEX_MIN_LINES 行
+    正文一律 0.0——一行的巧合不构成"这是个索引"。"""
+    lines = [ln.strip() for ln in block.splitlines()[1:] if ln.strip()]
+    if len(lines) < INDEX_MIN_LINES:
+        return 0.0
+    return sum(bool(_INDEX_LINE_RE.match(ln)) for ln in lines) / len(lines)
 
 
 def table_ratio(block: str) -> float:
@@ -167,6 +192,8 @@ def classify_block(block: str, source: str | None) -> str | None:
         return SKIP_TOO_SHORT
     if "<table" in block and table_ratio(block) > TABLE_RATIO_MAX:
         return SKIP_TABLE
+    if index_line_ratio(block) >= INDEX_LINE_RATIO_MAX:
+        return SKIP_INDEX
     if len(block) > BLOCK_MAX_CHARS:
         return SKIP_TOO_LONG
     predicate = ENTRY_PREDICATES.get(source or "")
@@ -195,8 +222,8 @@ def prefilter_blocks(
 
 
 def format_prefilter_summary(n_total: int, counts: dict[str, int]) -> str:
-    """「812 块 → 保留 443 块（跳过：过短 31 / 表格 9 / 超长 2 / 无结构标记 327）」。
-    四个数加起来 = 跳过总数，人一眼能看出被丢的主要是什么。"""
+    """「740 块 → 保留 457 块（跳过：过短 9 / 表格 8 / 索引 25 / 超长 0 / 无结构标记 241）」。
+    五个数加起来 = 跳过总数，人一眼能看出被丢的主要是什么。"""
     n_skipped = sum(counts.get(r, 0) for r in SKIP_REASONS)
     detail = " / ".join(f"{r} {counts.get(r, 0)}" for r in SKIP_REASONS)
     return f"{n_total} 块 → 保留 {n_total - n_skipped} 块（跳过：{detail}）"

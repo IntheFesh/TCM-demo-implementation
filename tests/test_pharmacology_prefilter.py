@@ -78,8 +78,10 @@ def test_classify_order_is_short_then_table_then_long_then_structure():
     assert ps.classify_block(MODERN_ENTRY, "classic") == ps.SKIP_NO_STRUCTURE
 
 
-def test_unknown_source_skips_only_the_three_structure_free_classes():
-    """docx 转出来的医案 txt 没有结构判据（不猜它该长什么样），只跳过短/表格/超长。"""
+def test_unknown_source_skips_only_the_structure_free_classes():
+    """docx 转出来的医案 txt 没有结构判据（不猜它该长什么样），只跳过跟源类型无关的
+    那几类（过短/表格/索引/超长）。R8 收尾加了「索引」类，所以这条的名字从"三类"改成
+    不带数字的说法——断言本身没放松。"""
     prose = "患者男，60 岁，胃脘胀痛三月，纳差，舌淡苔白，脉弦细。予香砂六君子汤加减，七剂。"
     assert ps.classify_block(prose, "unknown") is None
     assert ps.classify_block(prose, None) is None
@@ -102,7 +104,49 @@ def test_prefilter_keeps_block_indexes_and_counts_add_up():
     assert [i for i, _ in kept] == [1]                       # 块号沿用切块时的编号
     assert [(i, r) for i, r, _ in skipped] == [(0, "过短"), (2, "表格"), (3, "无结构标记")]
     assert sum(counts.values()) == len(skipped)
-    assert ps.format_prefilter_summary(4, counts) == "4 块 → 保留 1 块（跳过：过短 1 / 表格 1 / 超长 0 / 无结构标记 1）"
+    # R8 收尾在「表格」后面插了「索引」类（纯文本的药名-页码索引，表格占比拦不住它），
+    # 所以这一行从四个数变成五个数。**这是有意的契约变更**：五个数仍然加起来等于跳过
+    # 总数（上一行断言），顺序仍然是 SKIP_REASONS 的顺序，没有放松任何判据。
+    assert ps.format_prefilter_summary(4, counts) == (
+        "4 块 → 保留 1 块（跳过：过短 1 / 表格 1 / 索引 0 / 超长 0 / 无结构标记 1）")
+
+
+# ---------- 索引类（R8 收尾） ----------
+
+
+PAGE_INDEX_BLOCK = "# 附药：海金沙藤 196  \n\n石韦 196  \n冬葵子 196  \n灯心草 197  \n草 198\n"
+FUYAO_ENTRY = ("# 附药：葛花  \n\n本品为豆科植物野葛的未开放花蕾。性味甘，平；归脾、胃经。"
+               "功能解酒毒，醒脾和胃。主要用于饮酒过度，头痛头昏、烦渴、呕吐等症。常用量 3～15g。  \n")
+
+
+def test_index_line_ratio_separates_the_page_index_from_a_real_fuyao_entry():
+    """真实数据上这两群分得很开：目录页的附药索引 1.0，15 个真附药条目全是 0.0。"""
+    assert ps.index_line_ratio(PAGE_INDEX_BLOCK) == 1.0
+    assert ps.index_line_ratio(FUYAO_ENTRY) == 0.0
+    # 不足 INDEX_MIN_LINES 行正文不判这一类——一行的巧合不构成"这是个索引"
+    assert ps.index_line_ratio("# 附药：某药 196  \n\n石韦 196\n") == 0.0
+
+
+def test_page_index_block_is_skipped_and_the_real_entry_is_kept():
+    """`_FUYAO_TITLE_RE` 只看标题行，所以目录页的附药索引也顶着「# 附药：」——
+    正文是「药名 + 页码」列表，靠索引行占比拦下来。"""
+    assert ps.is_modern_entry(PAGE_INDEX_BLOCK)          # 标题形状确实像附药条目
+    assert ps.classify_block(PAGE_INDEX_BLOCK, "modern") == ps.SKIP_INDEX
+    assert ps.classify_block(FUYAO_ENTRY, "modern") is None
+
+
+def test_index_is_judged_before_长度_and_structure():
+    """判序：索引在「超长」和「结构标记」之前——一个既超长又是索引的块该记成索引
+    （它是什么，比它多长更有信息量），而且古籍源的索引页也要拦下来。"""
+    long_index = PAGE_INDEX_BLOCK + "".join(f"药名{i} {i}\n" for i in range(4000))
+    assert len(long_index) > ps.BLOCK_MAX_CHARS
+    assert ps.classify_block(long_index, "modern") == ps.SKIP_INDEX
+    assert ps.classify_block(PAGE_INDEX_BLOCK, "classic") == ps.SKIP_INDEX
+    assert ps.classify_block(PAGE_INDEX_BLOCK, "unknown") == ps.SKIP_INDEX
+
+
+def test_skip_reasons_order_is_the_documented_judgement_order():
+    assert ps.SKIP_REASONS == ("过短", "表格", "索引", "超长", "无结构标记")
 
 
 # ---------- heading 切块的两处修正 ----------
@@ -198,13 +242,15 @@ def test_plan_blocks_returns_all_kept_skipped_and_counts(tmp_path):
     assert ert.plan_blocks(text, "heading", "modern", prefilter=False)[1] == all_blocks
 
 
-def test_engine_dry_run_prints_the_four_skip_classes(tmp_path, capsys):
+def test_engine_dry_run_prints_every_skip_class(tmp_path, capsys):
+    """R8 收尾加了「索引」类，所以这一行从四个数变成五个数（有意的契约变更，
+    见 test_prefilter_keeps_block_indexes_and_counts_add_up 里的说明）。"""
     from offline import extract_materia_medica as emm
 
     emm.main(["--input", str(_textbook(tmp_path)), "--source", "modern", "--book", "中药学",
               "--chunk-by", "heading", "--dry-run", "--out", str(tmp_path / "o.jsonl")])
     out = capsys.readouterr().out
-    assert "预过滤：5 块 → 保留 2 块（跳过：过短 1 / 表格 1 / 超长 0 / 无结构标记 1）" in out
+    assert "预过滤：5 块 → 保留 2 块（跳过：过短 1 / 表格 1 / 索引 0 / 超长 0 / 无结构标记 1）" in out
     assert "预估调用数 2" in out
 
 
@@ -356,3 +402,92 @@ def test_manifest_in_repo_matches_the_declared_corpora():
         for key in ("original_name", "bytes", "sha256", "encoding", "origin", "scope_stats"):
             assert key in e, key
         assert (ROOT / "data" / e["file"]).exists()
+
+
+# ---------- 非参考文献输入的闸门（R8 收尾） ----------
+
+
+def _case_txt(tmp_path: Path) -> Path:
+    """规范名就是闸门的判据（只看文件名，不看目录）——从别处拷一份改成这个名字
+    同样该被拦住。"""
+    p = tmp_path / "李可医案.txt"
+    p.write_text("目录：1.1 脑瘤头痛...1 1.2 鼻硬结症..\n\n" + CLASSIC_ENTRY, encoding="utf-8")
+    return p
+
+
+def test_engine_refuses_a_non_reference_local_corpus_before_spending_a_call(tmp_path, monkeypatch):
+    """**在花第一次调用之前**拦住"拿医案去抽本草三元组"：药理层抽的是性味/归经/
+    功效/用量，医案里没有这些字段。"""
+    from offline import extract_materia_medica as emm
+
+    def boom():  # 真调了模型就会炸——证明拦在调用之前
+        raise AssertionError("不该走到调模型这一步")
+
+    monkeypatch.setattr(ert, "get_llm", boom)
+    with pytest.raises(SystemExit, match="拒绝抽取"):
+        emm.main(["--input", str(_case_txt(tmp_path)), "--source", "classic",
+                  "--book", "李可医案", "--out", str(tmp_path / "o.jsonl")])
+    assert not (tmp_path / "o.jsonl").exists()
+
+
+@pytest.mark.parametrize("flag", ["--include-out-of-scope", "--allow-non-reference-input"])
+def test_engine_lets_it_through_with_either_spelling_of_the_override(tmp_path, capsys, flag):
+    from offline import extract_materia_medica as emm
+
+    emm.main(["--input", str(_case_txt(tmp_path)), "--source", "classic", "--book", "李可医案",
+              "--dry-run", flag, "--out", str(tmp_path / "o.jsonl")])
+    assert "预估调用数" in capsys.readouterr().out
+
+
+def test_engine_does_not_second_guess_files_outside_the_declaration_table(tmp_path, capsys):
+    """不在声明表里的文件一律放行——用户自己下的本草/方书不该被这张表挡住。"""
+    from offline import extract_materia_medica as emm
+
+    emm.main(["--input", str(_textbook(tmp_path)), "--source", "modern", "--book", "中药学",
+              "--chunk-by", "heading", "--dry-run", "--out", str(tmp_path / "o.jsonl")])
+    assert "预估调用数" in capsys.readouterr().out
+
+
+def test_batch_dry_run_says_out_loud_that_local_corpora_are_not_included(tmp_path, capsys):
+    """默认行为要说出来：不打这一行，"六个源"会被读成"所有语料"。"""
+    _textbook(tmp_path)
+    assert rpe.run_all(tmp_path, dry_run=True) == 0
+    out = capsys.readouterr().out
+    assert "本地语料：3 份**都不在药理层抽取范围内**（其中 out_of_scope 2 份）" in out
+    for name in ("王云启医案.docx", "李可医案.docx", "脾胃论.txt"):
+        assert name in out
+
+
+def test_verifier_file_mode_says_the_block_count_is_not_a_call_estimate(tmp_path, capsys):
+    """段 1 对本地语料跑这个脚本只为看段落粒度。原来它照样打「真实抽取预估调用数
+    937」——那句会被读成"该花 937 次调用"。"""
+    p = tmp_path / "王云启医案.txt"
+    # 够 MIN_BLOCKS=50 块，好让退出码是 0——这条测的是措辞，不是阈值
+    p.write_text("\n\n".join(
+        [f"序言 {i}：认识云启主任已是多年，常闻其老师、同事、同道均翘首称颂。" for i in range(30)]
+        + [f"第 {i} 案：肝癌患者，胃脘胀痛，纳差，予肝复方加减，七剂。" for i in range(30)]),
+        encoding="utf-8")
+    assert vpc.main(["--file", str(p), "--show", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "不是**抽取预估调用数" in out
+    assert "不进抽取**，不是调用数" in out
+    assert "真实抽取预估调用数" not in out
+
+
+def test_onsite_segment_5_number_tracks_the_measured_kept_blocks():
+    import re
+
+    text = (ROOT / "scripts" / "run_onsite.sh").read_text(encoding="utf-8")
+    row = next(line for line in text.splitlines() if line.strip().startswith('"5|'))
+    _n, _name, calls, _gate, note = row.strip().strip('"').split("|")
+    kept = int(re.search(r"预过滤后 (\d+) 块", note).group(1))
+    assert int(calls) == kept + 6 * 5
+
+
+def test_onsite_segment_1_warns_that_sdt_error_analysis_needs_segment_7_first():
+    """段 1 的这一项依赖段 7 的产物，第一次跑必然跳过——不写明白，每次跑段 1 都会
+    有人以为哪里没配好。"""
+    text = (ROOT / "scripts" / "run_onsite.sh").read_text(encoding="utf-8")
+    seg1 = text[text.index("seg_1() {"): text.index("seg_2() {")]
+    assert "第一次跑必然跳过" in seg1 and "段 7 的产物" in seg1
+    assert "只看段落粒度" in seg1

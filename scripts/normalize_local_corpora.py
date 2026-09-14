@@ -40,7 +40,11 @@ R8 三个选项里选的是 ②：**接进来、标 `out_of_scope: true`、训�
 `scope_stats.incompatible_pair_paragraphs`——李可那份实测 75 段海藻甘草同用。
 
 `out_of_scope` 和 `copyright_status` 是这张表上的**声明**，不是从数字自动推的：
-数字给人看，决定由人写进 LOCAL_CORPORA。
+数字给人看，决定由人写进 LOCAL_CORPORA（现在住在 `offline/local_corpora.py`）。
+那张表上还有一个**独立**的字段 `pharmacology_source`：这份语料是不是本草/方剂参考
+文献。它跟 `out_of_scope` 回答的不是同一个问题（《脾胃论》在定位内，但按空行切
+方名和组成不在一块，同样不能进药理层抽取），理由写在那张表的模块文档里。
+抽取引擎据此在开跑前拦住"拿医案去抽本草三元组"。
 """
 from __future__ import annotations
 
@@ -48,7 +52,7 @@ import argparse
 import hashlib
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -63,59 +67,19 @@ from core.syndrome_norm import normalize as spleen_stomach_terms  # noqa: E402
 from offline.assess_case_scope import ONCOLOGY_HINTS  # noqa: E402
 from offline.docx_to_text import docx_paragraphs, to_text  # noqa: E402
 from offline.extract_reference_triples import split_blocks  # noqa: E402
+# 声明表住在 offline/（抽取引擎也要读它来拦住"拿医案抽本草"，而 offline/ 不能
+# import scripts/）。这个脚本是它唯一的写入方。
+from offline.local_corpora import (  # noqa: E402
+    DUPLICATE_OF_BOOKS,
+    LOCAL_CORPORA,
+    LOCAL_DIR_NAME,
+    MANIFEST_NAME,
+    CorpusSpec,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = ROOT / "data"
 DEFAULT_BOOKS_DIR = ROOT / "books"
-LOCAL_DIR_NAME = "local_corpora"
-MANIFEST_NAME = "MANIFEST.json"
-
-# books/ 里已经有的那本：data/ 根目录的同名文件是重复上传，见模块文档规则 2。
-DUPLICATE_OF_BOOKS = "584-医学衷中参西录.txt"
-
-
-@dataclass(frozen=True)
-class CorpusSpec:
-    """一份本地语料的声明。original_prefix/suffix 用来在 data/ 根目录里认出原文件
-    （原名里有空格和没闭合的括号，不按全名匹配）。"""
-    original_prefix: str
-    suffix: str
-    target: str
-    kind: str                 # case_docx = 现代医案 docx；classic_text = 古籍排印本电子文本
-    encoding: str
-    origin: str
-    copyright_status: str     # 跟 CaseRecord.copyright_status 同一套值
-    out_of_scope: bool
-    scope_reason: str
-
-
-LOCAL_CORPORA: tuple[CorpusSpec, ...] = (
-    CorpusSpec(
-        original_prefix="2_王云启", suffix=".docx", target="王云启医案.docx",
-        kind="case_docx", encoding="docx",
-        origin="《王云启治癌验案录》，现代出版的肿瘤科医案集，用户上传（R8 实测 1599 个非空段落）",
-        copyright_status="copyrighted", out_of_scope=True,
-        scope_reason="肿瘤科医案，不在本项目脾胃门定位内；含脾胃门门类词的段落比例见 scope_stats，"
-                     "选项 ②：接进来但标 out_of_scope，训练导出默认排除",
-    ),
-    CorpusSpec(
-        original_prefix="李可医案", suffix=".docx", target="李可医案.docx",
-        kind="case_docx", encoding="docx",
-        origin="李可肿瘤医案汇编（脑瘤/鼻硬结症/宫颈癌等），用户上传（R8 实测 556 个非空段落，"
-               "75 段海藻甘草同用）",
-        copyright_status="copyrighted", out_of_scope=True,
-        scope_reason="整份是肿瘤医案，不在脾胃门定位内；且含十八反配伍（海藻反甘草），"
-                     "抽成医案后 has_incompatible_pair 会命中、训练导出默认排除——两道过滤各管各的",
-    ),
-    CorpusSpec(
-        original_prefix="脾胃论", suffix=".txt", target="脾胃论.txt",
-        kind="classic_text", encoding="utf-8",
-        origin="《脾胃论》金·李东垣，人民卫生出版社 2005 排印本的电子文本（z-library），"
-               "原著公有领域；文件头约 30 行是版权页/CIP/推广广告，切块预过滤按结构跳过",
-        copyright_status="public_domain", out_of_scope=False,
-        scope_reason="脾胃门理论原典，在定位内",
-    ),
-)
 
 # 十八反十九畏表里出现过的所有写法（类目名 + 别名）。段落里出现哪些，就把哪些
 # 交给 check_incompatible 判——"含不含反药对"的判断只有那一处实现，这里只负责

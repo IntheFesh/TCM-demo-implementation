@@ -208,3 +208,56 @@ def test_export_cli_has_the_out_of_scope_flag_and_wires_it():
 @pytest.mark.parametrize("safe_name", list(ORIGINAL_NAMES))
 def test_safe_names_have_no_shell_hostile_characters(safe_name):
     assert not any(ch in safe_name for ch in " ()[],")
+
+
+# ---------- 声明表：两个独立判断（R8 收尾） ----------
+
+
+def test_two_independent_judgements_are_not_merged():
+    """`out_of_scope`（训练集要不要它）和 `pharmacology_source`（药理层抽取能不能拿
+    它当输入）回答的不是同一个问题。《脾胃论》是判据：**在定位内**，但同样不能进
+    药理层抽取（按空行切方名和组成不在一块）。合并成一个字段就看不出这个区别了。"""
+    from offline import local_corpora as lc
+
+    peiwei = lc.spec_for_target("脾胃论.txt")
+    assert peiwei is not None
+    assert peiwei.out_of_scope is False          # 在定位内
+    assert peiwei.pharmacology_source is False   # 但不是本草/方剂参考文献
+    assert "方名" in peiwei.pharmacology_reason and "source_span" in peiwei.pharmacology_reason
+    # 每份都要写明两个理由，不能只标一个布尔值
+    for spec in lc.LOCAL_CORPORA:
+        assert spec.scope_reason and spec.pharmacology_reason
+
+
+def test_spec_for_path_also_recognises_the_derived_txt_and_ignores_the_directory():
+    """真正会被拿去喂抽取的是 docx 派生出来的那份 .txt；从别处拷一份改成这个名字
+    同样该被认出来（只看文件名，不看目录）。"""
+    from offline import local_corpora as lc
+
+    assert lc.spec_for_path("data/local_corpora/李可医案.txt").target == "李可医案.docx"
+    assert lc.spec_for_path("/tmp/somewhere/李可医案.txt") is not None
+    assert lc.spec_for_path(Path("books/中药学.md")) is None
+
+
+def test_non_reference_reason_only_speaks_for_files_in_the_table():
+    from offline import local_corpora as lc
+
+    assert lc.non_reference_reason("books/中药学.md") is None
+    assert lc.non_reference_reason("books/000-神农本草经.txt") is None
+    for spec in lc.non_pharmacology_corpora():
+        reason = lc.non_reference_reason(f"data/local_corpora/{spec.target}")
+        assert reason is not None and spec.target in reason
+        assert ("定位外" in reason) == spec.out_of_scope
+
+
+def test_manifest_records_the_pharmacology_source_declaration_too():
+    """MANIFEST 是给人看的那份账：两个判断都要落在里面，不然"为什么它没进抽取"
+    只能去读代码。"""
+    from scripts import normalize_local_corpora as nlc
+
+    manifest = json.loads((Path(__file__).resolve().parent.parent / "data" / "local_corpora"
+                           / nlc.MANIFEST_NAME).read_text(encoding="utf-8"))
+    for entry in manifest["entries"]:
+        assert entry["pharmacology_source"] is False
+        assert entry["pharmacology_reason"]
+        assert "out_of_scope" in entry

@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from offline import extract_formulary, extract_materia_medica  # noqa: E402
+from offline.local_corpora import non_pharmacology_corpora  # noqa: E402
 from offline.pharmacology_sources import EXPECTED_SOURCES, book_title  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -60,6 +61,22 @@ def build_argv(name: str, path: Path, limit_blocks: int | None, dry_run: bool,
     return argv
 
 
+def print_local_corpora_accounting() -> None:
+    """**默认行为要说出来**：本地语料（data/local_corpora/）一份都不在这次抽取里。
+    不打这一行，"六个源"看起来就像是"所有语料"，而用户刚在段 1 看到那几份语料被
+    切成了上千块。每份的理由从 offline/local_corpora.py 的声明表取，不在这里重写。"""
+    specs = non_pharmacology_corpora()
+    if not specs:
+        return
+    n_oos = sum(1 for s in specs if s.out_of_scope)
+    print(f"本地语料：{len(specs)} 份**都不在药理层抽取范围内**"
+          f"（其中 out_of_scope {n_oos} 份），不计入下面的预估调用数：")
+    for spec in specs:
+        print(f"  - {spec.target}：{spec.pharmacology_reason}")
+    print("  （引擎也会拦：直接 --input 指到它们会被拒绝，除非加 --include-out-of-scope）")
+    print()
+
+
 def run_all(books_dir: Path, limit_blocks: int | None = None, dry_run: bool = False,
             no_prefilter: bool = False, crosscheck: bool = False,
             only_source: str | None = None) -> int:
@@ -76,6 +93,9 @@ def run_all(books_dir: Path, limit_blocks: int | None = None, dry_run: bool = Fa
         return 2
     if missing:
         print(f"以下源不在 {books_dir}，本次跳过（不算失败，但它们没有被抽）：{'、'.join(missing)}")
+    if dry_run:
+        print()
+        print_local_corpora_accounting()
 
     failures: dict[str, str] = {}
     for name in present:

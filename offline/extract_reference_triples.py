@@ -45,6 +45,7 @@ from core.schemas import (
     MateriaMedicaExtraction,
     MateriaMedicaRecord,
 )
+from offline.local_corpora import non_reference_reason
 from offline.pharmacology_sources import format_prefilter_summary, prefilter_blocks
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -331,6 +332,15 @@ def build_parser(kind_name: str | None) -> argparse.ArgumentParser:
     ap.add_argument("--limit", "--limit-blocks", dest="limit", type=int, default=None,
                     help="只处理（预过滤后的）前 N 块，调试/控成本用")
     ap.add_argument("--only-blocks", default="", help="只重跑这些块号（逗号分隔），结果按块号合并进 --out")
+    # 两个拼法同一个开关（跟 --limit/--limit-blocks 同一种做法）：
+    # --include-out-of-scope 跟 export_sft 那个同名开关读起来一致，
+    # --allow-non-reference-input 说的是这道闸门真正判的东西（不只是定位外——
+    # 《脾胃论》在定位内也过不了这道闸，见 offline/local_corpora.py）。
+    ap.add_argument("--include-out-of-scope", "--allow-non-reference-input",
+                    dest="allow_non_reference", action="store_true",
+                    help="强行拿不是本草/方剂参考文献的本地语料（医案、理论专著）当输入。"
+                         "默认拦住：药理层抽的是「性味/归经/功效/用量」，医案里没有这些字段，"
+                         "跑一遍是纯浪费钱")
     ap.add_argument("--no-prefilter", action="store_true",
                     help="关掉块级预过滤（R8-1：默认按源类型跳过过短/表格/超长/无结构标记的块，"
                          "见 offline/pharmacology_sources.py）。只在核对预过滤本身时用")
@@ -347,6 +357,15 @@ def run(argv: list[str] | None, kind_name: str | None, after_write=None) -> None
 
     if not args.input.exists():
         raise FileNotFoundError(f"未找到 {args.input}——整本原文 txt 要自己准备，见 README 3.1 的下载说明。")
+    # **在花第一次调用之前**拦住"拿医案去抽本草三元组"。判断只有
+    # offline/local_corpora.py 一处（那张表同时是规范化脚本和 MANIFEST 的来源），
+    # 这里不另写"文件名像不像医案"的猜测。不在表里的文件一律放行。
+    reason = non_reference_reason(args.input)
+    if reason is not None and not args.allow_non_reference:
+        raise SystemExit(
+            f"拒绝抽取：{reason}\n"
+            "确认真要拿它当输入就加 --include-out-of-scope（= --allow-non-reference-input）。"
+        )
     text = args.input.read_text(encoding="utf-8")
     all_blocks, blocks, skipped, counts = plan_blocks(
         text, args.chunk_by, args.source, prefilter=not args.no_prefilter)

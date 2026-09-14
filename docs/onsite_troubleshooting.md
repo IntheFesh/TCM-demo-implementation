@@ -26,7 +26,7 @@ watch -n 10 'ls -l --time-style=full-iso <日志文件>'
 | 现象 | 最可能的原因 | 处置 |
 |---|---|---|
 | **某段静默很久** | **正常**，见上面第 0 条 | 看日志文件 mtime，**不要 ps/kill** |
-| `pytest` 数不是预期的 2085（R8 起；6 条 skip 是 vllm/训练依赖没装时的正常跳过）| 依赖没装齐 | `pip install -r requirements.txt`；训练机还要 `-r requirements-train.txt` |
+| `pytest` 数不是预期的 2101（R8 起；6 条 skip 是 vllm/训练依赖没装时的正常跳过）| 依赖没装齐 | `pip install -r requirements.txt`；训练机还要 `-r requirements-train.txt` |
 | `RETRIEVER_MODE` 有残留值 | 上次跑 E8 时 export 过 | `unset RETRIEVER_MODE`——**它会让演示/评测跑的不是默认模式，而且没有任何提示** |
 | `LLMTruncatedError` | 真截断 or API 抖动 | **看返回长度**：< `TRUNCATION_MIN_LENGTH`（100 字符）的判为抖动、会自动重试；超过它才是真截断，要看 `max_tokens` |
 | 单条样本失败 | API 抖动 | 已有失败容忍，看报告里的 `n_failed`；**超过 20%**（`core/batch.py` 的 `FAILURE_RATE_WARNING_THRESHOLD`）脚本会自己吼一声，那时才需要管 |
@@ -44,6 +44,9 @@ watch -n 10 'ls -l --time-style=full-iso <日志文件>'
 | `--only-blocks` 报「这些块被预过滤跳过了」 | 点名的块号是过短/表格/超长/无结构标记之一 | 确认真要跑它就加 `--no-prefilter`；块号是切块结果里的位置，开/关预过滤不变 |
 | `extract_materia_medica: the following arguments are required: --input` | 直接调了引擎入口没给参数（R8 之前段 5 就是这么写的） | 用 `python -m scripts.run_pharmacology_extraction`，参数从六源表取 |
 | `normalize_local_corpora` 退出码 1「冲突」 | `data/` 根目录又出现了同一份语料但内容不同 | 脚本不替人决定：看打印的两个 sha256，人定留哪份，删掉另一份再跑 |
+| 抽取报「拒绝抽取：…不是本草/方剂参考文献」 | `--input` 指到了本地语料（医案 / 《脾胃论》） | 这是闸门在**花第一次调用之前**拦住：药理层抽的是性味/归经/功效/用量，医案里没有；真要跑加 `--include-out-of-scope` |
+| 段 1 对本地语料打出「粒度参考 N 块（不进抽取）」 | 正常：那三份不在药理层抽取范围内 | 它们在段 1 只用来看 docx 段落粒度；预估调用数只看六源那一行 |
+| 段 1 的 SDT 失分分析总是「跳过」 | 它的输入 `out/sdt_chain_v2.txt` 是段 7 的产物 | 第一次跑必然跳过，段 7 跑过一次之后才有输入——不是配置错了 |
 
 ## 2. 每段挂了之后怎么续
 
