@@ -85,12 +85,23 @@ _GUJI_PIAN_RE = re.compile(r"^<篇名>")
 #      正则命中的 54 个标题全是页眉/目录页眉/编写说明页眉，没有一个条目。
 _CONTINUATION_HEADING_RE = re.compile(
     r"^#{1,6}\s+(?:【|\d{1,4}(?:\s+\S{1,12}|[^\s\d.．、,，)）]\S{0,11})?\s*$)")
+#   3. 出处行：`# 《金匮要略》`、`# Xiongdanfen（《新修本草》)`——条目标题下面那一行
+#      "拼音 / 出处书名"被 OCR 也升成了 `#`。这一条是 R8 审查（review:chunker）在
+#      真实数据上抓出来的：方剂学 35 张方、中药学 2 味药的正文都挂在这种出处行下面，
+#      而真正的标题行（`# 大黄附子汤`，6 字）单独成块、短于 MIN_BLOCK_CHARS 被丢——
+#      正是"块里没有药名、s 只能猜"的那个洞。只认"整行只有一个《书名》、前面至多
+#      一段拉丁字母拼音"的形状：「一、现存最早的本草专著 一《神农本草经》」这种带
+#      中文正文的真标题不算。
+_SOURCE_LINE_HEADING_RE = re.compile(
+    r"^#{1,6}\s+(?:[A-Za-z][A-Za-z ]*\s*)?[（(]?《[^》]+》[)）]?\s*$")
 
 
 def _is_title_line(line: str) -> bool:
     if _GUJI_TITLE_RE.match(line):
         return True
-    return bool(_HEADING_RE.match(line)) and not _CONTINUATION_HEADING_RE.match(line)
+    if not _HEADING_RE.match(line):
+        return False
+    return not (_CONTINUATION_HEADING_RE.match(line) or _SOURCE_LINE_HEADING_RE.match(line))
 
 
 def _only_toc_lines(lines: list[str]) -> bool:

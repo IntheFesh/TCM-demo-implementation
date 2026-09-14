@@ -26,7 +26,7 @@ watch -n 10 'ls -l --time-style=full-iso <日志文件>'
 | 现象 | 最可能的原因 | 处置 |
 |---|---|---|
 | **某段静默很久** | **正常**，见上面第 0 条 | 看日志文件 mtime，**不要 ps/kill** |
-| `pytest` 数不是预期的 2080（R8 起；6 条 skip 是 vllm/训练依赖没装时的正常跳过）| 依赖没装齐 | `pip install -r requirements.txt`；训练机还要 `-r requirements-train.txt` |
+| `pytest` 数不是预期的 2085（R8 起；6 条 skip 是 vllm/训练依赖没装时的正常跳过）| 依赖没装齐 | `pip install -r requirements.txt`；训练机还要 `-r requirements-train.txt` |
 | `RETRIEVER_MODE` 有残留值 | 上次跑 E8 时 export 过 | `unset RETRIEVER_MODE`——**它会让演示/评测跑的不是默认模式，而且没有任何提示** |
 | `LLMTruncatedError` | 真截断 or API 抖动 | **看返回长度**：< `TRUNCATION_MIN_LENGTH`（100 字符）的判为抖动、会自动重试；超过它才是真截断，要看 `max_tokens` |
 | 单条样本失败 | API 抖动 | 已有失败容忍，看报告里的 `n_failed`；**超过 20%**（`core/batch.py` 的 `FAILURE_RATE_WARNING_THRESHOLD`）脚本会自己吼一声，那时才需要管 |

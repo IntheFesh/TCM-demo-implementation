@@ -113,6 +113,13 @@ SKIP_REASONS = (SKIP_TOO_SHORT, SKIP_TABLE, SKIP_TOO_LONG, SKIP_NO_STRUCTURE)
 # 不限行首会把这类总论段放进来（实测炮制学 +15 块、中药学 +1 块）。上限 12 字
 # 是为了不把「【」开头的整句话（OCR 偶尔把书名号识别成方头括号）当成标签。
 _FIELD_LABEL_RE = re.compile(r"^\s*【[^】]{1,12}】", re.M)
+# 教材的**附药子条目**：「# 附药：葛花」「# 附药：绿豆衣、赤小豆、黑豆」。这是十四五
+# 教材的排版约定（正条目后面附几味近缘药），字段刻意写成散文（"性味甘，平；归脾、
+# 胃经。功能解酒毒…常用量 3～15g"），没有 `【】`。R8 审查（review:prefilter）在真实
+# 数据上抓出来：中药学 15 个附药块、22 味药全被判成「无结构标记」丢掉——预过滤最贵
+# 的那种错（真条目一丢就永远抽不到）。「附药：」是标题行的结构标记，跟 `【字段】`
+# 同一性质，不是内容关键词。
+_FUYAO_TITLE_RE = re.compile(r"^#{1,6}\s+附药[：:]", re.M)
 # 古籍转录体例的条目标题行；正文标记是 `内容：`（神农本草经、本草备要）或
 # `属性：`（医学衷中参西录）。
 _PIAN_LINE_RE = re.compile(r"^<篇名>", re.M)
@@ -129,7 +136,7 @@ _TABLE_RE = re.compile(r"<table.*?</table>", re.S)
 
 
 def is_modern_entry(block: str) -> bool:
-    return _FIELD_LABEL_RE.search(block) is not None
+    return _FIELD_LABEL_RE.search(block) is not None or _FUYAO_TITLE_RE.search(block) is not None
 
 
 def is_classic_entry(block: str) -> bool:

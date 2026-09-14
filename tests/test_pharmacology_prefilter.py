@@ -134,6 +134,31 @@ def test_heading_mode_still_starts_blocks_at_real_titles_with_numbers(heading):
     assert len(blocks) == 2 and blocks[1].startswith(heading.strip()), blocks
 
 
+@pytest.mark.parametrize("heading", ["# 《金匮要略》  ", "# Xiongdanfen（《新修本草》)  ", "# Chuanbeimu（《神农本草经》）  "])
+def test_heading_mode_treats_source_attribution_lines_as_continuation(heading):
+    """R8 审查（review:chunker）在真实数据上抓出来的：方剂学 35 张方、中药学 2 味药的
+    标题下面那行「出处书名 / 拼音」被 OCR 升成了 `#`，真标题（`# 大黄附子汤`，6 字）
+    单独成块短于 MIN_BLOCK_CHARS 被丢，正文挂在 `# 《金匮要略》` 下面——块里没有方名。"""
+    text = "# 大黄附子汤  \n\n" + heading + "\n\n【组成】大黄三两 附子三枚 细辛二两  \n\n【功用】温里散寒，通便止痛。  \n"
+    blocks = ert.split_blocks(text, "heading")
+    assert len(blocks) == 1 and blocks[0].startswith("# 大黄附子汤") and "【组成】" in blocks[0], blocks
+
+
+def test_heading_mode_keeps_real_titles_that_merely_contain_a_book_name():
+    text = MODERN_ENTRY + "\n# 一、现存最早的本草专著 一《神农本草经》  \n\n【作者】不详。  \n\n【成书年代】东汉末年。  \n"
+    blocks = ert.split_blocks(text, "heading")
+    assert len(blocks) == 2 and blocks[1].startswith("# 一、现存最早的本草专著")
+
+
+def test_modern_predicate_accepts_fuyao_sub_entries_written_in_prose():
+    """R8 审查（review:prefilter）：中药学 15 个「# 附药：葛花」子条目字段是散文、没有
+    `【】`，原判据把 22 味药全丢了。「附药：」是标题行的结构标记，跟 `【字段】` 同一性质。"""
+    fuyao = ("# 附药：葛花  \n\n本品为豆科植物野葛的未开放花蕾。性味甘，平；归脾、胃经。"
+             "功能解酒毒，醒脾和胃。常用量 3～15g。  \n")
+    assert ps.is_modern_entry(fuyao)
+    assert ps.classify_block(fuyao, "modern") is None
+
+
 def test_heading_mode_splits_guji_txt_at_pian_and_attaches_the_toc_line():
     """古籍转录体例：`<篇名>` 是标题行；它前面单独成块的 `<目录>` 行并进来
     （"卷一\\上经"是品级，留着有用）。R8 之前古籍用 blank-line：`<篇名>丹沙`
