@@ -201,7 +201,9 @@ def test_epsilon_helpers_are_empty_without_the_file(tmp_path):
 
 
 def _md(row: str) -> str:
-    return "| # | 指标 | 后端 |\n|---|---|---|\n" + row + "\n"
+    """表头必须带「凭据」列——`metric_rows()` 就是靠它认出"这张表是指标表"的
+    （见 test_metric_rows_only_looks_inside_a_table_with_an_evidence_column）。"""
+    return "| # | 指标 | 后端 | 当前值 | 凭据 |\n|---|---|---|---|---|\n" + row + "\n"
 
 
 def test_parse_evidence_tokens_reads_file_key_value():
@@ -262,32 +264,46 @@ def test_check_catches_evidence_that_disagrees_with_its_own_row(tmp_path):
     assert not result["ok"] and result["missing_in_line"][0]["stated"] == "0.335"
 
 
-def test_check_lists_rows_without_evidence_without_failing(tmp_path):
-    """没有文件凭据不是错误，是一个要被看见的事实。"""
+def test_check_lists_pending_rows_without_failing(tmp_path):
+    """契约变更：`rows_without_evidence` 拆成两个键。**没有凭据分两种**——⏳ 标了
+    「还没跑过」的是刻意如此（真机数据不存在），不算失败；凭据列既没有记号也没有
+    ⏳ 标记的是**漏标**，算失败。合成一个键的时候，一个新加的行凭据列留空，读起来
+    跟有凭据的行一样，而没有任何东西会提醒。"""
     d = _make_eval_dir(tmp_path)
-    result = cr.check(_md("| 9 | E2 | deepseek | 0.420 vs 0.569 | 无文件凭据 |"), d)
+    result = cr.check(_md("| 9 | E2 | deepseek | 0.420 vs 0.569 | ⏳ 还没跑过 |"), d)
     assert result["ok"]
-    assert len(result["rows_without_evidence"]) == 1
+    assert len(result["rows_pending_measurement"]) == 1
+    assert result["rows_unmarked"] == []
+
+
+def test_check_fails_on_a_row_whose_evidence_cell_is_blank(tmp_path):
+    """凭据列留空 = 漏标，算失败。这是上一条测试里"合成一个键"会漏掉的那种情况。"""
+    d = _make_eval_dir(tmp_path)
+    result = cr.check(_md("| 9 | E2 | deepseek | 0.420 vs 0.569 | |"), d)
+    assert not result["ok"]
+    assert len(result["rows_unmarked"]) == 1
+    assert "漏标" in cr.format_check(result)
 
 
 def test_check_only_treats_numbered_rows_as_metric_rows(tmp_path):
     """文件里还有别的说明性表格（凭据核对表、ε 逐条地板表）。把它们也算进
     "没有凭据的行"，那张清单就被噪声淹掉，人就不看它了。"""
     d = _make_eval_dir(tmp_path)
-    text = ("| 凭据键 | 文件里的值 |\n|---|---|\n"
-            "| e3.change_rate | 0.3348 |\n"
-            "| 主诉一 | 0.0 |\n"
-            "| 3 | E3 | deepseek | 0.451 | 无文件凭据 |\n")
+    text = ("| 说明 | 文件里的值 |\n|---|---|\n"
+            "| 1 | 0.3348 |\n"                     # 编号行，但不在带「凭据」的表里
+            "\n"
+            "| # | 指标 | 后端 | 当前值 | 凭据 |\n|---|---|---|---|---|\n"
+            "| 3 | E3 | deepseek | 0.451 | ⏳ 还没跑过 |\n")
     result = cr.check(text, d)
-    assert len(result["rows_without_evidence"]) == 1
-    assert result["rows_without_evidence"][0].startswith("| 3 |")
+    assert len(result["rows_pending_measurement"]) == 1
+    assert result["rows_pending_measurement"][0].startswith("| 3 |")
 
 
 def test_check_accepts_the_dash_suffixed_local_row_numbering(tmp_path):
     """并列加行的编号是 `3-local`（R5-4），也算指标行。"""
     d = _make_eval_dir(tmp_path)
-    result = cr.check("| 3-local | E3 | tcm-local | 待跑 | 待跑 |\n", d)
-    assert len(result["rows_without_evidence"]) == 1
+    result = cr.check(_md("| 3-local | E3 | tcm-local | 待跑 | ⏳ 还没跑过 |"), d)
+    assert len(result["rows_pending_measurement"]) == 1
 
 
 # ---------- 对着仓库真实文件：钉住 RESULTS.md 不漂 ----------
@@ -302,14 +318,48 @@ def test_repo_results_md_evidence_all_checks_out():
     assert result["checked"] >= 13      # 少了说明凭据记号被删掉了，来看一眼
 
 
-def test_committed_reports_are_the_pre_fix_run_not_the_current_one():
-    """仓库里那四份 report 正好是 RESULTS.md 里「修复前 / 旧检索」那一列的凭据，
-    不是「当前值」那一列的。这条测试钉住这个事实——它一旦变了（有人提交了修复后
-    那一轮的 report），这条会红，那时候要做的是把 RESULTS.md 的凭据列改过来。"""
-    assert cr.evidence_value("e3.change_rate")[0] == 0.3348
-    assert cr.evidence_value("e4.change_rate")[0] == 0.3514
-    assert cr.evidence_value("e8.output_difference_rate")[0] == 0.366
-    assert cr.evidence_value("e9.change_rate")[0] == 0.2503
+def test_the_current_values_come_from_eval_and_the_baselines_from_archive():
+    """**这条测试的上一版做了它该做的事然后红了。** 它原来断言
+    `eval/report_e3.json` 里是 0.3348（修复前），并在文档字符串里写明"有人提交了
+    修复后那一轮的 report 这条就会红，那时候要做的是把 RESULTS.md 的凭据列改过来"。
+    修复后那一轮提交进来（f1d5520）之后它确实红了，于是凭据列改了、修复前那一轮
+    归档了。现在钉住的是新的分工：`eval/` 里是当前值，`eval/archive/2026-09-12/`
+    里是修复前的对照，两端都能核。"""
+    assert cr.evidence_value("e3.change_rate")[0] == 0.4508
+    assert cr.evidence_value("e4.change_rate")[0] == 0.4969
+    assert cr.evidence_value("e8.output_difference_rate")[0] == 0.4369
+    assert cr.evidence_value("e9.change_rate")[0] == 0.4628
+    assert cr.evidence_value("archive.e3.change_rate")[0] == 0.3348
+    assert cr.evidence_value("archive.e4.change_rate")[0] == 0.3514
+    assert cr.evidence_value("archive.e8.output_difference_rate")[0] == 0.366
+    assert cr.evidence_value("archive.e9.change_rate")[0] == 0.2503
+
+
+def test_the_gate_actually_passes_on_the_current_values_and_failed_before():
+    """闸门 ≥ 0.4 这件事本身要可核：修复前四项全部不过，修复后 E3/E4/E9 全过。
+    「修复前 → 修复后」这个叙事的两端都在文件里，不靠一句话。"""
+    for key in ("e3.change_rate", "e4.change_rate", "e9.change_rate"):
+        assert cr.evidence_value(key)[0] >= 0.4
+        assert cr.evidence_value(f"archive.{key}")[0] < 0.4
+
+
+def test_e2_school_pairs_flip_between_the_two_committed_runs():
+    """**同一份代码、同一批主诉，跑两次，E2 的判据一次成立一次不成立。**
+    这是「只报出、不设闸门」这个决定最硬的实测依据。哪天这条测试红了（两轮方向
+    一致了），要改的是 RESULTS.md 第 9 行的叙述，不是把这条测试删掉。"""
+    e9_holds = (cr.evidence_value("e9.school_cross_mean")[0]
+                > cr.evidence_value("e9.school_lineage_mean")[0])
+    e8_holds = (cr.evidence_value("e8.school_cross_mean")[0]
+                > cr.evidence_value("e8.school_lineage_mean")[0])
+    assert e9_holds and not e8_holds
+    assert cr.evidence_value("e9.school_n_cross_gt_lineage")[0] == 5
+    assert cr.evidence_value("e8.school_n_cross_gt_lineage")[0] == 4
+
+
+def test_every_report_md_is_in_sync_with_its_json():
+    """一份旧的人读报告躺在一份新的数据旁边，而人只会读 md。这条测试是那次
+    e8.md/e9.md 没跟着同步（只同步了 e3/e4）之后加的。"""
+    assert cr.check_md_json_sync() == []
 
 
 def test_repo_epsilon_stratification_has_both_error_directions():
@@ -357,3 +407,162 @@ def test_main_check_exits_nonzero_on_drift(tmp_path, capsys):
         cr.main(["--eval-dir", str(d), "--check", str(md)])
     assert e.value.code == 1
     assert "文件里实际是 0.3348" in capsys.readouterr().out
+
+
+# ---------- md / json 同步检查与重渲染 ----------
+
+
+def _md_for(json_path, ts):
+    json_path.with_suffix(".md").write_text(
+        f"# V1 评测汇总（{ts}）\n\n共 10 条查询。\n", encoding="utf-8")
+
+
+def test_md_json_sync_flags_a_stale_md(tmp_path):
+    """凭据记号只管 json 里的数，管不到 md——所以要单独查。"""
+    d = _make_eval_dir(tmp_path)
+    # _report() 里的 generated_at 是 2026-09-12，md 故意写成 09-01
+    _md_for(d / "report_e3.json", "2026-09-01T00:00:00+00:00")
+    drift = cr.check_md_json_sync(d)
+    assert len(drift) == 1
+    assert drift[0]["json"] == "report_e3.json"
+    assert drift[0]["md_ts"] == "2026-09-01T00:00:00+00:00"
+
+
+def test_md_json_sync_is_quiet_when_they_match(tmp_path):
+    d = _make_eval_dir(tmp_path)
+    _md_for(d / "report_e3.json", "2026-09-12T00:00:00+00:00")
+    (d / "report_e3.json").write_text(json.dumps(
+        dict(_report("swapped", 0.3348), generated_at="2026-09-12T00:00:00+00:00"),
+        ensure_ascii=False), encoding="utf-8")
+    assert cr.check_md_json_sync(d) == []
+
+
+def test_md_json_sync_skips_a_json_with_no_md(tmp_path):
+    """只有 json 没有 md 不算漂——那是"还没渲染过"，不是"渲染过但过期了"。"""
+    assert cr.check_md_json_sync(_make_eval_dir(tmp_path)) == []
+
+
+def test_check_fails_on_md_drift_even_when_every_token_matches(tmp_path):
+    d = _make_eval_dir(tmp_path)
+    _md_for(d / "report_e3.json", "2026-09-01T00:00:00+00:00")
+    result = cr.check(_md("| 3 | E3 | x | 0.335 | `report_e3.json:e3.change_rate=0.335` |"), d)
+    assert not result["ok"] and result["mismatches"] == []
+    assert len(result["md_json_drift"]) == 1
+    assert "只读 md" in cr.format_check(result)
+
+
+def test_rerender_rewrites_the_stale_md_from_its_own_json(tmp_path):
+    """md 是 json 的确定性渲染产物，重渲染不会造出任何新数字（零 LLM 调用）。"""
+    d = _make_eval_dir(tmp_path)
+    e8 = d / "report_e8.json"
+    report = json.loads(e8.read_text(encoding="utf-8"))
+    # render_markdown 要的键补齐（这几份合成 report 只有测凭据用的那几段）
+    report.update({
+        "n_queries": 10,
+        "divergence_vs_epsilon": {"available": True, "note": "n"},
+        "divergence_per_query": [],
+        "school_pairs": {"note": "s"},
+        "hallucination": {"note": "h"},
+        "safety_veto": {"note": "v"},
+        "retrieval_mode_comparisons": [], "ablations": [],
+        "react_process": None,
+        # retriever_mode_effect 非 None 时 render_markdown 要读它的 note
+        "retriever_mode_effect": {"output_difference_rate": 0.366, "note": "r"},
+    })
+    e8.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    _md_for(e8, "2026-09-01T00:00:00+00:00")
+    done = cr.rerender_drifted_md(d)
+    assert [x["rendered"] for x in done] == [True]
+    assert cr.check_md_json_sync(d) == []
+    assert report["generated_at"] in (d / "report_e8.md").read_text(encoding="utf-8")
+
+
+def test_rerender_reports_a_missing_key_instead_of_crashing(tmp_path):
+    """老 json 缺 render_markdown 要的键时，报出缺哪个键，不抛一个看不懂的栈。"""
+    d = _make_eval_dir(tmp_path)
+    _md_for(d / "report_e3.json", "2026-09-01T00:00:00+00:00")
+    done = cr.rerender_drifted_md(d)
+    assert done and done[0]["rendered"] is False and "缺键" in done[0]["reason"]
+
+
+def test_main_rerender_says_nothing_to_do_when_in_sync(tmp_path, capsys):
+    with pytest.raises(SystemExit) as e:
+        cr.main(["--eval-dir", str(_make_eval_dir(tmp_path)), "--rerender"])
+    assert e.value.code == 0
+    assert "没有需要重渲染的 md" in capsys.readouterr().out
+
+
+# ---------- 新增凭据键 ----------
+
+
+def test_paired_divergence_keys_count_verdicts_not_the_global_cut(tmp_path):
+    """`divergence_per_query` 是**逐条配对** ε 的判决，`divergence_vs_epsilon` 是拿
+    全局 ε 一刀切算的。同一份文件里两个都有，引用时必须说清是哪一个。"""
+    d = _make_eval_dir(tmp_path)
+    e3 = d / "report_e3.json"
+    report = json.loads(e3.read_text(encoding="utf-8"))
+    report["divergence_per_query"] = (
+        [{"verdict": "real_divergence"}] * 9 + [{"verdict": "unusable"}])
+    e3.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    assert cr.evidence_value("e3.paired_real_divergence", d)[0] == 9
+    assert cr.evidence_value("e3.paired_unusable", d)[0] == 1
+    assert cr.evidence_value("e3.paired_within_noise", d)[0] == 0
+
+
+def test_school_keys_read_from_each_report_separately(tmp_path):
+    """两份 report 的 school_pairs 各读各的——只挑一份写进文档就是在挑对自己
+    有利的那一次。"""
+    d = _make_eval_dir(tmp_path)
+    for name, lineage, cross in (("report_e8.json", 0.568, 0.557),
+                                 ("report_e9.json", 0.453, 0.584)):
+        path = d / name
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["school_pairs"] = {"lineage_mean": lineage, "cross_school_mean": cross,
+                                  "n_cross_school_gt_lineage": 4}
+        path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    assert cr.evidence_value("e8.school_lineage_mean", d)[0] == 0.568
+    assert cr.evidence_value("e9.school_lineage_mean", d)[0] == 0.453
+
+
+def test_archive_keys_point_at_the_archive_directory(tmp_path):
+    """归档目录一轮一个日期，只放不改——上表「修复前」那一列全靠"这个目录里的
+    四份文件是同一轮跑出来的"这个前提。"""
+    d = _make_eval_dir(tmp_path)
+    arch = d / cr.ARCHIVE_2026_09_12
+    arch.mkdir(parents=True)
+    (arch / "report_e3.json").write_text(
+        json.dumps(_report("swapped", 0.3348), ensure_ascii=False), encoding="utf-8")
+    value, path = cr.evidence_value("archive.e3.change_rate", d)
+    assert value == 0.3348
+    assert cr.ARCHIVE_2026_09_12 in str(path)
+
+
+def test_archive_key_missing_file_is_reported_not_silently_none(tmp_path):
+    value, path = cr.evidence_value("archive.e3.change_rate", _make_eval_dir(tmp_path))
+    assert value is None and not path.exists()
+
+
+def test_repo_readme_evidence_all_checks_out():
+    """README 里的评测数字跟 RESULTS.md 走**同一套凭据记号、同一个核对器**——
+    README 手抄一份数字出来漂了，跟 RESULTS.md 漂了是同一个问题，不该有两套机制。"""
+    from pathlib import Path as _Path
+
+    readme = _Path(__file__).resolve().parent.parent / "README.md"
+    result = cr.check(readme.read_text(encoding="utf-8"))
+    assert result["ok"], cr.format_check(result)
+    assert result["checked"] >= 9      # 少了说明 README 里的凭据记号被删掉了
+
+
+def test_default_check_paths_cover_both_documents():
+    assert len(cr.DEFAULT_CHECK_PATHS) == 2
+    assert {p.name for p in cr.DEFAULT_CHECK_PATHS} == {"RESULTS.md", "README.md"}
+
+
+def test_metric_rows_only_looks_inside_a_table_with_an_evidence_column():
+    """判据是结构性的：表头里有「凭据」这一列 → 这张表是指标表。别的文档里
+    「1/2/3」开头的普通表格（README 的已知局限清单就是）不该被当成漏标凭据。"""
+    text = ("| 块 | 一句话 | 详细 |\n|---|---|---|\n| 1 | 系统构成 | 下一节 |\n"
+            "\n"
+            "| # | 指标 | 凭据 |\n|---|---|---|\n| 3 | E3 | ⏳ 还没跑过 |\n")
+    rows = cr.metric_rows(text)
+    assert len(rows) == 1 and rows[0].startswith("| 3 |")

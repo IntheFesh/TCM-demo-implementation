@@ -1,68 +1,107 @@
 # 评测结果汇总（总纲 1.5c）
 
 下面这张表的每组数字都带**四样东西**：对照、后端、caveat、**凭据**。
-项目纪律（CLAUDE.md）：一个没有基准的数字在这个项目里等于没有意义。这一轮加的是
-第四样——「凭据」列写清楚这个数在本仓库里能不能被核对：
+项目纪律（CLAUDE.md）：一个没有基准的数字在这个项目里等于没有意义。
 
 ```bash
-python -m scripts.collect_results            # 打出各 report 文件里**实际**是什么数
-python -m scripts.collect_results --check     # 核对本文件引用的数没抄错；不一致退出码 1
+python -m scripts.collect_results              # 打出各 report 文件里**实际**是什么数
+python -m scripts.collect_results --check      # 核对本文件引用的数没抄错；不一致退出码 1
+python -m scripts.collect_results --rerender   # 把跟自己 .json 对不上的 .md 重渲染（零调用）
 ```
 
 凭据记号的格式是 `` `文件名:键=值` ``。`--check` 逐个记号去文件里取真值比较，
-并且要求同一行的正文里也出现这个数（凭据和正文不许各说一套）。**没有记号的行会被
-单独列出来**——那不是错误，是「这个数在本仓库里没有文件可核」这个事实，它必须看得见。
+要求同一行的正文里也出现这个数（凭据和正文不许各说一套），并且**顺带检查每份
+`report_e*.json` 旁边的 `.md` 是不是同一轮渲染的**——一份旧的人读报告躺在一份新的
+数据旁边，而人只会读 md。
+
+### 凭据的三种状态，分开写
+
+以前只有「有凭据 / 无凭据」两档，看不出哪些是能补的、哪些必须等上机。现在三档：
+
+| 记法 | 含义 | 要让它变成「有凭据」该做什么 |
+|---|---|---|
+| ✅ `文件名:键=值` | 本仓库里有文件可核，`--check` 会核它 | 已经是了 |
+| 📦 `archive/…:键=值` | 那一轮的文件被覆盖过，**已从 git 历史取回归档** | 已经是了 |
+| ⏳ 还没跑过 | 真机数据**根本不存在**，不是文件丢了 | 上机跑那一项 |
+
+**⏳ 和「文件丢了」是两件不同的事**：前者只能等上机（#10/#11 的 ε 分层真机值、
+#12 的 MES 人评），后者能从 git 历史补（#3~#6 的修复前对照，已经补了，见下面「归档」一节）。
 
 **来源约定**：
 
 - 「AutoDL 实测」= 在有真实语料（941 诊次 / 34211 三元组）和 DeepSeek 的机器上跑
   `python -m eval.run_eval` / `eval/sdt/run.py` 得到的数。
-- 「无文件凭据」= 数是真的（项目方在 AutoDL 上跑出来的），但**那一轮的 report 文件
-  还没提交进本仓库**，所以本仓库里核不了。见下面「⚠ 仓库里的 report 文件是修复前
-  那一轮」一节——那一节不是脚注，是读这张表之前必须知道的事。
 - 沙盒（写代码的环境）没有 cases.json / embedding 模型 / 网络，**本文件里凡是标着
   「沙盒模拟」的行都不是真机值**。
 
 | # | 指标 | 后端 | 当前值 | 对照 | 闸门 | 状态 | 凭据 |
 |---|---|---|---|---|---|---|---|
-| 1 | ε_online（噪声地板） | deepseek-chat | mean **0.241** / p50 0.000 / p95 0.857（9 条主诉 × 3 重复 = 81 个值） | 它本身就是别的指标的对照物。**按证型分层**，逐条地板 0.0 ~ 0.5099，见下面单独一节 | — | ⚠ **待重跑**：文件生成于 2026-09-11，R1 之后改过 S3 prompt | `epsilon.json:epsilon_online.mean=0.241` `epsilon.json:epsilon_online.p95=0.857` `epsilon.json:epsilon_online.n_queries_used=9` |
-| 2 | 分歧度 vs ε | deepseek-chat | 6/9 条主诉的用药 Jaccard 距离超出**配对** ε、判为真实分歧；3 条在噪声内；另 1 条被安全否决不可用 | 逐条配对 ε（不是减一个全局 0.241），判据见第 4 节 | — | ⚠ **待重跑**：判定用的 ε 来自 #1 | 无文件凭据（这一轮的 report 未提交） |
-| 3 | E3 own vs swapped（换掉参考医案，结论变不变） | deepseek-chat | **0.451** | 修复前 0.335（同一批主诉、同一模型、只改了检索层） | ≥ 0.4 ✅ | ✅ AutoDL 实测 | 修复前那个数有凭据：`report_e3.json:e3.change_rate=0.335`；**当前值 0.451 无文件凭据** |
-| 4 | E4 own vs none（有没有参考医案，结论变不变） | deepseek-chat | **0.497** | 修复前 0.351 | ≥ 0.4 ✅ | ✅ AutoDL 实测 | 修复前有凭据：`report_e4.json:e4.change_rate=0.351`；**当前值 0.497 无文件凭据** |
-| 5 | E8 四种检索模式输出差异率 | deepseek-chat | **0.437** | 旧检索层下 0.366（`_case_to_text` 用 raw_excerpt、融合准入、BM25 保底这三处改动之前） | 报出，不设闸门 | ✅ AutoDL 实测 | 旧数有凭据：`report_e8.json:e8.output_difference_rate=0.366`；**当前值 0.437 无文件凭据** |
-| 6 | E9 react off vs on（开 ReAct 输出变不变） | deepseek-chat | **0.463** | 修复前 0.250——那次测的是「医案层工具 9 次调用全空」的 ReAct（SOURCES.md 第 31 条） | ≥ 0.4 ✅ | ✅ AutoDL 实测 | 修复前有凭据：`report_e9.json:e9.change_rate=0.250`；**当前值 0.463 无文件凭据** |
-| 7 | SDT Test（TCMEval-SDT，chain 注入证素分析） | deepseek-chat | chain **22.833** / 50 | baseline 22.068（同模型、同三个输出头、不注入）；修复前 chain 21.702（曾低于 baseline）；关掉安全否决 27.729 | chain > baseline ✅（+0.765） | ✅ AutoDL 实测。**Test 已跑过 3 次完整 + 1 次局部**，再调 prompt 先在 Train 上验证方向 | `sdt/test_run_log.jsonl:sdt.chain_last=22.833` `sdt/test_run_log.jsonl:sdt.baseline=22.068` `sdt/test_run_log.jsonl:sdt.chain_first=21.702` `sdt/test_run_log.jsonl:sdt.ignore_safety_veto=27.729` |
-| 8 | 参考医案利用率 / 幻觉 | deepseek-chat | **27/27 条引用合法，0 条幻觉**（引了一个检索结果里不存在的 case_id） | 两组分母分开报：有医案可引时 27 条、幻觉 0；没有医案可引时 n=0（那一轮没有这种样本），**不合并成一个率** | 幻觉率 = 0 | ✅ 有文件凭据，但那是修复前那一轮的 report | `report_e3.json:hallucination.n=27` `report_e3.json:hallucination.n_hallucinated=0` |
-| 9 | E2 师承内 vs 跨学派（总纲 1.3） | deepseek-chat | lineage **0.420** vs cross_school **0.569** | 判据是「跨学派 > 师承内」，**逐条成立 5/9**——汇总均值方向对，但只有 5 条主诉上逐条成立，所以只报出不硬卡 | 只报出，不设闸门 | ✅ AutoDL 实测 | 无文件凭据（committed 的 report 里没有 `school_pairs` 键，那几份是这个字段加进去之前跑的） |
-| 10 | ε_core（君臣层噪声地板，R1 新增） | 沙盒（无 LLM，合成用药集合） | 无真机数；沙盒模拟 mean 0.0 | ε_online（整方地板）。判据是 ε_core < ε_online < ε_adjunct，`_report_layers` 如实报成不成立，不调参去凑 | — | ⏳ **待 AutoDL**：先过 `python -m scripts.verify_role_fill`（role 填充率 ≥ 90%） | 无文件凭据（`epsilon.json` 里没有 `layers` 键，那份是 R1 之前跑的） |
-| 11 | ε_adjunct（佐使层噪声地板，R1 新增） | 沙盒（无 LLM，合成用药集合） | 无真机数；沙盒模拟 mean 0.8426 | 同 #10。平均药味数（整方 9.0 / 君臣 4.0 / 佐使 5.0）是配套对照，用来辨「药少了所以碰巧一样」的假改善 | — | ⏳ **待 AutoDL**：同 #10 | 无文件凭据（同 #10） |
-| 12 | MES 盲评（人评） | —（未做） | 未做 | 三对两两 McNemar（`python -m eval.mes.collect --all-pairs`） | 20 条评完、三对 p 值 | ⏳ **待做**：导出要真实 LLM，评分要人。**这是训练的第三个前提** | 无文件凭据（还没有 items.json / ratings） |
+| 1 | ε_online（噪声地板） | deepseek-chat | mean **0.241** / p50 0.000 / p95 0.857（9 条主诉 × 3 重复 = 81 个值） | 它本身就是别的指标的对照物。**按证型分层**，逐条地板 0.0 ~ 0.5099，见下面单独一节 | — | ⚠ **待重跑**：文件生成于 2026-09-11，R1 之后改过 S3 prompt | ✅ `epsilon.json:epsilon_online.mean=0.241` `epsilon.json:epsilon_online.p95=0.857` `epsilon.json:epsilon_online.n_queries_used=9` |
+| 2 | 分歧度 vs 逐条配对 ε | deepseek-chat | **9**/9 条主诉超出各自的噪声地板（E3 那一轮）；E9 那一轮是 **8**/9（1 条落在噪声内）。另 1 条被安全否决、不可用 | 修复前那一轮只有 **6**/9（归档文件）。**同一份代码不同轮次给出 9/9、9/9、8/9、8/9**——这个判决本身带重复采样抖动 | — | ✅ AutoDL 实测 | ✅ `report_e3.json:e3.paired_real_divergence=9` `report_e9.json:e9.paired_real_divergence=8` 📦 `archive/2026-09-12/report_e3.json:archive.e3.paired_real_divergence=6` |
+| 3 | E3 own vs swapped（换掉参考医案，结论变不变） | deepseek-chat（人标，见下） | **0.451**（27/28 样本可用，逐条超出配对 ε 的占 0.593） | 修复前 **0.335**（同一批主诉、同一模型、只改了检索层） | ≥ 0.4 ✅ | ✅ AutoDL 实测 | ✅ `report_e3.json:e3.change_rate=0.451` `report_e3.json:e3.rate_above_paired_epsilon=0.593` 📦 `archive/2026-09-12/report_e3.json:archive.e3.change_rate=0.335` |
+| 4 | E4 own vs none（有没有参考医案，结论变不变） | deepseek-chat（人标） | **0.497**（逐条超出配对 ε 的占 0.667） | 修复前 **0.351** | ≥ 0.4 ✅ | ✅ AutoDL 实测 | ✅ `report_e4.json:e4.change_rate=0.497` `report_e4.json:e4.rate_above_paired_epsilon=0.667` 📦 `archive/2026-09-12/report_e4.json:archive.e4.change_rate=0.351` |
+| 5 | E8 四种检索模式输出差异率 | deepseek-chat（人标） | **0.437**（p50 0.477 / p95 0.767，27/27 条至少两种模式有结果） | 旧检索层下 **0.366**（`_case_to_text` 用 raw_excerpt、融合准入、BM25 保底这三处改动之前） | 报出，不设闸门 | ✅ AutoDL 实测 | ✅ `report_e8.json:e8.output_difference_rate=0.437` `report_e8.json:e8.p50=0.477` `report_e8.json:e8.p95=0.767` 📦 `archive/2026-09-12/report_e8.json:archive.e8.output_difference_rate=0.366` |
+| 6 | E9 react off vs on（开 ReAct 输出变不变） | deepseek-chat（人标） | **0.463**（逐条超出配对 ε 的占 0.63） | 修复前 **0.250**——那次测的是「医案层工具 9 次调用全空」的 ReAct（SOURCES.md 第 31 条） | ≥ 0.4 ✅ | ✅ AutoDL 实测 | ✅ `report_e9.json:e9.change_rate=0.463` `report_e9.json:e9.rate_above_paired_epsilon=0.63` 📦 `archive/2026-09-12/report_e9.json:archive.e9.change_rate=0.250` |
+| 7 | SDT Test（TCMEval-SDT，chain 注入证素分析） | deepseek-chat | chain **22.833** / 50 | baseline 22.068（同模型、同三个输出头、不注入）；修复前 chain 21.702（曾低于 baseline）；关掉安全否决 27.729 | chain > baseline ✅（+0.765） | ✅ AutoDL 实测。**Test 已跑过 3 次完整 + 1 次局部**，再调 prompt 先在 Train 上验证方向 | ✅ `sdt/test_run_log.jsonl:sdt.chain_last=22.833` `sdt/test_run_log.jsonl:sdt.baseline=22.068` `sdt/test_run_log.jsonl:sdt.chain_first=21.702` `sdt/test_run_log.jsonl:sdt.ignore_safety_veto=27.729` |
+| 8 | 参考医案利用率 / 幻觉 | deepseek-chat（人标） | **27** 条引用全部合法，**0** 条幻觉（引了检索结果里不存在的 case_id） | 两组分母分开报：有医案可引时 27 条、幻觉 0；没有医案可引时 n=0（那一轮没有这种样本），**不合并成一个率**。安全否决 1/10 条 | 幻觉率 = 0 | ✅ AutoDL 实测（修复后那一轮） | ✅ `report_e3.json:hallucination.n=27` `report_e3.json:hallucination.n_hallucinated=0` `report_e3.json:safety_veto.n_vetoed=1` |
+| 9 | E2 师承内 vs 跨学派（总纲 1.3） | deepseek-chat（人标） | **两轮结论相反**：E9 那一轮 lineage **0.453** vs cross **0.584**，逐条 **5**/9，判据成立；E8 那一轮 lineage **0.568** vs cross **0.557**，逐条 **4**/9，判据**不成立** | 判据是「跨学派 > 师承内」。两轮方向相反 → **这个判据本身落在重复采样噪声里**，所以它只报出、绝不设闸门 | 只报出，不设闸门 | ✅ AutoDL 实测（两轮都有文件）。⚠ 口头引用过的 0.420 / 0.569 跟这两份文件都不符，见下 | ✅ `report_e9.json:e9.school_lineage_mean=0.453` `report_e9.json:e9.school_cross_mean=0.584` `report_e9.json:e9.school_n_cross_gt_lineage=5` `report_e8.json:e8.school_lineage_mean=0.568` `report_e8.json:e8.school_cross_mean=0.557` `report_e8.json:e8.school_n_cross_gt_lineage=4` |
+| 10 | ε_core（君臣层噪声地板，R1 新增） | 沙盒（无 LLM，合成用药集合） | 无真机数；沙盒模拟 mean 0.0 | ε_online（整方地板）。判据是 ε_core < ε_online < ε_adjunct，`_report_layers` 如实报成不成立，不调参去凑 | — | ⏳ **待 AutoDL**：先过 `python -m scripts.verify_role_fill`（role 填充率 ≥ 90%） | ⏳ 还没跑过——`epsilon.json` 里没有 `layers` 键，那份是 R1 之前跑的。**不是文件丢了，是这个数不存在** |
+| 11 | ε_adjunct（佐使层噪声地板，R1 新增） | 沙盒（无 LLM，合成用药集合） | 无真机数；沙盒模拟 mean 0.8426 | 同 #10。平均药味数（整方 9.0 / 君臣 4.0 / 佐使 5.0）是配套对照，用来辨「药少了所以碰巧一样」的假改善 | — | ⏳ **待 AutoDL**：同 #10 | ⏳ 还没跑过（同 #10） |
+| 12 | MES 盲评（人评） | —（未做） | 未做 | 三对两两 McNemar（`python -m eval.mes.collect --all-pairs`） | 20 条评完、三对 p 值 | ⏳ **待做**：导出要真实 LLM，评分要人。**这是训练的第三个前提** | ⏳ 还没跑过——盲评要人评分，没有任何脚本能替它产出 |
 
-## ⚠ 仓库里的 report 文件是修复前那一轮
+## 📦 修复前那一轮已归档，对照也可核了
 
-`python -m scripts.collect_results` 机读出来的事实：
+「修复前 0.335 → 修复后 0.451」是这个项目最有说服力的叙事之一，**两端都该可核**。
+修复后那四份 report 提交进来时（`f1d5520`）**覆盖**了修复前那一轮，于是对照那一端
+一度只剩一句话。修复的办法不用去 AutoDL 找文件——**git 历史里还在**：
 
-| 凭据键 | 文件里的值 | 文件生成于 | 这个数在上表里的角色 |
-|---|---|---|---|
-| `e3.change_rate` | 0.3348 | 2026-09-12 | #3 的**修复前对照** |
-| `e4.change_rate` | 0.3514 | 2026-09-12 | #4 的**修复前对照** |
-| `e8.output_difference_rate` | 0.366 | 2026-09-12 | #5 的**旧检索对照** |
-| `e9.change_rate` | 0.2503 | 2026-09-12 | #6 的**修复前对照** |
+```bash
+git show 85b7d23:eval/report_e3.json > eval/archive/2026-09-12/report_e3.json
+```
 
-也就是说：**本仓库里那四份 `report_e*.json` 正好是上表四行「修复前 / 旧检索」那一列的
-凭据，不是「当前值」那一列的。** 当前值（0.451 / 0.497 / 0.437 / 0.463）、E2 的
-lineage/cross、以及 ε 的分层值，在本仓库里没有任何文件可核——它们是项目方在 AutoDL
-上跑出来的真数，但那一轮的 report 文件没有提交进来。
+四份 json + 四份 md 都取回来了，放在 `eval/archive/2026-09-12/`（`.gitignore` 的
+`*.jsonl` 整体忽略只管 `.jsonl`，`.json` 不受影响——这一点是核过的，不是假设的）。
+注册成 `archive.*` 凭据键，`--check` 一并核。
 
-这不是一个可以忽略的细节：上表第 3~6 行的「闸门 ✅」全部建立在当前值上，而当前值现在
-只有一个来源是人写的表格。**要让它们有凭据，把那一轮的
-`eval/report_e{3,4,8,9}.json`（以及带 `school_pairs` 的那份）提交进来**，然后
-`python -m scripts.collect_results --check` 就会把这几行从「无文件凭据」变成核对通过。
-顺带那几份新 report 会同时带上 R5 加的 `backend` 块，后端标签也就有了文件凭据。
+**归档目录的规矩**：一轮一个日期目录，**只放，不改**。要新增一轮就新建目录，
+不要往已有目录里补文件——那会让「这个目录里的四份文件是同一轮跑出来的」这个
+前提失效，而上表第 3~6 行的「修复前」对照全靠这个前提。
 
-另外 `report_e*.json` 的 `model` / `backend` 两列在 `collect_results` 里打出来是 `—`：
-那几份文件生成于 R5-4 之前，报告里还没有 `backend` 块。上表第 3~6 行的
-「deepseek-chat」目前是人标的，不是从文件里读的。
+## ⚠ 三件读这张表之前要知道的事
+
+### 1. `backend` 列还是人标的，不是机读的
+
+`python -m scripts.collect_results` 把 `report_e*.json` 的 model / backend 打成 `—`：
+**那四份文件生成于 2026-09-13，而给报告加 `backend` 块的 `backend_tags()` 是 R5-4
+（2026-09-14）才写的。** 所以第 3~6、8、9 行的「deepseek-chat」现在仍然是人标的，
+标注写着「（人标）」不遮掩。
+
+下一次真机跑 `python -m eval.run_eval` 出来的报告会自带 `backend` 块
+（`{"models": [...], "backends": [...]}`，`collect_results` 两种形状都认），那时候把
+「（人标）」去掉。**在那之前不要把它当成机读过的。**
+
+### 2. 同一个指标在不同轮次给出不同的值
+
+这不是数据错误，是**重复采样的抖动本来就存在**（ε 量的就是它）。目前已知三处：
+
+| 指标 | 各轮次的值 | 影响 |
+|---|---|---|
+| 逐条配对分歧判决（#2） | 9/9（e3）、9/9（e4）、8/9（e8）、8/9（e9） | 引用时要说明是哪一轮 |
+| E2 lineage vs cross（#9） | e9 轮 0.453/0.584 判据成立；e8 轮 0.568/0.557 判据**不成立** | **两轮结论相反**——这是「只报出不设闸门」这个决定最硬的依据 |
+| 幻觉 / 安全否决（#8） | 四份 report 一致（27/0、1/10） | 无 |
+
+**#9 那个翻转值得单独说**：同一份代码、同一批 10 条主诉，跑两次，「跨学派分歧是不是
+大于师承内分歧」这个结论一次成立一次不成立。所以拿任何单独一轮的 lineage/cross
+去说「跨学派确实分歧更大」都是在挑对自己有利的那一次。总纲 1.3 把它定成「只报出、
+不作硬闸门」是对的，现在有了实测依据。
+
+### 3. 口头引用过的 0.420 / 0.569 跟两份文件都不符
+
+E2 曾被口头引用成「lineage 0.420 vs cross 0.569，逐条成立 5/9」。逐条 5/9 跟
+`report_e9.json` 一致，但那两个均值跟 e9（0.453 / 0.584）和 e8（0.568 / 0.557）
+**都不一样**——大概是第三轮（AutoDL 上还留着的 `e9_v2` / `e9_v3`）的数。
+**本文件只写有文件可核的两组**；那第三组要么把文件提交进来、要么不要再引用它。
+这正是凭据机制要防的事：一个只在对话里出现过的数，过两周没人能说清它是哪来的。
 
 ## ε 按证型分层：为什么不能拿一个全局 ε 当阈值
 
@@ -112,9 +151,11 @@ zhang_xichun 0.3247。张锡纯那一支的地板明显高——他的医案里�
 ## 每组的 caveat（不是脚注，是数字的一部分）
 
 1. **ε 按证型分层**：见上一节。#2 的判定是逐条配对做的；拿全局 mean 0.241 一刀切
-   会在 5 条上漏判、4 条上误判。
+   会在 5 条上漏判、4 条上误判。**注意 #2 的当前值 9/9 和 8/9 在不同轮次之间会变**
+   （见上面「同一个指标在不同轮次给出不同的值」），引用时要带上是哪一轮。
 2. **E3/E4 的「修复前」数**（0.335 / 0.351）成立的前提是「只改了检索层」——模型和
-   主诉都没换。这两个数在本仓库里有文件凭据（见上面那一节），当前值没有。
+   主诉都没换。修复前和修复后**两端现在都有文件凭据**：当前值在 `eval/report_e*.json`，
+   修复前在 `eval/archive/2026-09-12/`（从 git 历史取回）。
 3. **E8 的 graph 模式覆盖率 caveat**（原样从 `report_e8.json` 带出来）：graph 模式依赖
    `data/element_index.json` 把医案连到证素，覆盖率不是 100%，**这台机器上实测
    444/941（47%）**。覆盖不到的医案在 graph 模式下证素集合为空、相似度恒 0，系统性排在
@@ -133,9 +174,10 @@ zhang_xichun 0.3247。张锡纯那一支的地板明显高——他的医案里�
    （SOURCES.md 第 30 条的成果），但 physician 参数填的是中文名、医案库按 id 存，
    9 次调用全空，模型只能退回国标层（第 31 条）。修复后的 E9 是另一个实验，
    0.250 只能当「修复前」读，不能当「ReAct 本来就没用」读。
-7. **#9 的汇总均值方向对、逐条只成立 5/9**，所以它只报出不设闸门。三方两两配对
+7. **#9 在两轮之间结论相反**（e9 轮判据成立、e8 轮不成立），所以它只报出、绝不设闸门
+   ——这是「只报出」这个决定最硬的实测依据，不是谨慎措辞。三方两两配对
    （`school_pairs`）而不是算一个三方交并比：三方交并比在师承内和跨学派之间分不出来
-   （总纲 1.3 / E2）。
+   （总纲 1.3 / E2）。另外口头引用过的 0.420 / 0.569 跟两份文件都不符，见上面第 3 条。
 8. **#10/#11 是沙盒模拟，跟 #1 不是同一个口径**：那组数只有一条主诉、一位医家
    （诊断报告里重复三次的那条），单条整方 ε 是 0.5769——它是最坏的一条，跟 #1 的
    9 条主诉汇总 0.241 不能混着引。role 也是我手工按君臣骨架标的，不是模型标的，
@@ -145,9 +187,10 @@ zhang_xichun 0.3247。张锡纯那一支的地板明显高——他的医案里�
    （E3 ≥ 40% ✅、SDT 有基线 ✅、MES 显示哪个维度弱 ⏳）现在满足两个，所以 R5 只准备了
    训练代码和数据，没有训练。
 10. **模型不同数字不可比**：上表全部是 DeepSeek 后端（「后端」列写明了，未做/沙盒模拟的行
-    没有冒充成 DeepSeek 跑的）。将来训练后的本地模型重跑这整张表，按下面
-    「同一指标、两个后端」那一节**并列**加行，不覆盖，并带上
-    `manifest.comparability_warning`。
+    没有冒充成 DeepSeek 跑的）。但注意第 3~6、8、9 行的后端标签**目前是人标的**——
+    那几份 report 生成于 R5-4 给报告加 `backend` 块之前，见上面「backend 列还是人标的」。
+    将来训练后的本地模型重跑这整张表，按下面「同一指标、两个后端」那一节**并列**加行，
+    不覆盖，并带上 `manifest.comparability_warning`。
 
 ## 同一指标、两个后端：并列，不覆盖（R5-4）
 
@@ -160,7 +203,7 @@ zhang_xichun 0.3247。张锡纯那一支的地板明显高——他的医案里�
 | # | 指标 | 后端 | 当前值 | 对照 | 闸门 | 状态 | 凭据 |
 |---|---|---|---|---|---|---|---|
 | 3 | E3 own vs swapped | deepseek-chat | 0.451 | 修复前 0.335 | ≥ 0.4 | ✅ AutoDL 实测 | 见上表 |
-| 3-local | E3 own vs swapped | tcm-local（Qwen2.5-1.5B + LoRA） | 待跑 | **同一行的 deepseek-chat 值 0.451** | ≥ 0.4 | 待训练 | 待跑 |
+| 3-local | E3 own vs swapped | tcm-local（Qwen2.5-1.5B + LoRA） | 待跑 | **同一行的 deepseek-chat 值 0.451** | ≥ 0.4 | 待训练 | ⏳ 还没跑过（要先训练） |
 
 为什么不能覆盖：
 
