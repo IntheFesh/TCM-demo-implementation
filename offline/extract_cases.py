@@ -23,9 +23,18 @@ WARNINGS_PATH = Path(__file__).resolve().parent.parent / "extract_warnings.json"
 
 
 def iter_segment_files(limit: int | None = None):
-    """遍历 data/{physician}/*.json（粗段），按 physician 目录名、文件名排序，保证可复现。"""
+    """遍历 data/{physician}/*.json（粗段），按 physician 目录名、文件名排序，保证可复现。
+
+    **只认医家 id 命名的目录**（core.physicians.PHYSICIANS）：data/ 下还有
+    standard/（证候表）、_archive_r1_txt/、R8 起的 local_corpora/（里面有
+    MANIFEST.json）——之前按"是目录就遍历"能跑对只是因为那些目录里碰巧没有
+    .json，local_corpora/MANIFEST.json 一出现就会被当成粗段读进来。
+    """
+    from core.physicians import PHYSICIANS
+
     count = 0
-    for physician_dir in sorted(p for p in DATA_ROOT.iterdir() if p.is_dir()):
+    for physician_dir in sorted(p for p in DATA_ROOT.iterdir()
+                                if p.is_dir() and p.name in PHYSICIANS):
         for seg_path in sorted(physician_dir.glob("*.json")):
             if limit is not None and count >= limit:
                 return

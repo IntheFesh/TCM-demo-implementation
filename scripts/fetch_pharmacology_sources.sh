@@ -78,8 +78,10 @@ done
 # 确认上游真的改了之后，手工更新表里的数字并在 data/SOURCES.md 记一笔。
 #
 # 每行第 6 列是**推荐的切块模式**（真实抽取时传给 --chunk-by）：教材是
-# markdown 层级标题排版，必须用 heading；古籍是空行分段的纯文本，用 blank-line。
-# 这一列不是装饰——切错了会打开一个防幻觉的洞，见
+# markdown 层级标题排版，用 heading；古籍是 `<篇名>药名` + `内容：…` 的转录体例，
+# R8 起 heading 模式也认 `<篇名>` 行，所以六个源全是 heading——R8 实测古籍用
+# blank-line 会把 `<篇名>丹沙` 跟正文切开、药名短于下限被丢，379 味里 350 味
+# 的药名进不了模型。这一列不是装饰——切错了会打开一个防幻觉的洞，见
 # offline/extract_reference_triples.split_blocks 的文档字符串。
 SOURCES=(
   # 现代教材（十四五规划教材）。**是 .md 不是 .txt**，路径是 十四五教材/xxx.md
@@ -95,8 +97,8 @@ SOURCES=(
   # 古籍（GB18030，下载后转 UTF-8）。编号是**三位补零**（仓库里 704 个文件
   # 全是 NNN-书名.txt，从 000 开始）；第一版猜的 1- 和 9- 都是 404。
   # 本地文件名保留编号前缀，跟 README 3.1 里 367/361/584 那三本一个写法。
-  "000-神农本草经.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/000-%E7%A5%9E%E5%86%9C%E6%9C%AC%E8%8D%89%E7%BB%8F.txt|gb18030|classic|180115|blank-line|古籍本草"
-  "018-本草备要.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/018-%E6%9C%AC%E8%8D%89%E5%A4%87%E8%A6%81.txt|gb18030|classic|293521|blank-line|古籍本草"
+  "000-神农本草经.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/000-%E7%A5%9E%E5%86%9C%E6%9C%AC%E8%8D%89%E7%BB%8F.txt|gb18030|classic|180115|heading|古籍本草"
+  "018-本草备要.txt|https://raw.githubusercontent.com/xiaopangxia/TCM-Ancient-Books/master/018-%E6%9C%AC%E8%8D%89%E5%A4%87%E8%A6%81.txt|gb18030|classic|293521|heading|古籍本草"
 )
 
 command -v curl >/dev/null 2>&1 || { echo "没有 curl，装了再跑。" >&2; exit 2; }
@@ -168,8 +170,8 @@ if [ "$DRY_RUN" = "1" ]; then
   echo
   echo "URL 和期望字节数已由项目方在有网络的机器上实测校正（见 data/SOURCES.md 第 42 条）。"
   echo "期望字节数是**上游原文**的大小：古籍落盘后（转成 UTF-8）会变大，那是转码不是缺失。"
-  echo "切块模式那一列真实抽取时要传给 --chunk-by：教材必须 heading，"
-  echo "按空行切会把一味药切成五六块、其中"用量"那块里根本没有药名。"
+  echo "切块模式那一列真实抽取时要传给 --chunk-by：六个源都是 heading（教材认「#」、"
+  echo "古籍认「<篇名>」）；按空行切会把药名跟它的字段切成两块，那块里根本没有药名。"
   exit 0
 fi
 

@@ -22,11 +22,15 @@ from offline import extract_formulary as ef
 from offline import extract_materia_medica as emm
 from offline import extract_reference_triples as ert
 
+# 合成语料要**同时**过 modern 和 classic 两种预过滤判据（R8-1，见
+# offline/pharmacology_sources.py）：行首的 `【字段】` 标签是教材条目的结构标记，
+# 「三钱」这种剂量词是古籍方药的——同一份语料在下面的 modern（中药学）和
+# classic（本经）两组端到端测试里都要用，缺一种标记那一组就会被预过滤全跳过。
 BOOK_TEXT = """黄芪
-甘，微温。归脾、肺经。补气升阳，固表止汗。9～30g。表实邪盛者不宜。
+【性味】甘，微温。归脾、肺经。补气升阳，固表止汗。9～30g。古方每用三钱。表实邪盛者不宜。
 
 炙甘草
-甘，平。归心、肺、脾、胃经。补脾益气。3～10g。反海藻、大戟。
+【性味】甘，平。归心、肺、脾、胃经。补脾益气。3～10g。古方每用一钱。反海藻、大戟。
 
 第三节
 """

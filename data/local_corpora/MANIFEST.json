@@ -1,0 +1,89 @@
+{
+  "generated_by": "scripts/normalize_local_corpora.py（幂等；重跑不改内容就不写文件）",
+  "note": "out_of_scope / copyright_status 是 LOCAL_CORPORA 里的人工声明，scope_stats 是数出来给人看的依据；两者的关系见 scripts/normalize_local_corpora.py 模块文档",
+  "entries": [
+    {
+      "kind": "case_docx",
+      "encoding": "docx",
+      "origin": "李可肿瘤医案汇编（脑瘤/鼻硬结症/宫颈癌等），用户上传（R8 实测 556 个非空段落，75 段海藻甘草同用）",
+      "copyright_status": "copyrighted",
+      "out_of_scope": true,
+      "scope_reason": "整份是肿瘤医案，不在脾胃门定位内；且含十八反配伍（海藻反甘草），抽成医案后 has_incompatible_pair 会命中、训练导出默认排除——两道过滤各管各的",
+      "file": "local_corpora/李可医案.docx",
+      "original_name": "李可医案.docx",
+      "bytes": 85550,
+      "sha256": "ce5ed7952a5002559fa2a5d8fa2d4ab02356dd2159b22ed4708a3b907262d6e1",
+      "derived_text": "local_corpora/李可医案.txt",
+      "scope_stats": {
+        "n_paragraphs": 556,
+        "spleen_stomach_paragraphs": 42,
+        "spleen_stomach_rate": 0.0755,
+        "oncology_paragraphs": 224,
+        "oncology_rate": 0.4029,
+        "incompatible_pair_paragraphs": 105,
+        "incompatible_pairs": {
+          "海藻 反 甘草": 75,
+          "乌头 反 半夏": 51,
+          "乌头 反 贝母": 34,
+          "五灵脂 反 人参": 24,
+          "乌头 反 瓜蒌": 3,
+          "丁香 反 郁金": 1
+        },
+        "note": "比例的分母是非空段落数（docx）或空行分段的块数（txt）；脾胃门词表 = core.syndrome_norm.SYNONYMS，肿瘤词表 = offline.assess_case_scope.ONCOLOGY_HINTS，反药判定 = core.safety_output.check_incompatible"
+      }
+    },
+    {
+      "kind": "case_docx",
+      "encoding": "docx",
+      "origin": "《王云启治癌验案录》，现代出版的肿瘤科医案集，用户上传（R8 实测 1599 个非空段落）",
+      "copyright_status": "copyrighted",
+      "out_of_scope": true,
+      "scope_reason": "肿瘤科医案，不在本项目脾胃门定位内；含脾胃门门类词的段落比例见 scope_stats，选项 ②：接进来但标 out_of_scope，训练导出默认排除",
+      "file": "local_corpora/王云启医案.docx",
+      "original_name": "2_王云启(1).docx",
+      "bytes": 2409099,
+      "sha256": "e18b61af4895605fbfd1a95d32e81287318b8b8447c655f7cac761fb5c20d8eb",
+      "derived_text": "local_corpora/王云启医案.txt",
+      "scope_stats": {
+        "n_paragraphs": 1599,
+        "spleen_stomach_paragraphs": 211,
+        "spleen_stomach_rate": 0.132,
+        "oncology_paragraphs": 746,
+        "oncology_rate": 0.4665,
+        "incompatible_pair_paragraphs": 4,
+        "incompatible_pairs": {
+          "乌头 反 贝母": 2,
+          "乌头 反 半夏": 2,
+          "乌头 反 瓜蒌": 2,
+          "乌头 反 白及": 2
+        },
+        "note": "比例的分母是非空段落数（docx）或空行分段的块数（txt）；脾胃门词表 = core.syndrome_norm.SYNONYMS，肿瘤词表 = offline.assess_case_scope.ONCOLOGY_HINTS，反药判定 = core.safety_output.check_incompatible"
+      }
+    },
+    {
+      "kind": "classic_text",
+      "encoding": "utf-8",
+      "origin": "《脾胃论》金·李东垣，人民卫生出版社 2005 排印本的电子文本（z-library），原著公有领域；文件头约 30 行是版权页/CIP/推广广告，切块预过滤按结构跳过",
+      "copyright_status": "public_domain",
+      "out_of_scope": false,
+      "scope_reason": "脾胃门理论原典，在定位内",
+      "file": "local_corpora/脾胃论.txt",
+      "original_name": "脾胃论 (中医经典文库) (金·李东垣 [金·李东垣], 古聖先賢) (z-library.sk,.txt",
+      "bytes": 152385,
+      "sha256": "6416c23be443114a3bc93a0c111a759cd60a4fc628b49966228f5523c31d8c30",
+      "derived_text": null,
+      "scope_stats": {
+        "n_paragraphs": 671,
+        "spleen_stomach_paragraphs": 147,
+        "spleen_stomach_rate": 0.2191,
+        "oncology_paragraphs": 0,
+        "oncology_rate": 0.0,
+        "incompatible_pair_paragraphs": 2,
+        "incompatible_pairs": {
+          "乌头 反 半夏": 2
+        },
+        "note": "比例的分母是非空段落数（docx）或空行分段的块数（txt）；脾胃门词表 = core.syndrome_norm.SYNONYMS，肿瘤词表 = offline.assess_case_scope.ONCOLOGY_HINTS，反药判定 = core.safety_output.check_incompatible"
+      }
+    }
+  ]
+}

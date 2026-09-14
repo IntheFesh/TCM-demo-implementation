@@ -29,26 +29,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BOOKS_DIR = ROOT / "books"
 
-# 六个源：文件名 -> (source 标签, kind, 推荐切块模式, 用途)。跟
-# scripts/fetch_pharmacology_sources.sh 的 SOURCES 表一一对应；那边负责下载，
-# 这边负责验切块。**两处都列一遍是刻意的**：下载脚本是 bash、这里是 Python，
-# 强行共用一份表要引入一个中间文件，而这张表一年动不了一次，代价不划算。
-# 加/删源时两处都要改——tests/test_pharmacology_prep.py 有一条测试逐字段比对
-# 两张表（文件名、source、切块模式），漏改一处会红。
-#
-# **教材是 .md（markdown）不是 .txt**，而且推荐切块模式是 heading 不是
-# blank-line：一味药的条目是「# 药名」加下面若干段（性味/归经/功效/用法用量），
-# 按空行切会把一味药切成五六块、其中"用量"那块里根本没有药名。见
-# offline/extract_reference_triples.split_blocks 的文档字符串（那里写了为什么
-# 这不是"效果好不好"而是防幻觉的前提）。
-EXPECTED_SOURCES: dict[str, tuple[str, str, str, str]] = {
-    "中药学.md": ("modern", "materia_medica", "heading", "性味归经功效用量"),
-    "临床中药学.md": ("modern", "materia_medica", "heading", "临床用量、配伍"),
-    "中药炮制学.md": ("modern", "materia_medica", "heading", "炮制方法与目的"),
-    "方剂学.md": ("modern", "formulary", "heading", "方剂组成、君臣佐使、加减法"),
-    "000-神农本草经.txt": ("classic", "materia_medica", "blank-line", "古籍本草"),
-    "018-本草备要.txt": ("classic", "materia_medica", "blank-line", "古籍本草"),
-}
+# 六个源的表住在 offline/pharmacology_sources.py（R8 挪过去的：抽取引擎的预过滤
+# 和批量抽取入口也要读它，而 offline/ 不能反过来 import scripts/）。这里再导出
+# 同名，调用方和测试不用改。表的说明（跟下载脚本各列一份是刻意的、教材为什么
+# 是 heading、古籍为什么 R8 起也是 heading）都在那个模块里。BLOCK_MAX_CHARS
+# 也从那里来：预过滤的「超长」一类和这里的第三个阈值必须是同一个数。
+from offline.pharmacology_sources import (  # noqa: E402
+    BLOCK_MAX_CHARS,
+    ENTRY_PREDICATES,
+    EXPECTED_SOURCES,
+    format_prefilter_summary,
+)
+from offline.extract_reference_triples import plan_blocks  # noqa: E402
+
+UNKNOWN_SOURCE = "unknown"
+FILTERED_PREVIEW = 5
 
 # ---- 三个异常阈值，以及每个数的依据 ----
 #
@@ -65,11 +60,8 @@ MIN_BLOCKS = 50
 # "典型的一块长什么样"。
 MEDIAN_MAX_CHARS = 3000
 
-# BLOCK_MAX_CHARS = 10000：单块上万字一定有问题。这个数还有一个硬依据——
-# 引擎的 MAX_TOKENS=16384，而中文约 1 token/字，一块一万字的输入加上
-# schema hint 和输出，会直接顶到上限被判截断（LLMTruncatedError），
-# 那一块的调用是纯浪费。所以这不只是"不像一个条目"，是"这一块注定抽不出来"。
-BLOCK_MAX_CHARS = 10000
+# BLOCK_MAX_CHARS（单块上限 10000 字）的依据写在 offline/pharmacology_sources.py：
+# 引擎 MAX_TOKENS=16384、中文约 1 token/字，一万字的块注定被判截断。
 
 MIN_BLOCKS_REASON = f"一本本草/教材至少上百个条目，不到 {MIN_BLOCKS} 块 = 没按条目切开或文件残缺"
 MEDIAN_REASON = f"典型一块超过 {MEDIAN_MAX_CHARS} 字 = 一块已经不是一个条目（大概率整节成一块）"
@@ -123,13 +115,30 @@ def compare_modes(text: str) -> dict[str, dict]:
             for mode in ("blank-line", "line", "heading")}
 
 
+def prefilter_counts(text: str, chunk_by: str, source: str) -> tuple[int, int, dict[str, int]]:
+    """(切块总数, 预过滤后保留数, 各类跳过计数)。保留数 = 真实抽取的调用数。
+    走引擎的 plan_blocks，不另算——三处各算一遍迟早对不上。"""
+    all_blocks, kept, _skipped, counts = plan_blocks(text, chunk_by, source, prefilter=True)
+    return len(all_blocks), len(kept), counts
+
+
 def report_source(path: Path, label: tuple[str, str, str, str], chunk_by: str,
-                  show: int, preview_chars: int, compare: bool = False) -> list[str]:
-    """打印一个源的切块统计 + 前 N 块原文，返回问题清单。
+                  show: int, preview_chars: int, compare: bool = False,
+                  prefilter: bool = True) -> list[str]:
+    """打印一个源的切块统计 + 预过滤结果 + 前 N 块原文，返回问题清单。
 
     **原文必须打出来。** 统计数字能说"切成了 800 块、中位数 400 字"，说不了
     "切出来的是不是一味药"——那只有人看原文才判得出来。这个脚本的主要产出
     其实就是这几段原文，阈值检查只是顺手能自动化的那部分。
+
+    R8 起前 N 块打的是**预过滤后保留的**前 N 块（真实抽取会喂给模型的那些），
+    另外把**被预过滤跳过的前 FILTERED_PREVIEW 块**连原因一起打出来——预过滤
+    是按结构判的，判错了只有人看原文才看得出来，这两组原文缺一组都不完整。
+    三个阈值检查对**预过滤后保留的块**做——那才是真实抽取会喂给模型的；中药学的
+    药名索引表一块 18686 字，但它被预过滤按「表格」跳掉了，不会有那一次调用，
+    再拿它判"没过"就是在拦一个不存在的浪费。切块结果里最长的那块仍然会打出开头
+    （信息，不是判据）。`--no-prefilter` 时退回 R4-2 的行为：阈值对切块结果做，
+    前 N 块 = 切块结果的前 N 块。
     """
     source, kind, recommended, purpose = label
     text = path.read_text(encoding="utf-8")
@@ -144,22 +153,52 @@ def report_source(path: Path, label: tuple[str, str, str, str], chunk_by: str,
               "教材用 blank-line 会把一味药切成五六块、其中「用量」那块没有药名——"
               "那种块抽出来的 s 是模型猜的，而 s 不过 source_span 核验。")
     print(f"全文 {stats['n_chars']} 字　切成 {stats['n_blocks']} 块"
-          f"（= 真实抽取的调用数）")
+          + ("（预过滤前）" if prefilter else "（= 真实抽取的调用数）"))
     print(f"每块字数：中位数 {stats['median_chars']}　均值 {stats['mean_chars']}　"
           f"最短 {stats['min_chars']}（第 {stats['shortest_index']} 块）　"
           f"最长 {stats['max_chars']}（第 {stats['longest_index']} 块）")
-    problems = check_anomalies(stats)
+    if prefilter:
+        _all, kept, skipped, counts = plan_blocks(text, effective, source, prefilter=True)
+        rule = (f"source={source} 的结构判据" if source in ENTRY_PREDICATES
+                else f"source={source} 没有结构判据，只跳过过短/表格/超长三类")
+        print(f"预过滤（{rule}）：{format_prefilter_summary(len(_all), counts)}"
+              "　← 保留数 = 真实抽取的调用数")
+        kept_lengths = [len(b) for _i, b in kept]
+        judged = {
+            "n_blocks": len(kept),
+            "median_chars": statistics.median(kept_lengths) if kept_lengths else 0,
+            "max_chars": max(kept_lengths) if kept_lengths else 0,
+        }
+        if kept:
+            longest_i = max(kept, key=lambda ib: len(ib[1]))[0]
+            print(f"保留块字数：中位数 {judged['median_chars']}　"
+                  f"最短 {min(kept_lengths)}　最长 {judged['max_chars']}（第 {longest_i} 块）")
+        judged_on = f"对预过滤后保留的 {len(kept)} 块"
+        shown = kept
+    else:
+        judged, judged_on = stats, "对切块结果"
+        shown, skipped = list(enumerate(stats["blocks"])), []
+    problems = check_anomalies(judged)
     for p in problems:
         print(f"  ✗ {p}")
     if not problems:
-        print("  ✓ 三个阈值检查都过")
+        print(f"  ✓ 三个阈值检查都过（{judged_on}）")
     print()
-    n = min(show, stats["n_blocks"])
+    n = min(show, len(shown))
     if n:
-        print(f"前 {n} 块原文（**人工确认切的是不是一味药 / 一张方**）：")
-        for i, block in enumerate(stats["blocks"][:n]):
+        print(f"前 {n} 块原文（**人工确认切的是不是一味药 / 一张方**"
+              + ("；块号是切块结果里的位置" if prefilter else "") + "）：")
+        for i, block in shown[:n]:
             print(f"  --- 第 {i} 块（{len(block)} 字）---")
             for line in _preview(block, preview_chars).splitlines():
+                print(f"    {line}")
+        print()
+    if skipped:
+        m = min(FILTERED_PREVIEW, len(skipped))
+        print(f"被预过滤跳过的前 {m} 块（**人工确认跳掉的确实不是条目**）：")
+        for i, reason, block in skipped[:m]:
+            print(f"  --- 第 {i} 块（{len(block)} 字）[{reason}]---")
+            for line in _preview(block, min(preview_chars, 160)).splitlines():
                 print(f"    {line}")
         print()
     if compare:
@@ -193,20 +232,31 @@ def main(argv: list[str] | None = None) -> int:
                     help="每个源额外报三种切法的块数/中位数对比，用来确认推荐模式选对了")
     ap.add_argument("--show", type=int, default=DEFAULT_SHOW, help="每个源打印前几块原文")
     ap.add_argument("--preview-chars", type=int, default=400, help="每块原文打印前多少字")
+    ap.add_argument("--source", choices=("classic", "modern", UNKNOWN_SOURCE), default=None,
+                    help="只对 --file 生效：这个文件按哪种源类型做预过滤的结构判据"
+                         "（classic=古籍 <篇名>/剂量词，modern=教材 【字段】）。不传 = 六源清单里"
+                         "有就用清单的，没有就 unknown（不做结构判据，只跳过过短/表格/超长）")
+    ap.add_argument("--no-prefilter", action="store_true",
+                    help="不做块级预过滤，前 N 块打的是切块结果的前 N 块（R4-2 的行为）。"
+                         "只在核对预过滤本身时用——真实抽取默认是开着预过滤的")
     args = ap.parse_args(argv)
 
-    print("**零 LLM 调用**：只切块 + 统计 + 打印原文。一块 = 真实抽取的一次调用，"
-          "所以这一步过不了就不要去跑抽取。")
+    print("**零 LLM 调用**：只切块 + 预过滤 + 统计 + 打印原文。预过滤后保留的一块 = "
+          "真实抽取的一次调用，所以这一步过不了就不要去跑抽取。")
     print("切块模式：" + (f"命令行指定 {args.chunk_by}（对所有源生效）"
-                         if args.chunk_by else "按每个源的推荐值（教材 heading、古籍 blank-line）")
+                         if args.chunk_by else "按每个源的推荐值（六个源都是 heading：教材认「#」、古籍认「<篇名>」）")
           + "——真实抽取要传跟这里一致的 --chunk-by")
     print()
 
     if args.file is not None:
         # 不在六源清单里的文件（docx 转出来的医案 txt 之类）默认按 blank-line，
-        # 并标明它不在清单里——不猜它该用哪种切法。
-        targets = [(args.file, EXPECTED_SOURCES.get(
-            args.file.name, ("unknown", "unknown", "blank-line", "（不在六源清单里）")))]
+        # 并标明它不在清单里——不猜它该用哪种切法；源类型（决定预过滤的结构判据）
+        # 可以用 --source 指定，不指定就 unknown = 不做结构判据。
+        label = EXPECTED_SOURCES.get(
+            args.file.name, (UNKNOWN_SOURCE, UNKNOWN_SOURCE, "blank-line", "（不在六源清单里）"))
+        if args.source is not None:
+            label = (args.source, *label[1:])
+        targets = [(args.file, label)]
     else:
         targets = [(args.books_dir / name, label)
                    for name, label in EXPECTED_SOURCES.items()]
@@ -227,15 +277,28 @@ def main(argv: list[str] | None = None) -> int:
         print()
 
     problems_by_source: dict[str, list[str]] = {}
+    total_blocks = total_kept = 0
+    total_counts: dict[str, int] = {}
     for path, label in present:
         problems_by_source[path.name] = report_source(
             path, label, args.chunk_by, args.show, args.preview_chars,
-            compare=args.compare_modes)
+            compare=args.compare_modes, prefilter=not args.no_prefilter)
+        if not args.no_prefilter:
+            n_all, n_kept, counts = prefilter_counts(
+                path.read_text(encoding="utf-8"), args.chunk_by or label[2], label[0])
+            total_blocks += n_all
+            total_kept += n_kept
+            for reason, n in counts.items():
+                total_counts[reason] = total_counts.get(reason, 0) + n
 
     print("=" * 70)
     failed = {k: v for k, v in problems_by_source.items() if v}
     print(f"验了 {len(present)} 个源，{len(present) - len(failed)} 个过、{len(failed)} 个没过"
           f"（六源清单共 {len(EXPECTED_SOURCES)} 个，缺 {len(missing)} 个没验）")
+    if not args.no_prefilter:
+        # 这一行就是剧本段 5 的预估调用数的来源（run_onsite.sh 的 SEGMENTS 表）
+        print(f"合计（{len(present)} 个源）：切 {format_prefilter_summary(total_blocks, total_counts)}"
+              f"　→ 真实抽取预估调用数 {total_kept}")
     if not failed:
         print("★ 阈值检查全过。**但阈值只能排除明显切错**——请人工看一遍上面打印的"
               "前几块原文，确认切出来的是一味药 / 一张方，再去跑真实抽取。")

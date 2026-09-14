@@ -41,13 +41,26 @@ def test_segment_numbers_are_contiguous_and_unique():
     assert nums == list(range(len(nums))), nums
 
 
-def test_segments_are_ordered_cheapest_first_and_most_expensive_last():
-    """段序按「依赖 + 成本」排：零调用的先跑（免费的问题先发现掉），
-    最贵的放最后。这条钉住那个顺序不会被随手改乱。"""
+def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents():
+    """段序按「依赖 + 成本」排：零调用的先跑（免费的问题先发现掉），最贵的放最后
+    ——**但依赖优先于成本**。R8 之前这里断言"最后一段是最贵的"，那时段 5 写的是
+    拍的 500；R8 按真实数据算出段 5 是 2167（六源预过滤后 2137 块 + 试抽），比段 7
+    的 1200 贵，而段 5 不能挪到最后：`core/tools.py` 读 data/materia_medica.jsonl，
+    段 6 的录制和段 7 的评测都要在药理层数据落盘**之后**跑，否则录下来的是
+    「数据文件不存在」的工具输出。所以这条改成：前两段零调用；药理层抽取在录制和
+    评测之前；最后一段是全套评测（没有任何段依赖它、且是不被依赖的段里最贵的）。
+    这是一次有意的契约变更，不是把断言改绿。"""
     rows = _segments()
     assert rows[0][2] == 0 and rows[1][2] == 0, "前两段必须是零调用"
+    names = [r[1] for r in rows]
+    i_pharm = next(i for i, n in enumerate(names) if "药理层" in n)
+    i_record = next(i for i, n in enumerate(names) if "录制" in n)
+    i_eval = next(i for i, n in enumerate(names) if "评测" in n)
+    assert i_pharm < i_record < i_eval, "药理层抽取必须在录制和评测之前（core/tools.py 读它的产出）"
+    assert i_eval == len(rows) - 1, "全套评测必须是最后一段"
     calls = [r[2] for r in rows]
-    assert calls[-1] == max(calls), "最贵的一段必须在最后"
+    # 不被依赖的段里（录制、评测），评测是最贵的那个
+    assert calls[i_eval] > calls[i_record]
 
 
 def test_exactly_two_human_gates_and_they_are_segments_3_and_5():

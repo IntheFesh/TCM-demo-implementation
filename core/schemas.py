@@ -70,6 +70,13 @@ class CaseRecord(VisitStructured):
     # 过滤），也是 README 里要说明的取舍：系统的安全层会拦这类配伍，数据里
     # 的反药配伍跟 M2 的检查直接冲突，进训练集等于教模型开反药。
     has_incompatible_pair: bool = False
+    # R8-2 选项 ②：不在本项目脾胃门定位内的医案（王云启治癌验案录、李可肿瘤医案，
+    # 见 data/local_corpora/MANIFEST.json 的 out_of_scope 声明）接进来但打标，
+    # 训练导出默认排除（export_sft.py 的 filter_out_of_scope，--include-out-of-scope
+    # 才带上）。跟 has_incompatible_pair 同一个形状：标记在数据边界上落好，过滤只
+    # 看标记。**不是从证型覆盖率自动推的**——那个数（assess_case_scope）给人看，
+    # 决定由人写进 MANIFEST。
+    out_of_scope: bool = False
 
 
 # ---------- X3：医案三元组（S5 抽取，LLM 输出） ----------

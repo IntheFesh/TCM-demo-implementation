@@ -45,6 +45,7 @@ from core.schemas import (
     MateriaMedicaExtraction,
     MateriaMedicaRecord,
 )
+from offline.pharmacology_sources import format_prefilter_summary, prefilter_blocks
 
 ROOT = Path(__file__).resolve().parent.parent
 # 每处理完这么多块报一次进度、落盘一次——跟 X3 同一个理由（中途崩了不该把
@@ -63,6 +64,37 @@ CHUNK_MODES = ("blank-line", "line", "heading")
 # markdown），排版是「# 第N节 病名 / # N.证型名」这种层级标题 + 逐行标注的
 # 字段，见 offline/build_syndrome_textbook.py 对同一批文件的解析规则。
 _HEADING_RE = re.compile(r"^#{1,6}\s+\S")
+# 中医古籍 txt 库（xiaopangxia/TCM-Ancient-Books）的转录体例：`<篇名>药名` 是
+# 条目标题，`<目录>卷一\上经` 是它上面的目录路径。两种行在 heading 模式下都
+# 算标题行——跟 markdown 的「#」是同一个概念（一个标题到下一个标题之间是一块）。
+# offline/split_cases.py 也按 `<篇名>` 切，但它回答的是另一个问题：「哪些篇名
+# 属于脾胃门」（按 gate 过滤标题、剥掉 `属性：`），不是「怎么把整本书切成块」。
+_GUJI_TITLE_RE = re.compile(r"^<(篇名|目录)>")
+_GUJI_TOC_RE = re.compile(r"^<目录>")
+_GUJI_PIAN_RE = re.compile(r"^<篇名>")
+# **不该开新块的"标题"**（OCR 把两种东西也升成了 `#`，R8 实测）：
+#   1. 字段标签本身：`# 【临床应用】`、`# 【炮制方法】`、`# 【现代研究】`。
+#      临床中药学 333 味药里每一味的「用法用量」都在 `# 【临床应用】` 那一块——
+#      按它开新块，那一块里没有药名，s 只能靠模型猜（353 处）；炮制学 437 处。
+#   2. 页眉页脚：`# 106 中药炮制学`、`# 38 方剂学`、`# 75`、`# 16目录`——页码
+#      开头、后面至多跟一个书名（OCR 有时把中间的空格吞掉）。方剂学 235 张方里
+#      有一张（麻黄杏仁甘草石膏汤）被一个页眉从「证治机理」和「方解」之间劈成
+#      两块。只认**页码在前**的形状：「痛泻要方 67」这种页码在后的是真标题带了
+#      页码，仍然开新块；「1.分类」「2.制藤黄」这种编号标题（数字后面紧跟标点）
+#      也不算——数字后面直接跟汉字才是吞了空格的页眉。四本教材逐一核过：这条
+#      正则命中的 54 个标题全是页眉/目录页眉/编写说明页眉，没有一个条目。
+_CONTINUATION_HEADING_RE = re.compile(
+    r"^#{1,6}\s+(?:【|\d{1,4}(?:\s+\S{1,12}|[^\s\d.．、,，)）]\S{0,11})?\s*$)")
+
+
+def _is_title_line(line: str) -> bool:
+    if _GUJI_TITLE_RE.match(line):
+        return True
+    return bool(_HEADING_RE.match(line)) and not _CONTINUATION_HEADING_RE.match(line)
+
+
+def _only_toc_lines(lines: list[str]) -> bool:
+    return all(not line.strip() or _GUJI_TOC_RE.match(line) for line in lines)
 
 OnProgress = Callable[[int, int, dict], None]
 OnBlockDone = Callable[[int, list[BaseModel], "str | None"], None]
@@ -117,13 +149,24 @@ def split_blocks(text: str, chunk_by: str = "blank-line", min_chars: int = MIN_B
     heading 模式把标题行本身留在块里（药名就在那一行），第一个标题之前的内容
     （前言、目录）单独成一块——不丢掉它，是因为"丢了什么"应该由 min_chars 和
     切块验证脚本来判断，不该由切块函数偷偷决定。
+
+    **R8 起 heading 模式也认古籍转录体例的标题行**（`<篇名>`/`<目录>`，见
+    _GUJI_TITLE_RE）。R8 在真实数据上实测：两本古籍用 blank-line，`<篇名>丹沙`
+    跟下一段 `内容：味甘微寒…` 之间隔着空行，被切成两块——前者 7 字、短于
+    MIN_BLOCK_CHARS 直接被丢，神农本草经 379 味药里 350 味的药名进不了模型，
+    模型看到的是一段没有主语的「味甘微寒。主…」。这跟上面教材按空行切的问题
+    是同一个（药名跟字段不在一块），修法也是同一个（按标题切）。`<目录>` 行
+    单独成块时会被下一个 `<篇名>` 并进来（"卷一\上经"「草部」是条目的品级/
+    部类，留在块里有用），其它情况下各自成块。
     """
     if chunk_by not in CHUNK_MODES:
         raise ValueError(f"chunk_by 必须是 {CHUNK_MODES} 之一，收到 {chunk_by!r}")
     if chunk_by == "heading":
         raw_blocks, current = [], []
         for line in text.splitlines():
-            if _HEADING_RE.match(line) and current:
+            if _is_title_line(line) and current and not (
+                _GUJI_PIAN_RE.match(line) and _only_toc_lines(current)
+            ):
                 raw_blocks.append("\n".join(current))
                 current = []
             current.append(line)
@@ -142,6 +185,21 @@ def split_blocks(text: str, chunk_by: str = "blank-line", min_chars: int = MIN_B
         if current:
             raw_blocks.append("\n".join(current))
     return [b.strip() for b in raw_blocks if len(b.strip()) >= min_chars]
+
+
+def plan_blocks(
+    text: str, chunk_by: str, source: str | None, prefilter: bool = True,
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]], list[tuple[int, str, str]], dict[str, int]]:
+    """切块 + 预过滤，返回 (全部块, 保留块, 跳过块(带原因), 各类跳过计数)。
+    run()、切块验证脚本、批量入口算"预估调用数"走的都是这一个函数——
+    调用数 = 保留块数，三处各算一遍迟早对不上。块号一律是切块结果里的位置：
+    预过滤只挑块、不重新编号，所以 --only-blocks 和输出行里的 _block 在开/关
+    预过滤时指的是同一块。"""
+    all_blocks = list(enumerate(split_blocks(text, chunk_by)))
+    if not prefilter:
+        return all_blocks, list(all_blocks), [], {}
+    kept, skipped, counts = prefilter_blocks(all_blocks, source)
+    return all_blocks, kept, skipped, counts
 
 
 def extract_block(
@@ -257,8 +315,14 @@ def build_parser(kind_name: str | None) -> argparse.ArgumentParser:
     ap.add_argument("--book", required=True, help="书名，写进每条记录的 book 字段")
     ap.add_argument("--out", type=Path, default=None, help="默认按 kind 取 data/materia_medica.jsonl 或 data/formulary.jsonl")
     ap.add_argument("--chunk-by", choices=CHUNK_MODES, default="blank-line")
-    ap.add_argument("--limit", type=int, default=None, help="只处理前 N 块，调试/控成本用")
+    # --limit-blocks 是 --limit 的别名（R8）：剧本和文档里两个名字都出现过，
+    # 跟 extract_case_triples 的 --limit 同形。一个参数两个拼法，不是两个参数。
+    ap.add_argument("--limit", "--limit-blocks", dest="limit", type=int, default=None,
+                    help="只处理（预过滤后的）前 N 块，调试/控成本用")
     ap.add_argument("--only-blocks", default="", help="只重跑这些块号（逗号分隔），结果按块号合并进 --out")
+    ap.add_argument("--no-prefilter", action="store_true",
+                    help="关掉块级预过滤（R8-1：默认按源类型跳过过短/表格/超长/无结构标记的块，"
+                         "见 offline/pharmacology_sources.py）。只在核对预过滤本身时用")
     ap.add_argument("--dry-run", action="store_true", help="只打印块数（=预估调用数），不真的调模型")
     return ap
 
@@ -273,21 +337,31 @@ def run(argv: list[str] | None, kind_name: str | None, after_write=None) -> None
     if not args.input.exists():
         raise FileNotFoundError(f"未找到 {args.input}——整本原文 txt 要自己准备，见 README 3.1 的下载说明。")
     text = args.input.read_text(encoding="utf-8")
-    all_blocks = list(enumerate(split_blocks(text, args.chunk_by)))
-    blocks = all_blocks
+    all_blocks, blocks, skipped, counts = plan_blocks(
+        text, args.chunk_by, args.source, prefilter=not args.no_prefilter)
+    prefilter_line = ("预过滤已关（--no-prefilter）" if args.no_prefilter
+                      else "预过滤：" + format_prefilter_summary(len(all_blocks), counts))
     if args.only_blocks:
         wanted = {int(x) for x in args.only_blocks.split(",") if x.strip()}
         missing = wanted - {i for i, _ in all_blocks}
         if missing:
             raise SystemExit(f"--only-blocks 里这些块号超出范围（共 {len(all_blocks)} 块）：{sorted(missing)}")
-        blocks = [(i, b) for i, b in all_blocks if i in wanted]
+        filtered = {i: reason for i, reason, _ in skipped if i in wanted}
+        if filtered:
+            # 点名要跑的块被预过滤挡住了，要说清楚是哪一类原因、怎么绕——不能静默
+            # 少跑几块让人以为跑过了
+            raise SystemExit(
+                f"--only-blocks 里这些块被预过滤跳过了：{filtered}。"
+                "确认要跑它们就加 --no-prefilter。")
+        blocks = [(i, b) for i, b in blocks if i in wanted]
     if args.limit is not None:
         blocks = blocks[: args.limit]
 
     if args.dry_run:
-        print(f"--dry-run：{args.input} 切成 {len(all_blocks)} 块（chunk_by={args.chunk_by}），"
-              f"本次将处理 {len(blocks)} 块 = 预估调用数 {len(blocks)}，不真的调模型")
+        print(f"--dry-run：{args.input} 切成 {len(all_blocks)} 块（chunk_by={args.chunk_by}）；"
+              f"{prefilter_line}；本次将处理 {len(blocks)} 块 = 预估调用数 {len(blocks)}，不真的调模型")
         return
+    print(prefilter_line)
 
     by_block = load_existing_rows(out_path)
 

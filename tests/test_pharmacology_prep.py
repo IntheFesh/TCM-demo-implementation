@@ -34,11 +34,16 @@ def test_fetch_script_lists_all_six_sources_with_encoding_and_source_tag():
     for name in ("中药学.md", "临床中药学.md", "中药炮制学.md", "方剂学.md",
                  "000-神农本草经.txt", "018-本草备要.txt"):
         assert name in text, f"{name} 不在下载脚本的源表里"
-    # 四本教材 UTF-8 + heading 切块、两本古籍 GB18030 + blank-line
+    # 四本教材 UTF-8、两本古籍 GB18030。切块模式**六个源全是 heading**——R8 之前
+    # 古籍是 blank-line（这里原来断言 heading 4 / blank-line 2），R8 在真实数据上
+    # 实测 blank-line 会把 `<篇名>丹沙` 跟正文切开、药名被丢，改成 heading 模式
+    # 认 `<篇名>` 行（见 offline/extract_reference_triples.split_blocks）。这是一次
+    # 有意的契约变更，不是把断言改绿：源表的切块列跟 EXPECTED_SOURCES 逐字段比对
+    # 的那条测试（下面）没动，两张表必须一起改。
     assert text.count("|utf-8|modern|") == 4
     assert text.count("|gb18030|classic|") == 2
-    assert text.count("|heading|") == 4
-    assert text.count("|blank-line|") == 2
+    assert text.count("|heading|") == 6
+    assert text.count("|blank-line|") == 0
     # 教材路径在 十四五教材/ 下（URL 编码后的形式），不是 books/
     assert text.count("%E5%8D%81%E5%9B%9B%E4%BA%94%E6%95%99%E6%9D%90/") == 4
     assert "/books/" not in text
@@ -696,9 +701,9 @@ def test_heading_mode_is_registered_in_chunk_modes_and_cli():
 
 
 def test_verifier_uses_the_per_source_recommended_mode_by_default(tmp_path, capsys):
-    """不传 --chunk-by 时按每个源的推荐值跑：教材 heading、古籍 blank-line。
-    传一个全局值只是为了对比，不该是默认——默认值搞错会让验证验的是另一个
-    切法，而真实抽取用的是推荐那个。"""
+    """不传 --chunk-by 时按每个源的推荐值跑（R8 起六个源都是 heading：教材认「#」、
+    古籍认「<篇名>」）。传一个全局值只是为了对比，不该是默认——默认值搞错会让
+    验证验的是另一个切法，而真实抽取用的是推荐那个。"""
     (tmp_path / "中药学.md").write_text(MARKDOWN_TEXTBOOK, encoding="utf-8")
     vpc.main(["--books-dir", str(tmp_path), "--show", "0"])
     out = capsys.readouterr().out

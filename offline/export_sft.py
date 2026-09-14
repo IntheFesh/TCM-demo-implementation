@@ -96,6 +96,27 @@ def filter_incompatible_pairs(cases: list[CaseRecord],
     return kept
 
 
+def filter_out_of_scope(cases: list[CaseRecord], include: bool = False) -> list[CaseRecord]:
+    """R8-2 选项 ②：不在脾胃门定位内的医案（`CaseRecord.out_of_scope`，来源是
+    data/local_corpora/MANIFEST.json 的人工声明）默认不进训练集——demo 的证候表、
+    检索语料、评测主诉全在脾胃门，肿瘤科样本混进去训出来的东西跟评测对不上，
+    而"要不要扩定位"是产品决定，不该由导出脚本顺手做掉。
+    跟 filter_incompatible_pairs 同一个形状：只按标记过滤，条数打到 stderr，
+    `--include-out-of-scope` 显式打开时照样把条数打出来并警告。"""
+    tagged = [c.case_id for c in cases if c.out_of_scope]
+    if include:
+        if tagged:
+            print(f"[export_sft] **--include-out-of-scope：把 {len(tagged)} 条定位外（out_of_scope）"
+                  f"的医案也导出了**（默认是排除的）。这些样本不在脾胃门评测集覆盖的范围里，"
+                  f"训练效果对不上现有评测——只有在明确要扩定位时才用这个开关："
+                  f"{tagged[:10]}{'…' if len(tagged) > 10 else ''}", file=sys.stderr)
+        return list(cases)
+    if tagged:
+        print(f"[export_sft] 排除 {len(tagged)} 条定位外（out_of_scope）的医案："
+              f"{tagged[:10]}{'…' if len(tagged) > 10 else ''}", file=sys.stderr)
+    return [c for c in cases if not c.out_of_scope]
+
+
 def _sample(task: str, instruction: str, input_text: str, output: str, case: CaseRecord) -> dict:
     return {
         "instruction": instruction,
@@ -677,11 +698,15 @@ def main(argv: list[str] | None = None) -> None:
                     help="把含十八反十九畏配伍的医案也导出（默认排除，见 "
                          "filter_incompatible_pairs 的文档字符串）。这些样本会教模型"
                          "开反药，而输出侧安全检查又会拦住它，自相矛盾。")
+    ap.add_argument("--include-out-of-scope", action="store_true",
+                    help="把标了 out_of_scope（不在脾胃门定位内，R8-2 选项 ②）的医案也导出"
+                         "（默认排除，见 filter_out_of_scope 的文档字符串）。")
     args = ap.parse_args(argv)
 
     cases = load_cases(args.cases_path)
     cases = filter_public_domain(cases)
     cases = filter_incompatible_pairs(cases, include=args.include_incompatible)
+    cases = filter_out_of_scope(cases, include=args.include_out_of_scope)
 
     if args.format == "chain":
         out_path = args.out or CHAIN_OUT_PATH

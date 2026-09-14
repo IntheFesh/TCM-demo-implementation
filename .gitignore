@@ -50,3 +50,8 @@ books/
 .coverage
 htmlcov/
 .ruff_cache/
+# R8-2：本地语料里 docx 转出来的 txt 是派生物（scripts/normalize_local_corpora.py
+# 幂等重生成），而且两本都是现代出版物——docx 本体是用户自己上传进版本控制的，
+# 派生 txt 不再多放一份。脾胃论.txt 是原始语料（公有领域），不在这条里。
+data/local_corpora/王云启医案.txt
+data/local_corpora/李可医案.txt

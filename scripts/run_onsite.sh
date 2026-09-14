@@ -11,8 +11,10 @@
 #   1. **一段失败不影响后面的段**。段与段之间只有"先后"没有"依赖崩塌"——
 #      段 5 的药理层抽取挂了，段 6 的录制照样该跑。每段末尾打时间戳和退出码，
 #      最后汇总，不在中途 `set -e` 掉整个脚本。
-#   2. **段序按「依赖 + 成本」排**：零调用的先跑（免费的先把能发现的问题发现掉），
-#      最贵的那段（全套评测重跑）放最后。
+#   2. **段序按「依赖 + 成本」排，依赖优先**：零调用的先跑（免费的先把能发现的问题
+#      发现掉）；段 5 药理层抽取（R8 实测后是最贵的一段）必须在段 6 录制、段 7 评测
+#      之前——core/tools.py 读它落盘的 data/materia_medica.jsonl；没有段依赖的
+#      全套评测放最后。
 #   3. **两处人工卡点**（段 3 role 填充率、段 5 抽取质量）**必须停下来等人确认**。
 #      这两处一路冲到底的代价是：闸门没过就往下跑，后面几百次调用全部白花。
 #
@@ -31,11 +33,11 @@ YUAN_PER_CALL=0.0055
 # 段号|名称|预估调用数|人工卡点|一句话
 SEGMENTS=(
   "0|环境自检|0|no|零成本：pytest / ruff / 环境变量残留 / 数据文件齐不齐"
-  "1|零调用的验证|0|no|凭据核对 / 切块验证（要人看原文）/ SDT 失分分析"
+  "1|零调用的验证|0|no|凭据核对 / 本地语料规范化 / 切块验证（要人看原文）/ SDT 失分分析"
   "2|本地模型|2|no|起 vLLM + verify_local_backend（要先装 vllm、下基座）"
   "3|R1 前提：role 填充率|60|YES|**不过就停**——填充率不够，分层 ε 三个数没有意义"
   "4|R1 验收：噪声地板 ε|215|no|实测 215 次调用 / 1347s（eval/epsilon.json 的 llm_calls）"
-  "5|药理层抽取|500|YES|先 --limit 5 人工核质量，再全量，最后 --crosscheck"
+  "5|药理层抽取|2167|YES|六源预过滤后 2137 块（R8 实测，verify_pharmacology_chunks 合计行）+ 6×5 试抽；先 --limit-blocks 5 人工核质量，再全量 --crosscheck"
   "6|录制回放|278|no|record_fixtures（--dry-run 实测 278）+ verify_replay"
   "7|全套评测重跑|1200|no|最贵，放最后：run_eval 四项 + SDT Test（会写台账）"
 )
@@ -70,7 +72,8 @@ print_plan() {
   echo "全部跑完预估 ${total} 次调用 ≈ ¥${yuan}（均价 ¥${YUAN_PER_CALL}/次，"
   echo "来源是 README 里 record_fixtures 那条「约 272 次 ¥1.5」——量级估算，不是账单）"
   echo
-  echo "段 0/1 零调用，先跑它们：免费的问题先发现掉。段 7 最贵，放最后。"
+  echo "段 0/1 零调用，先跑它们：免费的问题先发现掉。段 5 最贵，但段 6/7 要用它落盘的"
+  echo "药理层数据（core/tools.py 读 data/materia_medica.jsonl），所以它在两者之前；段 7 放最后。"
 }
 
 gate() {   # $1 = 段号, $2 = 这一步要人确认什么
@@ -100,8 +103,22 @@ seg_0() {
 seg_1() {
   python -m scripts.collect_results || return 1
   echo
-  echo "--- 切块验证：**下面会打出每个源的前 3 块原文，要人看** ---"
+  echo "--- 本地语料规范化（幂等：第二遍就是没事做）---"
+  python -m scripts.normalize_local_corpora || return 1
+  echo
+  echo "--- 切块验证：**下面会打出每个源预过滤后的前 3 块、被跳过的前 5 块原文，要人看** ---"
+  echo "--- 最后一行「合计 … 真实抽取预估调用数 N」要跟本脚本段 5 的预估对得上 ---"
   python -m scripts.verify_pharmacology_chunks || return 1
+  echo
+  echo "--- 本地语料的切块验证（脾胃论按古籍判据；两份医案 txt 没有结构判据，只看粒度）---"
+  local_ok=0
+  if [ -f data/local_corpora/脾胃论.txt ]; then
+    python -m scripts.verify_pharmacology_chunks --file data/local_corpora/脾胃论.txt --source classic || local_ok=1
+  fi
+  for f in data/local_corpora/李可医案.txt data/local_corpora/王云启医案.txt; do
+    [ -f "$f" ] && { python -m scripts.verify_pharmacology_chunks --file "$f" || local_ok=1; }
+  done
+  [ "$local_ok" = "0" ] || return 1
   echo
   echo "--- SDT 失分分析（零调用，对已有提交文件重新聚合）---"
   if [ -n "${SDT:-}" ] && [ -f out/sdt_chain_v2.txt ]; then
@@ -129,13 +146,16 @@ seg_4() {
 }
 
 seg_5() {
-  echo "--- 先抽 5 条看质量（**这一步的输出要人逐条看**）---"
-  python -m offline.extract_materia_medica --limit 5
+  echo "--- 先每个源抽 5 块看质量（**这一步的输出要人逐条看**）---"
+  # R8 之前这里写的是 `offline.extract_materia_medica --limit 5`：引擎的
+  # --input/--source/--book 都是必填，那条命令在 argparse 就退出，段 5 一步都跑不了。
+  # 现在走批量入口，六个源的参数从 offline/pharmacology_sources.EXPECTED_SOURCES 取。
+  python -m scripts.run_pharmacology_extraction --dry-run || return 1
+  python -m scripts.run_pharmacology_extraction --limit-blocks 5
 }
 
 seg_5b() {
-  python -m offline.extract_materia_medica || return 1
-  python -m offline.extract_materia_medica --crosscheck
+  python -m scripts.run_pharmacology_extraction --crosscheck
 }
 
 seg_6() {

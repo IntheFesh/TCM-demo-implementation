@@ -141,7 +141,14 @@ demo，它报的每个数都不可信。
 
 - **只覆盖脾胃门**（呕吐、痞满、肿胀、痰饮等相关证候），不是全科辨证系统。
   **肿瘤科医案不在当前范围内**：实测 337 条标准证候里跟肿瘤/积聚沾边的是 **0 条**
-  （`python -m offline.assess_case_scope --input <文件>` 可复现）。
+  （`python -m offline.assess_case_scope --input <文件>` 可复现）。R8 接进来的两份本地
+  医案（`data/local_corpora/` 的王云启治癌验案录、李可肿瘤医案）按选项 ②处理：**接进
+  仓库、标 `out_of_scope: true`、训练导出默认排除**（`--include-out-of-scope` 才带上）。
+  依据是数出来的：段落里含脾胃门门类词的比例，王云启 **211/1599 = 13.2%**、李可
+  **42/556 = 7.5%**，而《脾胃论》同一口径是 **147/671 = 21.9%**；含肿瘤词的比例
+  王云启 46.7%、李可 40.3%、脾胃论 0%（`data/local_corpora/MANIFEST.json` 的
+  `scope_stats`，`python -m scripts.normalize_local_corpora` 可复现）。两份都是现代出版物，
+  `copyright_status: copyrighted` 这一道过滤也会把它们挡在训练集外——两道过滤各管各的。
 - **doctor 模式能导出处方建议稿**（`POST /api/prescription/export`），那是建议不是医嘱，
   必须经执业医师审核签发，每次导出记审计日志。其余三种模式没有任何写入能力。
 - **沙箱开发环境连不上 huggingface hub**，`dense`/`hybrid` 需要的 embedding 模型下不下来，
@@ -427,6 +434,9 @@ compound 父子节点）+ 各位医家的结论对照 + 分歧度（医家数取
 | `offline/tag_incompatible_cases.py` | 给任意医案文件（`.json` 数组 / `.jsonl`）打「含十八反十九畏」标记，训练导出默认排除这类样本 |
 | `offline/assess_case_scope.py` | 接新一批医案**之前**量它在现有 337 条标准证候表里的覆盖率，未覆盖的列出来（零 LLM 调用；只报数不自动判决） |
 | `offline/docx_to_text.py` | `.docx` 医案 → UTF-8 txt（段落之间空行，下游按空行切块；含表格，医案 docx 偶尔用表格排药物剂量） |
+| `offline/pharmacology_sources.py` | 药理层六源的唯一一张表 + 按源类型的块级预过滤（R8-1）：过短 / 表格 / 超长 / 无结构标记四类，阈值和判据的依据都在文件里 |
+| `scripts/run_pharmacology_extraction.py` | 段 5 的批量入口：按六源表逐个源调抽取，`--dry-run` 报预估调用数、`--limit-blocks 5` 试抽、`--crosscheck` 全量 |
+| `scripts/normalize_local_corpora.py` | 把 `data/` 根目录的本地语料规范化进 `data/local_corpora/`（安全文件名 + MANIFEST + docx→txt），幂等 |
 
 ## 知识图谱权重（进阶功能，非 consult 主流程必需）
 
@@ -881,8 +891,11 @@ devtools 照样能看到。
 ```bash
 bash scripts/fetch_pharmacology_sources.sh --dry-run   # 看清单：4 本教材 + 2 本古籍
 bash scripts/fetch_pharmacology_sources.sh             # 下载 + 校验字节数
-python -m scripts.verify_pharmacology_chunks           # 切块统计 + 打印前 3 块原文
+python -m scripts.verify_pharmacology_chunks           # 切块 + 预过滤统计 + 打印保留的前 3 块 / 跳过的前 5 块原文
 python -m scripts.verify_pharmacology_chunks --compare-modes   # 三种切法并排比
+python -m scripts.run_pharmacology_extraction --dry-run        # 六个源的预估调用数（预过滤后），零调用
+python -m scripts.run_pharmacology_extraction --limit-blocks 5 # 段 5 卡点：每个源抽 5 块看质量
+python -m scripts.run_pharmacology_extraction --crosscheck     # 全量 + DOSE_LIMITS 交叉校验
 ```
 
 | 本地文件 | 用途 | `--source` | 编码 | `--chunk-by` | 字节数 |
@@ -891,8 +904,11 @@ python -m scripts.verify_pharmacology_chunks --compare-modes   # 三种切法并
 | `临床中药学.md` | 临床用量、配伍 | modern | UTF-8 | heading | 951968 |
 | `中药炮制学.md` | 炮制方法与目的 | modern | UTF-8 | heading | 1436809 |
 | `方剂学.md` | 方剂组成、君臣佐使、加减法 | modern | UTF-8 | heading | 1098496 |
-| `000-神农本草经.txt` | 古籍本草 | classic | GB18030 → 转 UTF-8 | blank-line | 180115 |
-| `018-本草备要.txt` | 古籍本草 | classic | GB18030 → 转 UTF-8 | blank-line | 293521 |
+| `000-神农本草经.txt` | 古籍本草 | classic | GB18030 → 转 UTF-8 | heading | 180115 |
+| `018-本草备要.txt` | 古籍本草 | classic | GB18030 → 转 UTF-8 | heading | 293521 |
+
+这张表在代码里只有一份：`offline/pharmacology_sources.EXPECTED_SOURCES`（切块验证、
+抽取引擎的预过滤、批量入口三处都读它；下载脚本是 bash，另列一份并有测试逐字段比对）。
 
 四本教材是 **markdown（`.md`）而不是 `.txt`**，来自 `PanckooAI/TCM_Datasets` 的
 `十四五教材/` 目录——`offline/build_syndrome_textbook.py` 已经在解析同一批文件里的
@@ -917,16 +933,66 @@ UTF-8 会把中文从 2 字节变成 3 字节，先转码再比字节数，两�
 那次调用是纯浪费。**但阈值只能排除明显切错**，"切出来的是不是一味药 / 一张方"
 只有人看原文才判得出来，所以这个脚本会把每个源的前 3 块原文打出来。
 
-**教材按标题切，古籍按空行切——这不是审美问题，是防幻觉的前提。**
+**教材按标题切，古籍也按标题切（`<篇名>`）——这不是审美问题，是防幻觉的前提。**
 `s6_extract_materia_medica.yaml` 要求 `s` 填"原文里这一条目的药材正名"，而
 `source_span` 校验只覆盖 `o`（宾语原文），**`s` 没有任何原文校验**。markdown 教材
 按空行切的话，`# 麻黄` 自己是一块（5 字，被引擎的 `MIN_BLOCK_CHARS=8` 丢掉），
 `【用法用量】煎服，2～10g。` 又是另一块——里面根本没有"麻黄"三个字，模型只能猜
 `s`，猜错了没有任何一道闸能发现。所以引擎加了第三种切法 `heading`（`#`~`######`
 标题起一块、标题行留在块内），一味药的正名和它的性味/功效/用量在同一块里。
-古籍没有 markdown 标题，仍按空行切。每个源的推荐切法写在上表和两个脚本里，
+古籍原来按空行切，R8 在真实数据上实测**同样的洞**：转录体例是 `<篇名>丹沙` 空一行
+`内容：味甘，微寒…`，按空行切 `<篇名>丹沙` 7 字短于 `MIN_BLOCK_CHARS=8` 直接被丢，
+神农本草经 379 味里 350 味的药名进不了模型。所以 `heading` 模式现在也认 `<篇名>`/
+`<目录>` 行，六个源全部 `heading`。每个源的推荐切法写在上表和两个脚本里，
 `--chunk-by` 强行改成别的会打警告；`--compare-modes` 把三种切法的块数/中位数
 并排打出来供对比。
+
+**heading 模式还认两种"不该开新块的标题"**（R8 实测，OCR 把它们也升成了 `#`）：
+字段标签本身（`# 【临床应用】`——临床中药学 333 味药的用法用量全在这一块，按它开
+新块那块里没有药名，353 处；炮制学 437 处）和页眉（`# 106 中药炮制学`、`# 38 方剂学`、
+`# 16目录`，54 处，逐个核过没有一个是条目）。修正前六源切 4818 块，修正后 3391 块。
+
+**块级预过滤（R8-1）：切完还要按源类型挑出"像条目的块"再喂模型。** 六源切完 3391
+块，其中教材的封面/CIP/公众号/目录/药名索引表（一块 18686 字）、章节导语、复习题，
+古籍的书头，都不是条目——喂给模型只会诱导它从几个字里编三元组。判据**全是排版结构、
+没有关键词黑名单**（"公众号""版权页"这种黑名单是打地鼠）：教材 = 行首有 `【字段】`
+标签；古籍 = `<篇名>` + `内容：`/`属性：` 正文，或带剂量词（钱/两/分/枚/铢）的方药。
+四类跳过按顺序判：过短（< 30 字）/ 表格（HTML 表格占比 > 0.8）/ 超长（> 10000 字）/
+无结构标记，阈值的依据写在 `offline/pharmacology_sources.py`。实测：
+
+| 源 | 切块 | 保留 | 过短 / 表格 / 超长 / 无结构标记 | 对照 |
+|---|---|---|---|---|
+| 中药学.md | 740 | **443** | 9 / 8 / 0 / 280 | 书里 `【功效】` 出现 440 次、`【现代研究】` 443 次 = 443 味药 |
+| 临床中药学.md | 700 | **341** | 11 / 3 / 1 / 344 | `【处方用名】` 333 次 = 333 味药 + 7 条本草史条目 + 1 块 OCR 碎片 |
+| 中药炮制学.md | 694 | **254** | 29 / 5 / 0 / 406 | `【处方用名】` 240 次 = 240 味药 + 14 条子条目（「2.制马钱子」这类） |
+| 方剂学.md | 390 | **235** | 4 / 4 / 0 / 147 | `【组成】` 235 次 = 235 张方 |
+| 000-神农本草经.txt | 379 | **378** | 0 / 0 / 0 / 1 | `<篇名>` 379 个（含 3 篇序）；跳掉的 1 块是书头 |
+| 018-本草备要.txt | 488 | **486** | 1 / 0 / 0 / 1 | `<篇名>` 488 个（含 3 篇序）；跳掉的是书头和一条 26 字的「银」 |
+| **合计** | 3391 | **2137** | 54 / 20 / 1 / 1179 | 修正前 4818 块 ≈ ¥26.5，现在 2137 × ¥0.0055 ≈ ¥11.8 |
+
+保留数就是真实抽取的调用数，`scripts/run_onsite.sh` 段 5 的预估（2167 = 2137 + 每源
+5 块试抽）从这里来。`--no-prefilter` 关掉它；`--dry-run` 打「N 块 → 保留 M 块（跳过：
+过短 / 表格 / 超长 / 无结构标记）」；切块验证脚本把保留的前 3 块和跳过的前 5 块原文
+都打出来——预过滤是按结构判的，判错了只有人看原文才看得出来。**两本古籍保留的
+前 3 块是序（邵序/张序/孙序、陈序/童序/自序）**，它们跟药物条目一样是 `<篇名>` +
+`内容：`，结构上分不开、也不该靠"序"这个字去分——6 块的代价是 6 次调用。
+
+### 本地语料（R8-2）
+
+用户上传到 `data/` 根目录的四个文件由 `scripts/normalize_local_corpora.py` 规范化进
+`data/local_corpora/`（幂等，段 1 每次都跑）：
+
+| 规范名 | 原名 | 类型 | 定位 | 版权 |
+|---|---|---|---|---|
+| `王云启医案.docx` | `2_王云启(1).docx` | 现代医案 docx | **out_of_scope**（肿瘤科） | copyrighted |
+| `李可医案.docx` | `李可医案.docx` | 现代医案 docx | **out_of_scope**（肿瘤科；105/556 段含反药对，海藻甘草 75 段） | copyrighted |
+| `脾胃论.txt` | `脾胃论 (中医经典文库) (金·李东垣 [金·李东垣], 古聖先賢) (z-library.sk,.txt` | 古籍排印本电子文本 | 在定位内 | public_domain |
+| `584-医学衷中参西录.txt` | 同名 | 古籍 | 跟 `books/` 那本逐字节相同 → 删掉 data/ 这份（books/ 不进版本控制） | public_domain |
+
+原名、字节数、sha256、来源说明、`scope_stats` 都在 `data/local_corpora/MANIFEST.json`。
+docx 顺手转成同名 `.txt`（不进版本控制，派生物）供切块验证；**脾胃论按空行切出来
+的块里方名和组成不在同一块**（切块验证会把这打出来）——它现在只是接进来、验过粒度，
+没有进任何抽取。
 
 ## 录制回放（演示模式，`LLM_MODE=replay`）
 
