@@ -91,6 +91,10 @@
             <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
           </div>
           <div id="cy"></div>
+          <!-- §3.2 规格 2：边透明度编码 λ1，而当前语料下 λ1 恒为 0、所有边
+               同一透明度。**图上要有这一行说明**——不解释的话看图的人会以为
+               图没建好。文字来自 offline/graph_stats.lambda1_note()，只此一处。 -->
+          <div id="cy-lambda1-note"></div>
           <div id="residual-note"></div>
           <div id="graph-note"></div>
           <div id="graph-tooltip" class="gt-tooltip"></div>
@@ -151,7 +155,9 @@
     <span id="gb-search-status"></span>
     <select id="gb-physician-select"></select>
     <button class="ghost-btn" id="gb-layer-toggle" hidden>切换到医案层</button>
-    <button class="ghost-btn" id="gb-more" hidden>加载更多证型</button>
+    <!-- R16 §3.2 规格 9：「加载更多证型」换成「按门类浏览」。翻页在一堆互不
+         相连的证型上没有意义——翻到第 3 页看到的还是一堆孤立方块。 -->
+    <select id="gb-category-select" hidden></select>
     <button class="ghost-btn" id="gb-reset-btn">重置视图</button>
   </div>
   <div id="gb-panel">

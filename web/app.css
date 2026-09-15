@@ -199,6 +199,16 @@
     color: var(--caution);
   }
   #residual-note { bottom: 26px; }
+  /* λ1 说明不是角标：它是一整段解释，要横着占满、能换行。放在画布下面而不是
+     压在画布上——角标那两条是一句话，这段是三四行。 */
+  #cy-lambda1-note { display: none; }
+  #cy-lambda1-note.show {
+    display: block;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--muted);
+    padding: var(--s3) var(--s3) 0;
+  }
   #graph-note { bottom: 8px; }
   #divergence-banner {
     display: none;

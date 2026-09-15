@@ -250,64 +250,152 @@ function computeLayout(nodes, edges) {
   return positions;
 }
 
-function buildStylesheet() {
+// ---------- 两张图共用的一份样式表（R16 §3.2 规格 7）----------
+//
+// R16 之前这里有两份：`buildStylesheet()`（问诊图）和
+// `buildGraphBrowserStylesheet()`（图谱浏览器）。基础节点样式、边样式、
+// 证素的紫、医案的橙……逐条重复，而两边的值已经开始漂了（问诊图证素用
+// 一组淡紫，浏览器同一种节点也写了一遍同样的值——**同样的值写两遍，
+// 就是下一次只改一遍的开始**）。CLAUDE.md 第 31 条。
+//
+// **差异只在一个参数**：问诊图按医家染色（三列的身份色要在图上对得上），
+// 浏览器不染（那张图上没有"这是谁的判断"这回事，染色只会误导）。
+//
+// 共用的前提是两边说同一套词汇。持久图的节点一直带 `node_type`，问诊图只有
+// `layer`——R16 让 `to_graph()` 也发 `node_type`（layer 是**布局**，node_type
+// 是**这是什么东西**，两件事）。
+
+// cytoscape 读不到 CSS 变量，只能在 JS 里取一次当前计算值。**颜色仍然只在
+// app.css 的 :root 里定义一处**（总纲 §7 第 7 条），这里是把它读出来交给
+// cytoscape，不是第二处定义。取不到时回落到 fallback：图不至于变透明，
+// 而"取不到"本身在断网/测试环境下是正常的（node 里没有 getComputedStyle）。
+// **不带兜底色值。** 写一个 fallback 就是把那个颜色在 JS 里又定义了一遍——
+// `--verified` 的值恰好等于叶天士的身份色，写成兜底之后
+// `test_the_frontend_injects_them_instead_of_hard_coding` 当场红（实测），
+// 而那条断言是对的：身份色的唯一来源是 core/physicians.py，语义色的唯一来源
+// 是 app.css 的 :root，JS 里一处都不该有。
+//
+// 取不到就返回 null，调用方用 `pick()` 把这一条样式整个略掉，cytoscape 用它
+// 自己的默认值。取不到只发生在没有 CSS 的环境（node 测试），那里本来也不渲染。
+function cssVar(name) {
+  try {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name);
+    return (v || "").trim() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 值为 null 的样式项整个去掉——cytoscape 收到 null 会当成非法值报错。
+function pick(styleObj) {
+  const out = {};
+  for (const [k, v] of Object.entries(styleObj)) {
+    if (v !== null && v !== undefined && v !== "") out[k] = v;
+  }
+  return out;
+}
+
+// node_type → 一组颜色。**分色分形的唯一定义**（§3.2 规格 7）：
+// 形状在下面的 shape 规则里，颜色在这里，两张图都读这一份。
+function graphPalette() {
+  return {
+    symptom: { bg: cssVar("--surface-2"), border: cssVar("--edge"),
+               text: cssVar("--ink") },
+    element: { bg: cssVar("--accent-bg"), border: cssVar("--verified"),
+               text: cssVar("--verified") },
+    syndrome: { bg: cssVar("--surface"), border: cssVar("--ink-2"),
+                text: cssVar("--ink") },
+    formula: { bg: cssVar("--surface"), border: cssVar("--ink-2"),
+               text: cssVar("--ink") },
+    herb: { bg: cssVar("--surface-2"), border: cssVar("--edge"),
+            text: cssVar("--ink") },
+    case: { bg: cssVar("--caution-bg"), border: cssVar("--caution"),
+            text: cssVar("--caution") },
+  };
+}
+
+// §3.2 规格 11：节点 label 13px 黑体，证素 15px 宋体 600。
+// 证素比别的节点大一号是因为**它是图谱浏览器的枢纽**（首屏只铺证素），
+// 问诊图上它也是"症状收敛到哪里"的那一层。
+const NODE_FONT_SIZE = 13;
+const ELEMENT_FONT_SIZE = 15;
+
+function buildStylesheet({ physicianColors = null } = {}) {
+  const pal = graphPalette();
   const style = [
     {
       selector: "node",
-      style: {
-        shape: "round-rectangle",
+      style: pick({
+        // is_category（证候表里的类目节点）用菱形，其余圆角矩形。用函数值
+        // 而不是选择器匹配布尔字段——避免对 cytoscape 选择器语法里"布尔真值
+        // 怎么写"做不必要的猜测。
+        shape: (ele) => (ele.data("is_category") ? "diamond" : "round-rectangle"),
         label: "data(label)",
         "text-valign": "center",
         "text-halign": "center",
-        "font-size": 11,
-        color: "#24262b",
-        "background-color": "#f4f4f6",
+        "font-size": NODE_FONT_SIZE,
+        "font-family": cssVar("--font-ui"),
+        color: pal.symptom.text,
+        "background-color": pal.symptom.bg,
         "border-width": 1,
-        "border-color": "#c7c9d1",
+        "border-color": pal.symptom.border,
         padding: "6px",
         width: "label",
         height: "label",
         "text-wrap": "wrap",
         "text-max-width": "90px",
-      },
+      }),
+    },
+    // 按 node_type 分色。**两张图读的是同一组规则**——问诊图的 layer 1 和
+    // 浏览器的 element 现在是同一个 node_type，写一遍就够。
+    {
+      selector: 'node[node_type = "element"]',
+      style: pick({
+        "background-color": pal.element.bg, "border-color": pal.element.border,
+        color: pal.element.text,
+        "font-size": ELEMENT_FONT_SIZE,
+        "font-family": cssVar("--font-classic"),
+        "font-weight": 600,
+      }),
     },
     {
+      selector: 'node[node_type = "syndrome"]',
+      style: pick({ "background-color": pal.syndrome.bg, "border-color": pal.syndrome.border,
+                    color: pal.syndrome.text }),
+    },
+    {
+      selector: 'node[node_type = "case"]',
+      style: pick({ "background-color": pal.case.bg, "border-color": pal.case.border,
+                    color: pal.case.text }),
+    },
+    // 残差辨证补上的症状/证素，跟初轮推出来的分开标（朱砂虚线）。
+    {
       selector: 'node[layer = 0][state = "residual"]',
-      style: {
-        "background-color": "#fdf1ea",
-        "border-color": "#C2410C",
-        "border-width": 2,
-      },
+      style: pick({ "background-color": cssVar("--danger-bg"),
+                    "border-color": cssVar("--danger"), "border-width": 2 }),
     },
     {
       selector: "node[residual]",
-      style: { "border-color": "#C2410C", "border-width": 2, "border-style": "dashed" },
+      style: pick({ "border-color": cssVar("--danger"), "border-width": 2,
+                    "border-style": "dashed" }),
     },
     {
       selector: "edge[residual]",
-      style: { "line-color": "#C2410C", "target-arrow-color": "#C2410C", "line-style": "dashed" },
+      style: pick({ "line-color": cssVar("--danger"),
+                    "target-arrow-color": cssVar("--danger"), "line-style": "dashed" }),
     },
+    // 一个症状都没被解释：黄褐虚线。跟残差的朱砂分开——"补上了"和"还没解释"
+    // 是两件事。
     {
       selector: 'node[layer = 0][state = "unexplained"]',
-      style: {
-        "background-color": "#fff4e5",
-        "border-color": "#e08a2b",
-        "border-style": "dashed",
-        "border-width": 2,
-      },
+      style: pick({ "background-color": cssVar("--caution-bg"),
+                    "border-color": cssVar("--caution"),
+                    "border-style": "dashed", "border-width": 2 }),
     },
     {
-      selector: "node[layer = 1]",
-      style: {
-        "background-color": "#efe7fb",
-        "border-color": "#8b6fd9",
-        color: "#4b2e9e",
-      },
-    },
-    {
-      // M5：方剂（layer 3）现在是 compound 父节点，:parent 是 cytoscape 内建的
-      // 伪类选择器，匹配"带子节点的节点"，不用按 layer 另判一次。父节点框要
-      // 半透明——不透明会把里面的药材（子节点）整个盖住看不见。
+      // M5：方剂（layer 3）是 compound 父节点，:parent 是 cytoscape 内建伪类，
+      // 匹配"带子节点的节点"，不用按 layer 另判一次。父节点框要半透明——
+      // 不透明会把里面的药材（子节点）整个盖住看不见。
       selector: "node:parent",
       style: {
         "background-opacity": 0.12,
@@ -317,64 +405,60 @@ function buildStylesheet() {
         padding: "14px",
       },
     },
-    {
-      // source 三档的边框区分：classic 用默认实线不用另写规则，
-      // modified 虚线，composed 点线。
-      selector: 'node[layer = 3][source = "modified"]',
-      style: { "border-style": "dashed" },
-    },
-    {
-      selector: 'node[layer = 3][source = "composed"]',
-      style: { "border-style": "dotted" },
-    },
+    // §3.2 规格 1：方剂框按来源区分边框。**用的是既有的 `source` 字段**
+    // （`FormulaCandidate.source` 早就是 Literal["classic","modified","composed"]），
+    // 不新建一个同义的 `source_kind`——那会是同一个概念的第二处实现。
+    // classic 走默认实线，不用另写规则。
+    { selector: 'node[node_type = "formula"][source = "modified"]',
+      style: { "border-style": "dashed" } },
+    { selector: 'node[node_type = "formula"][source = "composed"]',
+      style: { "border-style": "dotted" } },
+    { selector: "node.gb-search-hit", style: { "border-width": 3 } },
     {
       selector: "edge",
-      style: {
+      style: pick({
         width: 1.4,
-        "line-color": "#d3d5db",
-        "target-arrow-color": "#d3d5db",
+        "line-color": cssVar("--edge-soft"),
+        "target-arrow-color": cssVar("--edge-soft"),
         "target-arrow-shape": "triangle",
         "curve-style": "bezier",
         "arrow-scale": 0.7,
         opacity: 0.85,
-      },
+      }),
     },
-    // M7：症状->方剂路径高亮用的淡化样式。放在样式表末尾（selector 顺序即
-    // 层叠顺序，医家配色规则在下面的循环里还会追加），这样 .gt-faded 的
-    // opacity 会盖过医家配色规则设的任何值——同一条"选中/拦截红框必须盖过
-    // 医家色"的道理（见下面 node[?selected] 的注释），淡化同样必须盖过颜色。
-    // R15：淡化到 **0.25**（总纲 §3.4 写死的值），不是 0.15/0.06。
-    // 0.15 太狠——被淡掉的节点几乎看不见，"高亮一条路径"就变成了"只剩一条
-    // 路径"，而学生要看的恰恰是"这条路径在整张图里的位置"。两个数字统一成
-    // 一个 FADED_OPACITY：节点和边淡成不同的程度没有任何理由，只会让边先
-    // 消失、节点还在，图看起来像断了。
-    { selector: "node.gt-faded", style: { opacity: FADED_OPACITY } },
-    { selector: "edge.gt-faded", style: { opacity: FADED_OPACITY } },
   ];
-  for (const [phys, color] of Object.entries(PHYSICIAN_COLORS)) {
+
+  // 按医家染色**只有问诊图要**：那张图上每个证型/方剂/药材都属于某一位医家，
+  // 颜色要跟三列的顶边对得上。浏览器那张图没有"这是谁的判断"这回事
+  // ——染了只会让人以为某个国标证型是某位医家的。
+  for (const [phys, color] of Object.entries(physicianColors || {})) {
     style.push({
       selector: `node[layer > 1][phys = "${phys}"]`,
-      style: { "background-color": color, "border-color": color, color: "#ffffff" },
+      style: pick({ "background-color": color, "border-color": color,
+                    color: cssVar("--paper") }),
     });
     style.push({
       selector: `edge[phys = "${phys}"]`,
       style: { "line-color": color, "target-arrow-color": color },
     });
   }
-  // selected/safety_blocking 要放在医家配色循环之后：医家配色规则也会设
-  // border-color，样式表按声明顺序层叠（后面的覆盖前面同名属性），选中框和
-  // 安全拦截的红框必须始终盖过医家色，不能被医家配色循环反过来盖掉。
+
+  // selected/safety_blocking 放在医家配色之后：医家配色也会设 border-color，
+  // 样式表按声明顺序层叠，选中框和安全拦截的红框必须始终盖过医家色。
   style.push({
-    // [?field] 是 cytoscape 的"布尔真值"选择器，跟内建的 :selected（用户
-    // 交互选中状态）是两回事——这里选的是我们自己的数据字段
-    // data.selected（这位医家当前选中的候选方），别选错成 :selected。
+    // [?field] 是 cytoscape 的"布尔真值"选择器，跟内建的 :selected（用户交互
+    // 选中状态）是两回事——这里选的是我们自己的数据字段 data.selected。
     selector: "node[?selected]",
     style: { "border-width": 3 },
   });
   style.push({
     selector: "node[?safety_blocking]",
-    style: { "border-color": "#dc2626", "border-width": 3 },
+    style: pick({ "border-color": cssVar("--danger"), "border-width": 3 }),
   });
+
+  // 淡化放最后：它的 opacity 必须盖过上面任何规则设的值（§3.4 的 0.25）。
+  style.push({ selector: "node.gt-faded", style: { opacity: FADED_OPACITY } });
+  style.push({ selector: "edge.gt-faded", style: { opacity: FADED_OPACITY } });
   return style;
 }
 
@@ -594,7 +678,8 @@ function ensureCanvas() {
   cy = cytoscape({
     container: document.getElementById("cy"),
     elements: [],
-    style: buildStylesheet(),
+    // 问诊图按医家染色（三列的身份色要在图上对得上）；浏览器那张不传这个参数。
+    style: buildStylesheet({ physicianColors: PHYSICIAN_COLORS }),
     layout: { name: "preset" },
     userZoomingEnabled: true,
     userPanningEnabled: true,
@@ -658,7 +743,7 @@ function ensureCanvas() {
 // 个节点、377 条边，AutoDL 上的 data/graph.json 现在是 2451 节点 / 4147 边，
 // 教材五本扩完（证候 337 -> 1444、症状 1282 -> 约 7000）还要再翻几倍。
 // 服务端分页是 api/main.py 的契约变更，留到教材扩充那一轮一起做；这一轮先在
-// 前端侧止血（见下面 GB_MAX_NEW_NODES / GB_INITIAL_SYNDROMES / GB_COSE_MAX_NODES）。"渐进式展开"因此是纯前端的
+// 前端侧止血（见下面 GB_MAX_NEW_NODES / GB_ELEMENT_LIMIT / GB_COSE_MAX_NODES）。"渐进式展开"因此是纯前端的
 // 显示策略：拿到全量数据后先只画证型节点，点开才把它连着的证素/症状加进
 // 画布，不是一次性把 123 个节点全铺开——那样会是一团看不出结构的乱线。
 
@@ -669,41 +754,13 @@ let gbVisibleIds = new Set();   // 当前画布上已经显示的节点 id
 let gbCurrentPhysician = null;
 let gbShowCaseLayer = false;    // 只有 has_case_layer 为真时这个开关才有意义（按钮本身也只在那时才显示）
 
-function buildGraphBrowserStylesheet() {
-  return [
-    {
-      selector: "node",
-      style: {
-        // is_category 决定形状用函数值而不是 CSS 选择器匹配布尔字段——避免
-        // 对 cytoscape 选择器语法里"布尔真值怎么写"这件事做不必要的猜测，
-        // 函数值直接读 JS 里的布尔值，语义没有歧义。
-        shape: (ele) => (ele.data("is_category") ? "diamond" : "round-rectangle"),
-        label: "data(label)", "text-valign": "center", "text-halign": "center",
-        "font-size": 11, color: "#24262b", "background-color": "#f4f4f6",
-        "border-width": 1, "border-color": "#c7c9d1", padding: "6px",
-        width: "label", height: "label", "text-wrap": "wrap", "text-max-width": "90px",
-      },
-    },
-    { selector: 'node[node_type = "element"]', style: { "background-color": "#efe7fb", "border-color": "#8b6fd9", color: "#4b2e9e" } },
-    { selector: 'node[node_type = "syndrome"]', style: { "background-color": "#e8f4f8", "border-color": "#2f7d95", color: "#1a4652" } },
-    { selector: 'node[node_type = "case"]', style: { "background-color": "#fdf1ea", "border-color": "#C2410C", color: "#7a2c07" } },
-    { selector: "node.gb-search-hit", style: { "border-width": 3 } },
-    {
-      selector: "edge",
-      style: {
-        width: 1.4, "line-color": "#d3d5db", "target-arrow-color": "#d3d5db",
-        "target-arrow-shape": "triangle", "curve-style": "bezier", "arrow-scale": 0.7,
-      },
-    },
-  ];
-}
-
 function ensureGraphBrowserCanvas() {
   if (gbCy) return gbCy;
   gbCy = cytoscape({
     container: document.getElementById("gb-cy"),
     elements: [],
-    style: buildGraphBrowserStylesheet(),
+    // 跟问诊图同一份样式表，只是不传 physicianColors（见 buildStylesheet 的注释）
+    style: buildStylesheet(),
     // per-consult 图（cy）用 preset 布局：症状/证素/病名证型/方剂/药材天然分层
     // （药材是方剂的 compound 子节点），坐标是 computeLayout() 算好摆的。
     // 这张图没有那种天然分层——点开才逐步长大，
@@ -777,8 +834,19 @@ function gbApplyPhysicianWeighting() {
 //     337 个互不相连的节点已经很勉强）
 //   - 超过多少个节点就不再跑 cose（力导向对大图是二次复杂度，会卡住浏览器）
 const GB_MAX_NEW_NODES = 150;
-const GB_INITIAL_SYNDROMES = 80;
 const GB_COSE_MAX_NODES = 200;
+// 证素总数是数据决定的（实测 20），limit 给一个宽裕的上限而不是写死 20——
+// 教材扩充后多出来的证素不该静默消失。
+const GB_ELEMENT_LIMIT = 200;
+
+// 首屏那批枢纽节点（证素）的 id。concentric 布局按这个集合分内外圈：
+// 枢纽在内圈、展开出来的在外圈。**不按 node_type 分圈**——同一个 node_type
+// 既可能是枢纽（首屏的证素）也可能是展开出来的（从证型再往外的证素），
+// 按"是不是首屏来的"分才对得上"点一层长一圈"这个心智模型。
+let gbHubIds = new Set();
+// 已经展开过的节点 → 它展开出来的那批 id。再点一次就按这张表收起。
+const gbExpanded = new Map();
+let gbTotalElements = 0;
 
 function gbSetHint(text) {
   const el = document.getElementById("gb-empty-hint");
@@ -827,9 +895,7 @@ function gbAddNodes(nodeIds) {
 
   if (toAdd.length || edgesToAdd.length) {
     gbApplyPhysicianWeighting();
-    // 大图不跑力导向：cose 对几百个节点会把浏览器卡住，grid 是 O(n) 的。
-    const layoutName = gbVisibleIds.size > GB_COSE_MAX_NODES ? "grid" : "cose";
-    gbCy.layout({ name: layoutName, animate: false, fit: true, padding: 24 }).run();
+    gbRelayout();
   }
   if (truncated > 0) {
     const status = document.getElementById("gb-search-status");
@@ -880,13 +946,110 @@ function gbMergeGraph(graph) {
   gbAddNodes((graph.nodes || []).map((n) => n.data.id));
 }
 
+// R16 §3.2 规格 6：点证素 → 拉它的证型放外圈；点证型 → 拉症状放更外圈；
+// **再点收起**。
+//
+// 收起这件事 R13 那版刻意没做（"加一套折叠状态管理跟本身价值不成比例"）。
+// 规格改了之后它是必需的：首屏 20 个证素，每个展开出十几个证型，点开三四个
+// 就又变成一屏摊平的方块——跟 F6 要治的是同一个病。
+//
+// 收起只删**这次展开新加的**那批（gbExpanded 记着），不是删所有邻居：
+// 一个证型可能同时挂在两个证素下面，按邻居删会把另一个证素展开的东西也删掉。
+// 展开是**分层**的（§3.2 规格 6），不是"把全部邻居倒出来"。这张表是那条
+// 规格的唯一定义：证素 → 证型，证型 → 症状，症状 → 证素（从一个症状反查
+// "它指向哪些病位病性"，是学生最常问的那个方向）。
+//
+// 不筛类型的后果实测过：证素「肝」有 **499** 个邻居，其中 61 个证型、其余基本
+// 都是症状。点一下就是 150 个症状铺满画布——跟 R16 要治的 F6 是同一个病。
+const GB_EXPAND_TARGET = {
+  element: "syndrome",
+  syndrome: "symptom",
+  symptom: "element",
+};
+
+const GB_TYPE_LABEL = { element: "证素", syndrome: "证型", symptom: "症状", case: "医案" };
+
 async function gbExpandNode(nodeId) {
-  await gbFetchInto(
-    `/api/graph/neighbors?node=${encodeURIComponent(nodeId)}&limit=${GB_MAX_NEW_NODES}`,
-    (page) => page.truncated
-      ? `这个节点有 ${page.total} 个关联，只展开了前 ${page.returned} 个`
-      : `展开了 ${page.returned} 个关联节点`
+  if (gbExpanded.has(nodeId)) {
+    gbCollapseNode(nodeId);
+    return;
+  }
+  const node = gbIndex.nodeById.get(nodeId);
+  const want = GB_EXPAND_TARGET[node && node.data.node_type];
+  // 医案层节点（或别的没登记的类型）不做分层展开，照旧倒全部邻居——
+  // 医案跟国标层之间实测 0 条边，本来也倒不出什么（λ1 恒为 0 那件事）。
+  const typeParam = want ? `&node_types=${encodeURIComponent(want)}` : "";
+  const wantLabel = GB_TYPE_LABEL[want] || "关联";
+  const before = new Set(gbVisibleIds);
+  const data = await gbFetchInto(
+    `/api/graph/neighbors?node=${encodeURIComponent(nodeId)}&limit=${GB_MAX_NEW_NODES}${typeParam}`,
+    (page) => page.total === 0
+      ? `这个节点下没有${wantLabel}`
+      : page.truncated
+        ? `这个节点有 ${page.total} 个${wantLabel}，只展开了前 ${page.returned} 个——再点一次收起`
+        : `展开了 ${page.returned} 个${wantLabel}——再点一次收起`
   );
+  if (!data) return;
+  const added = [...gbVisibleIds].filter((id) => !before.has(id));
+  // 一个新节点都没加 = 这个节点的邻居早就都在画布上了。不登记，否则下一次点
+  // 它会"收起"一批其实不是它展开出来的节点。
+  if (added.length) gbExpanded.set(nodeId, added);
+  gbRelayout();
+}
+
+function gbCollapseNode(nodeId) {
+  const added = gbExpanded.get(nodeId) || [];
+  gbExpanded.delete(nodeId);
+  for (const id of added) {
+    // 别人也展开出过它就留着——它现在属于那一支。
+    if ([...gbExpanded.values()].some((ids) => ids.includes(id))) continue;
+    // 它自己展开过东西，先把那一层收掉（否则会留下一批悬空节点）。
+    if (gbExpanded.has(id)) gbCollapseNode(id);
+    gbCy.getElementById(id).remove();
+    gbVisibleIds.delete(id);
+  }
+  const status = document.getElementById("gb-search-status");
+  if (status) status.textContent = `收起了 ${added.length} 个关联节点`;
+  gbRelayout();
+}
+
+// R16 §3.2 规格 5：**concentric**——枢纽（首屏那批证素）在内圈，展开出来的
+// 在外圈。concentric 的 `concentric` 回调返回的数越大越靠内。
+//
+// 为什么不是 cose：cose 是力导向，它摆出来的位置取决于连边的拉扯，
+// "谁是枢纽"这件事在图上看不出来。而这张图的整个心智模型就是"从证素往外长"。
+// 节点多到 cose 会卡的时候仍然退回 grid（那条上限没变）。
+function gbRelayout() {
+  if (!gbCy) return;
+  if (gbVisibleIds.size > GB_COSE_MAX_NODES) {
+    gbCy.layout({ name: "grid", animate: false, fit: true, padding: 24 }).run();
+    return;
+  }
+  gbCy.layout({
+    name: "concentric",
+    animate: false,
+    fit: true,
+    padding: 24,
+    // 内圈 = 枢纽证素；第二圈 = 从枢纽展开出来的；再外面 = 更深的层。
+    concentric: (ele) => (gbHubIds.has(ele.id()) ? 3 : gbDepthOf(ele.id())),
+    levelWidth: () => 1,
+    // 圈的半径 ≈ 圈上节点数 × minNodeSpacing / 2π。28 太小：20 个枢纽挤成中间
+    // 一个点，而展开出来的 61 个证型摊成一个大环——内圈看不见，"枢纽"这件事
+    // 在图上就不存在了。60 大致等于一个节点标签的宽度，两圈的半径比落在 1:3
+    // 上下（有一条 Playwright 判据钉住内圈半径不低于外圈的 15%）。
+    minNodeSpacing: 60,
+    avoidOverlap: true,
+  }).run();
+}
+
+// 一个节点离枢纽有多远：枢纽本身 3，枢纽展开出来的 2，再往外 1。
+// 数越大越靠内（concentric 的约定）。
+function gbDepthOf(nodeId) {
+  for (const [parent, ids] of gbExpanded.entries()) {
+    if (!ids.includes(nodeId)) continue;
+    return gbHubIds.has(parent) ? 2 : 1;
+  }
+  return 1;
 }
 
 async function gbSearch(query) {
@@ -949,38 +1112,47 @@ function gbResetView() {
   const layerBtn = document.getElementById("gb-layer-toggle");
   if (layerBtn) layerBtn.textContent = "切换到医案层";
 
-  // F1：重置 = 重新取第一页，不是从本地全量里切一刀（本地已经没有全量了）。
+  // F1：重置 = 重新铺首屏那批枢纽，不是从本地全量里切一刀（本地没有全量）。
   gbCursor = 0;
+  gbExpanded.clear();
   gbMergeGraph(gbGraphData.graph);
-  gbRenderMoreButton();
-  gbSetHint(gbTotalSyndromes > gbVisibleIds.size
-    ? `证型共 ${gbTotalSyndromes} 条，先显示 ${gbVisibleIds.size} 条——用搜索框定位、点节点展开关联，或点"加载更多证型"`
-    : "点击节点展开关联的证素/症状，或用上方搜索框定位");
+  gbSetHint(`首屏是 ${gbVisibleIds.size} 个证素——点一个展开它的证型，`
+    + `再点证型展开症状；再点一次收起。也可以用「按门类浏览」或上方搜索框。`);
 }
 
 // F1：翻页状态。cursor 是位置偏移，服务端按 networkx 的插入顺序切片，
 // build_graph 是确定性写入的，所以同一份 graph.json 上这个顺序稳定。
 let gbCursor = 0;
-let gbTotalSyndromes = 0;
 
-function gbRenderMoreButton() {
-  const btn = document.getElementById("gb-more");
-  if (!btn) return;
-  const more = gbTotalSyndromes > 0 && gbCursor !== null && gbCursor < gbTotalSyndromes;
-  btn.hidden = !more;
-  if (more) btn.textContent = `加载更多证型（还有 ${gbTotalSyndromes - gbCursor} 条）`;
+// R16 §3.2 规格 9：「加载更多证型」换成「按门类浏览」。
+//
+// 「加载更多」回答的是"再给我 80 个"——而用户想问的是"脾的证型有哪些"。
+// 翻页在一堆互不相连的证型上没有意义：翻到第 3 页看到的还是一堆孤立方块。
+//
+// 门类 = 证候表的 `location` 字段（脾/胃/肝/肠/中焦……）。**图里已经有这一层**：
+// build_graph 把每个 location 建成一个 category="location" 的证素节点，证型挂在
+// 它下面。所以「按门类浏览」= 展开那个证素——**复用 gbExpandNode 这一条路径**，
+// 不另写一套按门类拉数据的逻辑（CLAUDE.md 第 31 条）。
+function populateGbCategorySelect(nodes) {
+  const sel = document.getElementById("gb-category-select");
+  if (!sel) return;
+  sel.innerHTML = '<option value="">按门类浏览…</option>';
+  for (const n of nodes || []) {
+    if (n.data.category !== "location") continue;
+    const opt = document.createElement("option");
+    opt.value = n.data.id;
+    opt.textContent = n.data.label;
+    sel.appendChild(opt);
+  }
+  // 一个门类都没有时藏起来，不留一个只有占位项的空下拉。
+  sel.hidden = sel.options.length <= 1;
 }
 
-async function gbLoadMoreSyndromes() {
-  if (gbCursor === null) return;
-  const data = await gbFetchInto(
-    `/api/graph?node_types=syndrome&limit=${GB_INITIAL_SYNDROMES}&cursor=${gbCursor}`,
-    (page) => `又加载了 ${page.returned} 条证型`
-  );
-  if (!data) return;
-  gbCursor = data.page.next_cursor;
-  gbTotalSyndromes = data.page.total;
-  gbRenderMoreButton();
+async function gbBrowseCategory(elementId) {
+  if (!elementId) return;
+  // 门类本身可能还没在画布上（用户先搜索、再选门类），先把它加进去。
+  if (!gbVisibleIds.has(elementId)) gbAddNodes([elementId]);
+  await gbExpandNode(elementId);
 }
 
 function renderGbLambda1Note(note) {
@@ -1032,17 +1204,27 @@ async function loadGraphBrowserData() {
     return;
   }
   try {
-    // F1：**不再一次拿全图**。原来这里拉的是整张 data/graph.json——注释当年
-    // 写的是"123 个节点、377 条边，一次装得下"，AutoDL 上现在是 2256/3771，
-    // 教材五本扩完还要再翻几倍。现在只取第一页证型，其余靠展开/搜索/加载更多。
-    const resp = await fetch(`/api/graph?node_types=syndrome&limit=${GB_INITIAL_SYNDROMES}`);
+    // R16 §3.2 规格 5：**首屏铺证素，不铺证型。**
+    //
+    // 之前首屏是 80 个证型方块，互不相连、全同色、cose 摊成几排——总纲 §1
+    // 的 F6 点名的就是这个。证型之间本来就没有边，力导向对一堆孤立节点
+    // 只能摊平，那张图不传达任何东西。
+    //
+    // 证素只有 20 个（实测 data/graph.json：element 20 / syndrome 178 /
+    // symptom 1117），而且**每个证型都挂在证素下面**——它们是这张图真正的
+    // 枢纽。首屏铺证素 = 首屏就有结构：点一个证素，它的证型长在外圈。
+    //
+    // limit 用 GB_ELEMENT_LIMIT 而不是写 20：证素数量是数据决定的
+    // （教材扩充后可能变），写死 20 的话多出来的那几个会静默不显示。
+    const resp = await fetch(`/api/graph?node_types=element&limit=${GB_ELEMENT_LIMIT}`);
     if (!resp.ok) {
       const text = await resp.text();
       throw new Error(`服务返回错误（HTTP ${resp.status}）：${text}`);
     }
     gbGraphData = await resp.json();
     gbCursor = gbGraphData.page ? gbGraphData.page.next_cursor : null;
-    gbTotalSyndromes = gbGraphData.page ? gbGraphData.page.total : 0;
+    gbTotalElements = gbGraphData.page ? gbGraphData.page.total : 0;
+    gbHubIds = new Set((gbGraphData.graph.nodes || []).map((n) => n.data.id));
     gbBuildIndex();
     renderGbLambda1Note(gbGraphData.lambda1_note);
     renderGbStats(gbGraphData.stats);
@@ -1051,6 +1233,7 @@ async function loadGraphBrowserData() {
     // 点了没反应的——这个 sandbox 里 data/graph.json 只有国标层数据，
     // AutoDL 上跑过 attach_cases 之后 has_case_layer 会是 true，按钮才出现。
     document.getElementById("gb-layer-toggle").hidden = !gbGraphData.has_case_layer;
+    populateGbCategorySelect(gbGraphData.graph.nodes);
     gbResetView();
   } catch (err) {
     hint.hidden = true;
@@ -1093,7 +1276,7 @@ async function growGraph(graph, { animate = true } = {}) {
   ensureCanvas();
   if (cy && cy.resize) cy.resize(); // 容器高度改过之后要让 cytoscape 重新量一次
   // 配色随医家变化（physicians.py 是唯一源），每次重新应用样式表
-  cy.style(buildStylesheet());
+  cy.style(buildStylesheet({ physicianColors: PHYSICIAN_COLORS }));
   cy.elements().remove();
   // M7：新图跟旧图的节点 id 不一定还对得上（换了个主诉），上一次点开的高亮
   // 状态没有意义了，清掉——不清的话 highlightedSymptomId 会残留一个新图里
@@ -1216,7 +1399,8 @@ let lastGraph = null;
 // 反方向是空的：graph.js 不调用 app.js 的任何东西，宿主 UI 走 setGraphHooks 注入。
 window.TCM = Object.assign(window.TCM || {}, {
   // app.js 用到的图谱侧函数
-  gbApplyPhysicianWeighting, gbSearch, hideTooltip, loadGraphBrowserData, renderGraph,
+  gbApplyPhysicianWeighting, gbBrowseCategory, gbSearch, hideTooltip, loadGraphBrowserData,
+  renderGraph,
   // 两边共用的纯工具（定义在这一层，见文件顶部的依赖方向说明）。
   // sleep 不在清单里：搬过来之后只有 growGraph 用，app.js 一次都没调——
   // 清单只列**对面真的用到的**，多列一个就是给"清单齐全"那条测试留一个假绿点。

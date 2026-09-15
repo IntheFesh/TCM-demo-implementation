@@ -139,3 +139,98 @@ def test_formula_with_no_herbs_gets_zero_span_and_does_not_break_neighbors():
     formula_ids = [n["data"]["id"] for n in nodes if n["data"]["layer"] == 3]
     for fid in formula_ids:
         assert fid in positions
+
+
+# ---------- R16：两张图共用一份样式表（§3.2 规格 7） ----------
+
+
+def test_there_is_only_one_stylesheet_builder():
+    """R16 之前有两份：`buildStylesheet()`（问诊图）和
+    `buildGraphBrowserStylesheet()`（浏览器）。基础节点样式、边样式、证素的紫、
+    医案的橙……逐条重复——**同样的值写两遍，就是下一次只改一遍的开始**。
+
+    差异只在一个参数：问诊图按医家染色，浏览器不染（那张图上没有"这是谁的
+    判断"这回事，染了只会误导）。"""
+    src = _graph_js()
+    assert src.count("function buildStylesheet") == 1
+    assert "function buildGraphBrowserStylesheet" not in src
+    assert "buildStylesheet({ physicianColors: PHYSICIAN_COLORS })" in src
+
+
+def test_the_browser_gets_the_same_stylesheet_without_physician_colours():
+    """浏览器调的是同一个函数、不传 physicianColors。传了的话国标证型会被
+    染成某位医家的颜色——那是在说"这个国标证型是叶天士的"，而它不是。"""
+    src = _graph_js()
+    body = src[src.index("function ensureGraphBrowserCanvas"):]
+    body = body[:body.index("function gbBuildIndex")]
+    assert "style: buildStylesheet()," in body
+    # 只看代码行：注释里提到 physicianColors 是在解释"为什么不传"，
+    # 不该让这条断言反过来劝人别写注释。
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("//"))
+    assert "physicianColors" not in code
+
+
+def test_node_colours_come_from_css_tokens_not_from_literals():
+    """cytoscape 读不到 CSS 变量，所以颜色要在 JS 里取一次计算值——**但那是
+    "读出来交给 cytoscape"，不是第二处定义**。整份 graph.js 里一个十六进制
+    色值都不该有。
+
+    R16 实测踩到的：给 `cssVar` 写兜底值 `cssVar("--verified", "#2C5F5A")`，
+    而那个值恰好等于叶天士的身份色，
+    `test_the_frontend_injects_them_instead_of_hard_coding` 当场红。
+    那条断言是对的，改法是**不写兜底**：取不到就把这一条样式整个略掉
+    （`pick()`），cytoscape 用它自己的默认值。"""
+    import re
+    src = _graph_js()
+    code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("//"))
+    assert not re.findall(r"#[0-9a-fA-F]{6}\b", code), "graph.js 里还有写死的色值"
+    assert "function cssVar" in src and "function pick" in src
+
+
+def test_formula_border_encodes_the_three_sources():
+    """§3.2 规格 1：classic 实线 / modified 虚线 / composed 点线。
+    "这是仲景的方还是他自己拟的"一眼可辨。classic 走默认实线不另写规则。"""
+    src = _graph_js()
+    assert 'node[node_type = "formula"][source = "modified"]' in src
+    assert 'node[node_type = "formula"][source = "composed"]' in src
+
+
+def test_elements_are_typographically_the_hub():
+    """§3.2 规格 11：节点 label 13px 黑体，证素 15px 宋体 600。证素比别的节点
+    大一号，因为**它是图谱浏览器的枢纽**，在问诊图上也是"症状收敛到哪里"那一层。"""
+    src = _graph_js()
+    assert "const NODE_FONT_SIZE = 13;" in src
+    assert "const ELEMENT_FONT_SIZE = 15;" in src
+    block = src[src.index('node[node_type = "element"]'):]
+    block = block[:block.index("},")]
+    assert "ELEMENT_FONT_SIZE" in block and '"font-weight": 600' in block
+
+
+def test_the_lambda1_note_text_has_exactly_one_source():
+    """§3.2 规格 2：图上那一行说明的文字来自 `offline/graph_stats.lambda1_note()`。
+    前端两处（问诊图、浏览器）都只是原样显示——那段话是这个项目的一个真实
+    发现，改写或精简它比图上有 bug 更严重。"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    hits = [str(p.relative_to(root))
+            for p in list(root.glob("core/*.py")) + list(root.glob("offline/*.py"))
+            if "def lambda1_note" in p.read_text(encoding="utf-8")]
+    assert hits == ["offline/graph_stats.py"]
+    app = (root / "web" / "app.js").read_text(encoding="utf-8")
+    assert "renderConsultLambda1Note" in app
+    assert "health.lambda1_note" in app
+
+
+def test_the_formula_margin_says_why_it_is_sixty():
+    """§3.2 规格 3：60px 不是随手定的。compound 的 padding 是**固定屏幕像素**
+    （不随缩放变化），所以"药材中心间距够了"不等于"方框边缘不重叠"——
+    第一版用 20，Playwright 截图里相邻候选方的框依然互相压住。"""
+    src = _graph_js()
+    block = src[:src.index("const FORMULA_MARGIN = 60;")]
+    tail = block[-1200:]
+    assert "compound" in tail and "20" in tail and "60" in tail
+
+
+def _graph_js():
+    from pathlib import Path
+    return (Path(__file__).resolve().parent.parent / "web" / "graph.js").read_text(encoding="utf-8")

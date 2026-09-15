@@ -48,6 +48,7 @@ PREFIX = {
     "followup": "r14", "blocked": "r14", "done": "r14",
     "patient": "r15", "patient_high": "r15", "doctor_conflict": "r15",
     "student_highlight": "r15",
+    "consult_graph": "r16", "browser_home": "r16", "browser_expanded": "r16",
 }
 
 
@@ -136,6 +137,51 @@ STUDENT_GRAPH = {
         {"data": {"source": "el::湿热", "target": "syn::wu_jutong"}},
         {"data": {"source": "syn::ye_tianshi", "target": "formula::ye_tianshi::柴胡疏肝散"}},
         {"data": {"source": "syn::wu_jutong", "target": "formula::wu_jutong::龙胆泻肝汤"}},
+    ],
+    "dropped_edges": 0,
+}
+
+# R16：一张有六层的问诊图，三种 source 各一个方剂。node_type 由 to_graph()
+# 按 layer 填，这里照它的输出形状写。
+SIX_LAYER_GRAPH = {
+    "nodes": [
+        {"data": {"id": "sym::胃脘胀痛", "label": "胃脘胀痛", "layer": 0,
+                  "node_type": "symptom", "state": "explained"}},
+        {"data": {"id": "elem::肝郁", "label": "肝郁", "layer": 1,
+                  "node_type": "element", "kind": "nature"}},
+        {"data": {"id": "syn::ye_tianshi", "label": "胃痛 · 肝胃不和证", "layer": 2,
+                  "node_type": "syndrome", "phys": "ye_tianshi", "pname": "叶天士"}},
+        {"data": {"id": "syn::wu_jutong", "label": "胃痛 · 肝胃气滞证", "layer": 2,
+                  "node_type": "syndrome", "phys": "wu_jutong", "pname": "吴鞠通"}},
+        {"data": {"id": "syn::zhang_xichun", "label": "胃痛 · 肝气犯胃证", "layer": 2,
+                  "node_type": "syndrome", "phys": "zhang_xichun", "pname": "张锡纯"}},
+        {"data": {"id": "formula::ye_tianshi::柴胡疏肝散", "label": "柴胡疏肝散加减",
+                  "layer": 3, "node_type": "formula", "phys": "ye_tianshi",
+                  "source": "modified", "selected": True}},
+        {"data": {"id": "formula::wu_jutong::左金丸", "label": "左金丸", "layer": 3,
+                  "node_type": "formula", "phys": "wu_jutong", "source": "classic",
+                  "selected": True}},
+        {"data": {"id": "formula::zhang_xichun::自拟和胃汤", "label": "自拟和胃汤",
+                  "layer": 3, "node_type": "formula", "phys": "zhang_xichun",
+                  "source": "composed", "selected": True}},
+        {"data": {"id": "herb::ye_tianshi::柴胡", "label": "柴胡 6g", "layer": 4,
+                  "node_type": "herb", "phys": "ye_tianshi",
+                  "parent": "formula::ye_tianshi::柴胡疏肝散"}},
+        {"data": {"id": "herb::wu_jutong::黄连", "label": "黄连 3g", "layer": 4,
+                  "node_type": "herb", "phys": "wu_jutong",
+                  "parent": "formula::wu_jutong::左金丸"}},
+        {"data": {"id": "herb::zhang_xichun::赭石", "label": "生赭石 18g", "layer": 4,
+                  "node_type": "herb", "phys": "zhang_xichun",
+                  "parent": "formula::zhang_xichun::自拟和胃汤"}},
+    ],
+    "edges": [
+        {"data": {"source": "sym::胃脘胀痛", "target": "elem::肝郁"}},
+        {"data": {"source": "elem::肝郁", "target": "syn::ye_tianshi", "phys": "ye_tianshi"}},
+        {"data": {"source": "elem::肝郁", "target": "syn::wu_jutong", "phys": "wu_jutong"}},
+        {"data": {"source": "elem::肝郁", "target": "syn::zhang_xichun", "phys": "zhang_xichun"}},
+        {"data": {"source": "syn::ye_tianshi", "target": "formula::ye_tianshi::柴胡疏肝散"}},
+        {"data": {"source": "syn::wu_jutong", "target": "formula::wu_jutong::左金丸"}},
+        {"data": {"source": "syn::zhang_xichun", "target": "formula::zhang_xichun::自拟和胃汤"}},
     ],
     "dropped_edges": 0,
 }
@@ -259,6 +305,99 @@ STATES = {
           return null;
         }""",
     ),
+    # ---- R16：两张图 ----
+    "consult_graph": (
+        "renderComplaintBody(COMPLAINT);"
+        " renderConsultResult({...DONE_PAYLOAD, graph: SIX_LAYER_GRAPH});"
+        " document.getElementById('detail-zone').open = true;"
+        " skipAnimation();",
+        """async () => {
+          await new Promise(r => setTimeout(r, 1200));
+          if (!cy) return '画布没建起来';
+          if (cy.nodes().length < 11)
+            return '图没长全，只有 ' + cy.nodes().length + ' 个节点';
+          // §3.2 规格 1：方剂框按来源区分边框。用的是既有的 source 字段。
+          const modified = cy.getElementById('formula::ye_tianshi::柴胡疏肝散');
+          const composed = cy.getElementById('formula::zhang_xichun::自拟和胃汤');
+          const classic = cy.getElementById('formula::wu_jutong::左金丸');
+          for (const [n, name] of [[modified,'modified'],[composed,'composed'],[classic,'classic']]) {
+            if (!n.length) return '找不到 ' + name + ' 那个方剂节点';
+          }
+          if (modified.style('border-style') !== 'dashed') return 'modified 不是虚线';
+          if (composed.style('border-style') !== 'dotted') return 'composed 不是点线';
+          if (classic.style('border-style') !== 'solid') return 'classic 不是实线';
+          // §3.2 规格 2：λ1 说明必须在图上。
+          const note = document.getElementById('cy-lambda1-note');
+          if (!note.classList.contains('show') || !note.textContent.trim())
+            return '图上没有 λ1 说明';
+          // §3.2 规格 11：证素比别的节点大一号。
+          const el = cy.getElementById('elem::肝郁');
+          const sym = cy.getElementById('sym::胃脘胀痛');
+          if (!(parseFloat(el.style('font-size')) > parseFloat(sym.style('font-size'))))
+            return '证素字号没有比症状大';
+          return null;
+        }""",
+    ),
+    "browser_home": (
+        "switchTab('graph-browser'); await loadGraphBrowserData();",
+        """async () => {
+          await new Promise(r => setTimeout(r, 800));
+          if (!gbCy) return '浏览器画布没建起来';
+          const types = new Set(gbCy.nodes().map(n => n.data('node_type')));
+          // §3.2 规格 5：首屏只有证素。
+          if (types.size !== 1 || !types.has('element'))
+            return '首屏不是只有证素：' + [...types].join('/');
+          if (gbCy.nodes().length < 10)
+            return '首屏证素太少（' + gbCy.nodes().length + '），像是没加载出来';
+          // §3.2 规格 9：按门类浏览下拉存在且有选项。
+          const sel = document.getElementById('gb-category-select');
+          if (sel.hidden) return '按门类浏览下拉没出现';
+          if (sel.options.length < 2) return '门类下拉里一个门类都没有';
+          if (document.getElementById('gb-more')) return '「加载更多证型」还在';
+          return null;
+        }""",
+    ),
+    "browser_expanded": (
+        "switchTab('graph-browser'); await loadGraphBrowserData();"
+        " await new Promise(r => setTimeout(r, 400));"
+        " window.__hubIds = gbCy.nodes().map(n => n.id());"
+        " window.__hub = gbCy.nodes().filter(n => n.data('category') === 'location')[0].id();"
+        " await gbExpandNode(window.__hub);",
+        """async () => {
+          await new Promise(r => setTimeout(r, 800));
+          const types = new Set(gbCy.nodes().map(n => n.data('node_type')));
+          // §3.2 规格 6：点证素 → 它的证型长在外圈。
+          if (!types.has('syndrome')) return '展开之后没有证型';
+          const hub = gbCy.getElementById(window.__hub);
+          if (!hub.length) return '枢纽节点不在画布上：' + window.__hub;
+          const syns = gbCy.nodes('[node_type = "syndrome"]');
+          if (!syns.length) return '一个证型都没有';
+          // concentric：枢纽在内圈——离画布中心比展开出来的近。
+          const box = gbCy.extent();
+          const cx = (box.x1 + box.x2) / 2, cy2 = (box.y1 + box.y2) / 2;
+          const d = (n) => Math.hypot(n.position('x') - cx, n.position('y') - cy2);
+          const outer = syns.map(d).reduce((a, b) => a + b, 0) / syns.length;
+          if (!(d(hub) < outer))
+            return '枢纽没在内圈（枢纽 ' + Math.round(d(hub)) + ' vs 证型均值 '
+                   + Math.round(outer) + '）';
+          // 内圈要看得见。concentric 的圈半径 ≈ 节点数 × minNodeSpacing / 2π，
+          // 间距给小了会把 20 个枢纽挤成中间一个点——图上"枢纽"这件事就不存在了。
+          const hubs = gbCy.nodes().filter(n => window.__hubIds.includes(n.id()));
+          const inner = hubs.map(d).reduce((a, b) => a + b, 0) / hubs.length;
+          if (!(inner > outer * 0.15))
+            return '内圈被压扁了（内 ' + Math.round(inner) + ' / 外 '
+                   + Math.round(outer) + '）';
+          // 再点一次收起。
+          const before = gbCy.nodes().length;
+          await gbExpandNode(window.__hub);
+          await new Promise(r => setTimeout(r, 400));
+          if (gbCy.nodes().length >= before) return '再点一次没有收起';
+          // 收起之后再展开回来，截图要留展开的那张
+          await gbExpandNode(window.__hub);
+          await new Promise(r => setTimeout(r, 400));
+          return null;
+        }""",
+    ),
     # ---- R15：三种角色形态 ----
     "patient": (
         "document.getElementById('role-select').value = 'patient';"
@@ -346,9 +485,14 @@ STATES = {
                             'formula::wu_jutong::龙胆泻肝汤']) {
             if (!faded.includes(id)) return id + ' 应该被淡化，实际亮着';
           }
-          const op = cy.$('#' + CSS.escape('sym::口苦')).style('opacity');
-          if (Math.abs(parseFloat(op) - 0.25) > 0.001)
-            return '淡化透明度不是 0.25，是 ' + op;
+          // **先确认节点真的在**：cytoscape 的空集合 .style() 返回 undefined，
+          // parseFloat(undefined) 是 NaN，而 Math.abs(NaN - x) > eps 恒为 false
+          // ——判据会静默空过。R16 实测发现的正是这件事。
+          const faded1 = cy.getElementById('sym::口苦');
+          if (!faded1.length) return '找不到 sym::口苦 这个节点';
+          const op = parseFloat(faded1.style('opacity'));
+          if (!(Math.abs(op - 0.25) <= 0.001))
+            return '淡化透明度不是 0.25，是 ' + faded1.style('opacity');
           // §3.4 第三条：学生模式推理过程默认展开
           const open = document.querySelector('.col-reasoning[open]');
           if (!open) return '学生模式推理过程没有默认展开';
@@ -415,9 +559,12 @@ def run(only: str | None, wait_ms: int) -> int:
                                    ("PATIENT_HIGH_PAYLOAD", PATIENT_HIGH_PAYLOAD),
                                    ("STUDENT_GRAPH", STUDENT_GRAPH),
                                    ("DOCTOR_SAFETY", DOCTOR_SAFETY),
+                                   ("SIX_LAYER_GRAPH", SIX_LAYER_GRAPH),
                                    ("COMPLAINT", COMPLAINT)):
                     page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
-                page.evaluate(setup)
+                # setup 里可能有 await（图谱浏览器要先把数据拉回来），
+                # 统一包成 async IIFE——page.evaluate 会 await 返回的 Promise。
+                page.evaluate(f"(async () => {{ {setup} }})()")
                 page.wait_for_timeout(wait_ms)
                 out = OUT_DIR / f"{PREFIX[name]}_{name}.png"
                 page.screenshot(path=str(out), full_page=True)

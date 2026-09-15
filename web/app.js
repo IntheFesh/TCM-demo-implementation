@@ -101,7 +101,9 @@ function switchTab(tab) {
 
 document.getElementById("tab-btn-consult").addEventListener("click", () => switchTab("consult"));
 document.getElementById("tab-btn-graph-browser").addEventListener("click", () => switchTab("graph-browser"));
-document.getElementById("gb-more").addEventListener("click", gbLoadMoreSyndromes);
+document.getElementById("gb-category-select").addEventListener("change", (e) => {
+  gbBrowseCategory(e.target.value);
+});
 document.getElementById("gb-search-btn").addEventListener("click", () => gbSearch(document.getElementById("gb-search").value));
 document.getElementById("gb-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") gbSearch(e.target.value);
@@ -505,6 +507,7 @@ async function initDemoModeBanner() {
     // 示例主诉和身份色同一趟拿：两者都要在"点第一次辨证之前"就到位。
     EXAMPLE_COMPLAINTS = health.example_complaints || [];
     renderExamples(EXAMPLE_COMPLAINTS);
+    renderConsultLambda1Note(health.lambda1_note);
   } catch (e) {
     // 网络不通时 fetch 会抛——演示模式的意义之一就是断网可用，所以这里
     // 只是拿不到提示，不是错误。身份色同理：CSS 里有兜底值，页面不会变成
@@ -1181,6 +1184,17 @@ function bindSafetyBlockBack() {
     document.getElementById("complaint").value = "";
     document.getElementById("complaint").focus();
   });
+}
+
+// R16 §3.2 规格 2：问诊图上的 λ1 说明。**原样显示后端 lambda1_note() 那段话**
+// ——跟图谱浏览器那张图读的是同一处（offline/graph_stats.py），前端不改写、
+// 不精简一个字。那段话是这个项目的一个真实发现，弱化它比图上有 bug 更严重。
+// 拿不到（这台机器没建过图谱）就不显示这一行，不是显示一句"未知"。
+function renderConsultLambda1Note(note) {
+  const el = document.getElementById("cy-lambda1-note");
+  if (!el) return;
+  el.textContent = note || "";
+  el.classList.toggle("show", !!note);
 }
 
 // ---------- 主诉正文（28px 宋体，行宽 ≤ 38 汉字） ----------

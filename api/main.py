@@ -156,6 +156,15 @@ def demo_mode_info() -> dict | None:
     }
 
 
+def _lambda1_note_or_none() -> str | None:
+    """图谱没建过（这台机器上没有 data/graph.json）时返回 None 而不是抛：
+    /health 是存活探针，不该因为一个可选的数据文件缺失就报 503。"""
+    store = get_graph_store()
+    if store is None:
+        return None
+    return lambda1_note(compute_stats(store))
+
+
 @app.get("/health")
 async def health() -> dict:
     """async def 而不是 def：同步端点跑在 anyio 的线程池里（默认 40 个槽），
@@ -186,6 +195,19 @@ async def health() -> dict:
         # 而这三条已经在 DEMO.md 和录制清单里各有一份。回放按主诉原文的哈希索引，
         # 三份副本漂了一个标点，演示当场 LLMError（core/examples.py 的由来）。
         "example_complaints": [dict(e) for e in EXAMPLE_COMPLAINTS],
+        # lambda1_note：R16 §3.2 规格 2 要求**问诊图上也有那一行说明**
+        # （"当前语料中医案术语与国标不对齐，医家层权重为 0，边权重显示的是
+        # 标准先验层"）。之前只有图谱浏览器那张图有——而问诊图的边同样是
+        # 等透明度的，看图的人同样会以为图没建好。
+        #
+        # 文字来自 offline/graph_stats.lambda1_note() 这唯一一处，前端原样显示、
+        # 不改写不精简一个字：那段话是这个项目的一个真实发现，弱化它比图上有
+        # bug 更严重。
+        #
+        # 放 /health 而不是问诊响应里：这行说明跟"这一次问诊"无关，它描述的是
+        # 图谱本身，而且页面一加载就该能显示。图谱没建过时是 None，前端不显示
+        # 这一行——不是显示一句"未知"。
+        "lambda1_note": _lambda1_note_or_none(),
     }
 
 
@@ -344,17 +366,28 @@ def api_graph(
 
 
 @app.get("/api/graph/neighbors")
-def api_graph_neighbors(node: str, limit: int = 200) -> dict:
+def api_graph_neighbors(node: str, limit: int = 200, node_types: str | None = None) -> dict:
     """展开一个节点的邻居。
 
     分页之后**必须有这个端点**：原来前端一次拿全图、在本地邻接表上展开，
     图一分页本地就没有全量邻接表了，展开会静默只展开"恰好在本页里"的那部分。
     无向看待（进边出边都算）——图谱浏览器展示的是关联，不是流向。
+
+    R16 加 `node_types`：图谱浏览器的展开是**分层**的（§3.2 规格 6：点证素出
+    证型、点证型出症状），不是"把全部邻居倒出来"。实测「肝」这个证素有 499 个
+    邻居，其中绝大多数是症状——不筛类型的话点一下就是 150 个症状铺满画布，
+    那张图跟 R16 要治的 F6（一屏互不相连的方块）是同一个病。
+
+    **筛在服务端**：前端筛意味着先把 499 个全拉回来再扔掉 480 个，而且
+    `limit` 会先在服务端把想要的那些截掉——截断发生在筛之前，结果是
+    "限 150 个邻居里恰好有几个证型就显示几个"，而那个数完全取决于
+    networkx 的遍历顺序。这种错不会报错，只会让人以为脾没几个证型。
     """
     store = _require_store()
     if not store.g.has_node(node):
         raise HTTPException(status_code=404, detail=_public_text(f"图里没有这个节点：{node}"))
 
+    wanted = {x.strip() for x in (node_types or "").split(",") if x.strip()}
     seen: dict[str, dict] = {}
     edges = []
     for u, v, k, d in store.g.edges(node, keys=True, data=True):
@@ -364,6 +397,8 @@ def api_graph_neighbors(node: str, limit: int = 200) -> dict:
         edges.append(_edge_payload(u, v, k, d))
         seen.setdefault(u, store.g.nodes[u])
     seen.pop(node, None)
+    if wanted:
+        seen = {nid: d for nid, d in seen.items() if d.get("node_type") in wanted}
 
     total = len(seen)
     picked = list(seen.items())[:max(limit, 0)] if limit and limit > 0 else list(seen.items())
@@ -1151,10 +1186,19 @@ def to_graph(
     edges: list[dict] = []
     seen: set[str] = set()
 
+    # R16：**两张图共用一份 cytoscape 样式表**（问诊图 + 图谱浏览器），差异只在
+    # "是否按医家染色"这一个参数。共用的前提是两边说同一套词汇：持久图的节点
+    # 一直带 `node_type`（symptom / element / syndrome / case），问诊图只有
+    # `layer`。layer 是**布局**（第几列），node_type 是**这是什么东西**——
+    # 两件事，之前混在一个字段上，于是样式表也只能有两份。
+    LAYER_NODE_TYPE = {0: "symptom", 1: "element", 2: "syndrome",
+                       3: "formula", 4: "herb"}
+
     def add_node(node_id: str, **data) -> None:
         if node_id in seen:
             return
         seen.add(node_id)
+        data.setdefault("node_type", LAYER_NODE_TYPE.get(data.get("layer")))
         nodes.append({"data": {"id": node_id, **data}})
 
     dropped: list[tuple[str, str]] = []
