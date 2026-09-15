@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 
 from core.graph.store import NetworkXStore
+from core.physicians import PHYSICIANS
 from core.schemas import SyndromeDefinition
 
 STANDARD_PATH = Path(__file__).resolve().parent.parent / "data" / "standard" / "syndromes.jsonl"
@@ -224,12 +225,31 @@ def attach_cases(store: NetworkXStore, cases_path: Path) -> dict:
     stats = {"cases": 0, "evidences_edges": 0, "syndrome_matched": 0, "syndrome_unmatched": 0}
     for c in cases:
         case_id = f"case::{c['case_id']}"
+        # A5：case 节点原来不写 name。api/main.py::_persistent_graph_to_cytoscape
+        # 取的是 data.get("name", node_id)，所以图谱浏览器里医案节点的标签退化成
+        # 原始 id（case::ye_tianshi_0012），而 gbSearch 是按 label 做中文匹配的
+        # ——医案层打开之后，搜任何中文都搜不到一个医案节点。
+        # 这个缺陷在 sandbox 里看不见（没有 cases.json，has_case_layer=false，
+        # 切换按钮压根不出现），只在 AutoDL 上暴露。
+        # 带上证型是为了让搜索能按证型命中；证型缺失（清代医案大多没有）时就
+        # 只用 case_id，不编一个。
+        syndrome = c.get("syndrome")
+        # A5b：光去掉 case:: 前缀不够。941 条医案里只有 116 条带证型（这一轮
+        # attach_cases 自己报的"对不齐 116"就是这个数），其余 825 条的标签退化成
+        # wu_jutong-0000-p0-0 这种纯拼音串——图谱浏览器的搜索是按 label 做中文
+        # 子串匹配的，搜不到就等于医案层形同虚设。
+        # 标签里放进真正能被中文搜到的东西：医家中文名 + 证型（有就用），没有
+        # 证型就退回前两个症状。都没有就只剩 case_id，如实如此，不编。
+        pname = (PHYSICIANS.get(c["physician"]) or {}).get("name") or c["physician"]
+        tail = syndrome or "、".join((c.get("symptoms") or [])[:2])
+        case_label = f"{pname}·{c['case_id']}" + (f"（{tail}）" if tail else "")
         store.add_node(
             case_id,
             node_type="case",
+            name=case_label,
             physician=c["physician"],
             symptoms=c.get("symptoms") or [],
-            syndrome=c.get("syndrome"),
+            syndrome=syndrome,
             case_group_id=c.get("case_group_id"),
             visit_index=c.get("visit_index"),
         )

@@ -55,3 +55,8 @@ htmlcov/
 # 派生 txt 不再多放一份。脾胃论.txt 是原始语料（公有领域），不在这条里。
 data/local_corpora/王云启医案.txt
 data/local_corpora/李可医案.txt
+
+# .env 的任何衍生文件（.bak/.old/.local…）都不能进版本控制，里面有 LLM_API_KEY。
+# 原来只忽略了 `.env` 本身，`.env.bak` 是漏网的。
+.env*
+!.env.example

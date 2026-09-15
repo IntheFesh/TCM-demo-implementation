@@ -4,6 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>名医辨证对照</title>
+<!-- 内联 data URI 的 favicon：不额外加静态文件，也不再每次加载吃一个 404。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%233b5bdb'/%3E%3Ctext x='16' y='23' font-size='20' text-anchor='middle' fill='white' font-family='sans-serif'%3E%E8%AF%81%3C/text%3E%3C/svg%3E" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
 <style>
   :root {
@@ -19,10 +21,19 @@
     --purple-bg: #efe7fb;
     --purple-border: #8b6fd9;
     --purple-text: #4b2e9e;
-    --ye: #1d9e75;
-    --wu: #d85a30;
+    /* 医家配色不在这里定义。唯一来源是 core/physicians.py，经
+       api/main.py::_serialize_result 的 color 字段下发，前端存进
+       PHYSICIAN_COLORS。原来这里有 --ye/--wu 两个变量，但全文件没有任何
+       CSS 规则引用过它们（所以"张锡纯漏了一个变量"是个误判）——正确的做法
+       是删掉这两行，不是补第三行，那样才对得上 physicians.py 里"加医家只
+       改注册表一处"那条注释。 */
   }
   * { box-sizing: border-box; }
+  /* 只给屏幕阅读器的文字：处方表最后一列是操作按钮列，表头不该是空的。 */
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
   body {
     margin: 0;
     background: var(--bg);
@@ -64,14 +75,6 @@
     border-radius: 6px;
     background: #fbfbfd;
   }
-  #cy-empty {
-    height: 540px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--muted);
-    font-size: 13px;
-  }
   #divergence-banner {
     display: none;
     background: #fff4e5;
@@ -107,6 +110,9 @@
   #complaint:focus { border-color: var(--accent); }
   .input-row {
     display: flex;
+    /* 窄屏上两个下拉 + 辨证/取消两个按钮放不下一行，原来没有 wrap 会直接
+       溢出卡片右缘。 */
+    flex-wrap: wrap;
     justify-content: flex-end;
     align-items: center;
     gap: 12px;
@@ -215,9 +221,13 @@
   /* EVAL_MODE 旁路了安全否决时的横幅：不能只在 JSON 里带个 safety_flag 字段、页面上看不出来 */
   #safety-flag-note { display: none; margin: 8px 0; padding: 10px 12px; border: 2px solid #B91C1C; background: #FEF2F2; color: #7F1D1D; font-size: 13px; border-radius: 6px; }
   #safety-flag-note.show { display: block; }
+  /* 列数跟着医家数走，不写死。auto-fit 在 1180px 容器里给两位医家两列、
+     三位医家三列，加第四位也不用再改这里。原来是写死的 1fr 1fr，注册
+     张锡纯那一轮没跟着改，第三张卡片掉到第二行落单——而"三家并排对照"
+     正是这个项目的主张，并排本身是断的比数字错更严重。 */
   #results {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 16px;
   }
   @media (max-width: 780px) {
@@ -408,6 +418,49 @@
     margin-top: 8px;
     overflow-x: auto;
   }
+  /* 七列的处方表在窄屏上会撑破卡片。套一层可横向滚动的容器，不改表格结构
+     也不砍列——砍列会损失医生模式的信息完整性。 */
+  .rx-table-wrap { overflow-x: auto; }
+  .rx-table-wrap .rx-table { min-width: 560px; }
+  /* 追问记录框。renderFollowup() 原来给它挂的类名是 residual-note，而全文件
+     只有 #residual-note 这个 **id** 选择器，同名的类选择器从来不存在——这个
+     框一直是完全没样式的裸文本。 */
+  .followup-note {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    color: #7a4a12;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.7;
+    margin-bottom: 16px;
+  }
+  /* 患者模式导诊面板。三档紧急度用边框色区分，high 必须一眼看出来。 */
+  #triage-box { display: none; margin-bottom: 16px; }
+  #triage-box.show { display: block; }
+  .triage-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 13.5px;
+    line-height: 1.7;
+  }
+  .triage-card.urgency-high { border-left-color: #B91C1C; background: #FEF2F2; }
+  .triage-card.urgency-medium { border-left-color: var(--warn-border); background: var(--warn-bg); }
+  .triage-card .t-label { color: var(--muted); font-size: 12px; margin-right: 6px; }
+  .triage-card .t-flags { color: #B91C1C; font-weight: 600; }
+  .triage-card .t-none { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  #cancel-btn {
+    background: none;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    padding: 8px 16px;
+    font-size: 13.5px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
 
   details {
     margin-top: 10px;
@@ -456,7 +509,11 @@
     transform: translateX(100%); transition: transform .22s ease-out;
     z-index: 50; display: flex; flex-direction: column;
   }
-  #evidence-panel.open { transform: translateX(0); }
+  /* 收起时 visibility:hidden，否则面板只是被 transform 推出视口、键盘
+     tab 仍然能走进去（焦点跑到看不见的地方）。transition 里带上
+     visibility 才不会让它在滑出动画开始前就消失。 */
+  #evidence-panel { visibility: hidden; transition: transform .22s ease-out, visibility .22s; }
+  #evidence-panel.open { transform: translateX(0); visibility: visible; }
   #evidence-head {
     display: flex; min-width: 0; align-items: center; justify-content: space-between;
     padding: 14px 16px; border-bottom: 1px solid #eceef2; flex: 0 0 auto;
@@ -467,7 +524,7 @@
   }
   #evidence-close {
     border: none; background: transparent; font-size: 22px; line-height: 1;
-    cursor: pointer; color: #8b8e96; padding: 0 4px;
+    cursor: pointer; color: var(--muted); padding: 0 4px;
   }
   #evidence-close:hover { color: #24262b; }
   #evidence-body {
@@ -479,12 +536,16 @@
   }
   #evidence-body * { max-width: 100%; box-sizing: border-box; }
   .ev-sec { margin-bottom: 16px; }
-  .ev-sec > .label { font-size: 11px; color: #8b8e96; margin-bottom: 5px; }
+  /* 这三处原来写死 #8b8e96（白底约 3.3:1）、页脚写死 #9a9da5（约 2.7:1），
+     都低于 WCAG AA 的 4.5:1，而且都是 11px；投影仪上更糟。有意思的是
+     --muted（#6b6f7a，约 5.0:1）本身是合格的——不合格的正好是这几处绕开
+     变量写死的颜色。 */
+  .ev-sec > .label { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
   .ev-case {
     border: 1px solid #e6e7eb; border-radius: 6px; padding: 9px 10px; margin-bottom: 9px;
   }
   .ev-case .cid { font-weight: 600; font-size: 12px; }
-  .ev-case .meta { font-size: 11px; color: #8b8e96; margin: 3px 0 5px; }
+  .ev-case .meta { font-size: 11px; color: var(--muted); margin: 3px 0 5px; }
   .ev-raw {
     background: #f7f7f9; border-left: 2px solid #c7c9d1; padding: 7px 9px;
     font-size: 12px; line-height: 1.7; color: #4a4d55;
@@ -631,6 +692,18 @@
     text-align: center;
   }
   #demo-mode-banner.show { display: block; }
+  /* 原来全文件只有一个 780px 断点、只改了 #results 的列数。画布固定
+     540/520px 高、header/main 固定 24px 内边距，手机上图几乎看不清。 */
+  @media (max-width: 640px) {
+    header { padding: 14px 14px 10px; }
+    header h1 { font-size: 19px; }
+    main { padding: 14px 14px 48px; }
+    #tab-bar { padding: 8px 14px 0; }
+    #cy { height: 380px; }
+    #gb-cy { height: 360px; }
+    .input-row { justify-content: stretch; }
+    .input-row > select, .input-row > button { flex: 1 1 auto; }
+  }
 </style>
 </head>
 <body>
@@ -655,8 +728,11 @@
 <main>
 <div id="tab-consult" class="tab-panel">
   <div id="divergence-banner"></div>
-  <div id="error-box"></div>
-  <div id="safety-flag-note"></div>
+  <div id="error-box" role="alert" aria-live="assertive"></div>
+  <div id="safety-flag-note" role="alert" aria-live="assertive"></div>
+  <!-- A2：患者模式导诊面板。后端在 role=patient 时下发 triage/food_therapy/
+       patent_medicines 三个字段，之前前端一个都没渲染。 -->
+  <div id="triage-box"></div>
 
   <div id="graph-panel">
     <div id="graph-toolbar">
@@ -689,8 +765,15 @@
         <option value="researcher" selected>研究者（完整信息）</option>
         <option value="student">学生（教学展开）</option>
         <option value="doctor">医生（可编辑处方）</option>
+        <!-- A2：后端 api/main.py:36 的 Role 四种角色一直齐全，README 也写着
+             "四种模式"、DEMO.md 第 5 点写着"『查看模式』切到『患者』"，但
+             这个 option 从来没加过——照 DEMO.md 演示会当场找不到它。 -->
+        <option value="patient">患者（导诊，不提供方药）</option>
       </select>
       <button id="submit-btn">辨证</button>
+      <!-- E1：一次问诊是分钟级（v4-pro + ReAct），原来点下去就只能等或刷新
+           整个页面。取消按钮平时不显示，跑起来才出现。 -->
+      <button id="cancel-btn" style="display:none;">取消</button>
     </div>
     <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
          其余模式下这两个字段不出现——不是禁用置灰，是压根不摆出来，跟
@@ -702,7 +785,7 @@
       <label id="patient-ref-label" for="patient-ref-input">患者标识（可选）</label>
       <input type="text" id="patient-ref-input" placeholder="例如：门诊号/化名" style="flex:1;padding:7px 8px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:12.5px;" />
     </div>
-    <div id="progress-log"></div>
+    <div id="progress-log" role="status" aria-live="polite"></div>
     <div id="need-input-box">
       <div id="need-input-question"></div>
       <div class="input-row" style="justify-content: flex-start;">
@@ -714,7 +797,7 @@
 
   <div id="results"></div>
 
-  <div id="manifest-footer" style="margin:18px 0 8px;font-size:11px;color:#9a9da5;text-align:center;"></div>
+  <div id="manifest-footer" style="margin:18px 0 8px;font-size:11px;color:var(--muted);text-align:center;"></div>
 </div>
 
 <div id="tab-graph-browser" class="tab-panel" hidden>
@@ -736,7 +819,7 @@
   <div id="gb-stats"></div>
 </div>
 </main>
-<aside id="evidence-panel">
+<aside id="evidence-panel" role="dialog" aria-modal="false" aria-label="证据详情" aria-hidden="true">
     <div id="evidence-head">
       <span id="evidence-title"></span>
       <button id="evidence-close" title="关闭">×</button>
@@ -770,6 +853,35 @@ const Y_MIN = 60, Y_MAX = 620;
 const HERB_GAP = 26;
 
 let cy = null;
+
+// ---------- C1：cytoscape 加载兜底 ----------
+//
+// 图谱库原来只从 cdnjs 取，没有本地副本。CDN 取不到时的真实表现是
+// ensureCanvas() 抛 "cytoscape is not defined"，被 submitConsult 的 catch
+// 抓成"请求失败"——把一个静态资源问题报成后端问题，现场会照错方向排查。
+// 而"断网可用"正是录制回放这条路线存在的理由，图又是演示里最有冲击力的
+// 那部分。
+//
+// 兜底不写成第二个内联脚本标签，因为 12 个前端测试都靠"按开标签切分、取最后
+// 一段"的办法抽这份脚本，多一个字面开标签就会静默抽错
+// （见 tests/test_web_single_script.py 钉住的那条）。改成用时才动态插入。
+let _cytoscapePromise = null;
+function ensureCytoscape() {
+  if (typeof cytoscape !== "undefined") return Promise.resolve(true);
+  if (_cytoscapePromise) return _cytoscapePromise;
+  _cytoscapePromise = new Promise((resolve) => {
+    const el = document.createElement("script");
+    el.src = "vendor/cytoscape.min.js";
+    el.onload = () => resolve(typeof cytoscape !== "undefined");
+    el.onerror = () => resolve(false);
+    document.head.appendChild(el);
+  });
+  return _cytoscapePromise;
+}
+const CYTOSCAPE_MISSING_MSG =
+  "图谱库没有加载成功：CDN 不可达，本地副本 web/vendor/cytoscape.min.js 也不存在。"
+  + "辨证结果本身不受影响，只有图画不出来——断网演示前先把这个文件放好"
+  + "（见 README「离线演示」）。";
 
 function evenY(index, total) {
   if (total <= 1) return (Y_MIN + Y_MAX) / 2;
@@ -915,6 +1027,35 @@ function computeLayout(nodes, edges) {
         ? f.y
         : f.y - f.herbSpan / 2 + (f.herbSpan * hi) / (f.herbs.length - 1);
       positions[h.data.id] = { x: LAYER_X[4], y: hy };
+    });
+  }
+
+  // B1：证型节点跟着它自己的方剂走。
+  // 上面那道跨医家带的碰撞检查只推方剂（layer 3），不动证型（layer 2）。
+  // 两位医家时每条带 260 个逻辑单位，推得少、看不出来；三位医家时同一个
+  // 纵向范围被切成三条、每条只剩 160，而 FORMULA_MARGIN=60 是当年在**两位
+  // 医家**上用 Playwright 实测标定的固定值——带一窄，累积推移就把方剂整体
+  // 顶下去，证型却还留在原来的带里。合成图上实测最大错位 512 个逻辑单位，
+  // 表现为证型节点跟它自己的方剂差了大半个画布、连线斜穿全图。
+  // 这里不动任何方剂/药材的坐标（所以整体高度、碰撞结论、已经验过的那份
+  // 基线都不变），只在方剂位置定下来之后把证型平移到它那些方剂的形心上。
+  const formulaYByPhys = {};
+  for (const n of byLayer[3] || []) {
+    const pos = positions[n.data.id];
+    if (!pos) continue;
+    (formulaYByPhys[n.data.phys] = formulaYByPhys[n.data.phys] || []).push(pos.y);
+  }
+  for (const phys of Object.keys(synByPhys)) {
+    const ys = formulaYByPhys[phys];
+    if (!ys || !ys.length) continue; // 没有候选方的医家保持按带排布，不凭空移动
+    const centre = ys.reduce((a, b) => a + b, 0) / ys.length;
+    const items = synByPhys[phys];
+    const base = items.map((n) => positions[n.data.id].y);
+    const mid = base.reduce((a, b) => a + b, 0) / base.length;
+    // 同一位医家有多个证型节点时仍按原来的相对间距摊开，只是整体平移到
+    // 形心上——不把它们叠在一个点。
+    items.forEach((n, i) => {
+      positions[n.data.id] = { x: LAYER_X[2], y: base[i] - mid + centre };
     });
   }
 
@@ -1304,8 +1445,11 @@ function ensureCanvas() {
 // ---------- 模块7：图谱浏览器（持久知识图谱，跟上面 per-consult 图是两回事）----------
 //
 // GET /api/graph 一次性把整张图（symptom/element/syndrome，这个 sandbox 里没有
-// case 层）都发过来——123 个节点、377 条边，一次响应装得下，没必要做服务端
-// 分页/按需查询这类复杂度（demo 阶段不过度设计）。"渐进式展开"因此是纯前端的
+// case 层）都发过来。**这个"一次装得下"的前提已经过期**：写这段注释时是 123
+// 个节点、377 条边，AutoDL 上的 data/graph.json 现在是 2451 节点 / 4147 边，
+// 教材五本扩完（证候 337 -> 1444、症状 1282 -> 约 7000）还要再翻几倍。
+// 服务端分页是 api/main.py 的契约变更，留到教材扩充那一轮一起做；这一轮先在
+// 前端侧止血（见下面 GB_MAX_NEW_NODES / GB_INITIAL_SYNDROMES / GB_COSE_MAX_NODES）。"渐进式展开"因此是纯前端的
 // 显示策略：拿到全量数据后先只画证型节点，点开才把它连着的证素/症状加进
 // 画布，不是一次性把 123 个节点全铺开——那样会是一团看不出结构的乱线。
 
@@ -1416,13 +1560,31 @@ function gbApplyPhysicianWeighting() {
   });
 }
 
+// F2/F3/F4：规模上限。这个模块当初是按"123 个节点、377 条边"写的，
+// AutoDL 上的 data/graph.json 已经是 2451 节点 / 4147 边，教材五本扩完
+// （证候 337 -> 1444、症状 1282 -> 约 7000）还要再翻几倍。三个上限缺一不可：
+//   - 一次最多加多少个节点（gbSearch 搜"痛"能命中几百个症状）
+//   - 初始铺多少个证型（原来是一次性把全部证型加进画布再跑 cose 力导向，
+//     337 个互不相连的节点已经很勉强）
+//   - 超过多少个节点就不再跑 cose（力导向对大图是二次复杂度，会卡住浏览器）
+const GB_MAX_NEW_NODES = 150;
+const GB_INITIAL_SYNDROMES = 80;
+const GB_COSE_MAX_NODES = 200;
+
+function gbSetHint(text) {
+  const el = document.getElementById("gb-empty-hint");
+  if (el) el.textContent = text;
+}
+
 // 新增节点/边只加不减（不做"点一下收起"）：这一轮的范围是"渐进式展开"，
 // 没有要求可折叠；加一套折叠状态管理会把这个模块的复杂度顶到跟本身价值
 // 不成比例，需要的话留给下一轮。
 function gbAddNodes(nodeIds) {
   ensureGraphBrowserCanvas();
   const toAdd = [];
+  let truncated = 0;
   for (const id of nodeIds) {
+    if (toAdd.length >= GB_MAX_NEW_NODES) { truncated += 1; continue; }
     if (gbVisibleIds.has(id)) continue;
     const n = gbIndex.nodeById.get(id);
     if (!n) continue;
@@ -1437,18 +1599,34 @@ function gbAddNodes(nodeIds) {
 
   // 两端都已经在画布上的边才补上——判据跟 api/main.py::to_graph() 的
   // add_edge 是同一个道理（两端节点都存在，边才有意义），不是巧合。
+  // F4：候选边只从**这次新加的节点**的邻接表里取（gbIndex.edgesByNode 建好
+  // 就是干这个的），不再每次都全量扫 graph.edges——原来是 O(每次调用 ×
+  // 总边数)，还对每条边做一次 getElementById。
   const edgesToAdd = [];
-  for (const e of gbGraphData.graph.edges) {
-    const { id, source, target } = e.data;
-    if (gbCy.getElementById(id).nonempty()) continue;
-    if (!gbVisibleIds.has(source) || !gbVisibleIds.has(target)) continue;
-    edgesToAdd.push({ data: e.data });
+  const seenEdgeIds = new Set();
+  for (const n of toAdd) {
+    for (const e of gbIndex.edgesByNode.get(n.data.id) || []) {
+      const { id, source, target } = e.data;
+      if (seenEdgeIds.has(id)) continue;
+      if (!gbVisibleIds.has(source) || !gbVisibleIds.has(target)) continue;
+      if (gbCy.getElementById(id).nonempty()) continue;
+      seenEdgeIds.add(id);
+      edgesToAdd.push({ data: e.data });
+    }
   }
   if (edgesToAdd.length) gbCy.add(edgesToAdd);
 
   if (toAdd.length || edgesToAdd.length) {
     gbApplyPhysicianWeighting();
-    gbCy.layout({ name: "cose", animate: false, fit: true, padding: 24 }).run();
+    // 大图不跑力导向：cose 对几百个节点会把浏览器卡住，grid 是 O(n) 的。
+    const layoutName = gbVisibleIds.size > GB_COSE_MAX_NODES ? "grid" : "cose";
+    gbCy.layout({ name: layoutName, animate: false, fit: true, padding: 24 }).run();
+  }
+  if (truncated > 0) {
+    const status = document.getElementById("gb-search-status");
+    if (status) {
+      status.textContent = `本次只加了 ${toAdd.length} 个节点，还有 ${truncated} 个未显示——请把搜索词写得更具体`;
+    }
   }
   document.getElementById("gb-empty-hint").hidden = gbVisibleIds.size > 0;
 }
@@ -1473,9 +1651,14 @@ function gbSearch(query) {
     status.textContent = "未找到匹配节点";
     return;
   }
-  status.textContent = `找到 ${matches.length} 个匹配节点`;
-  gbAddNodes(matches.map((n) => n.data.id));
-  const matchedIds = new Set(matches.map((n) => n.data.id));
+  // F3：命中数原来不设限，在扩表后的图上搜一个"痛"字能命中几百个症状，
+  // 全部一次性加进画布 + 跑力导向 = 卡死。如实报出总数，只画前 N 个。
+  const shown = matches.slice(0, GB_MAX_NEW_NODES);
+  status.textContent = matches.length > shown.length
+    ? `找到 ${matches.length} 个匹配节点，只显示前 ${shown.length} 个`
+    : `找到 ${matches.length} 个匹配节点`;
+  gbAddNodes(shown.map((n) => n.data.id));
+  const matchedIds = new Set(shown.map((n) => n.data.id));
   const eles = gbCy.nodes().filter((ele) => matchedIds.has(ele.id()));
   eles.addClass("gb-search-hit");
   gbCy.animate({ fit: { eles, padding: 40 } }, { duration: 300 });
@@ -1509,11 +1692,23 @@ function gbResetView() {
   gbVisibleIds = new Set();
   document.getElementById("gb-search").value = "";
   document.getElementById("gb-search-status").textContent = "";
+  // gbShowCaseLayer 也要一起复位，否则切到医案层之后点"重置视图"，
+  // 按钮文字还写着"切换到国标层"，但画布上一个 case 节点都没有。
+  gbShowCaseLayer = false;
+  const layerBtn = document.getElementById("gb-layer-toggle");
+  if (layerBtn) layerBtn.textContent = "切换到医案层";
+
   const syndromeIds = gbGraphData.graph.nodes
     .filter((n) => n.data.node_type === "syndrome")
     .map((n) => n.data.id);
-  document.getElementById("gb-empty-hint").textContent = "点击节点展开关联的证素/症状，或用上方搜索框定位";
-  gbAddNodes(syndromeIds);
+  // F2：原来一次性把全部证型加进画布再跑 cose。sandbox 里 17 条没问题，
+  // AutoDL 上已经是 337 条，教材扩完是 1444 条——几百个互不相连的节点跑
+  // 力导向会把浏览器卡住，而且铺开也看不出结构。
+  const shown = syndromeIds.slice(0, GB_INITIAL_SYNDROMES);
+  gbSetHint(syndromeIds.length > shown.length
+    ? `证型共 ${syndromeIds.length} 条，先显示 ${shown.length} 条——用上方搜索框定位，或点节点展开关联的证素/症状`
+    : "点击节点展开关联的证素/症状，或用上方搜索框定位");
+  gbAddNodes(shown);
 }
 
 function renderGbLambda1Note(note) {
@@ -1533,6 +1728,15 @@ function renderGbStats(stats) {
 function populateGbPhysicianSelect(physicians) {
   const sel = document.getElementById("gb-physician-select");
   sel.innerHTML = "";
+  // A4：顺手把这两张展示用的映射填上。describeNodeTooltip /
+  // describeEdgeTooltip 的 λ1 那行读的就是它们，而原来只有 /api/consult
+  // 回来时才填——新开页面直接点"图谱浏览器"，hover 边看到的是
+  // "λ1（ye_tianshi）= 0.00" 这种英文 id。/api/graph 的 physicians 里
+  // name/color 本来就带着，缺的只是这两行。
+  for (const p of physicians || []) {
+    if (p.color) PHYSICIAN_COLORS[p.id] = p.color;
+    PHYSICIAN_NAMES[p.id] = p.name;
+  }
   for (const p of physicians || []) {
     const opt = document.createElement("option");
     opt.value = p.id;
@@ -1549,6 +1753,12 @@ async function loadGraphBrowserData() {
   hint.hidden = false;
   hint.textContent = "加载中…";
   errBox.classList.remove("show");
+  if (!(await ensureCytoscape())) {
+    hint.hidden = true;
+    errBox.textContent = CYTOSCAPE_MISSING_MSG;
+    errBox.classList.add("show");
+    return;
+  }
   try {
     const resp = await fetch("/api/graph");
     if (!resp.ok) {
@@ -1601,7 +1811,21 @@ function sleep(ms) {
 let growToken = 0; // 每次新的生长自增，旧的循环据此提前退出
 
 async function growGraph(graph, { animate = true } = {}) {
+  if (!(await ensureCytoscape())) { showError(CYTOSCAPE_MISSING_MSG); return; }
+  // B1 的另一半：容器高度跟着医家数走。cy.fit() 最后会把全部内容按同一个
+  // 缩放系数塞进 #cy，医家从两位变三位、内容纵向长了一半，容器还是 540px
+  // 的话缩放系数就变大，节点上的字跟着变小。270 × 医家数：两位时算出来正好
+  // 是 540，跟改动前一致；三位是 810，上限 900 防止在笔记本屏幕上把输入框
+  // 挤出首屏。
+  const physCount = new Set(
+    (graph.nodes || []).filter((n) => Number(n.data.layer) === 2).map((n) => n.data.phys)
+  ).size;
+  const cyEl = document.getElementById("cy");
+  if (cyEl && cyEl.style) {
+    cyEl.style.height = `${Math.min(900, Math.max(540, 270 * physCount))}px`;
+  }
   ensureCanvas();
+  if (cy && cy.resize) cy.resize(); // 容器高度改过之后要让 cytoscape 重新量一次
   // 配色随医家变化（physicians.py 是唯一源），每次重新应用样式表
   cy.style(buildStylesheet());
   cy.elements().remove();
@@ -1613,7 +1837,14 @@ async function growGraph(graph, { animate = true } = {}) {
 
   const positions = computeLayout(graph.nodes, graph.edges);
   const nodesByLayer = { 0: [], 1: [], 2: [], 3: [], 4: [] };
-  for (const n of graph.nodes) nodesByLayer[n.data.layer].push(n);
+  for (const n of graph.nodes) {
+    // E4：跟 computeLayout() 同一条兜底（那边的注释写着"layer 不在 0-4 时
+    // 不要整页崩"）。两处对同一件事的处理原来不一致——这边 layer 越界会直接
+    // TypeError 把整页打掉。超出 0-4 的层只是不参与排布，不崩。
+    const L = Number(n.data.layer);
+    if (!nodesByLayer[L]) nodesByLayer[L] = [];
+    nodesByLayer[L].push(n);
+  }
 
   const myToken = ++growToken;
   const addNode = (n) =>
@@ -1626,11 +1857,18 @@ async function growGraph(graph, { animate = true } = {}) {
   // CSS transition 对它无效。
   const addReadyEdges = (grow = false) => {
     const present = new Set(cy.nodes().map((n) => n.id()));
+    // E3：去重改用自己维护的 key 集合，不再把节点 id 拼进 cytoscape 选择器
+    // 字符串。节点 id 形如 herb::ye_tianshi::瓜蒌薤白半夏汤::瓜蒌，其中方剂名
+    // 和药材名**是模型生成的**——出现一个引号或右方括号就会让整张图渲染失败。
+    // 顺带把 O(边数 × 选择器匹配) 降成 O(边数)。
+    const seenEdges = new Set(cy.edges().map((e) => `${e.data("source")}::${e.data("target")}`));
     const added = [];
     for (const e of graph.edges) {
       const { source, target } = e.data;
       if (!present.has(source) || !present.has(target)) continue;
-      if (cy.edges(`[source = "${source}"][target = "${target}"]`).length) continue;
+      const key = `${source}::${target}`;
+      if (seenEdges.has(key)) continue;
+      seenEdges.add(key);
       added.push(cy.add({ group: "edges", data: e.data }));
     }
     if (!grow) return added;
@@ -1875,9 +2113,9 @@ function evidenceSectionHtml(s) {
         const long = raw.length > 110;
         return `<div class="ev-case">
           <div class="cid">${escapeHtml(r.case_id)}</div>
-          <div class="meta">${r.visit_label}　相似度 ${r.score}${r.syndrome ? "　证：" + escapeHtml(r.syndrome) : ""}</div>
+          <div class="meta">${escapeHtml(r.visit_label)}　相似度 ${escapeHtml(r.score)}${r.syndrome ? "　证：" + escapeHtml(r.syndrome) : ""}</div>
           <div>${escapeHtml((r.symptoms || []).slice(0, 5).join("；"))}</div>
-          ${raw ? `<div class="ev-raw" id="raw-${i}-${Math.random().toString(36).slice(2, 7)}">${escapeHtml(raw)}</div>
+          ${raw ? `<div class="ev-raw">${escapeHtml(raw)}</div>
             ${long ? '<span class="ev-more" onclick="this.previousElementSibling.classList.toggle(\'expanded\'); this.textContent = this.textContent === \'展开全文\' ? \'收起\' : \'展开全文\';">展开全文</span>' : ""}` : ""}
         </div>`;
       };
@@ -1890,21 +2128,34 @@ function evidenceSectionHtml(s) {
   }
 
   return `<div class="ev-sec">
-    <div style="font-weight:600;color:${s.color || "#333"};margin-bottom:6px;">${escapeHtml(s.physician_name)}</div>
+    <div style="font-weight:600;color:${escapeHtml(s.color || "#333")};margin-bottom:6px;">${escapeHtml(s.physician_name)}</div>
     ${rows.join("")}
   </div>`;
 }
+
+// 打开侧栏前记住焦点在哪，关闭时还回去——否则用键盘操作的人在关掉面板之后
+// 焦点落在 body 上，得重新 tab 一遍才能回到图上。
+let _evidenceReturnFocus = null;
 
 function openEvidence(nodeId) {
   const e = EVIDENCE[nodeId];
   if (!e) return;
   document.getElementById("evidence-title").textContent = e.title;
   document.getElementById("evidence-body").innerHTML = e.sections.map(evidenceSectionHtml).join("");
-  document.getElementById("evidence-panel").classList.add("open");
+  const panel = document.getElementById("evidence-panel");
+  panel.classList.add("open");
+  panel.setAttribute("aria-hidden", "false");
+  _evidenceReturnFocus = document.activeElement || null;
+  const closeBtn = document.getElementById("evidence-close");
+  if (closeBtn && closeBtn.focus) closeBtn.focus();
 }
 
 function closeEvidence() {
-  document.getElementById("evidence-panel").classList.remove("open");
+  const panel = document.getElementById("evidence-panel");
+  panel.classList.remove("open");
+  panel.setAttribute("aria-hidden", "true");
+  if (_evidenceReturnFocus && _evidenceReturnFocus.focus) _evidenceReturnFocus.focus();
+  _evidenceReturnFocus = null;
 }
 
 // R1 分层：君臣（核心判断）/ 佐使（加减）各自的文案。每一层都跟**自己那一层的**
@@ -2008,7 +2259,11 @@ function divergenceBannerText(divergence) {
     return text;
   }
   if (divergence && divergence.same === false) {
-    return "两位医家的辨证结论不同（按证型名称精确比对，为粗略判定）";
+    // A3：医家数从 pairs 推，不写死"两位"——注册张锡纯之后这句话就是错的。
+    // 推不出来（pairs 缺失）时退回不带数字的说法，不编一个数出来。
+    const n = Object.keys(physicianNameMap(divergence)).length;
+    const who = n >= 2 ? `${n} 位医家` : "各位医家";
+    return `${who}的辨证结论不同（按证型名称精确比对，为粗略判定）`;
   }
   return null;
 }
@@ -2052,6 +2307,55 @@ async function initDemoModeBanner() {
   }
 }
 
+// ---------- A2：患者模式导诊面板 ----------
+//
+// 后端在 role=patient/doctor 时下发 triage（dept/urgency/red_flags/advice）与
+// food_therapy/patent_medicines，之前前端一个字段都没渲染，所以即使把 patient
+// 选项加回来，DEMO.md 第 5 点要的"病名 + 建议科室 + 红旗症状"页面上也看不到。
+//
+// 食疗/中成药目前是空列表（M9 的数据还没接），这里如实说明"尚未接入"，
+// 不显示成"没有推荐"——两者意思不同。urgency=high 时后端 _apply_medication_gate
+// 无论如何都返回空列表，这条闸门在服务端，这里只是不去暗示它本该有内容。
+const URGENCY_LABEL = { high: "紧急", medium: "较急", low: "常规" };
+
+function triageBoxHtml(data) {
+  const t = data.triage;
+  if (!t) {
+    return `<div class="triage-card"><div class="t-none">本次没有导诊依据：模型给出的病名不在参考病名表里，不编造科室建议。</div></div>`;
+  }
+  const urgency = t.urgency || "low";
+  const rows = [];
+  rows.push(`<div><span class="t-label">紧急度</span>${escapeHtml(URGENCY_LABEL[urgency] || urgency)}</div>`);
+  if (t.dept) rows.push(`<div><span class="t-label">建议科室</span>${escapeHtml(t.dept)}</div>`);
+  if (t.advice) rows.push(`<div><span class="t-label">建议</span>${escapeHtml(t.advice)}</div>`);
+  if ((t.red_flags || []).length) {
+    rows.push(`<div><span class="t-label">需要警惕</span><span class="t-flags">${escapeHtml(t.red_flags.join("、"))}</span></div>`);
+  }
+  const food = data.food_therapy || [];
+  const otc = data.patent_medicines || [];
+  const gated = urgency === "high";
+  rows.push(`<div class="t-none">${gated
+    ? "紧急度为「紧急」，按安全规则不提供任何用药或食疗建议，请尽快就医。"
+    : (food.length || otc.length)
+      ? `食疗 ${food.length} 条　中成药 ${otc.length} 条`
+      : "食疗与 OTC 中成药数据尚未接入（M9），此处暂无内容。"}</div>`);
+  return `<div class="triage-card urgency-${escapeHtml(urgency)}">${rows.join("")}</div>`;
+}
+
+function renderTriage(data) {
+  const box = document.getElementById("triage-box");
+  if (!box) return;
+  // triage 这个键只在 patient/doctor 角色下存在。researcher/student 拿不到，
+  // 这时整个面板不出现——不是显示一个空框。
+  if (!data || !("triage" in data)) {
+    box.innerHTML = "";
+    box.classList.remove("show");
+    return;
+  }
+  box.innerHTML = triageBoxHtml(data);
+  box.classList.add("show");
+}
+
 function renderDivergence(divergence) {
   const banner = document.getElementById("divergence-banner");
   const text = divergenceBannerText(divergence);
@@ -2075,7 +2379,7 @@ function refListHtml(refs) {
         ? `<div class="ref-excerpt">${escapeHtml(r.excerpt.slice(0, 120))}${r.excerpt.length > 120 ? "…" : ""}</div>`
         : "";
       return `<div class="ref-item">
-        <b>${escapeHtml(r.case_id)}</b>　${r.visit_label}　相似度 ${r.score}${syn}
+        <b>${escapeHtml(r.case_id)}</b>　${escapeHtml(r.visit_label)}　相似度 ${escapeHtml(r.score)}${syn}
         <div class="ref-sym">${escapeHtml(sym)}</div>
         ${ex}
       </div>`;
@@ -2193,6 +2497,7 @@ function initDoctorState(results) {
       herb_items: (cand.herb_items || []).map((h) => ({ ...h })),
       model_suggestion: JSON.parse(JSON.stringify(cand)),
       safety: null,
+      safetyError: null,
       exportResult: null,
       exportError: null,
       pendingOverrideReason: null,
@@ -2220,7 +2525,14 @@ function rxRowHtml(physician, i, h) {
 // blocking），这里只是把它渲染成人看的文字——判断"有没有问题"这件事本身
 // 不在前端重新做一遍，safety.blocking 和各个数组是否非空都是后端算好直接
 // 传过来的。
-function rxSafetyHtml(safety) {
+// error 参数可选：不传时行为跟改动前完全一致（tests/test_prescription_frontend.py
+// 就是单参数调用的）。
+function rxSafetyHtml(safety, error) {
+  // A7：校验请求失败原来也走 safety=null 这条路，显示成"尚未校验"——网络断了、
+  // 后端 500 了，跟"还没触发校验"长得一模一样。在一个安全闸门上这种静默是危险的。
+  if (error) {
+    return `<div class="safety-incompatible">⚠ 安全校验没能完成（${escapeHtml(error)}）：这不等于"没问题"，请重试或检查服务端。</div>`;
+  }
   if (!safety) return `<div style="font-size:12px;color:var(--muted);margin:4px 0;">尚未校验</div>`;
   const blocks = [];
   if (safety.incompatible && safety.incompatible.length) {
@@ -2258,10 +2570,12 @@ function doctorSectionHtml(physician, mode) {
       <label>剂数　<input type="number" data-rx-phys="${physician}" data-rx-field="doses_count" value="${state.doses_count != null ? state.doses_count : ""}" style="width:50px" /></label>
       <label>用法　<input type="text" data-rx-phys="${physician}" data-rx-field="usage" value="${escapeHtml(state.usage || "")}" style="width:220px" /></label>
     </div>
+    <div class="rx-table-wrap">
     <table class="rx-table">
-      <thead><tr><th>药名</th><th>剂量</th><th>单位</th><th>炮制</th><th>煎法</th><th>作用</th><th></th></tr></thead>
+      <thead><tr><th scope="col">药名</th><th scope="col">剂量</th><th scope="col">单位</th><th scope="col">炮制</th><th scope="col">煎法</th><th scope="col">作用</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
       <tbody id="rx-table-body-${physician}">${state.herb_items.map((h, i) => rxRowHtml(physician, i, h)).join("")}</tbody>
     </table>
+    </div>
     <button type="button" class="rx-add-btn" data-rx-add="${physician}">+ 添加药味</button>
     <div id="rx-safety-${physician}">${rxSafetyHtml(state.safety)}</div>
     <button type="button" class="rx-export-btn" data-rx-export="${physician}">导出处方</button>
@@ -2280,7 +2594,7 @@ function renderDoctorSafety(physician) {
   const el = document.getElementById(`rx-safety-${physician}`);
   const state = DOCTOR_STATE[physician];
   if (!el || !state) return;
-  el.innerHTML = rxSafetyHtml(state.safety);
+  el.innerHTML = rxSafetyHtml(state.safety, state.safetyError);
 }
 
 const RX_VALIDATE_TIMERS = {};
@@ -2301,6 +2615,7 @@ async function runValidate(physician) {
   const herbItems = state.herb_items.filter((h) => (h.name || "").trim());
   if (!herbItems.length) {
     state.safety = null;
+    state.safetyError = null;
     renderDoctorSafety(physician);
     return;
   }
@@ -2312,9 +2627,11 @@ async function runValidate(physician) {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     state.safety = await resp.json();
+    state.safetyError = null;
   } catch (err) {
     console.error("处方校验失败：", err);
     state.safety = null;
+    state.safetyError = err.message || String(err);
   }
   renderDoctorSafety(physician);
 }
@@ -2511,16 +2828,26 @@ function cardHtml(result, mode = "researcher") {
   // 表现为"（无）"——不是本模块的显示 bug，是 M6 定的安全边界本该如此）。
   const selectedCand = (s3.formula_candidates && s3.formula_candidates.length)
     ? s3.formula_candidates[s3.selected] : null;
-  const herbsHtml = selectedCand
-    ? herbGroupsHtml(selectedCand)
-    : `<div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>`;
+  // A2：patient 角色下 formula_candidates/formula/herbs 三个键都被后端整个摘掉
+  // （api/main.py::_filter_s3_for_role，安全边界不是前端藏起来）。原来这里会
+  // 退回显示"用药（无）"和"方剂（未明确）"——那是在暗示"这次没开出方"，
+  // 而真相是"这个角色本来就拿不到"。两者意思完全不同，必须分开说。
+  const isPatient = mode === "patient";
+  const herbsHtml = isPatient
+    ? `<div class="doctor-disclaimer">患者模式不提供具体方剂与药材——这是服务端的字段裁剪（响应体里根本没有这几个键），不是本次没开出方。具体用药请咨询执业医师。</div>`
+    : selectedCand
+      ? herbGroupsHtml(selectedCand)
+      : `<div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>`;
+  const formulaRow = isPatient
+    ? ""
+    : `<div class="field"><b>方剂</b>${escapeHtml(s3.formula || "（未明确）")}</div>`;
 
   return `
     <div class="card">
-      <h2 style="color:${color}">${result.physician_name}</h2>
+      <h2 style="color:${escapeHtml(color)}">${escapeHtml(result.physician_name)}</h2>
       <div class="field"><b>证型</b>${escapeHtml(s3.syndrome)}</div>
       <div class="field"><b>治法</b>${escapeHtml(s3.treatment_principle)}</div>
-      <div class="field"><b>方剂</b>${escapeHtml(s3.formula || "（未明确）")}</div>
+      ${formulaRow}
       ${herbsHtml}
       ${westernHtml}
       ${incompatibleHtml}
@@ -2549,7 +2876,8 @@ function cardHtml(result, mode = "researcher") {
 // 「参西用药」栏。张锡纯「衷中参西」会在方里用阿斯匹林这类西药，是他最有辨识度的
 // 特征，单独一栏展示；叶天士/吴鞠通两本书实测一个西药词都没有，他们的 western_drugs
 // 恒为空，此时返回空串——不显示一个空栏。提成顶层纯函数是为了能被测试直接调用
-// （tests/test_web_render.py 用 node 跑的就是这里这份代码，不是另抄一份）。
+// （tests/test_western_drugs.py 用 node 跑的就是这里这份代码，不是另抄一份。
+// 原来这行写的是 tests/test_web_render.py，那个文件不存在）。
 function westernDrugsHtml(s3) {
   const drugs = (s3 && s3.western_drugs) || [];
   if (!drugs.length) return "";
@@ -2583,6 +2911,7 @@ function getSelectedRole() {
 // 证据索引、上一张图。否则「重播」会重绘上一位患者的图。
 function resetSecondaryPanels() {
   lastGraph = null;
+  if (typeof updateGraphToolbar === "function") updateGraphToolbar();
   EVIDENCE = {};
   DOCTOR_STATE = {};
   closeEvidence();
@@ -2592,6 +2921,7 @@ function resetSecondaryPanels() {
     if (el) { el.textContent = ""; el.style.display = "none"; }
   }
   renderSafetyFlag(null);
+  renderTriage(null);
   const footer = document.getElementById("manifest-footer");
   if (footer) footer.textContent = "";
 }
@@ -2604,7 +2934,9 @@ function renderFollowup(followup) {
   if (!el) {
     el = document.createElement("div");
     el.id = "followup-note";
-    el.className = "residual-note";
+    // 原来挂的是 residual-note，而全文件只有 #residual-note 这个 id 选择器，
+    // 同名的类选择器从来不存在——这个框一直没有任何样式。
+    el.className = "followup-note";
     const results = document.getElementById("results");
     results.parentElement.insertBefore(el, results);
   }
@@ -2727,6 +3059,7 @@ function renderConsultResult(data) {
     }
   }
   lastGraph = data.graph;
+  updateGraphToolbar();
   const dropped = data.graph.dropped_edges || 0;
   const note = document.getElementById("graph-note");
   if (dropped > 0) {
@@ -2736,6 +3069,7 @@ function renderConsultResult(data) {
     note.style.display = "none";
   }
   renderDivergence(data.divergence);
+  renderTriage(data);
   // M8：医生模式的可编辑处方状态要在渲染卡片之前建好——cardHtml() 里的
   // doctorSectionHtml() 读的是 DOCTOR_STATE，不是 data.results 本身
   // （医生编辑的是自己的一份拷贝，不直接改问诊响应）。
@@ -2850,13 +3184,41 @@ async function readSSE(response, onEvent) {
       let eventName = "message";
       const dataLines = [];
       for (const line of frame.split("\n")) {
-        if (line.startsWith("event: ")) eventName = line.slice(7);
-        else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+        // 冒号后的空格按 SSE 规范是可选的，只认带空格的写法太脆。
+        if (line.startsWith("event:")) eventName = line.slice(6).replace(/^ /, "");
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
       }
-      if (dataLines.length) onEvent(eventName, JSON.parse(dataLines.join("\n")));
+      if (dataLines.length) {
+        // E2：一条畸形事件不该毁掉整次问诊。原来 JSON.parse 抛出来会一路冒泡到
+        // submitConsult 的 catch，已经跑完的推理全部作废、钱白花。
+        let payload;
+        try {
+          payload = JSON.parse(dataLines.join("\n"));
+        } catch (parseErr) {
+          console.error("SSE 帧解析失败，已跳过这一帧：", frame, parseErr);
+          continue;
+        }
+        onEvent(eventName, payload);
+      }
     }
   }
 }
+
+// ---------- E1：取消、空闲超时、已用时 ----------
+//
+// 一次问诊在 v4-pro + ReAct 下是分钟级，而后端 R9 刚加的墙钟（API 后端 180 秒
+// ×3 次重试）前端一点都没接上：原来点下"辨证"就只能等，流要是卡住（段 6 那种
+// 挂死在演示现场就是这个表现）唯一的出路是刷新整个页面。
+//
+// 三件事：
+//   1. AbortController，取消按钮和空闲看门狗共用同一个
+//   2. 看门狗按"距上一条事件多久"算，不是按总时长——ReAct 取证本来就慢，
+//      按总时长会把正常的长问诊误杀
+//   3. #status-text 原来是个永远为空的 span（只被写过空字符串），改成显示
+//      已用时。"静默很久是正常的"这件事，有个走字的秒数比一句文档管用
+let currentAbort = null;
+let cancelledByUser = false;
+const SSE_IDLE_TIMEOUT_MS = 300000;
 
 async function submitConsult() {
   const complaint = document.getElementById("complaint").value.trim();
@@ -2866,6 +3228,7 @@ async function submitConsult() {
   }
 
   const btn = document.getElementById("submit-btn");
+  const cancelBtn = document.getElementById("cancel-btn");
   const status = document.getElementById("status-text");
   btn.disabled = true;
   btn.textContent = "推理中…";
@@ -2875,9 +3238,30 @@ async function submitConsult() {
   hideNeedInput();
   currentStreamId = null;
 
+  currentAbort = new AbortController();
+  cancelledByUser = false;
+  let idleTimedOut = false;
+  if (cancelBtn) cancelBtn.style.display = "";
+
+  const t0 = Date.now();
+  const ticker = setInterval(() => {
+    status.textContent = `已用时 ${Math.round((Date.now() - t0) / 1000)}s`;
+  }, 1000);
+
+  let idleTimer = null;
+  const armWatchdog = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimedOut = true;
+      if (currentAbort) currentAbort.abort();
+    }, SSE_IDLE_TIMEOUT_MS);
+  };
+  armWatchdog();
+
   try {
     const resp = await fetch("/api/consult/stream", {
       method: "POST",
+      signal: currentAbort.signal,
       headers: { "Content-Type": "application/json" },
       // 检索模式跟着这一次请求走，不去调什么"服务端设置"接口——服务端的
       // RETRIEVER_MODE 是进程级的，改它会影响同时在跑的别人的请求。
@@ -2892,6 +3276,7 @@ async function submitConsult() {
     let doneData = null;
     let errorDetail = null;
     await readSSE(resp, (name, data) => {
+      armWatchdog(); // 每收到一条事件就把空闲计时归零
       if (name === "stream_id") {
         currentStreamId = data.stream_id;
       } else if (name === "need_input") {
@@ -2913,8 +3298,23 @@ async function submitConsult() {
     renderConsultResult(doneData);
   } catch (err) {
     console.error("consult failed:", err);
-    showError(`请求失败：${err.message || err}\n${(err.stack || "").split("\n").slice(0, 3).join("\n")}`);
+    if (cancelledByUser) {
+      showError("已取消本次辨证。服务端可能还在跑完当前这一步，费用已经发生的部分不会退回。");
+    } else if (idleTimedOut || (err && err.name === "AbortError")) {
+      showError(
+        `等待服务端新进度超过 ${Math.round(SSE_IDLE_TIMEOUT_MS / 1000)} 秒，已中断。`
+        + "服务端可能仍在重试（API 后端墙钟 180 秒 × 3 次）——先看服务端日志，"
+        + "不要先怀疑网络。"
+      );
+    } else {
+      showError(`请求失败：${err.message || err}\n${(err.stack || "").split("\n").slice(0, 3).join("\n")}`);
+    }
   } finally {
+    clearInterval(ticker);
+    clearTimeout(idleTimer);
+    if (cancelBtn) cancelBtn.style.display = "none";
+    currentAbort = null;
+    cancelledByUser = false;
     btn.disabled = false;
     btn.textContent = "辨证";
     status.textContent = "";
@@ -2924,12 +3324,26 @@ async function submitConsult() {
 
 initDemoModeBanner();
 document.getElementById("submit-btn").addEventListener("click", submitConsult);
+document.getElementById("cancel-btn").addEventListener("click", () => {
+  if (!currentAbort) return;
+  cancelledByUser = true;
+  currentAbort.abort();
+});
 document.getElementById("need-input-submit").addEventListener("click", submitNeedInputAnswer);
 document.getElementById("need-input-answer").addEventListener("keydown", (e) => {
   if (e.key === "Enter") submitNeedInputAnswer();
 });
+// 没有图时这两个按钮点了什么都不会发生（lastGraph 为 null），原来仍然是
+// 可点的实心按钮，看起来像坏了。
+function updateGraphToolbar() {
+  for (const id of ["skip-btn", "replay-btn"]) {
+    const b = document.getElementById(id);
+    if (b) b.disabled = !lastGraph;
+  }
+}
 document.getElementById("skip-btn").addEventListener("click", skipAnimation);
 document.getElementById("replay-btn").addEventListener("click", replayGraph);
+updateGraphToolbar();
 // 保险起见运行时把面板挂到 body 末尾：只要祖先里有任何 transform/filter，
 // position:fixed 就会相对该祖先定位而不是视口，面板会跑到页面中间去。
 {
