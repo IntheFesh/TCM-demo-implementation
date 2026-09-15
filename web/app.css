@@ -13,22 +13,22 @@
 @font-face {
   font-family: "Noto Serif SC";
   font-style: normal; font-weight: 400; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@latest/chinese-simplified-400-normal.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@5.3.0/chinese-simplified-400-normal.woff2") format("woff2");
 }
 @font-face {
   font-family: "Noto Serif SC";
   font-style: normal; font-weight: 600; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@latest/chinese-simplified-600-normal.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@5.3.0/chinese-simplified-600-normal.woff2") format("woff2");
 }
 @font-face {
   font-family: "Noto Sans SC";
   font-style: normal; font-weight: 400; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@latest/chinese-simplified-400-normal.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@5.3.0/chinese-simplified-400-normal.woff2") format("woff2");
 }
 @font-face {
   font-family: "Noto Sans SC";
   font-style: normal; font-weight: 500; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@latest/chinese-simplified-500-normal.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@5.3.0/chinese-simplified-500-normal.woff2") format("woff2");
 }
 
   :root {
@@ -47,7 +47,9 @@
     --danger-bg:  #FBEAE8;
     --caution:    #8A6D1F;   /* 毒性药材、剂量警告 */
     --caution-bg: #F7F1DF;
-    --verified:   #2C5F5A;   /* 有出处可核（复用青黛） */
+    /* 同值是巧合不是绑定：叶天士的身份色从 core/physicians.py 注入，这里是语义色。
+       哪天叶天士换色，「有出处可核」没有理由跟着换——不要把这一行改成 var(--ye)。 */
+    --verified:   #2C5F5A;   /* 有出处可核（总纲 §2.1「复用青黛」，同值不是绑定） */
 
     /* ---- 分歧读数专用（§2.1）---- */
     --noise:      #B9BDB3;   /* ε 噪声地板的参考线 */
@@ -165,6 +167,21 @@
     border-radius: var(--r-md);
     background: var(--surface-2);
   }
+  /* 图谱容器右下角的两条角标。R14 第 0 项之前它们是 index.html 里的 `style="..."`
+     内联属性，色值各写各的（一个偏橙一个偏褐）——扫描只看 app.css，所以两个都躲过了
+     "规则里不许出现十六进制"那条断言。搬到这里之后两条角标都走 --caution：它们
+     回答的是同一个问题（这次结果有欠缺，别当完整的看），原来那点橙/褐的色差是
+     两次各写各的留下的，不表示任何语义区别。 */
+  #residual-note, #graph-note {
+    display: none;
+    position: absolute;
+    left: 14px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--caution);
+  }
+  #residual-note { bottom: 26px; }
+  #graph-note { bottom: 8px; }
   #divergence-banner {
     display: none;
     background: var(--caution-bg);

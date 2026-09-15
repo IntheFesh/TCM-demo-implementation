@@ -10,10 +10,22 @@
 node 测试读的是 app.js/graph.js，而浏览器跑的是它俩加上那段内联的——同一个静默分叉
 换了个形状回来。
 """
+import json
+import re
 import subprocess
 from pathlib import Path
 
-from tests.web_harness import SCRIPT_FILES, load_app_js, load_css, load_html
+from tests.web_harness import (
+    DOM_STUB, SCRIPT_FILES, js_tmp, load_app_js, load_css, load_html,
+)
+
+WEB_FILES: dict[str, str] = {}
+
+
+def _read(name: str) -> str:
+    if name not in WEB_FILES:
+        WEB_FILES[name] = (ROOT / "web" / name).read_text(encoding="utf-8")
+    return WEB_FILES[name]
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
@@ -74,32 +86,99 @@ def test_the_graph_code_went_to_graph_js_and_the_rest_to_app_js():
                    "async function gbExpandNode"):
         assert marker in graph_js, f"graph.js 里没有 {marker}"
         assert marker not in app_js, f"{marker} 同时出现在 app.js 里——拆重复了"
-    for marker in ("function cardHtml", "function escapeHtml", "function renderDivergence"):
+    # escapeHtml / sleep 不在这张表里：第 0 项断循环依赖时它们**下沉到了 graph.js**
+    # （纯工具没有 UI 归属，放在底层两边都能取，依赖方向才是单向的）。
+    for marker in ("function cardHtml", "function submitConsult", "function renderDivergence"):
         assert marker in app_js, f"app.js 里没有 {marker}"
         assert marker not in graph_js, f"{marker} 同时出现在 graph.js 里——拆重复了"
 
 
-def test_the_tcm_namespace_exposes_the_agreed_function_list():
-    """两个文件靠 `window.TCM` 协作。**清单写死在测试里**：少一个名字就是某处
-    协作点被悄悄改掉了，而那种改动在浏览器里表现为"点了没反应"，没有报错。"""
-    script = load_app_js()
-    expected = [
-        # graph.js 侧
-        "ensureCytoscape", "computeLayout", "buildStylesheet", "growGraph", "renderGraph",
-        "replayGraph", "skipAnimation", "computeHighlightPath", "applyPathHighlight",
-        "clearPathHighlight", "handleSymptomClick", "describeNodeTooltip",
-        "describeEdgeTooltip", "showTooltip", "hideTooltip", "loadGraphBrowserData",
-        "gbExpandNode", "gbSearch", "gbResetView", "gbToggleLayer",
-        # app.js 侧
-        "cardHtml", "escapeHtml", "renderDivergence", "divergenceBannerText",
-        "groupHerbsByRole", "herbGroupsHtml", "buildEvidenceIndex", "openEvidence",
-        "renderTriage", "demoModeText", "usageText", "switchTab",
-    ]
-    assert len(expected) >= 25
-    missing = [name for name in expected if f"{name}," not in script and f"{name}:" not in script]
-    assert not missing, f"window.TCM 的清单里缺这些：{missing}"
-    for name in expected:
-        assert f"function {name}" in script or f"async function {name}" in script, name
+def _defs(text: str) -> set[str]:
+    return set(re.findall(r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", text, re.M))
+
+
+def _calls(text: str) -> set[str]:
+    return set(re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", text))
+
+
+def _tcm_list(text: str) -> set[str]:
+    """从一份源码里抓 `window.TCM = Object.assign(...)` 挂上去的名字。"""
+    m = re.search(r"window\.TCM = Object\.assign\(window\.TCM \|\| \{\}, \{(.*?)\n\}\)",
+                  text, re.S)
+    if not m:
+        return set()
+    body = re.sub(r"//[^\n]*", "", m.group(1))          # 去注释
+    return {n for n in re.findall(r"[A-Za-z_$][\w$]*", body)}
+
+
+def test_the_dependency_between_the_two_files_goes_only_one_way():
+    """**graph.js 不许调用 app.js 的任何函数。**
+
+    R13 拆分时两边留下了双向的裸全局互调（graph.js 直接调 app.js 的 showError /
+    openEvidence / closeEvidence / escapeHtml / sleep），形成循环依赖——谁也不能单独
+    被理解或替换。R14 前把它断开：纯工具（escapeHtml/sleep）下沉到 graph.js，
+    宿主 UI（错误条、证据侧栏）改成 `setGraphHooks` 注入。
+    """
+    app, graph = _read("app.js"), _read("graph.js")
+    back_edges = sorted(_calls(graph) & _defs(app))
+    assert not back_edges, f"graph.js 反过来调了 app.js 的函数：{back_edges}"
+
+
+def test_the_tcm_list_equals_the_real_cross_file_call_set():
+    """**清单必须恰好等于真实跨文件调用集合，多一个少一个都红。**
+
+    R13 那版是手写的 33 个名字，而实测两边**对面一个都没用到**（app→graph 真实只有
+    5 个、graph→app 5 个，两份清单里 27 个名字纯属装饰）。于是那条"清单齐全"永远绿
+    ——删掉 `showError` 也绿，而浏览器里表现为"点了没反应、不报错"，正是 graph.js
+    自己的注释担心的那种事故。
+
+    所以判据改成**从源码算**：真实调用集合由 `_calls ∩ _defs` 得到，跟两份
+    `window.TCM` 清单的并集比较。手写清单和代码任何一边漂了，这条都会红。
+    """
+    app, graph = _read("app.js"), _read("graph.js")
+    real = (_calls(app) & _defs(graph)) | (_calls(graph) & _defs(app))
+    listed = _tcm_list(app) | _tcm_list(graph)
+    assert real, "一个跨文件调用都没算出来——多半是正则没跟上代码风格的变化"
+    assert listed == real, (
+        f"window.TCM 清单跟真实跨文件调用对不上。\n"
+        f"  清单里有、实际没人用：{sorted(listed - real)}\n"
+        f"  实际用了、清单里没有：{sorted(real - listed)}")
+
+
+def test_app_js_exports_nothing_and_registers_hooks_instead():
+    """依赖单向的落法：app.js 不往 window.TCM 上挂东西，改成把自己的 UI 注册进去。"""
+    app, graph = _read("app.js"), _read("graph.js")
+    assert _tcm_list(app) == set(), f"app.js 还在往 window.TCM 上挂：{sorted(_tcm_list(app))}"
+    assert "setGraphHooks({" in app and "onError: showError" in app
+    assert "function setGraphHooks" in graph
+    # 默认实现不能是静默空函数——出了错还是要有痕迹，静默才是最坏的情况
+    assert "console.error" in graph
+
+
+def test_the_hooks_are_really_wired_at_load_time_not_just_declared():
+    """静态断言只能证明 app.js 里写着 `setGraphHooks({...})`，证明不了它跑过。
+    会出事的形态是「注册语句被挪进某个没被调用的函数里」——源码上一模一样，
+    运行时 graph.js 报的错全落进 console.error 那个兜底，页面上什么都不显示。
+
+    所以把两份脚本按 index.html 的顺序真喂给 node，比对**函数身份**：注册跑过的话
+    `graphHooks.onError` 就是 app.js 那个 `showError` 本身。
+    刻意不去断言 `#error-box` 的文字——`DOM_STUB` 是个什么都接住的 Proxy，
+    故意不做成像样的 DOM（理由见 web_harness 的注释）；真实渲染归 Playwright 管。
+    """
+    tail = """
+console.log(JSON.stringify({
+  error: graphHooks.onError === showError,
+  open: graphHooks.onOpenEvidence === openEvidence,
+  close: graphHooks.onCloseEvidence === closeEvidence,
+}));
+"""
+    proc = subprocess.run(
+        ["node", js_tmp(DOM_STUB + load_app_js() + "\n" + tail)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, f"node 执行失败：\nstdout={proc.stdout}\nstderr={proc.stderr}"
+    out = json.loads(proc.stdout)
+    assert out == {"error": True, "open": True, "close": True}, f"钩子没在加载时注册：{out}"
 
 
 def test_css_carries_the_styles_that_used_to_be_inline():

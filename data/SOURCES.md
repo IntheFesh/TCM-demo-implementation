@@ -3260,3 +3260,67 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     起真实 uvicorn 而不是 `file://`——后者下 `/health` 注入身份色和拉额度全是 CORS
     错误，截出来的图跟线上不是一个东西；**页面里有任何 JS 错误就判失败**，
     一张"看起来还行"的截图掩盖不了控制台里的报错，而那正是 M5 那次真正出问题的地方）。
+
+56. **R14 第 0 项：把 R13 拆分留下的循环依赖断开，并补上三处"扫描范围没覆盖到"的漏网。**
+
+    **一、`window.TCM` 是装饰性的（结构性的那处）。** 两份清单手写了 33 个名字，
+    实测真实跨文件调用是 app→graph 五个（`gbApplyPhysicianWeighting` / `gbSearch` /
+    `hideTooltip` / `loadGraphBrowserData` / `renderGraph`）、graph→app 五个
+    （`closeEvidence` / `escapeHtml` / `openEvidence` / `showError` / `sleep`），
+    其中 27 个名字对面一个都没用到。于是 R13 那条"清单齐全"永远绿：删掉 `showError`
+    也绿，而浏览器里的表现是"点了没反应、控制台也不报错"。
+
+    **判据改成从源码算**：真实集合 = `_calls(A) ∩ _defs(B)`，断言它**恰好等于**两份
+    清单的并集，多一个少一个都红。手写清单和代码任何一边漂了都会被抓到。
+
+    **取舍：不是修清单，是断循环。** graph.js 反过来调 app.js 的 UI 函数构成双向依赖，
+    两个文件谁也不能单独被理解或替换——而 CLAUDE.md 的架构判据是"换实现时改的是一个类
+    还是整个模块"。断法按调用的性质分两类：纯工具（`escapeHtml` / `sleep`）**下沉**到
+    graph.js（工具没有 UI 归属，放底层两边都取得到，依赖方向自然单向）；宿主 UI
+    （错误条、证据侧栏）**注入**——graph.js 声明 `graphHooks` 三个钩子，app.js 在加载时
+    `setGraphHooks({onError: showError, ...})` 注册。**没有选"把 UI 函数也搬进 graph.js"**：
+    那是把两个文件合回一个，拆分就白做了。
+
+    钩子的默认实现刻意**不是静默空函数**，是 `console.error`——没注册时错误至少还有痕迹。
+    结果：`graph.js → app.js` 的调用集合为空集，app.js 不再往 `window.TCM` 上挂任何东西。
+
+    **静态断言证明不了注册跑过。** "注册语句被挪进一个没人调用的函数"这种形态源码字面
+    一模一样，运行时错误全落进 console.error 兜底。所以另加一条 node 里的**函数身份**
+    断言（`graphHooks.onError === showError`）。实测这个变异下静态那条 PASSED、
+    身份那条 FAILED——这就是它存在的理由。不去断言 `#error-box` 的文字：`DOM_STUB`
+    是个什么都接住的 Proxy，**故意**不做成像样的 DOM，真实渲染归 Playwright。
+
+    **二、颜色扫描的范围（两处小的里的第一处）。** R13 的"写死颜色"扫描只看 app.css，
+    于是 `index.html` 第 8 行内联 SVG favicon 里的旧模板蓝 `%233b5bdb` 活到了 R14
+    ——总纲第一部分点名要避开的那个蓝，显示在浏览器标签页上，比页面里任何一处都显眼。
+    改成青黛 `%232C5F5A`，扫描范围扩到 index.html。
+
+    扫描一扩开，当场又抓出**两个**：`#residual-note` 和 `#graph-note` 的 `style="..."`
+    属性里各写死了一个橙褐色。**真正的漏洞是"`style=` 属性不算内联样式"**——R13 的
+    `test_index_html_has_no_inline_script_or_style` 只查 `<style>` 块，两条断言各自都通过，
+    颜色就从这道缝里活下来。补一条：`style=` 属性里出现的任何颜色都必须是 `var(--令牌)`。
+    不禁止 `style=` 本身（排版微调留在结构文件里可读性更好）。两条角标搬进 app.css 后
+    统一走 `--caution`：它们回答同一个问题（这次结果有欠缺），原来那点色差是两次各写各的
+    留下的，不表示语义区别。
+
+    **三、字体版本浮动。** 四个 `@font-face` 写的是 `fontsource/...@latest`，而同一个项目里
+    cytoscape 钉死 3.30.2。上游一改版字形就变，**不报任何错**，只是上周的截图跟这周对不上，
+    而没人会想到是字体——这个项目对"两次跑出来的不一样"特别敏感（ε、fixture 回放、
+    截图对比全建立在"同样输入同样输出"上）。钉到 `@5.3.0`（`@fontsource/noto-serif-sc`
+    与 `@fontsource/noto-sans-sc` 的 npm `dist-tags.latest`，实测于 registry）。
+    ⏳ **待上机核**：沙盒到 cdn.jsdelivr.net 是 403，这四个 URL 没能真发一次请求；
+    联网的机器上跑一次 `scripts/screenshot_ui.py` 并看 network 面板确认 200。
+    退一步也不会出事：取不到就走 `font-display: swap` 落到系统栈（断网页面完整这条
+    R13 已验证过）。
+
+    **四、`--verified` 跟叶天士同值：不绑定，只写清楚。** 总纲 §2.1 原文是"有出处可核
+    （复用青黛）"，但叶天士的色现在从 `core/physicians.py` 注入、`--verified` 写死在 CSS，
+    将来会分叉。**没改成 `var(--ye)`**：语义色不该跟着某位医家走——哪天叶天士换色，
+    "有出处可核"这个语义没有任何理由跟着变，反过来也一样。处理方式是在那一行上面写明
+    "同值是巧合不是绑定，不要把它接起来"，并加一条断言钉住这句说明还在。
+
+    **五、验证。** 全套 **2366 → 2373**（+7：`test_css_tokens` 13→17、
+    `test_web_split` 8→11），6 skipped，ruff 干净，`min_length` 仍 31（`grep -c "= Field(min_length=1"`），
+    `--check` 退出码 0。四条新断言全部先红后绿，两条做了变异验证（人为把颜色写回
+    `style=` 属性 / 把注册语句挪进没人调用的函数），确认它们抓得住。
+    `scripts/screenshot_ui.py` 真浏览器跑通、零 pageerror——钩子注入没有把渲染改坏。

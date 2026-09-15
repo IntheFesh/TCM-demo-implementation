@@ -1,3 +1,47 @@
+// ---------- 底层：纯工具 + 宿主钩子 ----------
+//
+// **依赖方向只能是 app.js → graph.js，反过来不行。** R13 拆分时两边留下了双向的
+// 裸全局互调（graph.js 直接调 app.js 的 showError / openEvidence / closeEvidence /
+// escapeHtml / sleep），形成循环依赖：谁也不能单独被理解或替换，而 `window.TCM`
+// 那两份"公开清单"里 33 个名字**对面一个都没用到**，所以那条"清单齐全"的测试
+// 永远绿——删掉 showError 也绿，而浏览器里表现为"点了没反应、不报错"。
+//
+// 断开的办法分两类，按被调用的东西**是不是宿主的 UI** 来分：
+//
+//   纯工具（escapeHtml / sleep）：没有任何 UI 归属，搬到这一层来，两边都从这里取。
+//   宿主 UI（错误条、证据侧栏）：**不搬**——它们属于问诊页，图谱不该知道页面上
+//     有没有错误条。改成钩子：graph.js 只声明"出错时喊一声"，由 app.js 在启动时
+//     注册真正的实现。默认实现是无害的兜底（console + 无操作），所以 graph.js
+//     单独跑（node 测试、将来嵌到别的页面）也不会炸。
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function escapeHtml(str) {
+  // 引号也转：这个函数的输出偶尔会被放进属性值里（title="..."），只转尖括号
+  // 的话一个带引号的医案 id 就能从属性里逃出来。
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// 宿主钩子。默认值故意**不是空函数**：出了错还是要有痕迹，静默才是最坏的情况
+// （这正是循环依赖那条假测试造成的事故形状）。
+const graphHooks = {
+  onError: (message) => { console.error("[graph]", message); },
+  onOpenEvidence: () => {},
+  onCloseEvidence: () => {},
+};
+
+function setGraphHooks(hooks) {
+  Object.assign(graphHooks, hooks || {});
+}
+
 // ---------- C1：cytoscape 加载兜底 ----------
 //
 // 图谱库原来只从 cdnjs 取，没有本地副本。CDN 取不到时的真实表现是
@@ -537,7 +581,7 @@ function ensureCanvas() {
   });
   cy.on("tap", "node", (evt) => {
     const n = evt.target;
-    openEvidence(n.id());
+    graphHooks.onOpenEvidence(n.id());
     // M7：只有症状节点（层0）触发路径高亮——点其他层级的节点应该只是照旧
     // 打开证据侧栏，不应该顺带清空/改变当前的路径高亮状态（那样点一下证型
     // 节点看侧栏，画面上的高亮却跟着消失，会很意外）。
@@ -545,7 +589,7 @@ function ensureCanvas() {
   });
   cy.on("tap", (evt) => {
     if (evt.target === cy) {
-      closeEvidence();
+      graphHooks.onCloseEvidence();
       clearPathHighlight();
     }
   });
@@ -1000,7 +1044,7 @@ async function loadGraphBrowserData() {
 let growToken = 0; // 每次新的生长自增，旧的循环据此提前退出
 
 async function growGraph(graph, { animate = true } = {}) {
-  if (!(await ensureCytoscape())) { showError(CYTOSCAPE_MISSING_MSG); return; }
+  if (!(await ensureCytoscape())) { graphHooks.onError(CYTOSCAPE_MISSING_MSG); return; }
   // B1 的另一半：容器高度跟着医家数走。cy.fit() 最后会把全部内容按同一个
   // 缩放系数塞进 #cy，医家从两位变三位、内容纵向长了一半，容器还是 540px
   // 的话缩放系数就变大，节点上的字跟着变小。270 × 医家数：两位时算出来正好
@@ -1133,15 +1177,17 @@ let lastGraph = null;
 
 // ---------- 对外接口：window.TCM ----------
 //
-// index.html 里 graph.js 和 app.js 是两个 <script src>，**共用同一个全局作用域**，
-// 所以严格说不需要命名空间就能互相调用。仍然显式挂一份的理由是**可读性和可测性**：
-// 拆成两个文件之后，"哪些函数是给另一个文件用的"必须能一眼看出来，否则两边会
-// 越缠越紧、下次再拆就拆不动了。tests/test_web_split.py 把这份清单写死，
-// 少一个名字就红——那种改动在浏览器里表现为"点了没反应"，不报任何错。
+// **这份清单必须恰好等于 app.js 真正调用到的那些**，不多不少
+// （tests/test_web_split.py 从源码算出真实跨文件调用集合来比对——R13 那版是手写的
+// 33 个名字、对面一个都没用，那条测试等于没测）。
+// 反方向是空的：graph.js 不调用 app.js 的任何东西，宿主 UI 走 setGraphHooks 注入。
 window.TCM = Object.assign(window.TCM || {}, {
-  ensureCytoscape, computeLayout, buildStylesheet, growGraph, renderGraph,
-  replayGraph, skipAnimation, computeHighlightPath, applyPathHighlight,
-  clearPathHighlight, handleSymptomClick, describeNodeTooltip,
-  describeEdgeTooltip, showTooltip, hideTooltip, loadGraphBrowserData,
-  gbExpandNode, gbSearch, gbResetView, gbToggleLayer,
+  // app.js 用到的图谱侧函数
+  gbApplyPhysicianWeighting, gbSearch, hideTooltip, loadGraphBrowserData, renderGraph,
+  // 两边共用的纯工具（定义在这一层，见文件顶部的依赖方向说明）。
+  // sleep 不在清单里：搬过来之后只有 growGraph 用，app.js 一次都没调——
+  // 清单只列**对面真的用到的**，多列一个就是给"清单齐全"那条测试留一个假绿点。
+  escapeHtml,
+  // 宿主在启动时注册自己的 UI 实现
+  setGraphHooks,
 });

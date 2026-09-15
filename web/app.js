@@ -104,9 +104,6 @@ document.getElementById("gb-physician-select").addEventListener("change", (e) =>
 document.getElementById("gb-layer-toggle").addEventListener("click", gbToggleLayer);
 document.getElementById("gb-reset-btn").addEventListener("click", gbResetView);
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 // 节点 id -> 该节点对应的证据。图上只有 id 和 label，医家的 refs 在
 // data.results 里，点击时要能反查，所以每次响应回来先建一张索引。
@@ -1079,17 +1076,6 @@ function westernDrugsHtml(s3) {
   return `<div class="western-drugs"><b>参西用药</b>　${escapeHtml(drugs.join("、"))}</div>`;
 }
 
-function escapeHtml(str) {
-  // 引号也转：这个函数的输出偶尔会被放进属性值里（title="..."），只转尖括号
-  // 的话一个带引号的医案 id 就能从属性里逃出来。
-  if (str === null || str === undefined) return "";
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 function renderResults(results, mode = "researcher") {
   document.getElementById("results").innerHTML = results.map((r) => cardHtml(r, mode)).join("");
@@ -1607,10 +1593,14 @@ document.addEventListener("keydown", (e) => {
 });
 
 
-// ---------- 对外接口：window.TCM ----------
-// 理由见 graph.js 末尾同名的那一段。这边挂的是"问诊页渲染"这一侧的公开函数。
-window.TCM = Object.assign(window.TCM || {}, {
-  cardHtml, escapeHtml, renderDivergence, divergenceBannerText, injectPhysicianColors,
-  groupHerbsByRole, herbGroupsHtml, buildEvidenceIndex, openEvidence,
-  renderTriage, demoModeText, usageText, switchTab,
+// ---------- 把宿主 UI 注册给 graph.js ----------
+//
+// **app.js 不往 window.TCM 上挂任何东西。** 依赖方向是单向的：app.js → graph.js。
+// 图谱要用到问诊页的错误条和证据侧栏，走这三个钩子注入，而不是反过来直接调
+// app.js 的全局函数——那样两个文件谁也不能单独被理解或替换（R13 拆分时留下的
+// 循环依赖就是这个形状）。
+setGraphHooks({
+  onError: showError,
+  onOpenEvidence: openEvidence,
+  onCloseEvidence: closeEvidence,
 });

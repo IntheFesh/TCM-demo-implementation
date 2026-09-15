@@ -50,12 +50,59 @@ def test_the_token_values_match_the_design_doc(css):
         assert re.search(rf"{name}:\s*{value}", css, re.I), f"{name} 不是 {value}"
 
 
+def test_verified_is_documented_as_coincidentally_equal_to_ye_tianshi(css):
+    """`--verified` 跟叶天士同值（总纲 §2.1："复用青黛"），但叶天士的色现在从
+    `core/physicians.py` 注入、`--verified` 写死在 CSS——**将来会分叉**。
+
+    **不改成绑定**：语义色不该跟着某位医家走。哪天叶天士换个色，"有出处可核"这个
+    语义没有任何理由跟着变；反过来也一样。所以处理方式是在那一行写清楚"同值是巧合
+    不是绑定"，让下一个看到这里的人不会顺手把它们接起来。
+    """
+    line = next(ln for ln in css.splitlines() if "--verified:" in ln)
+    assert "巧合" in line or "不是绑定" in line, f"那一行没说明同值的性质：{line.strip()}"
+
+
 def test_no_hard_coded_colour_outside_root_and_font_face(body):
     """**全部颜色只在 :root 里定义一处。** 散落在规则里的十六进制值没有任何人能
     回答"这个灰跟那个灰是不是同一件事"——而那正是"色只承担语义"（§7 第 7 条）
     唯一可执行的落法。R13 拆分前这个文件里有 62 个。"""
     found = HEX.findall(body)
     assert not found, f"规则里还有写死的颜色：{sorted(set(found))}"
+
+
+def test_no_hard_coded_colour_in_the_html_either():
+    """**扫描范围包括 index.html。** R13 只扫了 app.css，于是第 8 行那个内联 SVG
+    favicon 里的旧模板蓝 `%233b5bdb` 一路留到了 R14——而那正好是总纲第一部分点名
+    要避开的那个蓝，出现在浏览器标签页上，比页面里任何一处都显眼。
+
+    HTML 里的颜色必须是总纲里的值（favicon 是内联 data URI，没法引用 CSS 变量，
+    所以这里只能比对"是不是总纲定义过的颜色"，不能像 CSS 那样要求零十六进制）。
+    """
+    html = load_html()
+    allowed = {"#2C5F5A", "#9C6B16", "#8A4736", "#F2F3EF", "#1E211C", "#B3261E"}
+    found = {m.upper().replace("%23", "#") for m in re.findall(r"(?:%23|#)[0-9a-fA-F]{6}", html)}
+    extra = found - allowed
+    assert not extra, f"index.html 里有总纲之外的颜色：{sorted(extra)}"
+    assert "3B5BDB" not in "".join(found), "旧模板蓝还在（总纲第一部分点名要避开它）"
+
+
+def test_inline_style_attributes_carry_no_colour_of_their_own():
+    """**颜色藏在 `style="..."` 属性里才是上一条漏掉两个色值的真正原因。**
+    R13 的 `test_index_html_has_no_inline_script_or_style` 只查 `<style>` 块，
+    `style=` 属性不算内联样式；而 `test_no_hard_coded_colour_*` 只扫 app.css。
+    两条断言各自都通过，两条角标的橙和褐就从这道缝里活了下来。
+
+    这里不禁止 `style=` 本身（排版微调放在结构文件里可读性更好），只禁止它带
+    自己的颜色：属性里出现的任何颜色都必须是 `var(--令牌)`。
+    """
+    html = load_html()
+    decls = re.findall(r'style="([^"]*)"', html)
+    offenders = []
+    for decl in decls:
+        for prop, value in re.findall(r"([a-z-]*(?:color|background)[a-z-]*)\s*:\s*([^;]+)", decl):
+            if "var(--" not in value:
+                offenders.append(f"{prop}: {value.strip()}")
+    assert not offenders, f"内联 style 属性里写死了颜色：{offenders}"
 
 
 def test_identity_colours_are_not_written_into_the_css(css, body):
@@ -137,6 +184,21 @@ def test_webfonts_have_a_system_fallback_and_swap(css):
     for face in faces:
         assert "font-display: swap" in face, face[:80]
     assert "Songti SC" in css and "PingFang SC" in css, "字体栈里要有系统兜底"
+
+
+def test_webfont_urls_are_pinned_to_a_version(css):
+    """**字体版本不许浮动。** 同一个项目里 cytoscape 钉死 3.30.2 且有本地 vendor 兜底，
+    字体却写 `@latest` —— 上游一改版字形就变，而这个项目对"两次跑出来的不一样"
+    特别敏感（ε、fixture 回放、截图对比都建立在"同样输入同样输出"上）。
+
+    字形变了不会报任何错，只会让上周的截图跟这周的对不上，而没人会想到是字体。
+    """
+    urls = re.findall(r'src:\s*url\("([^"]+)"\)', css)
+    assert urls, "一个 @font-face 的 URL 都没抓到"
+    floating = [u for u in urls if "@latest" in u or "/latest/" in u]
+    assert not floating, f"字体 URL 版本浮动：{floating}"
+    for url in urls:
+        assert re.search(r"@\d+\.\d+\.\d+", url), f"URL 里没有具体版本号：{url}"
 
 
 def test_reduced_motion_is_respected(css):
