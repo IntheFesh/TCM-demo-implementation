@@ -211,10 +211,23 @@ def test_export_include_out_of_scope_keeps_them_but_warns(capsys):
     assert "--include-out-of-scope" in err and "默认是排除的" in err
 
 
-def test_export_cli_has_the_out_of_scope_flag_and_wires_it():
+def test_export_cli_now_filters_by_scope_instead():
+    """R18-G **有意的契约变更**：门类过滤从"整本书的布尔标记 + 默认排除"
+    换成"按一例的 scope + 默认不排"。
+
+    原断言是 `"include=args.include_out_of_scope" in src`。改的理由有两层：
+      1. 默认排除会让王云启 77 例（全肿瘤）和李可 55/57 例进不了训练集——
+         R18-B/C 白写；
+      2. `out_of_scope` 的粒度是**整本书**，李可那 57 例里有 2 例不是肿瘤，
+         一刀切会把那 2 例一起切掉。`scope` 的粒度是**一例**，能留下它们。
+    `filter_out_of_scope` 这个函数本身**没有删也没有改**（它的单元测试原样
+    通过），只是 CLI 不再调它；要按门类排除用 --exclude-scope oncology。
+    """
     src = (Path(__file__).resolve().parent.parent / "offline" / "export_sft.py").read_text(encoding="utf-8")
+    assert '"--exclude-scope"' in src
+    assert "filter_by_scope(cases, exclude_scopes)" in src
+    # 旧开关留着、但已是 no-op
     assert '"--include-out-of-scope", action="store_true"' in src
-    assert "include=args.include_out_of_scope" in src
 
 
 @pytest.mark.parametrize("safe_name", list(ORIGINAL_NAMES))

@@ -18,10 +18,13 @@
     其余 LLMError 记下块号、支持 --only-blocks 重跑那几块；每 PROGRESS_EVERY
     块落盘一次。
 
-产出文件放 data/ 下（data/materia_medica.jsonl、data/formulary.jsonl），跟
-data/case_triples.jsonl 一样是"在有真实 LLM 的机器上生成的产物"，不进版本
-控制（.gitignore 只给 data/standard/*.jsonl 开了例外，那是人工整理的静态表，
-见 CLAUDE.md「已知的坑」）。
+产出文件落 **data/standard/** 下（data/standard/materia_medica.jsonl、
+data/standard/formulary.jsonl），**进版本控制**——这是 R18-F 改的。
+理由：这两份是 10248 + 3737 条带 source_span 的三元组，在 AutoDL 上跑一次要
+几个小时和一笔 token 钱，而且重跑得到的不是同一份文件（真实 LLM 抽取）。
+不进版本控制等于"这份数据只存在于一台机器上"。路径由 core.data_paths 决定，
+这里不写死；`.gitignore` 对 `*.jsonl` 整体忽略、只给 `data/standard/*.jsonl`
+开了例外（CLAUDE.md「已知的坑」里那条已经踩过两次），所以必须落在那个目录。
 
 用法：
     python -m offline.extract_materia_medica --input books/xxx.txt --source classic --book 神农本草经
@@ -38,6 +41,7 @@ from typing import Callable
 
 from pydantic import BaseModel
 
+from core.data_paths import pharmacology_write_path
 from core.llm import LLMError, LLMTruncatedError, get_llm, load_prompt, render
 from core.progress import Progress
 from core.schemas import (
@@ -130,14 +134,14 @@ KINDS: dict[str, ReferenceKind] = {
         prompt="s6_extract_materia_medica",
         extraction=MateriaMedicaExtraction,
         record=MateriaMedicaRecord,
-        default_out=ROOT / "data" / "materia_medica.jsonl",
+        default_out=pharmacology_write_path("materia_medica"),
     ),
     "formulary": ReferenceKind(
         name="formulary",
         prompt="s7_extract_formulary",
         extraction=FormularyExtraction,
         record=FormularyRecord,
-        default_out=ROOT / "data" / "formulary.jsonl",
+        default_out=pharmacology_write_path("formulary"),
     ),
 }
 

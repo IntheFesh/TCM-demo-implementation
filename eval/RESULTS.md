@@ -152,7 +152,8 @@ E2 曾被口头引用成「lineage 0.420 vs cross 0.569，逐条成立 5/9」。
 | ε_online p95 | 0.7857 | 0.8571（表里写作 0.857） |
 | ε 三段 LLM 调用数 | 212 | 215 |
 | SDT Test chain | 23.173 / 50 | 22.833（对照：baseline 22.068、修复前 chain 21.702） |
-| 药理层抽取产出 | 本草 10248 条 / 方剂 3737 条 | 无旧值（这一层是阶段二新增） |
+| 药理层抽取产出 | 本草 10248 条 | 无旧值（这一层是阶段二新增）。R18-F 起有凭据键 `pharmacology.n_materia_medica`，⏳ 两个 jsonl 还没从 AutoDL 提交进来 |
+| 药理层抽取产出 | 方剂 3737 条 | 同上，凭据键 `pharmacology.n_formulary` |
 
 **两列不可直接相减**（换了模型），所以不写"ε 降低了 0.02""SDT 涨了 0.34"这种话。
 SDT 那一行同一列内部是可比的：23.173 跟 22.068 的 baseline 差 1.105，但那个
@@ -161,6 +162,11 @@ baseline 也是 deepseek-chat 跑的——要说"新模型下 chain 仍然高于
 
 **把它们变成凭据要做的事**（两步，做完 `--check` 就自动核它们）：
 
+0. 把 AutoDL 上的 `data/materia_medica.jsonl` / `data/formulary.jsonl` 挪到
+   `data/standard/` 下提交进来（R18-F 把落盘路径改到了那儿，旧位置仍然可读）。
+   这两个文件一进来，`pharmacology.n_materia_medica` / `pharmacology.n_formulary`
+   两个凭据键就自动生效——「10248 / 3737」这两个数至今是**手抄**的，
+   而这个项目手抄数字漂过三次。
 1. 把 AutoDL 上的 `eval/epsilon.json` 和 `eval/sdt/test_run_log.jsonl` 提交进来；
 2. 跑 `python -m scripts.collect_results --check`，它会**逐个点出**哪几个凭据记号
    对不上（预期是 #1 行的 `epsilon_online.mean` / `epsilon_online.p95` 和 #7 行的

@@ -1232,3 +1232,35 @@
   .rx-table input[type="number"], .gt-tooltip code {
     font-family: var(--font-num);
   }
+
+/* R18-I 参考医家：三列下面那一块折叠区。用的是跟三列同一套细线分隔、无卡片
+   的处理——它是同一份信息的旁证，做成卡片会让它看起来比三列更重要。 */
+#reference-physicians { margin: var(--s4) 0 0; }
+#reference-body { display: flex; flex-direction: column; gap: var(--s3); padding-top: var(--s2); }
+.ref-phys { border-top: 1px solid var(--rule-soft); padding-top: var(--s2); }
+.ref-head {
+  display: flex; align-items: baseline; gap: var(--s2);
+  border-left: 3px solid var(--rule); padding-left: var(--s2); margin-bottom: var(--s2);
+}
+.ref-name { font-family: var(--font-classic); font-size: 16px; color: var(--ink); }
+.ref-tag {
+  font-size: 11px; color: var(--muted); border: 1px solid var(--rule-soft);
+  border-radius: var(--r-sm); padding: 0 4px;
+}
+.ref-case { padding: var(--s2) 0; border-top: 1px dashed var(--rule-soft); }
+.ref-case:first-of-type { border-top: none; }
+.ref-case-head { display: flex; gap: var(--s2); align-items: baseline; margin-bottom: 2px; }
+.ref-case-id { font-family: var(--font-mono); font-size: 12px; color: var(--muted); }
+.ref-case-score, .ref-case-visit { font-family: var(--font-num); font-size: 12px; color: var(--muted); }
+.ref-line { font-size: 14px; line-height: 1.7; color: var(--ink); }
+.ref-label { color: var(--muted); margin-right: var(--s2); }
+/* 反药配对用 --caution 而不是 --danger：它不是"这次开错了药"，是"名家这样用过、
+   照搬要说明"。用朱砂会跟真正的危重拦截抢那一种红。 */
+.ref-incompat {
+  margin-top: 4px; padding: var(--s2); background: var(--caution-bg);
+  border-left: 2px solid var(--caution); border-radius: var(--r-sm);
+}
+.ref-pairs { font-family: var(--font-mono); font-size: 12px; color: var(--caution); margin-right: var(--s2); }
+.ref-note { font-size: 13px; line-height: 1.6; color: var(--ink-2); }
+.ref-empty { font-size: 13px; color: var(--muted); }
+.ref-error { color: var(--danger); }

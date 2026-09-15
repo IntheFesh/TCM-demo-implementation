@@ -77,6 +77,20 @@ class CaseRecord(VisitStructured):
     # 看标记。**不是从证型覆盖率自动推的**——那个数（assess_case_scope）给人看，
     # 决定由人写进 MANIFEST。
     out_of_scope: bool = False
+    # R18-G：这一例**讲的是哪个门类**（spleen_stomach / oncology / other，
+    # offline/extract_cases_li_ke.classify_scope 从正文判）。
+    #
+    # 跟上面的 out_of_scope **不是同一个问题**（CLAUDE.md 第 31 条的例外，
+    # 走例外必须写清区别）：
+    #   out_of_scope 回答「这本书整体要不要进训练集」——人工写在
+    #       data/local_corpora/MANIFEST.json 里，粒度是**整本书**；
+    #   scope 回答「这一例的病在哪个门类」——从这一例的正文判，粒度是**一例**。
+    # 李可那 57 例里有 2 例不是肿瘤，王云启 77 例全是肿瘤：整本书一刀切会把
+    # 那 2 例一起切掉，而按 scope 过滤能留下它们。合成一个字段就只能二选一。
+    #
+    # None = 没判过（叶天士/吴鞠通那批抽取脚本不产出这个字段），**不是
+    # "已判定为脾胃门"**——倒填一个猜的值会让 --exclude-scope 把没判过的也算进去。
+    scope: str | None = None
 
 
 # ---------- X3：医案三元组（S5 抽取，LLM 输出） ----------
@@ -221,6 +235,38 @@ class FormularyRecord(BaseModel):
     o: str = Field(min_length=1)
     source_span: str = Field(min_length=1)
     source: ReferenceSource
+    book: str = Field(min_length=1)
+
+
+# ---------- R18-D：《脾胃论》立论层（确定性抽取，不是 LLM 输出） ----------
+
+# 谓词受控，六选一，理由跟 CaseTriplePredicate 完全一样：不限定的话同一个关系
+# 会有好几种写法（「治以」/「治法」/「当用」），下游的字面匹配对同义词无能为力。
+#
+# 这一层**不是 LLM 抽的**，跟 MateriaMedicaRecord 那套（S6/S7 真实模型调用）
+# 分开看：产出文件落在 data/standard/ 下、要进版本控制，那就必须是任何人在任何
+# 机器上重跑都能字字相同的确定性转换——原文里「如脉缓……此湿胜，从平胃散」这类
+# 句式本身就是规整的条件-处置句，规则抽取够用，不需要模型，也就没有幻觉风险。
+# source_span 仍然强制：它是**逐字**从原文截的那一句，
+# offline/extract_rationale_pwl.py 落盘前核验 span 真的出现在原文里，
+# 核验不过的整条丢弃并计数。规则抽取不会编造 span，但会因为切句边界写错而
+# 截出一段原文里不存在的文字，这道核验拦的是那个。
+RationalePredicate = Literal["病机", "治法", "用方", "加药", "去药", "禁忌"]
+
+
+class RationaleRecord(BaseModel):
+    """写进 data/standard/rationale_pwl.jsonl 的一条立论三元组。
+
+    形状对齐 MateriaMedicaRecord（s/p/o/source_span/book），多一个 chapter：
+    《脾胃论》同一个论断在不同篇里的分量不同（「脾胃胜衰论」是主论，
+    「用药宜禁论」是禁忌专篇），丢掉篇名就没法说这条出自哪里。
+    """
+
+    s: str = Field(min_length=1)
+    p: RationalePredicate
+    o: str = Field(min_length=1)
+    source_span: str = Field(min_length=1)
+    chapter: str = Field(min_length=1)
     book: str = Field(min_length=1)
 
 

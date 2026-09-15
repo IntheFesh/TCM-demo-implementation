@@ -53,6 +53,11 @@ ARCHIVE_2026_09_12 = "archive/2026-09-12"
 # 图谱规模的来源不在 eval/ 下。写成相对 eval/ 的路径而不是另起一套机制：
 # 凭据记号里的文件名要能让人直接去开那个文件。
 GRAPH_JSON = "../data/graph.json"
+# R18-F：药理层两个文件从 data/ 挪进 data/standard/（进版本控制）之后，
+# 「本草 10248 条 / 方剂 3737 条」这两个数第一次有了可机读的凭据——
+# 之前它们只写在 RESULTS.md 的表格里、是手抄的（这个项目手抄数字漂过三次）。
+MATERIA_MEDICA_JSONL = "../data/standard/materia_medica.jsonl"
+FORMULARY_JSONL = "../data/standard/formulary.jsonl"
 
 
 def _load_json(path: Path):
@@ -231,6 +236,12 @@ EVIDENCE: dict[str, tuple[str, object]] = {
         EPSILON_JSON, lambda d: _strat(d)["n_floor_above_global"]),
     "epsilon.stratification.max_over_global": (
         EPSILON_JSON, lambda d: _strat(d)["max_over_global"]),
+    #
+    # 盲区三（R18-F 补的）：**药理层规模**。两个文件在 R18-F 之前不进版本控制，
+    # 所以「10248 / 3737」在 RESULTS.md 里只能是手抄。挪进 data/standard/ 之后
+    # 它们跟 graph.json 同一个形状：来源是数据文件本身，不是 eval/ 下的 report。
+    "pharmacology.n_materia_medica": (MATERIA_MEDICA_JSONL, len),
+    "pharmacology.n_formulary": (FORMULARY_JSONL, len),
 }
 
 

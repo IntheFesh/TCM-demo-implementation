@@ -1,4 +1,5 @@
 """offline/export_sft.py 的离线测试：版权过滤、按字段是否为空决定是否生成对应任务样本。"""
+from core.safety_output import INCOMPATIBLE_TRAINING_NOTE
 from core.schemas import CaseRecord
 from offline.export_sft import filter_public_domain, to_samples
 
@@ -21,6 +22,8 @@ def _case(**overrides) -> CaseRecord:
     )
     base.update(overrides)
     return CaseRecord(**base)
+
+
 
 
 def test_filter_public_domain_excludes_copyrighted():
@@ -158,10 +161,42 @@ def test_main_chain_format_writes_samples_and_excludes_incompatible(tmp_path, ca
     export_sft.main(["--format", "chain", "--cases-path", str(cases_path),
                      "--triples-path", str(tmp_path / "missing.jsonl"), "--out", str(out)])
     lines = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
-    assert [s["meta"]["case_id"] for s in lines] == ["ye_tianshi-001"]
+    # R18-G **有意的契约变更**：含反药配伍的医案默认不再被排除。
+    # 原断言是 == ["ye_tianshi-001"]（like-001 被排掉）。改的理由：按原默认，
+    # 李可 57 例里的 21 例和王云启的肿瘤例全部进不来，R18-B/C 两个抽取脚本
+    # 贡献的样本数是 0。带上它们的代价由链末那一步「配伍提示」补偿
+    # （见下面那条断言），要回到原行为传 --exclude-incompatible（另有一条测试钉它）。
+    assert [s["meta"]["case_id"] for s in lines] == ["ye_tianshi-001", "like-001"]
+    like = next(s for s in lines if s["meta"]["case_id"] == "like-001")
+    assert like["chain"][-1]["step"] == "配伍提示"
+    assert like["chain"][-1]["output"] == INCOMPATIBLE_TRAINING_NOTE
+    assert like["meta"]["has_incompatible_pair"] is True
     captured = capsys.readouterr()
     assert "rationale 都会是 None" in captured.err
-    assert "链路样本数：1" in captured.out
+    # 同一处契约变更的另一端：样本数 1 → 2。
+    assert "链路样本数：2" in captured.out
+    assert "配伍提示步：1 条" in captured.out
+
+
+def test_main_chain_format_exclude_incompatible_restores_the_old_behaviour(tmp_path, capsys):
+    """R18-G 把默认反过来了，原来的行为要仍然拿得到——否则"改默认"就变成了
+    "删功能"。这一条钉住 --exclude-incompatible 排掉那一例、也不再有配伍提示步。"""
+    import json
+    from offline import export_sft
+
+    rows = [
+        _case().model_dump(),
+        _case(case_id="like-001", case_group_id="like-001", has_incompatible_pair=True).model_dump(),
+    ]
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "chain.jsonl"
+    export_sft.main(["--format", "chain", "--cases-path", str(cases_path),
+                     "--triples-path", str(tmp_path / "missing.jsonl"),
+                     "--out", str(out), "--exclude-incompatible"])
+    lines = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert [s["meta"]["case_id"] for s in lines] == ["ye_tianshi-001"]
+    assert "配伍提示步：0 条" in capsys.readouterr().out
 
 
 def test_to_samples_generates_all_four_tasks_when_fields_present():

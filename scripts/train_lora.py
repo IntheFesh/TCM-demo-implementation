@@ -40,7 +40,12 @@ import json
 import sys
 from pathlib import Path
 
-from core.physicians import PHYSICIANS, physician_choices_text, resolve_physician_id
+from core.physicians import (
+    PHYSICIANS,
+    physician_choices_text,
+    physicians_all,
+    resolve_physician_id,
+)
 from offline.export_sft import ITEMIZED_STEPS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -316,6 +321,13 @@ def format_plan_text(plan: dict, bases: list[dict]) -> str:
             f" → {job['out_dir']}")
         if job["unlabeled"]:
             lines.append(f"    ⚠ {job['unlabeled']} 条样本没有 split 标记，已算进 train")
+        if job["train"] == 0:
+            # R18-H：注册表从两位扩到五位之后，李可/王云启在 cases.json 里
+            # 还没有条目时 train 会是 0。**必须在计划里就喊出来**：不喊的话
+            # 五个 adapter 目录照样建出来，其中两个是空训练，看目录看不出区别。
+            lines.append("    ⚠ train 为 0：这位医家在这份样本里没有任何条目，"
+                         "训不出 adapter。先跑 offline/extract_cases_* 把他的医案"
+                         "抽进 cases.json，再跑 offline/export_sft --format chain")
         if job["heldout"] == 0:
             lines.append("    ⚠ heldout 为 0：这个 adapter 的过拟合不可观测，"
                          "训出来不要拿去报数字")
@@ -401,7 +413,38 @@ def train_one(base: dict, physician_id: str, samples: list[dict], out_dir: Path,
     return gap_report(train_loss, heldout_loss, baseline)
 
 
-def main(argv: list[str] | None = None) -> None:
+def report_deps() -> bool:
+    """训练依赖装没装。**逐个报**而不是笼统说"环境不对"：这台机器上
+    torch/transformers 装了、peft 没装，笼统报会让人重装一遍已经有的几个 G。
+
+    R18-H 的现状：沙盒里 peft 缺失，所以 train_one 跑不了，只有 --dry-run 和
+    --check-deps 能跑。这个函数就是那件事的**退出码**——不是在报告里写一句
+    "环境不支持"就算完了。
+    """
+    import importlib.util
+
+    need = {
+        "torch": "pip install torch",
+        "transformers": "pip install transformers",
+        "peft": "pip install peft",
+        "accelerate": "pip install accelerate",
+    }
+    missing = []
+    for mod, how in need.items():
+        if importlib.util.find_spec(mod) is None:
+            missing.append((mod, how))
+            print(f"  ✗ {mod} 未安装 → {how}")
+        else:
+            print(f"  ✓ {mod}")
+    if missing:
+        print(f"\n缺 {len(missing)} 个依赖，train_one 跑不了（--dry-run / --check-deps "
+              f"仍然可跑）。一次装全：pip install -r requirements-train.txt")
+        return False
+    print("\n训练依赖齐了。")
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="按医家训 LoRA（阶段五 M16）。两个基座都能跑，并列出对照。")
     ap.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES_PATH,
@@ -422,7 +465,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--dry-run", action="store_true",
                     help="只打计划和第一条渲染好的样本，不加载模型、不训练")
+    ap.add_argument("--check-deps", action="store_true",
+                    help="只检查训练依赖装没装（peft/transformers/torch/accelerate），"
+                         "缺哪个就报哪个，退出码非 0。不加载模型、不读样本")
     args = ap.parse_args(argv)
+
+    if args.check_deps:
+        return 0 if report_deps() else 1
 
     base_keys = args.base or sorted(BASES)
     if args.base_model and len(base_keys) != 1:
@@ -430,7 +479,11 @@ def main(argv: list[str] | None = None) -> None:
     bases = [resolve_base(k, args.base_model) for k in base_keys]
 
     if args.physician == "all":
-        physician_ids = sorted(PHYSICIANS)
+        # 用 physicians_all 而不是 physicians_enabled：训练是"给每位**登记**的
+        # 医家各训一个 adapter"，跟"这一次问诊出场哪几位"是两件事。enabled=False
+        # 的医家也该有 adapter——正是因为还没训出来才没开。
+        # 有语料才训得出来这件事由 build_plan 的 train=0 警示负责，不在这里拦。
+        physician_ids = sorted(physicians_all(PHYSICIANS))
     else:
         pid = resolve_physician_id(args.physician)
         if pid is None:
@@ -442,14 +495,20 @@ def main(argv: list[str] | None = None) -> None:
     print(format_plan_text(plan, bases))
 
     if args.dry_run:
+        if not samples:
+            print("\n--dry-run：样本文件是空的，没有可渲染的样本。"
+                  "先跑 python -m offline.export_sft --format chain")
+            return 1
         first = render_example(samples[0])
         print("\n第一条样本渲染后（prompt / completion，出处 id 不进 completion）：")
         print("--- prompt ---")
         print(first["prompt"])
         print("--- completion ---")
         print(first["completion"])
-        print("\n--dry-run：没有加载模型，没有训练。")
-        return
+        print("\n--dry-run：没有加载模型，没有训练。**没有检查的事**："
+              "基座仓库 id 能不能拉下来、显存够不够、peft 装没装"
+              "（后者跑 --check-deps）。")
+        return 0
 
     reports = []
     for base in bases:
@@ -467,7 +526,8 @@ def main(argv: list[str] | None = None) -> None:
     print("\n这张表只说明「哪个基座在 heldout 上 loss 更低」。**loss 不是靶子**："
           "训完要按 eval/RESULTS.md 的口径重跑 ε/E3/E4/E8/E9/SDT/MES，"
           "并**并列**报在 DeepSeek 那组数旁边（不是覆盖）。")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

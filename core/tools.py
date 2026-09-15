@@ -32,6 +32,7 @@ from typing import Callable
 
 from pydantic import BaseModel, Field
 
+from core.data_paths import pharmacology_read_path, pharmacology_read_path_or_canonical
 from core.graph.store import NetworkXStore
 from core.herbs import normalize_herb
 from core.physicians import physician_choices_text, resolve_physician_id
@@ -46,9 +47,11 @@ STANDARD_PATH = ROOT / "data" / "standard" / "syndromes.jsonl"
 # 就跟凭空生成的没区别，防幻觉链条在工具这一层断掉。
 CASE_TRIPLES_PATH = ROOT / "data" / "case_triples.jsonl"
 # 总纲 2.2/2.4d：药理层三元组（offline/extract_materia_medica.py 产出，一行一条
-# {s, p, o, source_span, source, book}，source 是 classic/modern）。跟
-# case_triples.jsonl 一样是在有真实 LLM 的机器上生成的产物，不进版本控制。
-MATERIA_MEDICA_PATH = ROOT / "data" / "materia_medica.jsonl"
+# {s, p, o, source_span, source, book}，source 是 classic/modern）。
+# R18-F 起它**进版本控制**（挪到 data/standard/ 下，见 core/data_paths.py 的
+# 模块文档字符串）；旧位置 data/materia_medica.jsonl 仍然可读，因为 AutoDL 上
+# 那台机器已经有一份。路径解析不在这里写死，走 core.data_paths 那一处。
+MATERIA_MEDICA_PATH = pharmacology_read_path_or_canonical("materia_medica")
 
 
 # ---------- 惰性单例（模块顶层不加载任何文件） ----------
@@ -138,6 +141,22 @@ def _load_case_triples() -> list[dict] | None:
         return _case_triples
 
 
+def _materia_medica_path() -> Path | None:
+    """这一次要读哪个文件。
+
+    两件事都要成立，所以不能只写一句：
+      - `MATERIA_MEDICA_PATH` **可被覆盖**（测试 monkeypatch 它指到 tmp_path，
+        部署也可能把它指到别处）。直接调 `pharmacology_read_path()` 会让那个
+        覆盖失效——覆盖失效不报错，只是静默读了另一份文件，最难查的一类。
+      - 文件可能在 import 之后才生成（run_onsite.sh 段 5 落盘、服务先起来）。
+        只用 import 时算好的常量会永远读不到新文件。
+    回退顺序本身仍然只有一处实现（core.data_paths），这里只加"覆盖优先"。
+    """
+    if MATERIA_MEDICA_PATH.exists():
+        return MATERIA_MEDICA_PATH
+    return pharmacology_read_path("materia_medica")
+
+
 def _load_materia_medica() -> list[dict] | None:
     """None = 文件还没生成；坏行记成 {"_bad_line": n} 不中断——跟
     _load_case_triples 同一套处理，理由也一样（机器生成的文件一行坏了不该让
@@ -148,11 +167,12 @@ def _load_materia_medica() -> list[dict] | None:
     with _load_lock:
         if _materia_medica is not None:
             return _materia_medica
-        if not MATERIA_MEDICA_PATH.exists():
+        path = _materia_medica_path()
+        if path is None:
             return None
         rows = []
         for lineno, line in enumerate(
-            MATERIA_MEDICA_PATH.read_text(encoding="utf-8").splitlines(), 1
+            path.read_text(encoding="utf-8").splitlines(), 1
         ):
             line = line.strip()
             if not line:

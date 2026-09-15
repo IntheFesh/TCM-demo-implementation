@@ -10,6 +10,9 @@ let PHYSICIAN_NAMES = {};
 // 数据、同一个来源（core/physicians.py → /health → injectPhysicianColors），
 // 不在前端另抄一张表：注册表加第四位医家时这里自动跟上。
 let PHYSICIAN_META = {};
+// R18-I：注册表里 enabled=false 的那几位（李可、王云启）。由 injectPhysicianColors
+// 从 /health 算出来，同时决定「参考医家」那一栏列谁、三列**不**列谁。
+let REFERENCE_PHYSICIANS = [];
 
 // 首屏三条示例主诉。同样从 /health 下发（core/examples.py），不写死在这里——
 // DEMO.md 和录制清单里已经各有一份，第三份副本漂一个标点就是演示当场 LLMError。
@@ -537,6 +540,10 @@ const PHYSICIAN_CSS_ALIAS = { ye_tianshi: "ye", wu_jutong: "wu", zhang_xichun: "
 
 function injectPhysicianColors(physicians) {
   if (!Array.isArray(physicians)) return;
+  // R18-I：谁算「参考医家」由注册表的 enabled 说了算，前端不列名单。
+  REFERENCE_PHYSICIANS = physicians
+    .filter((p) => p && p.id && p.enabled === false)
+    .map((p) => p.id);
   const root = document.documentElement;
   for (const p of physicians) {
     if (!p || !p.id) continue;
@@ -1370,8 +1377,16 @@ function renderRxCompare(divergence, results) {
 // 三列的**列表**不依赖结果：还没有结果时也要摆出三列（表头着色靠 /health 下发的
 // 身份色，不用等问诊回来）。顺序按 PHYSICIAN_META 的键序——那是 /health 下发的
 // 顺序，而 /health 遍历的是 PHYSICIANS 注册表，跟后端 results 的顺序是同一个。
+//
+// **只算 enabled 的那几位。** R18-A 把注册表从三位扩到五位（加了李可、王云启，
+// 两位 enabled=false 的参考医家），而 /health 下发的是**全部**五位——前端得知道
+// 李可存在才画得出「参考医家」那一栏。这里不过滤的话非终态会摆出五列，其中两列
+// 永远停在"辨证中"，因为后端集注只跑 physicians_enabled 那三位。
+// Playwright 实测就是这么发现的：running/insufficient/followup 三个状态的
+// 「不是三列，是 5」。纯函数测试测不出来——它们要么不调这个函数，要么自己喂
+// 一份三人的 PHYSICIAN_META。
 function physicianOrder() {
-  return Object.keys(PHYSICIAN_META);
+  return Object.keys(PHYSICIAN_META).filter((pid) => !REFERENCE_PHYSICIANS.includes(pid));
 }
 
 // S1/S2 是全局跑一次、三列共用的（CLAUDE.md：S1 全局只跑一次），所以三列的前两步
@@ -1640,6 +1655,102 @@ function westernDrugsHtml(s3) {
 }
 
 
+// ---------- R18-I：参考医家（enabled=false 的那几位） ----------
+//
+// 谁算「参考医家」不由前端判断，读 /health 下发的 enabled 字段
+// （源头 core/physicians.py → physicians_all）。前端自己列一份名单就是第二处实现，
+// 注册表里开/关一位医家时这份名单不会跟着变（CLAUDE.md 第 31 条）。
+// 声明在文件顶部（跟 PHYSICIAN_META 一起）：physicianOrder() 要用它过滤三列，
+// 而那个函数在这一段之前定义——`let` 的 TDZ 会让"先调用后声明"直接抛。
+// 哪些查看模式显示这一栏。患者模式不显示（不该看到不参与结论的医案），
+// 医生模式不显示（版面留给可编辑处方）。
+const REFERENCE_ROLES = ["student", "researcher"];
+
+function referenceCaseHtml(c) {
+  const parts = [];
+  parts.push(`<div class="ref-case-head">`
+    + `<span class="ref-case-id">${escapeHtml(c.case_id || "")}</span>`
+    + `<span class="ref-case-score">相似度 ${escapeHtml(String(c.score ?? ""))}</span>`
+    + (c.visit_index ? `<span class="ref-case-visit">第 ${escapeHtml(String(c.visit_index))} 诊</span>` : "")
+    + `</div>`);
+  const line = (label, val) => val
+    ? `<div class="ref-line"><span class="ref-label">${label}</span>${escapeHtml(val)}</div>` : "";
+  parts.push(line("证型", c.syndrome));
+  parts.push(line("治法", c.treatment_principle));
+  parts.push(line("方", c.formula));
+  if (Array.isArray(c.herbs) && c.herbs.length) {
+    parts.push(line("药", c.herbs.join("、")));
+  }
+  // 反药配对**只在真有的时候**才出现，并且原样显示后端给的那句话
+  // （core/safety_output.INCOMPATIBLE_TRAINING_NOTE，跟训练样本里的逐字相同）。
+  // 前端不自己拼这句话：拼了就是界面在替模型背书它没学过的话。
+  if (Array.isArray(c.incompatible_pairs) && c.incompatible_pairs.length) {
+    parts.push(`<div class="ref-incompat">`
+      + `<span class="ref-pairs">${escapeHtml(c.incompatible_pairs.join("、"))}</span>`
+      + `<span class="ref-note">${escapeHtml(c.note || "")}</span></div>`);
+  }
+  return `<div class="ref-case">${parts.join("")}</div>`;
+}
+
+function referenceBlockHtml(pid, data) {
+  const meta = (data && data.physician) || {};
+  const name = meta.name || PHYSICIAN_NAMES[pid] || pid;
+  // 身份色走 CSS 变量，不把 /api 返回的色值直接写进 style——变量由
+  // injectPhysicianColors 从同一份注册表注入，两条路会漂。
+  const head = `<div class="ref-head" style="border-left-color: var(--phys-${pid})">`
+    + `<span class="ref-name">${escapeHtml(name)}</span>`
+    + `<span class="ref-tag">参考</span></div>`;
+  // 三种"空"分开说，跟后端 search_cases 的三分法一一对应（SOURCES.md 第 31 条）：
+  // 参数错 / 数据文件不存在 / 真没匹配。一律显示"没有结果"会把三件事混成一件。
+  if (data && data.error) {
+    return `<div class="ref-phys">${head}<div class="ref-empty ref-error">${escapeHtml(data.error)}</div></div>`;
+  }
+  if (data && data.available === false) {
+    return `<div class="ref-phys">${head}<div class="ref-empty">语料未就绪：${escapeHtml(data.note || "")}</div></div>`;
+  }
+  const cases = (data && data.cases) || [];
+  if (!cases.length) {
+    return `<div class="ref-phys">${head}<div class="ref-empty">${escapeHtml((data && data.note) || "没有相似度达标的医案")}</div></div>`;
+  }
+  return `<div class="ref-phys">${head}${cases.map(referenceCaseHtml).join("")}</div>`;
+}
+
+function hideReferencePhysicians() {
+  const box = document.getElementById("reference-physicians");
+  if (!box) return;
+  box.hidden = true;
+  const body = document.getElementById("reference-body");
+  if (body) body.innerHTML = "";
+}
+
+// 拉取并渲染。**独立于 /api/consult**：集注是分钟级的 LLM 调用，检索是毫秒级的，
+// 合在一起会让这一栏跟着三列一起等。
+async function renderReferencePhysicians(complaint, role) {
+  const box = document.getElementById("reference-physicians");
+  const body = document.getElementById("reference-body");
+  if (!box || !body) return;
+  if (!REFERENCE_ROLES.includes(role) || !REFERENCE_PHYSICIANS.length || !complaint) {
+    hideReferencePhysicians();
+    return;
+  }
+  box.hidden = false;
+  body.innerHTML = `<div class="ref-empty">正在检索参考医家的医案…</div>`;
+  const blocks = [];
+  for (const pid of REFERENCE_PHYSICIANS) {
+    let data = null;
+    try {
+      const resp = await fetch("/api/reference_cases?complaint="
+        + encodeURIComponent(complaint) + "&physician=" + encodeURIComponent(pid));
+      data = resp.ok ? await resp.json() : { error: `接口返回 ${resp.status}` };
+    } catch (e) {
+      // 网络抛了要说出来：静默留空会让人以为这几位医家没有相似医案。
+      data = { error: "检索请求失败（服务未连接？）" };
+    }
+    blocks.push(referenceBlockHtml(pid, data));
+  }
+  body.innerHTML = blocks.join("");
+}
+
 function renderColumns(results, mode = "researcher") {
   document.getElementById("columns").innerHTML = results.map((r) => columnHtml(r, mode)).join("");
 }
@@ -1666,6 +1777,9 @@ function resetSecondaryPanels() {
   }
   renderSafetyFlag(null);
   renderTriage(null);
+  // 参考医案也归零：它是上一条主诉的检索结果，留着会跟新主诉的三列并排显示，
+  // 看起来像是这一次也检索出了这几条。
+  hideReferencePhysicians();
   const footer = document.getElementById("manifest-footer");
   if (footer) footer.textContent = "";
   // R14：对照带和分层读数也是"上一次问诊留下的东西"。不清的话，被拦截的
@@ -1842,6 +1956,9 @@ function renderConsultResult(data) {
     hidePatientView();
     renderColumns(data.results, getSelectedRole());
   }
+  // R18-I：参考医家那一栏不等三列、也不阻塞后面的渲染——它自己 fetch，
+  // 回来了再填。await 它会让图谱和追问提示跟着一次检索的往返延迟。
+  renderReferencePhysicians(LAST_COMPLAINT, getSelectedRole());
   renderFollowup(data.followup);
   renderGraph(data.graph);
 }

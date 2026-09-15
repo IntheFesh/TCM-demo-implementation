@@ -155,10 +155,21 @@ def is_modern_entry(block: str) -> bool:
     return _FIELD_LABEL_RE.search(block) is not None or _FUYAO_TITLE_RE.search(block) is not None
 
 
+def has_classic_dose(text: str) -> bool:
+    """这段文字里有没有古籍方药的剂量写法（「二钱」「一两五钱」）。
+
+    R18-D 的《脾胃论》篇名识别也要问这个问题——「黄丹二钱定粉舶上硫黄陀僧已上各
+    三钱轻粉少许」整行没有标点、长度也够短，不认剂量就会被当成篇名。抽成公开函数
+    而不是在那边另写一条正则（CLAUDE.md 第 31 条），_CLASSIC_DOSE_RE 本来就是
+    为《脾胃论》这类不带 <篇名> 标记的本子写的。
+    """
+    return _CLASSIC_DOSE_RE.search(text) is not None
+
+
 def is_classic_entry(block: str) -> bool:
     if _PIAN_LINE_RE.search(block) and _CLASSIC_BODY_RE.search(block):
         return True
-    return _CLASSIC_DOSE_RE.search(block) is not None
+    return has_classic_dose(block)
 
 
 # 按 EXPECTED_SOURCES 的 source 列取谓词。没有对应谓词的 source（切块验证的

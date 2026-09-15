@@ -50,6 +50,7 @@ PREFIX = {
     "student_highlight": "r15",
     "consult_graph": "r16", "browser_home": "r16", "browser_expanded": "r16",
     "topbar_byok": "r17", "demo_mode": "r17",
+    "reference_physicians": "r18",
 }
 
 
@@ -239,6 +240,42 @@ DONE_PAYLOAD = {
 }
 
 # 每种状态：截图文件名 + 把页面推进那个状态的 JS + 一条 DOM 断言（返回 null 表示通过）。
+# R18-I 的两个 fixture。医家列表带 enabled=false 两位——REFERENCE_PHYSICIANS
+# 就是从这个字段算出来的，写死一份名单在前端是第二处实现（CLAUDE.md 第 31 条）。
+REFERENCE_HEALTH = {
+    "physicians": [
+        {"id": "ye_tianshi", "name": "叶天士", "color": "#2C5F5A", "color_bg": "#E8EFEE",
+         "enabled": True},
+        {"id": "wu_jutong", "name": "吴鞠通", "color": "#9C6B16", "color_bg": "#F6EFE1",
+         "enabled": True},
+        {"id": "zhang_xichun", "name": "张锡纯", "color": "#8A4736", "color_bg": "#F4E9E5",
+         "enabled": True},
+        {"id": "li_ke", "name": "李可", "color": "#4A6B4E", "color_bg": "#E9EFE9",
+         "enabled": False},
+        {"id": "wang_yunqi", "name": "王云启", "color": "#5B5470", "color_bg": "#EBEAEF",
+         "enabled": False},
+    ],
+}
+
+# 一条带反药配对、一条不带——「只在真有的时候才出现」这件事要有对照才验得出来。
+REFERENCE_FIXTURE = [
+    ["li_ke", {"available": True, "physician": {"id": "li_ke", "name": "李可"}, "cases": [
+        {"case_id": "li_ke-014", "score": 0.72, "visit_index": 1,
+         "syndrome": "脾胃阳虚，寒湿内盛", "treatment_principle": "温阳散寒，健脾化湿",
+         "formula": "附子理中汤加减", "herbs": ["制附子", "干姜", "炙甘草", "海藻"],
+         "incompatible_pairs": ["炙甘草-海藻"],
+         "note": "【配伍提示】本例含十八反十九畏配伍，是名家在特定病情下的用法，"
+                 "不是常规配伍；照搬前须核对剂量、炮制与煎法，并说明用此配伍的理由。"},
+        {"case_id": "li_ke-021", "score": 0.61, "visit_index": 2,
+         "syndrome": "中气不足", "treatment_principle": "补中益气",
+         "formula": "补中益气汤", "herbs": ["黄芪", "党参", "白术", "陈皮"],
+         "incompatible_pairs": [], "note": None},
+    ]}],
+    ["wang_yunqi", {"available": True, "physician": {"id": "wang_yunqi", "name": "王云启"},
+                    "cases": [], "note": "该医家（wang_yunqi）医案中没有相似度达标的匹配项，已查 77 条医案"}],
+]
+
+
 STATES = {
     "first": (
         "renderExamples(EXAMPLE_COMPLAINTS); setConsultState('first');",
@@ -355,6 +392,49 @@ STATES = {
           }
           const chip = document.getElementById('quota-chip');
           if (!chip.classList.contains('q-degraded')) return '额度 chip 没走 degraded 档';
+          return null;
+        }""",
+    ),
+    # ---- R18-I：参考医家那一栏 ----
+    #
+    # 它是**真实浏览器里唯一能验的那件事**：REFERENCE_PHYSICIANS 从 /health 的
+    # enabled 字段来、身份色走 CSS 变量、反药提示只在真有的时候出现。
+    # 纯函数测试（tests/test_reference_physicians_ui.py）验的是 HTML 字符串，
+    # 验不出「这块 details 到底有没有出现在三列下面」——R14 那次 #results→#columns
+    # 改名漏掉两处 addEventListener、整份 app.js 加载时就抛，就是这么发现的。
+    "reference_physicians": (
+        "renderComplaintBody(COMPLAINT);"
+        " injectPhysicianColors(REFERENCE_HEALTH.physicians);"
+        " renderConsultResult(DONE_PAYLOAD);"
+        " document.getElementById('reference-physicians').hidden = false;"
+        " document.getElementById('reference-physicians').open = true;"
+        " document.getElementById('reference-body').innerHTML ="
+        "   REFERENCE_FIXTURE.map(([pid, data]) => referenceBlockHtml(pid, data)).join('');",
+        """() => {
+          const box = document.getElementById('reference-physicians');
+          if (box.hidden) return '参考医家那一栏没出现';
+          const blocks = box.querySelectorAll('.ref-phys');
+          if (blocks.length !== 2) return '不是两位参考医家，是 ' + blocks.length;
+          // 它必须在三列**下面**：它是旁证，摆到三列上面就成了主角
+          const cols = document.getElementById('columns').getBoundingClientRect();
+          const r = box.getBoundingClientRect();
+          if (!(r.top >= cols.bottom - 1)) return '参考医家那一栏跑到三列上面去了';
+          // 身份色真的从 CSS 变量解析出来了（变量没注入时这里会拿到空串）
+          const head = box.querySelector('.ref-phys .ref-head');
+          const border = getComputedStyle(head).borderLeftColor;
+          if (!border || border === 'rgba(0, 0, 0, 0)') return '身份色没解析出来：' + border;
+          // 石绿 #4A6B4E = rgb(74, 107, 78)
+          if (!border.split(' ').join('').includes('74,107,78'))
+            return '李可那一块不是石绿，是 ' + border;
+          // 反药提示只在真有的时候出现：两条医案里只有一条有
+          const notes = box.querySelectorAll('.ref-incompat');
+          if (notes.length !== 1) return '反药提示出现 ' + notes.length + ' 次，应该只有 1 次';
+          if (!notes[0].textContent.includes('配伍提示')) return '提示语不对';
+          // 提示用 --caution 而不是 --danger：它不是"这次开错了药"
+          const bg = getComputedStyle(notes[0]).backgroundColor;
+          const danger = getComputedStyle(document.getElementById('error-box')).backgroundColor;
+          if (bg === danger && bg !== 'rgba(0, 0, 0, 0)')
+            return '反药提示用了跟错误一样的底色';
           return null;
         }""",
     ),
@@ -613,6 +693,8 @@ def run(only: str | None, wait_ms: int) -> int:
                                    ("STUDENT_GRAPH", STUDENT_GRAPH),
                                    ("DOCTOR_SAFETY", DOCTOR_SAFETY),
                                    ("SIX_LAYER_GRAPH", SIX_LAYER_GRAPH),
+                                   ("REFERENCE_HEALTH", REFERENCE_HEALTH),
+                                   ("REFERENCE_FIXTURE", REFERENCE_FIXTURE),
                                    ("COMPLAINT", COMPLAINT)):
                     page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
                 # setup 里可能有 await（图谱浏览器要先把数据拉回来），

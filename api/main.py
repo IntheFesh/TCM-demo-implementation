@@ -31,9 +31,13 @@ from core.physicians import (
     PHYSICIANS, physicians_all, physicians_enabled, resolve_physician_id,
 )
 from core.prescription import compute_herb_diffs, format_pharmacy_text
-from core.safety_output import assess_formula_safety
+from core.safety_output import (
+    INCOMPATIBLE_TRAINING_NOTE,
+    assess_formula_safety,
+    check_incompatible,
+)
 from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, S1Normalize
-from core.tools import GRAPH_PATH, get_graph_store
+from core.tools import GRAPH_PATH, get_graph_store, search_cases
 from offline.graph_stats import compute_stats, lambda1_note
 
 # M6：四种角色。前端按角色显示不同的 UI，但**字段裁剪在这里做，不在前端做**
@@ -579,6 +583,52 @@ def _usage_block(request: Request, decision) -> dict:
     snap["reason"] = decision.reason
     snap["degraded"] = decision.degraded
     return snap
+
+
+# R18-I：「参考医家」——注册表里 enabled=False 的那几位（李可、王云启）。
+#
+# 他们**不参加集注**（那是 physicians_enabled 的事），但语料在库里，学生/研究者
+# 模式下应该能看到"同一条主诉，这几位的医案里最像的是哪三条"。做成一个独立
+# 接口而不是塞进 /api/consult 的返回：集注是分钟级的 LLM 调用，检索是毫秒级的，
+# 合在一起会让这一栏跟着三列一起等。
+REFERENCE_CASES_K = 3
+
+
+@app.get("/api/reference_cases")
+def api_reference_cases(complaint: str, physician: str) -> dict:
+    """某位医家的医案里跟这条主诉最像的前三条（默认 k=3）。
+
+    三种"空"分开报，沿用 core/tools.py::search_cases 的分法（SOURCES.md 第 31 条
+    那个坑）：参数错 → `error` 并列出可用值；数据文件不存在 → `available: false`；
+    真没匹配 → `note` 带"已查 N 条"。前端据此显示不同的话，而不是一律"没有结果"。
+
+    每条医案带 `incompatible_pairs` 和 `note`：判定走 core.safety_output 的
+    check_incompatible（唯一实现），提示语走同一个模块的
+    INCOMPATIBLE_TRAINING_NOTE（唯一定义）——**界面显示的那句话必须跟训练样本
+    里的那句逐字相同**，各写一句的话界面就在替模型背书它没学过的话。
+    """
+    text = (complaint or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="complaint 不能为空")
+    if len(text) > MAX_COMPLAINT_CHARS:
+        raise HTTPException(status_code=422,
+                            detail=f"complaint 超过 {MAX_COMPLAINT_CHARS} 字")
+    out = search_cases(text, physician, k=REFERENCE_CASES_K)
+    pid = resolve_physician_id(physician)
+    info = physicians_all(PHYSICIANS).get(pid or "", {})
+    for c in out.get("cases") or []:
+        pairs = check_incompatible(c.get("herbs") or [])
+        c["incompatible_pairs"] = [f"{a}-{b}" for a, b in pairs]
+        # 有反药配对才带这句话；没有就不带，不要每条都挂一句让人习惯性忽略它。
+        c["note"] = INCOMPATIBLE_TRAINING_NOTE if pairs else None
+    out["physician"] = {
+        "id": pid, "name": info.get("name"),
+        "color": info.get("color"),
+        "enabled": info.get("enabled", True),
+        "source": info.get("source"),
+    }
+    out["k"] = REFERENCE_CASES_K
+    return out
 
 
 @app.post("/api/usage/validate-key")

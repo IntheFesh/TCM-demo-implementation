@@ -448,22 +448,60 @@ def test_export_excludes_incompatible_by_default(capsys):
 
 
 def test_export_include_flag_keeps_them_but_warns_loudly(capsys):
-    """带上它们是一个研究选择，不是可以顺手做的默认动作——所以要显式开关
-    且照样警告。"""
+    """带上时照样警告——**R18-G 改了这句警告的内容**（有意的契约变更）。
+
+    原断言是 `"--include-incompatible" in err and "默认是排除的" in err`。
+    两处都不再成立而且**不该**成立：R18-G 起带上它们是默认，那句话会把读日志
+    的人误导成"我打开了一个非默认开关"。新的那句说的是同一个风险
+    （不附提示 → 模型学成"这种配伍可以开" → 撞自己的安全层），
+    外加指出排掉它们的正确开关是 --exclude-incompatible。
+    """
     from offline.export_sft import filter_incompatible_pairs
 
     cases = [_case("a", True), _case("b", False)]
     kept = filter_incompatible_pairs(cases, include=True)
     assert [c.case_id for c in kept] == ["a", "b"]
     err = capsys.readouterr().err
-    assert "--include-incompatible" in err and "默认是排除的" in err
+    assert "--exclude-incompatible 可以排掉" in err
+    assert "R18-G 起这是默认" in err
     assert "自己的安全层面前跑不通" in err
 
 
-def test_export_cli_has_the_flag_and_defaults_to_excluding():
+def test_export_cli_has_the_flag_and_defaults_to_including():
+    """R18-G **有意的契约变更**：默认从"排除"改成"带上 + 链末附配伍提示"。
+
+    原断言是 `"include=args.include_incompatible" in src`（默认排除、显式开关
+    才带上）。改的理由：李可 57 例里有 21 例含反药配对，按原默认他贡献的样本
+    数是 0，而 R18 的目的正是把他接进训练。这里改成钉新的那一端——
+    `--exclude-incompatible` 存在、且接线是 `include=not args.exclude_incompatible`。
+    旧开关 `--include-incompatible` 仍然接受（README 和 run_onsite.sh 里写了它），
+    只是不再改变结果，另一条测试钉这件事。
+    """
     src = (ROOT / "offline" / "export_sft.py").read_text(encoding="utf-8")
+    assert '"--exclude-incompatible", action="store_true"' in src
+    assert "include=not args.exclude_incompatible" in src
+    # 旧开关留着，不能删（照文档敲命令的人会吃 unrecognized arguments）
     assert '"--include-incompatible", action="store_true"' in src
-    assert "include=args.include_incompatible" in src
+
+
+def test_export_cli_legacy_include_flag_is_accepted_and_says_it_is_a_noop(capsys, tmp_path):
+    """留着旧开关但不再改变结果——那就必须**说出来**，否则传了它的人会以为
+    自己打开了什么。"""
+    import json
+    from core.schemas import CaseRecord
+    from offline import export_sft
+
+    rows = [CaseRecord(case_id="a", case_group_id="a", physician="ye_tianshi", raw="x",
+                       symptoms=["面肿"], syndrome="湿热", pathogenesis="邪干阳位",
+                       treatment_principle="清肃上焦", herbs=["杏仁"]).model_dump()]
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    export_sft.main(["--format", "chain", "--cases-path", str(cases_path),
+                     "--triples-path", str(tmp_path / "m.jsonl"),
+                     "--out", str(tmp_path / "o.jsonl"), "--include-incompatible"])
+    err = capsys.readouterr().err
+    assert "--include-incompatible 从 R18-G 起是默认行为" in err
+    assert "不再改变任何结果" in err
 
 
 # ---------- R4-4：docx 转换 ----------

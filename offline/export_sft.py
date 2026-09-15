@@ -34,6 +34,8 @@ from collections import Counter
 from pathlib import Path
 
 from core.herbs import normalize_herb
+from core.data_paths import pharmacology_read_path_or_canonical
+from core.safety_output import INCOMPATIBLE_TRAINING_NOTE
 from core.schemas import CaseRecord
 
 CASES_PATH = Path(__file__).resolve().parent.parent / "cases.json"
@@ -75,17 +77,22 @@ def filter_incompatible_pairs(cases: list[CaseRecord],
     pair，core.safety_output.check_incompatible 唯一实现），这里只按标记过滤。
     过滤掉的条数打到 stderr，不静默——README 里要说明这个取舍，数字得有。
 
-    include=True（CLI 的 --include-incompatible）把它们带上。**默认是排除**：
-    一个要显式打开的开关，才能保证"没人主动要求"时训练集里不会混进反药样本。
-    打开时照样把条数和药对打出来并明确警告——带上它们是一个研究选择
-    （比如专门研究"名家为什么敢用反药"），不是一个可以顺手做的默认动作。"""
+    include=True 把它们带上。**R18-G 起 CLI 默认就是 include=True**（要排除传
+    --exclude-incompatible），因为按原来的默认李可 57 例里的 21 例进不来、
+    R18-B 白写；带上的代价由链末那一步「配伍提示」补偿（见
+    core/safety_output.INCOMPATIBLE_TRAINING_NOTE 和 incompatible_note）。
+    这个函数本身没变：它只回答"带不带"，默认参数仍是不带——一个纯函数的默认值
+    跟 CLI 的默认行为是两件事，把函数默认也翻过来会让直接调它的测试静默改变含义。
+    带上时照样把条数和药对打出来并警告：它们是名家在特定病情下的用法，
+    不是常规配伍。"""
     if include:
         tagged = [c.case_id for c in cases if c.has_incompatible_pair]
         if tagged:
-            print(f"[export_sft] **--include-incompatible：把 {len(tagged)} 条含十八反十九畏"
-                  f"配伍的医案也导出了**（默认是排除的）。这些样本会教模型开反药，"
-                  f"而输出侧 check_incompatible 又会拦住它——训练出来的模型在自己的"
-                  f"安全层面前跑不通。只有在明确知道自己在做什么时才用这个开关："
+            print(f"[export_sft] 把 {len(tagged)} 条含十八反十九畏配伍的医案也导出了"
+                  f"（R18-G 起这是默认；--exclude-incompatible 可以排掉）。"
+                  f"这些样本的链末会附一句固定的配伍提示——没有那一句，模型学到的是"
+                  f"「这种配伍可以开」，而输出侧 check_incompatible 又会拦住它，"
+                  f"训练出来的模型在自己的安全层面前跑不通："
                   f"{tagged[:10]}{'…' if len(tagged) > 10 else ''}", file=sys.stderr)
         return list(cases)
     kept = [c for c in cases if not c.has_incompatible_pair]
@@ -115,6 +122,38 @@ def filter_out_of_scope(cases: list[CaseRecord], include: bool = False) -> list[
         print(f"[export_sft] 排除 {len(tagged)} 条定位外（out_of_scope）的医案："
               f"{tagged[:10]}{'…' if len(tagged) > 10 else ''}", file=sys.stderr)
     return [c for c in cases if not c.out_of_scope]
+
+
+def filter_by_scope(cases: list[CaseRecord],
+                    exclude_scopes: tuple[str, ...] = ()) -> list[CaseRecord]:
+    """R18-G：按 `CaseRecord.scope`（这一例的门类）排除。**默认一个都不排。**
+
+    跟 `filter_out_of_scope` 的区别就是 `scope` 和 `out_of_scope` 两个字段的区别
+    （见 core/schemas.py 那两段注释）：这里按**一例**的门类排，那里按**整本书**
+    的人工声明排。李可 57 例里有 2 例不是肿瘤，整本书一刀切会把那 2 例一起切掉。
+
+    `scope is None`（没判过）**不算命中**：叶天士/吴鞠通那批抽取脚本不产出这个
+    字段，把 None 当成"未知所以排掉"会把原本的两位医家整个清空。
+    """
+    if not exclude_scopes:
+        return list(cases)
+    excluded = [c.case_id for c in cases if c.scope in exclude_scopes]
+    if excluded:
+        print(f"[export_sft] --exclude-scope {','.join(exclude_scopes)}：排除 "
+              f"{len(excluded)} 条该门类的医案：{excluded[:10]}"
+              f"{'…' if len(excluded) > 10 else ''}", file=sys.stderr)
+    return [c for c in cases if c.scope not in exclude_scopes]
+
+
+def incompatible_note(case: CaseRecord) -> str | None:
+    """这一例要不要附配伍提示。**判断只有这一处**，两种导出格式都调它。
+
+    R18-G 之前含反药配伍的医案是直接排除的（R5 那轮的决定）。改成"带上但附
+    这一句"，理由见 core/safety_output.INCOMPATIBLE_TRAINING_NOTE：排除等于把
+    李可 57 例里的 21 例——他最有辨识度的那部分——整个删掉，而 R18 的目的正是
+    把他接进训练。那一句话的**文本**也只有一处定义，在 safety_output 里。
+    """
+    return INCOMPATIBLE_TRAINING_NOTE if case.has_incompatible_pair else None
 
 
 def _sample(task: str, instruction: str, input_text: str, output: str, case: CaseRecord) -> dict:
@@ -239,7 +278,10 @@ TARGET_CHAIN: tuple[str, ...] = (
 # SDT 的 Task2/Task3 也是病机→证型；没有方名时药材直接挂在治法下。
 # **步骤名只有这一处定义**，_step() 会拒绝不在表里的名字——拼错一个箭头方向，
 # 下游按步骤名分组统计就会静默多出一类，报出来的覆盖率是错的。
-CHAIN_STEPS: tuple[str, ...] = TARGET_CHAIN + ("症状→病机", "病机→证型", "症状→证型", "治法→药材")
+# 「配伍提示」不进 TARGET_CHAIN（它不是辨证链的一环，是附在链末的安全说明），
+# 但必须进 CHAIN_STEPS——_step 会拒绝不在这个元组里的步骤名。
+CHAIN_STEPS: tuple[str, ...] = TARGET_CHAIN + (
+    "症状→病机", "病机→证型", "症状→证型", "治法→药材", "配伍提示")
 # 逐项带依据的步骤：output 是 [{name, rationale, rationale_source}]，一味药一个依据。
 # 其它步骤的 output 也可能是列表（症状→证素 就是一串证素词），但那种列表共用步骤
 # 这一层的依据。**判据只能是步骤名，不能是"output 是不是 list"**——加进证素那一步的
@@ -254,8 +296,26 @@ ITEMIZED_STEPS: tuple[str, ...] = ("方剂→药材", "治法→药材")
 MATERIA_MEDICA_PREDICATES = ("功效", "性味")
 FORMULARY_PREDICATES = ("功用", "主治")
 
-MATERIA_MEDICA_PATH = Path(__file__).resolve().parent.parent / "data" / "materia_medica.jsonl"
-FORMULARY_PATH = Path(__file__).resolve().parent.parent / "data" / "formulary.jsonl"
+# 路径走 core.data_paths 那一处：R18-F 之后这两个文件在 data/standard/ 下
+# （进版本控制），旧位置仍可读。三个调用方各写一份常量就是三处实现。
+MATERIA_MEDICA_PATH = pharmacology_read_path_or_canonical("materia_medica")
+FORMULARY_PATH = pharmacology_read_path_or_canonical("formulary")
+# 第五源：《脾胃论》立论层（R18-D，确定性抽取、进版本控制）。
+RATIONALE_PWL_PATH = Path(__file__).resolve().parent.parent / "data" / "standard" / "rationale_pwl.jsonl"
+PWL_BOOK = "脾胃论"
+# 短于这个长度的论断结论（「虚」「病」）拿去做子串匹配几乎必然命中，
+# 那不是"找到了依据"，是噪声。
+_PWL_MIN_MATCH_CHARS = 2
+# 哪几个谓词能给哪一步当依据。混用会让「加药」那 81 条去给证型步当依据。
+PWL_PREDICATES_FOR_PATHOGENESIS = ("病机",)   # 28 条，o 是「脾病」「胃实而肠虚」这类结论
+PWL_PREDICATES_FOR_FORMULA = ("用方",)         # 32 条，o 是方名
+# **「治法」那 21 条不接进治法步**，这不是漏了：数过了，它们的 o **全是单字**
+# （升/降/补/泻/汗/下……，`grep` 出来 21/21 条长度都是 1）。拿单字去子串匹配
+# 「健脾和胃」这种治法描述，「和」会命中、「补中益气」里的「补」会命中——那不是
+# 找到了依据，是任意命中。所以这一层只给病机步和方剂步补依据；
+# 治法步的依据继续只从医案三元组的「治以」来。
+# 这条不是"以后再做"：单字论断在这个匹配方式下根本不可用，要用得换一种匹配
+# （比如把治法词表接进证候归一），那是另一件事。
 # SDT 只导出 Train。Validation/Test 是评测集，导进训练数据就是泄漏——而且
 # eval/sdt/data.py 第 2 条实测记着：那两个 split 的 JSON 里答案字段全是空的，
 # 本来也拼不出链路。所以这里不给"换 split"的开关，写死 Train。
@@ -330,6 +390,50 @@ def load_materia_medica_rationales(path: Path = MATERIA_MEDICA_PATH) -> dict[str
     """药名归一只有 core.herbs.normalize_herb 一处实现（query_materia_medica 用的
     也是它），这里两边都过它，不另写一套前缀剥离。"""
     return _load_reference_rationales(path, MATERIA_MEDICA_PREDICATES, "materia_medica", normalize_herb)
+
+
+def load_rationale_pwl(path: Path | None = None) -> list[tuple[str, str, str]]:
+    """R18-G 的**第五源**：《脾胃论》立论层（R18-D 抽的 278 条）。
+
+    返回 [(谓词, o, source_span)]，按 o 的长度**降序**——查的时候拿 o 当子串去
+    比对医案的病机/治法文本，先比长的才不会让「虚」抢在「脾胃虚寒」之前命中。
+
+    跟另外四源（医案三元组 / 本草 / 方剂 / SDT）的区别：那四源都按主语建索引、
+    精确命中；这一源是**古籍论断**，医案里的病机写法跟《脾胃论》的原句不会逐字
+    相同，只能拿论断的结论去子串匹配。命中率因此低得多，所以 export_chain 的统计
+    里单独报它命中了几步——低命中率要看得见，不是悄悄接受。
+    """
+    p = path or RATIONALE_PWL_PATH
+    if not p.exists():
+        return []
+    rows: list[tuple[str, str, str]] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        o, span, pred = (row.get("o") or "").strip(), (row.get("source_span") or "").strip(), row.get("p")
+        if len(o) >= _PWL_MIN_MATCH_CHARS and span and pred:
+            rows.append((pred, o, span))
+    rows.sort(key=lambda r: -len(r[1]))
+    return rows
+
+
+def pwl_rationale(index: list[tuple[str, str, str]], predicates: tuple[str, ...],
+                  text: str | None) -> tuple[str, str] | None:
+    """《脾胃论》立论层查一步的依据。**匹配逻辑只有这一处**，三个调用点都走它
+    （CLAUDE.md 第 31 条——这个项目在"同一个词两处给出相反答案"上撞过三次）。"""
+    if not text:
+        return None
+    for pred, o, span in index:
+        if pred in predicates and o in text:
+            return span, f"rationale_pwl:{PWL_BOOK}"
+    return None
 
 
 def load_formulary_rationales(path: Path = FORMULARY_PATH) -> dict[str, tuple[str, str]]:
@@ -432,7 +536,8 @@ def _herb_item(name: str, triples: list[dict], case_source: str,
 def to_chain_sample(case: CaseRecord, triples: list[dict],
                     materia_medica: dict[str, tuple[str, str]] | None = None,
                     formulary: dict[str, tuple[str, str]] | None = None,
-                    lookup=None) -> dict | None:
+                    lookup=None,
+                    pwl: list[tuple[str, str, str]] | None = None) -> dict | None:
     """一条医案 → 一条链路样本；能派生的步骤不足两步（不成链）返回 None。
     步骤只按字段存在与否生成，缺哪层就没有哪层，不用占位文字补齐。
 
@@ -442,25 +547,35 @@ def to_chain_sample(case: CaseRecord, triples: list[dict],
     """
     materia_medica = materia_medica or {}
     formulary = formulary or {}
+    pwl = pwl or []
     source = f"case:{case.case_id}"
     prefix, prefix_miss = textbook_prefix_steps(case.syndrome, lookup=lookup)
     steps: list[dict] = list(prefix)
     if case.pathogenesis:
         span = _rationale(triples, "提示")
-        steps.append(_step("症状→病机", case.pathogenesis, span, source, source if span else None))
+        rat_src = source if span else None
+        if not span:
+            # 第五源兜底：医案三元组没抽到「提示」时，用《脾胃论》的病机论断。
+            hit = pwl_rationale(pwl, PWL_PREDICATES_FOR_PATHOGENESIS, case.pathogenesis)
+            if hit:
+                span, rat_src = hit
+        steps.append(_step("症状→病机", case.pathogenesis, span, source, rat_src))
     if case.syndrome:
         span = _rationale(triples, "属于")
         steps.append(_step("病机→证型" if case.pathogenesis else "症状→证型",
                            case.syndrome, span, source, source if span else None))
     if case.treatment_principle and case.syndrome:
         span = _rationale(triples, "治以")
+        # 这一步不走第五源：见 PWL_PREDICATES_FOR_PATHOGENESIS 上面那段
+        # ——《脾胃论》的治法论断 o 全是单字，子串匹配等于任意命中。
         steps.append(_step("证型→治法", case.treatment_principle, span, source,
                            source if span else None))
     if case.formula and case.treatment_principle:
         span = _rationale(triples, "用方")
         rat_src = source if span else None
         if not span:
-            hit = formulary.get(case.formula.strip())
+            hit = formulary.get(case.formula.strip()) or pwl_rationale(
+                pwl, PWL_PREDICATES_FOR_FORMULA, case.formula)
             if hit:
                 span, rat_src = hit
         steps.append(_step("治法→方剂", case.formula, span, source, rat_src))
@@ -472,6 +587,14 @@ def to_chain_sample(case: CaseRecord, triples: list[dict],
             # 没有单一依据，填 None 而不是拿第一味药的凑一个
             None, source, None,
         ))
+    note = incompatible_note(case)
+    if note and steps:
+        # 配伍提示做成**链上的最后一步**，不是塞在 meta 里：塞 meta 模型学不到它，
+        # 而不学它就会学成"这种配伍可以开"，跟输出侧 check_incompatible 直接冲突
+        # （见 core/safety_output.INCOMPATIBLE_TRAINING_NOTE）。
+        # 依据就是这一例本身——是这一例的处方含反药，不是某本书说的。
+        steps.append(_step("配伍提示", note, case.raw_excerpt or case.raw[:120],
+                           source, source))
     if len(steps) < 2:
         return None
     symptoms = "；".join(case.symptoms) if case.symptoms else ""
@@ -484,6 +607,9 @@ def to_chain_sample(case: CaseRecord, triples: list[dict],
             "physician_id": case.physician, "case_id": case.case_id,
             "case_group_id": case.case_group_id, "copyright_status": case.copyright_status,
             "standard_prefix_miss": prefix_miss,
+            # R18-G：两个筛选维度都落在 meta 里，训练集里"这条是哪个门类/有没有
+            # 反药"事后可查——不落的话只能靠重跑导出去反推。
+            "scope": case.scope, "has_incompatible_pair": case.has_incompatible_pair,
         },
     }
 
@@ -601,7 +727,8 @@ def export_chain(cases: list[CaseRecord], triples_by_case: dict[str, list[dict]]
                  sdt_samples: list[dict] | None = None,
                  materia_medica: dict[str, tuple[str, str]] | None = None,
                  formulary: dict[str, tuple[str, str]] | None = None,
-                 lookup=None) -> tuple[list[dict], dict]:
+                 lookup=None,
+                 pwl: list[tuple[str, str, str]] | None = None) -> tuple[list[dict], dict]:
     """返回 (样本列表, 统计)。统计里 rationale 覆盖率必须带对照报——
     "有多少步是带原文依据的"跟"有多少步是 None"并列，只报前者会显得都有依据。
 
@@ -614,7 +741,7 @@ def export_chain(cases: list[CaseRecord], triples_by_case: dict[str, list[dict]]
     for case in cases:
         sample = to_chain_sample(case, triples_by_case.get(case.case_id, []),
                                  materia_medica=materia_medica, formulary=formulary,
-                                 lookup=lookup)
+                                 lookup=lookup, pwl=pwl)
         if sample is None:
             continue
         sample["meta"]["split"] = split[case.case_group_id]
@@ -630,6 +757,21 @@ def export_chain(cases: list[CaseRecord], triples_by_case: dict[str, list[dict]]
         "split": dict(Counter(s["meta"]["split"] for s in samples)),
         # 教材前三步的命中情况：命中数旁边就是没命中的原因分布，不是只报命中数
         "standard_prefix": dict(prefix_miss),
+        # R18-G 五源汇总：每一源给了多少步依据。第五源（脾胃论）是子串匹配、
+        # 命中率天然低，单独报出来才看得见——不报的话"接了但一条没命中"跟
+        # "接了且有用"分不出来。
+        "rationale_pwl": {
+            "index_size": len(pwl or []),
+            "steps": sum(1 for smp in samples for st in smp["chain"]
+                         if (st.get("rationale_source") or "").startswith("rationale_pwl:")),
+        },
+        # 配伍提示步的条数：它等于"带了反药配伍的医案样本数"，跟 --exclude-incompatible
+        # 的过滤数是同一件事的两端，对不上就是有一头漏了。
+        "incompatible_note_steps": sum(
+            1 for smp in samples for st in smp["chain"] if st["step"] == "配伍提示"),
+        "samples_by_scope": dict(Counter(
+            smp["meta"].get("scope") or "未判" for smp in samples
+            if smp["meta"].get("source_kind") == "case")),
         **_count_rationales(samples),
     }
     # 泄漏检查跟统计一起交出去，不只在 CLI 里算：任何调用方（训练脚本、测试）
@@ -694,19 +836,46 @@ def main(argv: list[str] | None = None) -> None:
                     help="chain 格式的第三个来源：药材层三元组，给方剂→药材这一步补原文依据")
     ap.add_argument("--formulary-path", type=Path, default=FORMULARY_PATH,
                     help="同上，方剂层三元组，给治法→方剂这一步补原文依据")
+    # R18-G **把这两个开关的方向反过来了**，这是有意的契约变更：
+    #
+    # R18 把李可（57 例，55 例肿瘤、21 例含反药配对）和王云启（77 例，全肿瘤）
+    # 接进训练。按原来的默认（排除肿瘤、排除反药），这两位医家贡献的样本数是
+    # **0**——R18-B/C 两个抽取脚本白写。所以默认改成"都带上"：
+    #   - 反药配伍带上，但每条样本链末附一句固定的配伍提示
+    #     （core/safety_output.INCOMPATIBLE_TRAINING_NOTE），模型学到的是
+    #     "名家这样用过、且这是反药配伍要说明"，跟输出侧 check_incompatible 不冲突；
+    #   - 肿瘤门类带上，因为李可/王云启的语料**本来就是肿瘤**，排掉等于不接。
+    # 要回到原来的行为，显式传 --exclude-incompatible / --exclude-scope oncology。
+    ap.add_argument("--exclude-incompatible", action="store_true",
+                    help="排除含十八反十九畏配伍的医案。**R18-G 起默认是带上的**"
+                         "（带上时链末附固定的配伍提示）。传这个开关会让李可 57 例里的"
+                         "21 例不进训练集。")
+    ap.add_argument("--exclude-scope", default="",
+                    help="按门类排除，逗号分隔（如 oncology）。默认一个都不排。"
+                         "传 oncology 会让王云启 77 例全部、李可 55/57 例不进训练集。")
+    ap.add_argument("--rationale-pwl-path", type=Path, default=RATIONALE_PWL_PATH,
+                    help="第五源：《脾胃论》立论层（R18-D 产出，进版本控制）")
+    # 下面两个是 R18-G 之前的开关。**留着不删**：README、run_onsite.sh、
+    # onsite_troubleshooting.md 里都写了它们，删掉会让照文档敲命令的人吃一个
+    # "unrecognized arguments"。现在它们是默认行为，传了只说明一句、不改变结果。
     ap.add_argument("--include-incompatible", action="store_true",
-                    help="把含十八反十九畏配伍的医案也导出（默认排除，见 "
-                         "filter_incompatible_pairs 的文档字符串）。这些样本会教模型"
-                         "开反药，而输出侧安全检查又会拦住它，自相矛盾。")
+                    help="（R18-G 起这已经是默认行为，这个开关不再改变任何结果）")
     ap.add_argument("--include-out-of-scope", action="store_true",
-                    help="把标了 out_of_scope（不在脾胃门定位内，R8-2 选项 ②）的医案也导出"
-                         "（默认排除，见 filter_out_of_scope 的文档字符串）。")
+                    help="（R18-G 起这已经是默认行为，这个开关不再改变任何结果）")
     args = ap.parse_args(argv)
+
+    for legacy, now in (("--include-incompatible", "默认就带上了"),
+                        ("--include-out-of-scope", "默认就带上了")):
+        if getattr(args, legacy.lstrip("-").replace("-", "_")):
+            print(f"[export_sft] {legacy} 从 R18-G 起是默认行为（{now}），"
+                  f"这个开关不再改变任何结果。要排除请用 --exclude-incompatible / "
+                  f"--exclude-scope。", file=sys.stderr)
+    exclude_scopes = tuple(x.strip() for x in args.exclude_scope.split(",") if x.strip())
 
     cases = load_cases(args.cases_path)
     cases = filter_public_domain(cases)
-    cases = filter_incompatible_pairs(cases, include=args.include_incompatible)
-    cases = filter_out_of_scope(cases, include=args.include_out_of_scope)
+    cases = filter_incompatible_pairs(cases, include=not args.exclude_incompatible)
+    cases = filter_by_scope(cases, exclude_scopes)
 
     if args.format == "chain":
         out_path = args.out or CHAIN_OUT_PATH
@@ -719,6 +888,11 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[export_sft] {sdt_stats['note']}", file=sys.stderr)
         materia_medica = load_materia_medica_rationales(args.materia_medica_path)
         formulary = load_formulary_rationales(args.formulary_path)
+        pwl = load_rationale_pwl(args.rationale_pwl_path)
+        if not pwl:
+            print(f"[export_sft] 注意：{args.rationale_pwl_path} 不存在或为空，"
+                  "第五源（《脾胃论》立论层）不参与补依据——先跑 "
+                  "python -m offline.extract_rationale_pwl", file=sys.stderr)
         if not materia_medica and not formulary:
             print(f"[export_sft] 注意：药理层两个文件（{args.materia_medica_path}、"
                   f"{args.formulary_path}）都不存在或为空，方剂→药材 / 治法→方剂 只能靠医案"
@@ -727,6 +901,7 @@ def main(argv: list[str] | None = None) -> None:
         samples, stats = export_chain(
             cases, triples_by_case, args.heldout_ratio,
             sdt_samples=sdt_samples, materia_medica=materia_medica, formulary=formulary,
+            pwl=pwl,
         )
         stats["sdt"] = sdt_stats
         stats["pharmacology_index"] = {
@@ -750,6 +925,12 @@ def main(argv: list[str] | None = None) -> None:
         print(f"目标六步各自的步数：{stats['target_chain_coverage']}")
         print(f"教材前三步命中情况：{stats['standard_prefix']}")
         print(f"药理层索引：药材 {len(materia_medica)} 味 / 方剂 {len(formulary)} 张")
+        print(f"第五源《脾胃论》立论层：索引 {stats['rationale_pwl']['index_size']} 条，"
+              f"给了 {stats['rationale_pwl']['steps']} 步依据"
+              "（子串匹配，命中率天然低，报出来才看得见）")
+        print(f"配伍提示步：{stats['incompatible_note_steps']} 条"
+              f"（= 含反药配伍的医案样本数；--exclude-incompatible 可以排掉它们）")
+        print(f"样本按门类：{stats['samples_by_scope']}")
         print(f"泄漏检查：train {leak['train_groups']} 组 / heldout {leak['heldout_groups']} 组，"
               f"case_group_id 交集 {len(leak['group_overlap'])} 组"
               "（split_by_case_group 结构上保证为 0，这行是改切法时的报警器）")
