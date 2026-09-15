@@ -5,6 +5,15 @@ let PHYSICIAN_COLORS = {};
 // herb 没有——to_graph() 没为 herb 节点重复存一份，这里在前端补一份映射，不是
 // 因为后端漏了字段，是没必要为一个纯展示用途改后端契约（模块6"不改后端"）。
 let PHYSICIAN_NAMES = {};
+
+// 三列表头要显示的年代与学派（"叶天士 / 1667-1746 / 温病"）。跟身份色同一批
+// 数据、同一个来源（core/physicians.py → /health → injectPhysicianColors），
+// 不在前端另抄一张表：注册表加第四位医家时这里自动跟上。
+let PHYSICIAN_META = {};
+
+// 首屏三条示例主诉。同样从 /health 下发（core/examples.py），不写死在这里——
+// DEMO.md 和录制清单里已经各有一份，第三份副本漂一个标点就是演示当场 LLMError。
+let EXAMPLE_COMPLAINTS = [];
 // layer 4（药材）跟 layer 3（方剂）的 x 只差一小段——compound 子节点要贴着
 // 父节点画，隔太远 cytoscape 算出来的方剂包围盒会变成横跨整个画布的细长条，
 // 不会像"一个方框里装着自己的药"。
@@ -476,6 +485,7 @@ function injectPhysicianColors(physicians) {
     if (!p || !p.id) continue;
     PHYSICIAN_COLORS[p.id] = p.color;
     PHYSICIAN_NAMES[p.id] = p.name;
+    PHYSICIAN_META[p.id] = { years: p.years, school: p.school, name: p.name };
     const names = [`--phys-${p.id}`];
     if (PHYSICIAN_CSS_ALIAS[p.id]) names.push(`--${PHYSICIAN_CSS_ALIAS[p.id]}`);
     for (const name of names) {
@@ -492,6 +502,9 @@ async function initDemoModeBanner() {
     const health = await resp.json();
     renderDemoMode(health.demo_mode);
     injectPhysicianColors(health.physicians);
+    // 示例主诉和身份色同一趟拿：两者都要在"点第一次辨证之前"就到位。
+    EXAMPLE_COMPLAINTS = health.example_complaints || [];
+    renderExamples(EXAMPLE_COMPLAINTS);
   } catch (e) {
     // 网络不通时 fetch 会抛——演示模式的意义之一就是断网可用，所以这里
     // 只是拿不到提示，不是错误。身份色同理：CSS 里有兜底值，页面不会变成
@@ -548,15 +561,25 @@ function renderTriage(data) {
   box.classList.add("show");
 }
 
+// R14：分歧不再是一整段文字横幅（§1 的 F3），主角换成上面那条点阵对照带。
+// **但这段文字一个字都没删**：分层读数（君臣/佐使各自的 Jaccard 与各自的 ε）、
+// 未标注 role 的药味数、两两配对的师承内/跨学派均值——这些都是对照带画不出来、
+// 又确实有意义的数，收进对照带下面一个默认折叠的 <details> 里。
+// 把它整段去掉才是"为了版面好看牺牲信息"，那正是这个项目一直在避免的事。
 function renderDivergence(divergence) {
   const banner = document.getElementById("divergence-banner");
+  if (!banner) return;
+  const wrap = document.getElementById("divergence-detail");
   const text = divergenceBannerText(divergence);
   if (text === null) {
+    banner.textContent = "";
     banner.classList.remove("show");
+    if (wrap) wrap.hidden = true;
     return;
   }
   banner.textContent = text;
   banner.classList.add("show");
+  if (wrap) wrap.hidden = false;
 }
 
 function refListHtml(refs) {
@@ -577,6 +600,18 @@ function refListHtml(refs) {
       </div>`;
     })
     .join("");
+}
+
+// R14 §3.1 第九条：引用收成一行「引自 N 条医案 ▾」，展开后才是原文块。
+// N 从 refs.length 现算，不另存一个计数——两处各存一份必然有一处忘了更新。
+function refFoldHtml(refs) {
+  const n = (refs || []).length;
+  if (!n) {
+    return '<div class="col-refs col-refs-empty">无相关医案（相似度均低于阈值）</div>';
+  }
+  return `<details class="col-refs"><summary>引自 ${n} 条医案</summary>
+    <div class="detail-block">${refListHtml(refs)}</div>
+  </details>`;
 }
 
 // ---------- M7：君臣佐使分组 ----------
@@ -609,15 +644,55 @@ function herbItemLabel(item) {
   return item.processing ? `${base}（${item.processing}）` : base;
 }
 
-function herbGroupsHtml(cand) {
-  if (!cand || !cand.herb_items || !cand.herb_items.length) return "";
-  return groupHerbsByRole(cand.herb_items)
+// R14 §3.1 第四条：**默认只显示君臣 + 前两味佐药**，其余折叠成"⋯ 展开 N 味"。
+// 理由是三列并排时垂直空间是稀缺资源，而君臣决定了"这一路是什么打法"，佐使是加减。
+// VISIBLE_ADJUNCT_HERBS 是那个"两味"的唯一定义——写死在两个地方（渲染一处、
+// 计数一处）的话，展开按钮上的 N 迟早跟实际折叠的味数对不上。
+const VISIBLE_ADJUNCT_HERBS = 2;
+
+// 把分好组的药按"默认可见 / 折叠"切成两半。纯函数，单独提出来是因为
+// "折叠了几味"这个数要在两个地方用（按钮文案、测试断言），算两遍必然漂。
+function splitHerbGroupsForFold(groups) {
+  const visible = [];
+  const folded = [];
+  let adjunctBudget = VISIBLE_ADJUNCT_HERBS;
+  for (const g of groups) {
+    if (g.role === "君" || g.role === "臣") {
+      visible.push(g);
+      continue;
+    }
+    // 佐/使/未标注：从预算里取，取完的进折叠区。**不是按组折叠而是按味折叠**
+    // ——佐药一组就有六味时，整组留下等于没折叠。
+    const head = g.herbs.slice(0, adjunctBudget);
+    const tail = g.herbs.slice(adjunctBudget);
+    adjunctBudget -= head.length;
+    if (head.length) visible.push({ role: g.role, herbs: head });
+    if (tail.length) folded.push({ role: g.role, herbs: tail });
+  }
+  return { visible, folded, nFolded: folded.reduce((n, g) => n + g.herbs.length, 0) };
+}
+
+function herbRowsHtml(groups) {
+  return groups
     .map((g) => {
       const text = g.herbs.map((h) => escapeHtml(herbItemLabel(h))).join("、");
       const inner = g.role === "君" ? `<span class="herb-jun">${text}</span>` : text;
-      return `<div class="field"><b>${escapeHtml(g.role)}药</b>${inner}</div>`;
+      return `<div class="field"><b>${escapeHtml(g.role)}</b>${inner}</div>`;
     })
     .join("");
+}
+
+// fold=false 给医生模式/导出这类"要看全量"的场景留的口子：折叠是阅读密度的
+// 手段，不是信息裁剪，任何时候都必须有一条路看到全部药味。
+function herbGroupsHtml(cand, fold = true) {
+  if (!cand || !cand.herb_items || !cand.herb_items.length) return "";
+  const groups = groupHerbsByRole(cand.herb_items);
+  if (!fold) return herbRowsHtml(groups);
+  const { visible, folded, nFolded } = splitHerbGroupsForFold(groups);
+  const more = nFolded
+    ? `<details class="herb-fold"><summary>⋯ 展开 ${nFolded} 味</summary>${herbRowsHtml(folded)}</details>`
+    : "";
+  return herbRowsHtml(visible) + more;
 }
 
 // ---------- M7：卡片详情默认展开/折叠 ----------
@@ -911,12 +986,17 @@ async function runExport(physician) {
   renderDoctorExportPanel(physician);
 }
 
-// 事件委托绑在 #results 这个容器本身（每次响应回来只会替换它的子树，容器
+// 事件委托绑在 #columns 这个容器本身（每次响应回来只会替换它的子树，容器
 // 节点自己一直存在），不是每次重新渲染表格后逐个 input 重新 addEventListener
 // ——那样容易漏绑，而且用户正在打字的输入框如果整表重渲染会丢失光标位置，
 // 委托模式下"编辑单元格内容"根本不触发整表重渲染（见下面 input 分支只改
 // DOCTOR_STATE、不碰 DOM），只有加行/删行才会。
-document.getElementById("results").addEventListener("input", (e) => {
+//
+// R14 容器从 #results 改名成 #columns。委托的好处在这里反过来咬了一口：
+// 容器不在了 getElementById 返回 null，**整份 app.js 在加载时就抛**，
+// 页面上什么都不会发生——而 node 测试里 DOM_STUB 是个什么都接住的 Proxy，
+// 一个字都测不出来。这就是 CLAUDE.md 那条"Playwright 是必需环节"的又一例。
+document.getElementById("columns").addEventListener("input", (e) => {
   const t = e.target;
   const phys = t.dataset.rxPhys;
   if (!phys || !DOCTOR_STATE[phys]) return;
@@ -933,7 +1013,7 @@ document.getElementById("results").addEventListener("input", (e) => {
   scheduleValidate(phys);
 });
 
-document.getElementById("results").addEventListener("click", (e) => {
+document.getElementById("columns").addEventListener("click", (e) => {
   const addPhys = e.target.dataset.rxAdd;
   if (addPhys) {
     DOCTOR_STATE[addPhys].herb_items.push(blankHerbItem());
@@ -978,7 +1058,9 @@ function updateDisclaimer() {
 
 function updateDoctorFieldsVisibility() {
   const row = document.getElementById("doctor-id-row");
-  if (row) row.style.display = getSelectedRole() === "doctor" ? "flex" : "none";
+  // classList 而不是 style.display："显示成什么"（flex）归 CSS 管，这里只说
+  // "要不要显示"。R14 之前这行写死 flex，改版面时要同时改 JS 才生效。
+  if (row) row.classList.toggle("is-hidden", getSelectedRole() !== "doctor");
 }
 
 document.getElementById("role-select").addEventListener("change", () => {
@@ -988,8 +1070,317 @@ document.getElementById("role-select").addEventListener("change", () => {
 updateDisclaimer();
 updateDoctorFieldsVisibility();
 
-function cardHtml(result, mode = "researcher") {
-  const color = PHYSICIAN_COLORS[result.physician] || "#333";
+// ============================================================================
+// R14：问诊页的五种状态（docs/DESIGN.md §3.1 状态设计表）
+// ============================================================================
+//
+// 五种状态各有各的形态，不是"同一个页面加个 loading 遮罩"：
+//   first        首次进入——输入区居中放大，下面三条示例可点击填入
+//   running      辨证中——三列各自走 S1 → S2 → S3 的分步进度，不是一个转圈
+//   insufficient 信息不足——三列位置各一句话 + 该补什么，不留空白
+//   followup     追问——问题弹在提问那位医家的列里，其余两列"等待中"
+//   done         有结果
+// 第六种「安全拦截」不在这个类名里：它是**整页替换**，#safety-block 跟
+// #consult-page 是互斥的两个兄弟（§3.1 "打断必须彻底"）。
+const CONSULT_STATES = ["first", "running", "insufficient", "followup", "done"];
+
+function setConsultState(state) {
+  const page = document.getElementById("consult-page");
+  if (!page) return;
+  for (const s of CONSULT_STATES) page.classList.remove(`state-${s}`);
+  page.classList.add(`state-${state}`);
+}
+
+// 安全拦截：整页替换。**不是隐藏，是清空**——被拦截的请求不产出任何方药，
+// 页面上就不该留着上一次的三列在那儿等着被滚出来（DOM 里搜不到药名这件事
+// 有一条测试钉着）。
+function showSafetyBlock(reason) {
+  const page = document.getElementById("consult-page");
+  const block = document.getElementById("safety-block");
+  clearColumns();
+  document.getElementById("rx-compare").innerHTML = "";
+  if (typeof renderGraph === "function") renderGraph(null);
+  block.innerHTML = safetyBlockHtml(reason);
+  bindSafetyBlockBack();
+  block.hidden = false;
+  if (page) page.hidden = true;
+}
+
+function hideSafetyBlock() {
+  const block = document.getElementById("safety-block");
+  const page = document.getElementById("consult-page");
+  if (block) { block.hidden = true; block.innerHTML = ""; }
+  if (page) page.hidden = false;
+}
+
+// 就医指引是固定文案，不是模型生成的——拦截的整个意义就是"不让模型继续说话"。
+function safetyBlockHtml(reason) {
+  return `<div class="sb-inner">
+    <div class="sb-title">这条主诉需要先去医院，不适合在这里继续辨证</div>
+    <div class="sb-reason">${escapeHtml(reason || "命中危重症状")}</div>
+    <div class="sb-advice">
+      <div>· 立即前往急诊，或拨打 120。</div>
+      <div>· 携带既往病历与正在服用的药物清单。</div>
+      <div>· 不要自行服药、进食或饮水，以免影响后续检查。</div>
+    </div>
+    <div class="sb-note">本次已在证素推断之前中止，系统不会给出任何处方建议。这是设计如此，不是出错。</div>
+    <button type="button" id="sb-back">换一条主诉</button>
+  </div>`;
+}
+
+// 整页替换之后必须有路走回去。没有这颗按钮的话，拦截页是个死胡同——唯一的
+// 出路是刷新整个页面，而那会把 BYOK、角色、检索模式一起清掉。
+// "打断必须彻底"说的是不给方药，不是把人困在这一页。
+function bindSafetyBlockBack() {
+  const btn = document.getElementById("sb-back");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    hideSafetyBlock();
+    setConsultState("first");
+    renderComplaintBody("");
+    document.getElementById("complaint").value = "";
+    document.getElementById("complaint").focus();
+  });
+}
+
+// ---------- 主诉正文（28px 宋体，行宽 ≤ 38 汉字） ----------
+
+function renderComplaintBody(text) {
+  const el = document.getElementById("complaint-body");
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("show", !!text);
+}
+
+// ---------- 首屏三条示例 ----------
+
+function exampleListHtml(examples) {
+  if (!examples || !examples.length) return "";
+  const items = examples.map((e) => `<button type="button" class="example" data-complaint="${escapeHtml(e.text)}">
+      <span class="ex-label">${escapeHtml(e.label)}</span>
+      <span class="ex-text">${escapeHtml(e.text)}</span>
+      <span class="ex-hint">${escapeHtml(e.hint || "")}</span>
+    </button>`).join("");
+  return `<div class="ex-title">或从这三条开始</div><div class="ex-list">${items}</div>`;
+}
+
+function renderExamples(examples) {
+  const el = document.getElementById("examples");
+  if (!el) return;
+  el.innerHTML = exampleListHtml(examples);
+  for (const btn of el.querySelectorAll(".example")) {
+    btn.addEventListener("click", () => {
+      document.getElementById("complaint").value = btn.dataset.complaint;
+      document.getElementById("complaint").focus();
+    });
+  }
+}
+
+// ---------- 用药对照带（§3.1 第三条：页面的主角） ----------
+//
+// 不是"大数字配小标签"（那是默认做法），是一条点阵：共用药实心 --ink 点、
+// 各家独有药按各自身份色。一眼看出"共同的少、各自的多"——比 0.53 这个数直观。
+//
+// 集合本身在后端算（divergence.shared_herbs / unique_herbs），这里只负责画：
+// 判定两味药是不是同一味走的是 core/herbs.py::normalized_herb_set，
+// 前端拿 s3.herbs 自己做集合差就是第二套匹配实现（CLAUDE.md 第 31 条）。
+function dotsHtml(n, cls, color) {
+  const style = color ? ` style="background: ${color};"` : "";
+  return Array.from({ length: n }, () => `<span class="dot ${cls}"${style}></span>`).join("");
+}
+
+// ε 段 --noise 灰、超出段 --real 黑。两段的宽度比 = ε : (差异 - ε)，
+// 差异没超过 ε 时超出段宽度为 0，并且左右两个读数照旧都显示——
+// "没超出"本身就是结论，把带子藏起来等于把结论也藏了。
+function bandSegments(epsilon, divergenceValue) {
+  if (epsilon === null || epsilon === undefined || divergenceValue === null
+      || divergenceValue === undefined) {
+    return null;
+  }
+  const total = Math.max(epsilon, divergenceValue);
+  if (total <= 0) return { epsPct: 100, realPct: 0, exceeds: false };
+  const epsPct = Math.min(100, (epsilon / total) * 100);
+  return {
+    epsPct: Math.round(epsPct * 10) / 10,
+    realPct: Math.round((100 - epsPct) * 10) / 10,
+    exceeds: divergenceValue > epsilon,
+  };
+}
+
+function epsilonLabel(epsForQuery) {
+  const e = epsForQuery || {};
+  if (e.value === null || e.value === undefined) return "噪声地板 未测";
+  // scope=global 必须标出来：一个没说明来源的对照基准跟没有对照一样。
+  const scope = e.scope === "global" ? "（全局）" : "";
+  return `噪声地板 ε=${e.value}${scope}`;
+}
+
+function rxCompareHtml(divergence, results) {
+  if (!divergence) return "";
+  const shared = divergence.shared_herbs || [];
+  const unique = divergence.unique_herbs || {};
+  const order = (results || []).map((r) => r.physician);
+  const parts = [`<span class="rx-group"><span class="rx-tag">共用 ${shared.length}</span>${dotsHtml(shared.length, "dot-shared")}</span>`];
+  for (const pid of order) {
+    const own = unique[pid] || [];
+    const name = PHYSICIAN_NAMES[pid] || pid;
+    parts.push(`<span class="rx-group" data-physician="${escapeHtml(pid)}">`
+      + `<span class="rx-tag">${escapeHtml(name)}独有 ${own.length}</span>`
+      + dotsHtml(own.length, "dot-own", `var(--phys-${pid}, var(--ink))`)
+      + `</span>`);
+  }
+  const value = divergence.pairs_mean;
+  const seg = bandSegments((divergence.epsilon_for_query || {}).value, value);
+  const line = seg
+    ? `<div class="rx-line"><span class="rx-seg rx-seg-noise" style="width:${seg.epsPct}%"></span>`
+      + `<span class="rx-seg rx-seg-real" style="width:${seg.realPct}%"></span></div>`
+    : `<div class="rx-line rx-line-unmeasured"></div>`;
+  const right = value === null || value === undefined
+    ? "三家平均差异 未算出"
+    : `三家平均差异 ${value}`;
+  const verdict = seg
+    ? (seg.exceeds ? "超出噪声地板的部分是真实分歧" : "差异未超出噪声地板，这一条上三家实质一致")
+    : "没有噪声地板可比，这个数单独看没有意义";
+  return `<div class="rx-title">用药对照</div>
+    <div class="rx-dots">${parts.join("")}</div>
+    ${line}
+    <div class="rx-scale"><span>${escapeHtml(epsilonLabel(divergence.epsilon_for_query))}</span><span>${escapeHtml(right)}</span></div>
+    <div class="rx-verdict">${escapeHtml(verdict)}</div>`;
+}
+
+function renderRxCompare(divergence, results) {
+  const el = document.getElementById("rx-compare");
+  if (!el) return;
+  el.innerHTML = rxCompareHtml(divergence, results);
+  el.classList.toggle("show", !!el.innerHTML);
+}
+
+// ---------- 三列的非终态：进度 / 等待 / 信息不足 / 追问 ----------
+//
+// 三列的**列表**不依赖结果：还没有结果时也要摆出三列（表头着色靠 /health 下发的
+// 身份色，不用等问诊回来）。顺序按 PHYSICIAN_META 的键序——那是 /health 下发的
+// 顺序，而 /health 遍历的是 PHYSICIANS 注册表，跟后端 results 的顺序是同一个。
+function physicianOrder() {
+  return Object.keys(PHYSICIAN_META);
+}
+
+// S1/S2 是全局跑一次、三列共用的（CLAUDE.md：S1 全局只跑一次），所以三列的前两步
+// 永远同时亮；只有 S3 是各跑各的。这不是偷懒，是如实反映后端的执行形状。
+const COLUMN_STEPS = [
+  { key: "s1", label: "症状标准化" },
+  { key: "s2", label: "证素推断" },
+  { key: "s3", label: "证型与方药" },
+];
+
+function columnStepsHtml(reached) {
+  return `<ol class="col-steps">` + COLUMN_STEPS.map((s) => {
+    const idx = COLUMN_STEPS.findIndex((x) => x.key === s.key);
+    const at = COLUMN_STEPS.findIndex((x) => x.key === reached);
+    const state = idx < at ? "done" : idx === at ? "active" : "todo";
+    return `<li class="step step-${state}" data-step="${s.key}">${escapeHtml(s.label)}</li>`;
+  }).join("") + `</ol>`;
+}
+
+function columnRunningHtml(physician, reached) {
+  const meta = PHYSICIAN_META[physician] || {};
+  return columnShellHtml(physician, meta.name || PHYSICIAN_NAMES[physician] || physician,
+                         meta, "running", columnStepsHtml(reached));
+}
+
+function columnWaitingHtml(physician) {
+  const meta = PHYSICIAN_META[physician] || {};
+  return columnShellHtml(physician, meta.name || physician, meta, "waiting",
+    `<div class="col-wait">等待中——另一位医家正在向患者确认信息</div>`);
+}
+
+function columnFollowupHtml(physician, question) {
+  const meta = PHYSICIAN_META[physician] || {};
+  const body = `<div class="col-ask">
+      <div class="ask-q">${escapeHtml(question)}</div>
+      <div class="input-row input-row-left">
+        <input type="text" class="ask-input" placeholder="请输入回答，例如：有 / 没有" />
+        <button type="button" class="ask-submit">回答</button>
+      </div>
+    </div>`;
+  return columnShellHtml(physician, meta.name || physician, meta, "asking", body);
+}
+
+// 信息不足不是错误：系统承认没法有依据地辨证。三列位置各一句话 + 该补什么，
+// 不留空白——留空白的话页面看起来像坏了，而它其实是好好地拒绝了。
+function columnInsufficientHtml(physician, reason) {
+  const meta = PHYSICIAN_META[physician] || {};
+  return columnShellHtml(physician, meta.name || physician, meta, "insufficient",
+    `<div class="col-insufficient">
+       <div>现有症状不足以推断证素，这一列没有结论。</div>
+       <div class="ins-reason">${escapeHtml(reason || "请补充舌象、脉象、寒热喜恶、二便等信息。")}</div>
+     </div>`);
+}
+
+function clearColumns() {
+  const el = document.getElementById("columns");
+  if (el) el.innerHTML = "";
+}
+
+function renderColumnsPlaceholder(builder) {
+  const el = document.getElementById("columns");
+  if (!el) return;
+  el.innerHTML = physicianOrder().map(builder).join("");
+}
+
+// ---------- 辨证中：按 physician 路由，不假设顺序 ----------
+//
+// **R12 之后三位医家是并发跑的**，physician_start / s3_start / physician_done
+// 的到达顺序完全是乱的（docs/DESIGN.md §4.7 的订正）。所以这里按事件里的
+// physician 字段更新对应那一列，绝不按到达次序去推"现在轮到谁了"。
+let COLUMN_PROGRESS = {};
+
+function resetColumnProgress() {
+  COLUMN_PROGRESS = {};
+  for (const pid of physicianOrder()) COLUMN_PROGRESS[pid] = "s1";
+}
+
+function setColumnStep(physician, step) {
+  if (!physician) {
+    // S1/S2 是全局的，三列一起走。
+    for (const pid of Object.keys(COLUMN_PROGRESS)) COLUMN_PROGRESS[pid] = step;
+  } else {
+    COLUMN_PROGRESS[physician] = step;
+  }
+  renderColumnsPlaceholder((pid) => columnRunningHtml(pid, COLUMN_PROGRESS[pid] || "s1"));
+}
+
+// ---------- R14：一列集注 ----------
+//
+// **不是卡片。** 三家是对同一段主诉的三种读法（docs/DESIGN.md §3.1 第一条），
+// 卡片会暗示它们是三个独立的东西。列与列之间只有一条 --rule-soft 细线。
+//
+// **身份色只用在顶部三行 + 3px 顶边**（第二条）。列内正文一律 --ink：整列染色
+// 会让人看颜色而不看内容。色值走 `var(--phys-<id>)`，由 /health 注入——
+// 这里不写任何十六进制（CLAUDE.md 第 31 条前端小节）。
+//
+// 函数名从 cardHtml 改成 columnHtml：R13 之前它渲染的确实是一张卡片，现在不是了，
+// 留着旧名字会让下一个人以为外面还包着 .card。
+function columnHeadHtml(physician, name, meta) {
+  const m = meta || {};
+  const years = m.years ? `<div class="col-years">${escapeHtml(m.years)}</div>` : "";
+  const school = m.school ? `<div class="col-school">${escapeHtml(m.school)}</div>` : "";
+  return `<div class="col-head">
+    <div class="col-name">${escapeHtml(name || physician)}</div>
+    ${years}${school}
+  </div>`;
+}
+
+// 一列的外壳。五种状态共用它，区别只在 body 和 data-state——外壳统一，
+// 三列在任何状态下都等宽等高，不会因为某一列还在跑就把版面挤歪。
+function columnShellHtml(physician, name, meta, state, body) {
+  return `<div class="col" data-physician="${escapeHtml(physician)}" data-state="${escapeHtml(state)}"
+       style="--col: var(--phys-${escapeHtml(physician)}, var(--ink));">
+    ${columnHeadHtml(physician, name, meta)}
+    <div class="col-body">${body}</div>
+  </div>`;
+}
+
+function columnHtml(result, mode = "researcher") {
   const s3 = result.s3;
   const hallucinationHtml = result.hallucinated && result.hallucinated.length > 0
     ? `<div class="hallucination-warning">⚠ 检测到可能的幻觉引用：模型引用了检索结果之外的医案 id（${escapeHtml(result.hallucinated.join("、"))}），请勿采信该结论中的引用。</div>`
@@ -999,7 +1390,7 @@ function cardHtml(result, mode = "researcher") {
   // 它代表"系统尝试修正但没修好"，比没检查更需要让人看到。
   const so = result.safety_output || {};
   const incompatibleHtml = so.incompatible && so.incompatible.length > 0
-    ? `<div class="safety-incompatible">⚠ 配伍禁忌：${so.incompatible.map(p => `${escapeHtml(p[0])} 反/畏 ${escapeHtml(p[1])}`).join("；")}</div>`
+    ? `<div class="safety-incompatible">⚠ 配伍禁忌：${so.incompatible.map(pair => `${escapeHtml(pair[0])} 反/畏 ${escapeHtml(pair[1])}`).join("；")}</div>`
     : "";
   const thermalHtml = so.thermal_warning
     ? `<div class="safety-thermal">⚠ ${escapeHtml(so.thermal_warning)}</div>`
@@ -1014,31 +1405,25 @@ function cardHtml(result, mode = "researcher") {
   const openAttr = defaultDetailsOpenForMode(mode) ? "open" : "";
   const reactHtml = reactTraceDetailsHtml(result.react_trace, openAttr);
 
-  // M7：君臣佐使分组显示——只有 formula_candidates 存在时才有 herb_items 可分组
-  // （patient 角色下这个字段被后端整个摘掉，见 api/main.py::_filter_s3_for_role，
-  // 这里退回旧的扁平"用药"一行，s3.herbs 在 patient 下同样是 undefined，
-  // 表现为"（无）"——不是本模块的显示 bug，是 M6 定的安全边界本该如此）。
+  // patient 角色下 formula_candidates/formula/herbs 三个键被后端整个摘掉
+  // （api/main.py::_filter_s3_for_role，安全边界不是前端藏起来）。"这个角色
+  // 本来就拿不到"跟"这次没开出方"意思完全不同，必须分开说。
   const selectedCand = (s3.formula_candidates && s3.formula_candidates.length)
     ? s3.formula_candidates[s3.selected] : null;
-  // A2：patient 角色下 formula_candidates/formula/herbs 三个键都被后端整个摘掉
-  // （api/main.py::_filter_s3_for_role，安全边界不是前端藏起来）。原来这里会
-  // 退回显示"用药（无）"和"方剂（未明确）"——那是在暗示"这次没开出方"，
-  // 而真相是"这个角色本来就拿不到"。两者意思完全不同，必须分开说。
   const isPatient = mode === "patient";
+  // 医生模式要编辑全量药味，折叠会让"下面还有几味"变成一次多余的点击。
   const herbsHtml = isPatient
     ? `<div class="doctor-disclaimer">患者模式不提供具体方剂与药材——这是服务端的字段裁剪（响应体里根本没有这几个键），不是本次没开出方。具体用药请咨询执业医师。</div>`
     : selectedCand
-      ? herbGroupsHtml(selectedCand)
+      ? herbGroupsHtml(selectedCand, mode !== "doctor")
       : `<div class="field"><b>用药</b>${escapeHtml((s3.herbs || []).join("、") || "（无）")}</div>`;
   const formulaRow = isPatient
     ? ""
-    : `<div class="field"><b>方剂</b>${escapeHtml(s3.formula || "（未明确）")}</div>`;
+    : `<div class="col-formula">${escapeHtml(s3.formula || "（未明确）")}</div>`;
 
-  return `
-    <div class="card">
-      <h2 style="color:${escapeHtml(color)}">${escapeHtml(result.physician_name)}</h2>
-      <div class="field"><b>证型</b>${escapeHtml(s3.syndrome)}</div>
-      <div class="field"><b>治法</b>${escapeHtml(s3.treatment_principle)}</div>
+  const body = `
+      <div class="col-syndrome">${escapeHtml(s3.syndrome)}</div>
+      <div class="col-principle">${escapeHtml(s3.treatment_principle)}</div>
       ${formulaRow}
       ${herbsHtml}
       ${westernHtml}
@@ -1048,21 +1433,20 @@ function cardHtml(result, mode = "researcher") {
       ${noRefHtml}
       ${hallucinationHtml}
       ${doctorSectionHtml(result.physician, mode)}
-      <details ${openAttr}>
-        <summary>推理过程与引用详情</summary>
+      ${refFoldHtml(result.refs)}
+      <details class="col-reasoning" ${openAttr}>
+        <summary>推理过程</summary>
         <div class="detail-block">
-          <div class="label">推理过程</div>
           <div>${escapeHtml(s3.reasoning)}</div>
           <div class="label">引用医案 id</div>
           <div>${escapeHtml((s3.cited_case_ids || []).join("、") || "（无）")}</div>
-          <div class="label">检索结果与相似度</div>
-          ${refListHtml(result.refs)}
           ${s3.note ? `<div class="label">备注</div><div>${escapeHtml(s3.note)}</div>` : ""}
         </div>
       </details>
       ${reactHtml}
-    </div>
   `;
+  return columnShellHtml(result.physician, result.physician_name,
+                         PHYSICIAN_META[result.physician], "done", body);
 }
 
 // 「参西用药」栏。张锡纯「衷中参西」会在方里用阿斯匹林这类西药，是他最有辨识度的
@@ -1077,8 +1461,8 @@ function westernDrugsHtml(s3) {
 }
 
 
-function renderResults(results, mode = "researcher") {
-  document.getElementById("results").innerHTML = results.map((r) => cardHtml(r, mode)).join("");
+function renderColumns(results, mode = "researcher") {
+  document.getElementById("columns").innerHTML = results.map((r) => columnHtml(r, mode)).join("");
 }
 
 // role-select 的当前取值。跟 retriever-mode 一样"逐请求参数、不落进程状态"，
@@ -1105,6 +1489,12 @@ function resetSecondaryPanels() {
   renderTriage(null);
   const footer = document.getElementById("manifest-footer");
   if (footer) footer.textContent = "";
+  // R14：对照带和分层读数也是"上一次问诊留下的东西"。不清的话，被拦截的
+  // 那一次页面上还挂着上一位患者的用药分歧——比留一张旧图更容易被误读成
+  // "这次的结果"。
+  const rx = document.getElementById("rx-compare");
+  if (rx) { rx.innerHTML = ""; rx.classList.remove("show"); }
+  renderDivergence(null);
 }
 
 // G3 追问记录。HTTP 路径上现在没有提问渠道（api_consult 不传 ask_fn），所以正常情况
@@ -1118,8 +1508,8 @@ function renderFollowup(followup) {
     // 原来挂的是 residual-note，而全文件只有 #residual-note 这个 id 选择器，
     // 同名的类选择器从来不存在——这个框一直没有任何样式。
     el.className = "followup-note";
-    const results = document.getElementById("results");
-    results.parentElement.insertBefore(el, results);
+    const detail = document.getElementById("detail-body");
+    if (detail) detail.insertBefore(el, detail.firstChild);
   }
   if (!followup || !followup.history || followup.history.length === 0) {
     el.style.display = "none";
@@ -1182,11 +1572,12 @@ function buildConsultRequestBody(complaint) {
 function renderConsultResult(data) {
   resetSecondaryPanels();
   if (data.rejected) {
-    showError(`⚠ ${data.reject_reason}`);
+    // 安全拦截：**整页替换**（§3.1）。不是在三列上面加个红横幅——总纲的原话是
+    // "什么都标红会训练用户忽略标红"，这个系统只在真危重时打断，所以打断必须
+    // 彻底：三列清空、图不画、对照带不画，页面上不留任何可以被误读成"结论"的东西。
+    showSafetyBlock(data.reject_reason);
     renderDivergence(null);
-    renderResults([]);
     renderFollowup(data.followup);
-    renderGraph(data.graph);
     return;
   }
   if (data.retrieval_error) {
@@ -1195,16 +1586,19 @@ function renderConsultResult(data) {
     // 这里如实把原因显示出来（graph 模式的静默降级会让 E8 消融失去意义）。
     showError(`⚠ ${data.retrieval_error}`);
     renderDivergence(null);
-    renderResults([]);
+    clearColumns();
     renderFollowup(data.followup);
     renderGraph(data.graph);
     return;
   }
   if (data.insufficient) {
-    // 信息不足不是错误：系统承认没法有依据地辨证，要把补充信息的提示原样给用户
-    showError(`ℹ ${data.insufficient_reason || "现有症状不足以推断证素，请补充更多信息。"}`);
+    // 信息不足不是错误：系统承认没法有依据地辨证。§3.1 要求"三列位置显示一句话
+    // + 建议补充的信息，不留空白"——留空白的话页面看起来像坏了，而它其实是
+    // 好好地拒绝了。理由原样来自后端 insufficient_reason，不在前端编一句。
+    setConsultState("insufficient");
+    const reason = data.insufficient_reason || "";
+    renderColumnsPlaceholder((pid) => columnInsufficientHtml(pid, reason));
     renderDivergence(null);
-    renderResults([]);
     renderFollowup(data.followup);
     renderGraph(data.graph);
     return;
@@ -1250,12 +1644,14 @@ function renderConsultResult(data) {
     note.style.display = "none";
   }
   renderDivergence(data.divergence);
+  renderRxCompare(data.divergence, data.results);
   renderTriage(data);
   // M8：医生模式的可编辑处方状态要在渲染卡片之前建好——cardHtml() 里的
   // doctorSectionHtml() 读的是 DOCTOR_STATE，不是 data.results 本身
   // （医生编辑的是自己的一份拷贝，不直接改问诊响应）。
   initDoctorState(data.results);
-  renderResults(data.results, getSelectedRole());
+  setConsultState("done");
+  renderColumns(data.results, getSelectedRole());
   renderFollowup(data.followup);
   renderGraph(data.graph);
 }
@@ -1277,11 +1673,42 @@ function clearProgress() {
 
 let currentStreamId = null;
 
-function showNeedInput(question) {
+// R14 §3.1 追问状态：**问题弹在提问那位医家的列里，其余两列显示"等待中"**。
+//
+// 谁在问由 need_input 事件的 physician 字段说了算（后端 core/chain.py 的
+// ContextVar → api/main.py::_ConsultStream.ask）。physician 为空 = 全局追问
+// （run_followup 在三位医家之前跑，不属于任何一列），回落到输入区那个问答框
+// ——**不是随便挑一列塞进去**：挑一列会让人以为是那位医家在问。
+function showNeedInput(question, physician) {
+  if (physician && PHYSICIAN_META[physician]) {
+    setConsultState("followup");
+    renderColumnsPlaceholder((pid) => pid === physician
+      ? columnFollowupHtml(pid, question)
+      : columnWaitingHtml(pid));
+    bindColumnAsk();
+    return;
+  }
   document.getElementById("need-input-question").textContent = `❓ ${question}`;
   const input = document.getElementById("need-input-answer");
   input.value = "";
   document.getElementById("need-input-box").classList.add("show");
+  input.focus();
+}
+
+// 列内问答框的事件在每次重渲染之后重新绑：这几个节点是 innerHTML 生成的，
+// 上一批节点连同它们的监听器一起被丢掉了。答案照旧走同一个提交函数
+// （submitNeedInputAnswer 读的是那个隐藏输入框），不另开一条提交路径——
+// 两条路径迟早在"流已经结束了还能不能提交"这种细节上分叉。
+function bindColumnAsk() {
+  const box = document.querySelector(".col-ask");
+  if (!box) return;
+  const input = box.querySelector(".ask-input");
+  const submit = () => {
+    document.getElementById("need-input-answer").value = input.value;
+    submitNeedInputAnswer();
+  };
+  box.querySelector(".ask-submit").addEventListener("click", submit);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
   input.focus();
 }
 
@@ -1318,6 +1745,25 @@ async function submitNeedInputAnswer() {
 // core/chain.py::consult() 的 on_step 回调定义的契约——那边新增一种事件，
 // 这里要跟着加一个 case，不加也不会报错，只是进度条上少一行，不算严重故障，
 // 所以没有钉一条"事件名必须穷举"的断言，交给人工核对事件名对不对得上。
+// 事件 → 该把哪一列推到哪一步。纯函数：**这张表是"事件怎么映射成进度"的
+// 唯一定义**，散在 switch 里的话，加一种事件时三列的进度和左下角的日志会
+// 各更新各的、然后对不上。physician 为 null 表示三列一起走（S1/S2 是全局
+// 跑一次、三列共用的，CLAUDE.md 明令 S1 只能跑一次）。
+function columnStepForEvent(name, data) {
+  switch (name) {
+    case "s1_done":
+      return { physician: null, step: "s2" };
+    case "s2_done":
+      return { physician: null, step: "s3" };
+    case "physician_start":
+    case "react_step":
+    case "s3_start":
+      return { physician: data.physician, step: "s3" };
+    default:
+      return null;
+  }
+}
+
 function describeProgressEvent(name, data) {
   switch (name) {
     case "s1_done":
@@ -1417,12 +1863,19 @@ async function submitConsult() {
   clearError();
   clearProgress();
   hideNeedInput();
+  // R14：主诉从"输入框里的字"升格成页面正文（§3.1 布局图最上面那一段），
+  // 输入区同时从居中放大收到底部。整页替换的拦截页如果还开着，先收起来。
+  hideSafetyBlock();
+  renderComplaintBody(complaint);
+  setConsultState("running");
+  resetColumnProgress();
+  renderColumnsPlaceholder((pid) => columnRunningHtml(pid, "s1"));
   currentStreamId = null;
 
   currentAbort = new AbortController();
   cancelledByUser = false;
   let idleTimedOut = false;
-  if (cancelBtn) cancelBtn.style.display = "";
+  if (cancelBtn) cancelBtn.classList.remove("is-hidden");
 
   const t0 = Date.now();
   const ticker = setInterval(() => {
@@ -1464,7 +1917,7 @@ async function submitConsult() {
         if (data.usage) renderUsage(data.usage);
         currentStreamId = data.stream_id;
       } else if (name === "need_input") {
-        showNeedInput(data.question);
+        showNeedInput(data.question, data.physician);
       } else if (name === "error") {
         errorDetail = data.detail;
       } else if (name === "done") {
@@ -1472,6 +1925,11 @@ async function submitConsult() {
       } else {
         const line = describeProgressEvent(name, data);
         if (line) appendProgress(line);
+        // 三列各自的分步进度。**按 physician 字段路由，不按到达顺序推**——
+        // R12 之后三位医家是并发跑的，叶天士的 done 完全可能排在张锡纯的
+        // start 后面（docs/DESIGN.md §4.7 的订正）。
+        const step = columnStepForEvent(name, data);
+        if (step) setColumnStep(step.physician, step.step);
         if (name === "followup_answered") hideNeedInput();
       }
     });
@@ -1496,7 +1954,7 @@ async function submitConsult() {
   } finally {
     clearInterval(ticker);
     clearTimeout(idleTimer);
-    if (cancelBtn) cancelBtn.style.display = "none";
+    if (cancelBtn) cancelBtn.classList.add("is-hidden");
     currentAbort = null;
     cancelledByUser = false;
     btn.disabled = false;

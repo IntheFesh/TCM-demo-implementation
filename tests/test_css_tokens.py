@@ -201,6 +201,21 @@ def test_webfont_urls_are_pinned_to_a_version(css):
         assert re.search(r"@\d+\.\d+\.\d+", url), f"URL 里没有具体版本号：{url}"
 
 
+def test_no_animation_outside_the_three_tokens(css, body):
+    """§2.4 只允许三处动效。**判据是"规则里不许出现具体时长"**——写成
+    `.22s` 的那一处不会被 `prefers-reduced-motion` 那一块关掉（那一块重定义的
+    是令牌），于是"尊重系统的减弱动效设置"只对一半的动效成立，而页面上
+    看不出任何异常。
+
+    R14 抓到的就是这一处：证据侧栏的滑入写死 `.22s`，值恰好等于 --t-highlight
+    但语义是"展开/折叠"，两边都说得通——这正是为什么要用令牌而不是数值。
+    """
+    durations = re.findall(r"transition[^;{]*?:\s*[^;{]*?(\d*\.?\d+m?s)", body)
+    hard = [d for d in durations if not d.startswith(".001")]
+    assert not hard, f"规则里写死了动效时长（应当用 --t-* 令牌）：{sorted(set(hard))}"
+    assert "@keyframes" not in css, "§2.4 之外不许再加 keyframes 动画"
+
+
 def test_reduced_motion_is_respected(css):
     """§2.4：`prefers-reduced-motion: reduce` 时全部动效改为瞬时。"""
     assert "prefers-reduced-motion: reduce" in css

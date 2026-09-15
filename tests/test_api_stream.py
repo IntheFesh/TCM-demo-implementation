@@ -309,6 +309,59 @@ def test_ask_fn_returns_none_when_answer_times_out(monkeypatch):
     assert seen_answer["value"] is None
 
 
+# ---------- R14：need_input 带 physician（三列集注的追问要落到对的那一列） ----------
+
+
+def _need_input_payload(monkeypatch, ask_inside):
+    """跑一次流，返回那条 need_input 事件的 data。ask_inside 决定 ask_fn 是在
+    哪个上下文里被调的——这正是这两条测试要区分的东西。"""
+    def fake_consult(complaint, ask_fn=None, on_step=None, **kw):
+        ask_inside(ask_fn)
+        return _fake_outcome()
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    monkeypatch.setattr(api_main, "ANSWER_TIMEOUT_SECONDS", 0.2)
+    client = TestClient(api_main.app)
+    out_q: queue.Queue = queue.Queue()
+    _read_stream_into(client, "纳差", out_q)
+    events = []
+    while not out_q.empty():
+        events.append(out_q.get())
+    return next(d for name, d in events if name == "need_input")
+
+
+def test_need_input_carries_the_asking_physician(monkeypatch):
+    """R14 §3.1 追问状态：**问题弹在提问那位医家的列里**，其余两列"等待中"。
+    前端靠的就是这个字段（core/chain.py 的 ContextVar → _ConsultStream.ask）。
+
+    为什么用 ContextVar 而不是给 AskFn 加参数：`AskFn` 的契约是
+    `(question) -> str | None`，命令行、患者模拟器、SSE 端点三处实现都按这个
+    签名写；而"谁在问"对 ask_fn 的语义没有影响，只是给界面用来路由。
+    并发下仍然正确——每位医家的 worker 跑在自己那份 copy_context() 里。"""
+    import core.chain as chain
+
+    def ask_as_wu(ask_fn):
+        token = chain._ASKING_PHYSICIAN.set(("wu_jutong", "吴鞠通"))
+        try:
+            ask_fn("有没有便血？")
+        finally:
+            chain._ASKING_PHYSICIAN.reset(token)
+
+    data = _need_input_payload(monkeypatch, ask_as_wu)
+    assert data["question"] == "有没有便血？"
+    assert data["physician"] == "wu_jutong"
+    assert data["physician_name"] == "吴鞠通"
+
+
+def test_a_global_followup_says_it_belongs_to_no_column(monkeypatch):
+    """`run_followup` 在三位医家之前跑（S1/S2 之后、S3 之前），**不属于任何一列**。
+    这时 physician 必须是 null，前端据此回落到输入区那个问答框——随便挑一列
+    塞进去会让人以为是那位医家在问，而那位医家这会儿还没开始辨证。"""
+    data = _need_input_payload(monkeypatch, lambda ask_fn: ask_fn("平时怕冷吗？"))
+    assert data["question"] == "平时怕冷吗？"
+    assert data["physician"] is None and data["physician_name"] is None
+
+
 # ---------- 异常与资源清理 ----------
 
 

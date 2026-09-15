@@ -11,14 +11,34 @@
 </head>
 <body>
 
-<header>
-  <h1>名医辨证对照</h1>
-  <!-- M8：定位表述分模式——患者/学生/研究者模式沿用原文案，医生模式换成
-       任务描述原文给的处方辅助工具表述（见 describeDisclaimer()）。这里的
-       初始文案是默认角色 researcher 对应的那句，JS 在 role-select 变化时
-       会原地替换，不是另起一块只在医生模式下才出现的提示——同一个位置，
-       内容跟着角色换，位置本身不该因为角色不同而消失或新增。 -->
-  <div class="disclaimer" id="disclaimer-text">教学与研究用途，非诊断工具，不能替代执业医师</div>
+<!-- 顶栏 56px：左边标题 + 副标，右边角色/检索两个下拉（docs/DESIGN.md §3.1）。
+     两个下拉从输入区搬上来：它们决定"这一次问诊怎么跑"，属于全局设置，
+     混在输入区里会跟"输入主诉"这个动作抢注意力。 -->
+<header id="topbar">
+  <div class="tb-title">
+    <h1>名医辨证对照</h1>
+    <!-- M8：定位表述分模式——患者/学生/研究者模式沿用原文案，医生模式换成
+         处方辅助工具表述（见 describeDisclaimer()）。同一个位置内容跟着角色换，
+         不是另起一块只在医生模式下才出现的提示。 -->
+    <div class="tb-sub" id="disclaimer-text">教学与研究用途，非诊断工具，不能替代执业医师</div>
+  </div>
+  <div class="tb-controls">
+    <label id="role-select-label" for="role-select">查看模式</label>
+    <select id="role-select">
+      <option value="researcher" selected>研究者（完整信息）</option>
+      <option value="student">学生（教学展开）</option>
+      <option value="doctor">医生（可编辑处方）</option>
+      <option value="patient">患者（导诊，不提供方药）</option>
+    </select>
+    <label id="retriever-mode-label" for="retriever-mode">检索模式</label>
+    <select id="retriever-mode">
+      <option value="">默认</option>
+      <option value="hybrid">hybrid（稠密+BM25 融合）</option>
+      <option value="dense">dense（稠密向量）</option>
+      <option value="bm25">bm25（关键词）</option>
+      <option value="graph">graph（证素索引）</option>
+    </select>
+  </div>
 </header>
 
 <div id="demo-mode-banner"></div>
@@ -30,87 +50,92 @@
 
 <main>
 <div id="tab-consult" class="tab-panel">
-  <div id="divergence-banner"></div>
-  <div id="error-box" role="alert" aria-live="assertive"></div>
-  <div id="safety-flag-note" role="alert" aria-live="assertive"></div>
-  <!-- A2：患者模式导诊面板。后端在 role=patient 时下发 triage/food_therapy/
-       patent_medicines 三个字段，之前前端一个都没渲染。 -->
-  <div id="triage-box"></div>
 
-  <div id="graph-panel">
-    <div id="graph-toolbar">
-      <button class="ghost-btn" id="skip-btn" title="立即显示终态">⏭ 跳过动画</button>
-      <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
-    </div>
-    <div id="cy"></div>
-    <div id="residual-note"></div>
-    <div id="graph-note"></div>
-  <div id="graph-tooltip" class="gt-tooltip"></div>
-  </div>
+  <!-- 安全拦截是**整页替换**（§3.1）：它跟 #consult-page 是互斥的两个兄弟，
+       不是盖在上面的横幅。理由见总纲——"什么都标红会训练用户忽略标红"，
+       这个系统只在真危重时打断，所以打断必须彻底。 -->
+  <div id="safety-block" role="alert" aria-live="assertive" hidden></div>
 
-  <div id="input-panel">
-    <textarea id="complaint" placeholder="请输入患者主诉，例如：胃脘胀痛，食后加重，嗳气泛酸，舌淡红苔薄白，脉弦。"></textarea>
-    <div class="input-row">
-      <span id="status-text"></span>
-      <label id="retriever-mode-label" for="retriever-mode">检索模式</label>
-      <select id="retriever-mode">
-        <option value="">默认</option>
-        <option value="hybrid">hybrid（稠密+BM25 融合）</option>
-        <option value="dense">dense（稠密向量）</option>
-        <option value="bm25">bm25（关键词）</option>
-        <option value="graph">graph（证素索引）</option>
-      </select>
-      <!-- M7 只放了 researcher/student——patient 的专属界面（导诊横幅）仍是
-           未排期工作，这里还是不摆；doctor 的专属界面（可编辑处方表）M8 做了，
-           加回这个选项。 -->
-      <label id="role-select-label" for="role-select">查看模式</label>
-      <select id="role-select">
-        <option value="researcher" selected>研究者（完整信息）</option>
-        <option value="student">学生（教学展开）</option>
-        <option value="doctor">医生（可编辑处方）</option>
-        <!-- A2：后端 api/main.py:36 的 Role 四种角色一直齐全，README 也写着
-             "四种模式"、DEMO.md 第 5 点写着"『查看模式』切到『患者』"，但
-             这个 option 从来没加过——照 DEMO.md 演示会当场找不到它。 -->
-        <option value="patient">患者（导诊，不提供方药）</option>
-      </select>
-      <button id="submit-btn">辨证</button>
-      <!-- E1：一次问诊是分钟级（v4-pro + ReAct），原来点下去就只能等或刷新
-           整个页面。取消按钮平时不显示，跑起来才出现。 -->
-      <button id="cancel-btn" style="display:none;">取消</button>
-    </div>
-    <!-- D1：BYOK + 共享额度 + 用量看板。key 只存 sessionStorage（关标签页就没了），
-         随请求走 X-LLM-Key 头，服务端不落盘、不进日志、不进 manifest。 -->
-    <div id="usage-bar" role="status" aria-live="polite">
-      <span id="usage-text" class="grow"></span>
-      <label for="byok-key" style="font-size:12px;">自带 API key</label>
-      <input id="byok-key" type="password" autocomplete="off" spellcheck="false"
-             placeholder="sk-…（只存在本标签页；建议用额度有限的临时 key）" />
-      <button id="byok-save">使用</button>
-      <button id="byok-clear">清除</button>
-    </div>
-    <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
-         其余模式下这两个字段不出现——不是禁用置灰，是压根不摆出来，跟
-         patient/doctor 模式后端字段裁剪同一条"不该看到的东西不摆出来"的
-         精神，只是这里是前端表单层面的，不是安全边界。 -->
-    <div class="input-row" id="doctor-id-row" style="display:none;">
-      <label id="doctor-id-label" for="doctor-id-input">医生标识</label>
-      <input type="text" id="doctor-id-input" placeholder="例如：dr_ye（导出处方必填）" style="flex:1;padding:7px 8px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:12.5px;" />
-      <label id="patient-ref-label" for="patient-ref-input">患者标识（可选）</label>
-      <input type="text" id="patient-ref-input" placeholder="例如：门诊号/化名" style="flex:1;padding:7px 8px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:12.5px;" />
-    </div>
-    <div id="progress-log" role="status" aria-live="polite"></div>
-    <div id="need-input-box">
-      <div id="need-input-question"></div>
-      <div class="input-row" style="justify-content: flex-start;">
-        <input type="text" id="need-input-answer" placeholder="请输入回答，例如：有 / 没有" />
-        <button id="need-input-submit">回答</button>
+  <div id="consult-page" class="state-first">
+    <div id="error-box" role="alert" aria-live="assertive"></div>
+    <div id="safety-flag-note" role="alert" aria-live="assertive"></div>
+    <div id="triage-box"></div>
+
+    <!-- 主诉正文：28px 宋体，行宽 ≤ 38 汉字。这是页面的"正文"，不是回显。 -->
+    <div id="complaint-body"></div>
+
+    <!-- 用药对照带：点阵 + ε 参考线。页面的主角，不是一段文字横幅。 -->
+    <div id="rx-compare"></div>
+    <!-- 分层读数：君臣/佐使各自的 Jaccard 与各自的 ε、未标注 role 的药味数、
+         两两配对的师承内 vs 跨学派均值。这些是对照带画不出来又确实有意义的数，
+         默认折叠但一个字都没删——R14 换的是主角，不是把信息砍掉。 -->
+    <details id="divergence-detail" hidden>
+      <summary>分层读数（君臣 / 佐使各自的噪声地板）</summary>
+      <div id="divergence-banner"></div>
+    </details>
+
+    <!-- 三列集注：等宽等高、细线分隔、无卡片。 -->
+    <div id="columns"></div>
+
+    <details id="detail-zone">
+      <summary>推理链 · 图谱 · 取证过程</summary>
+      <div id="detail-body">
+        <div id="followup-note"></div>
+        <div id="graph-panel">
+          <div id="graph-toolbar">
+            <button class="ghost-btn" id="skip-btn" title="立即显示终态">⏭ 跳过动画</button>
+            <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
+          </div>
+          <div id="cy"></div>
+          <div id="residual-note"></div>
+          <div id="graph-note"></div>
+          <div id="graph-tooltip" class="gt-tooltip"></div>
+        </div>
+        <div id="progress-log" role="status" aria-live="polite"></div>
+        <div id="manifest-footer"></div>
+      </div>
+    </details>
+
+    <!-- 输入区在最下方：结果才是主体，输入是动作。首次进入（state-first）时
+         由 CSS 居中放大，并显示下面那三条示例。 -->
+    <div id="input-panel">
+      <div id="examples"></div>
+      <textarea id="complaint" placeholder="请输入患者主诉，例如：胃脘胀痛，食后加重，嗳气泛酸，舌淡红苔薄白，脉弦。"></textarea>
+      <div class="input-row">
+        <span id="status-text"></span>
+        <button id="submit-btn">辨证</button>
+        <!-- E1：一次问诊是分钟级（v4-pro + ReAct）。取消按钮平时不显示。 -->
+        <button id="cancel-btn" class="is-hidden">取消</button>
+      </div>
+      <!-- D1：BYOK + 共享额度 + 用量看板。key 只存 sessionStorage（关标签页就没了），
+           随请求走 X-LLM-Key 头，服务端不落盘、不进日志、不进 manifest。 -->
+      <div id="usage-bar" role="status" aria-live="polite">
+        <span id="usage-text" class="grow"></span>
+        <label class="byok-label" for="byok-key">自带 API key</label>
+        <input id="byok-key" type="password" autocomplete="off" spellcheck="false"
+               placeholder="sk-…（只存在本标签页；建议用额度有限的临时 key）" />
+        <button id="byok-save">使用</button>
+        <button id="byok-clear">清除</button>
+      </div>
+      <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
+           其余模式下压根不摆出来，不是禁用置灰。 -->
+      <div class="input-row is-hidden" id="doctor-id-row">
+        <label id="doctor-id-label" for="doctor-id-input">医生标识</label>
+        <input type="text" id="doctor-id-input" class="text-field" placeholder="例如：dr_ye（导出处方必填）" />
+        <label id="patient-ref-label" for="patient-ref-input">患者标识（可选）</label>
+        <input type="text" id="patient-ref-input" class="text-field" placeholder="例如：门诊号/化名" />
+      </div>
+      <!-- 全局追问（run_followup，在三位医家之前跑）的问答框。带 physician 的
+           追问弹在对应那一列里，不走这里。 -->
+      <div id="need-input-box">
+        <div id="need-input-question"></div>
+        <div class="input-row input-row-left">
+          <input type="text" id="need-input-answer" placeholder="请输入回答，例如：有 / 没有" />
+          <button id="need-input-submit">回答</button>
+        </div>
       </div>
     </div>
   </div>
-
-  <div id="results"></div>
-
-  <div id="manifest-footer" style="margin:18px 0 8px;font-size:11px;color:var(--muted);text-align:center;"></div>
 </div>
 
 <div id="tab-graph-browser" class="tab-panel" hidden>
@@ -133,14 +158,14 @@
   <div id="gb-stats"></div>
 </div>
 </main>
-<aside id="evidence-panel" role="dialog" aria-modal="false" aria-label="证据详情" aria-hidden="true">
-    <div id="evidence-head">
-      <span id="evidence-title"></span>
-      <button id="evidence-close" title="关闭">×</button>
-    </div>
-    <div id="evidence-body"></div>
-  </aside>
 
+<aside id="evidence-panel" role="dialog" aria-modal="false" aria-label="证据详情" aria-hidden="true">
+  <div id="evidence-head">
+    <span id="evidence-title"></span>
+    <button id="evidence-close" title="关闭">×</button>
+  </div>
+  <div id="evidence-body"></div>
+</aside>
 
 <script src="graph.js"></script>
 <script src="app.js"></script>

@@ -20,8 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.audit import append_audit
-from core.chain import consult, explained_symptoms
+from core.chain import consult, current_asking_physician, explained_symptoms
 from core.diseases import get_disease, triage_advice
+from core.examples import EXAMPLE_COMPLAINTS
 from core.herbs import is_western_drug, strip_dose_and_parens
 from core.llm import ByokBackend, LLMAuthError, check_api_key, get_llm, use_llm
 from core.react import react_enabled
@@ -180,6 +181,11 @@ async def health() -> dict:
              "color_bg": info["color_bg"]}
             for pid, info in PHYSICIANS.items()
         ],
+        # example_complaints：R14 首屏的三条可点击示例。**下发而不是写死在
+        # app.js 里**——CLAUDE.md 第 31 条前端小节写明"写死的常量也算一处实现"，
+        # 而这三条已经在 DEMO.md 和录制清单里各有一份。回放按主诉原文的哈希索引，
+        # 三份副本漂了一个标点，演示当场 LLMError（core/examples.py 的由来）。
+        "example_complaints": [dict(e) for e in EXAMPLE_COMPLAINTS],
     }
 
 
@@ -766,8 +772,19 @@ class _ConsultStream:
         with self._pending_lock:
             self._pending = answer_q
         try:
-            # 先登记再发 need_input：客户端收到事件时答案一定已经有地方接
-            self.emit("need_input", {"question": question})
+            # 先登记再发 need_input：客户端收到事件时答案一定已经有地方接。
+            # physician：R14 的三列集注要把问题弹在**提问那位医家的列里**，其余
+            # 两列显示"等待中"。谁在问由 core.chain 的 ContextVar 传过来——
+            # AskFn 的契约是 (question) -> str|None，三处实现（命令行、患者
+            # 模拟器、这里）都按这个签名写，加参数要同时改三处。
+            # None 表示全局追问（run_followup 在三位医家之前跑，不属于任何一列），
+            # 前端据此回落到输入区那个问答框，不是随便挑一列塞进去。
+            asking = current_asking_physician()
+            self.emit("need_input", {
+                "question": question,
+                "physician": asking[0] if asking else None,
+                "physician_name": asking[1] if asking else None,
+            })
             deadline = time.monotonic() + ANSWER_TIMEOUT_SECONDS
             while True:
                 if self.cancel.is_set():

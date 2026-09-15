@@ -132,19 +132,37 @@
        衬线的是中医的话，非衬线的是系统的话。 */
     font-family: var(--font-ui);
   }
-  header {
-    padding: 20px 24px 14px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
+  /* 顶栏 56px（§3.1 布局图）：左边标题 + 副标，右边角色/检索两个下拉。
+     min-height 而不是 height：窄屏上两个下拉会换行，写死高度会把它们切掉。 */
+  #topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+    min-height: 56px;
+    padding: 0 var(--s5);
+    background: var(--surface);
+    border-bottom: 1px solid var(--rule);
   }
-  header h1 {
-    margin: 0 0 4px;
-    font-size: 22px;
+  #topbar h1 {
+    margin: 0;
+    font-size: 17px;
     font-weight: 600;
+    letter-spacing: .02em;
   }
-  header .disclaimer {
+  #topbar .tb-sub {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+  #topbar .tb-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
     font-size: 12.5px;
     color: var(--muted);
+    padding: var(--s2) 0;
   }
   main {
     max-width: 1180px;
@@ -195,12 +213,163 @@
     white-space: pre-line;
   }
   #divergence-banner.show { display: block; }
+  /* §3.1 第五条：**输入框在最下方**，因为结果才是主体、输入是动作。
+     第一次进入（.state-first）时居中放大——此时页面上没有别的东西，
+     把输入框摆在底部等于让人对着一片空白往下找。 */
   #input-panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
+    background: var(--surface);
+    border: 1px solid var(--rule);
     border-radius: var(--r-lg);
-    padding: 16px;
-    margin-bottom: 20px;
+    padding: var(--s4);
+    margin-bottom: var(--s5);
+  }
+  .state-first #input-panel {
+    max-width: 720px;
+    margin: 8vh auto var(--s5);
+    padding: var(--s6);
+  }
+  .state-first #complaint { min-height: 120px; font-size: 16px; }
+  /* 还没问诊时这几块没有内容，摆一排空框比空白更像坏了。 */
+  .state-first #complaint-body,
+  .state-first #rx-compare,
+  .state-first #columns,
+  .state-first #detail-zone { display: none; }
+  /* 示例只在首屏出现：有结果之后它们就成了干扰。 */
+  #examples { display: none; }
+  .state-first #examples { display: block; margin-bottom: var(--s4); }
+  #examples .ex-title { font-size: 12.5px; color: var(--muted); margin-bottom: var(--s3); }
+  #examples .ex-list { display: flex; flex-direction: column; gap: var(--s2); }
+  #examples .example {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: var(--r-md);
+    padding: var(--s3);
+    cursor: pointer;
+    font-family: inherit;
+    color: var(--ink);
+  }
+  #examples .example:hover { border-color: var(--accent); }
+  #examples .ex-label {
+    font-weight: 600;
+    color: var(--muted);
+    margin-right: var(--s3);
+  }
+  #examples .ex-text { font-family: var(--font-classic); font-size: 14px; }
+  #examples .ex-hint { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  /* 主诉正文：28px 宋体，行宽 ≤ 38 汉字（§3.1 布局图）。这是页面的"正文"。 */
+  #complaint-body { display: none; }
+  #complaint-body.show {
+    display: block;
+    font-family: var(--font-classic);
+    font-size: 28px;
+    line-height: 1.75;
+    color: var(--ink);
+    max-width: 38em;
+    margin: var(--s5) 0 var(--s6);
+  }
+
+  /* ---- 用药对照带（§3.1 第三条：页面的主角） ---- */
+  #rx-compare { display: none; }
+  #rx-compare.show {
+    display: block;
+    border: 1px solid var(--rule-soft);
+    border-radius: var(--r-lg);
+    padding: var(--s4);
+    margin-bottom: var(--s5);
+    background: var(--surface);
+  }
+  .rx-title { font-size: 12.5px; color: var(--muted); margin-bottom: var(--s3); }
+  .rx-dots { display: flex; flex-wrap: wrap; gap: var(--s5); margin-bottom: var(--s3); }
+  .rx-group { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .rx-tag { font-size: 12px; color: var(--muted); margin-right: var(--s2); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .dot-shared { background: var(--ink); }
+  /* .dot-own 的底色由 JS 逐点注入 var(--phys-<id>)，这里只定形状 */
+  .rx-line { display: flex; height: 3px; border-radius: var(--r-sm); overflow: hidden; margin: var(--s3) 0 4px; }
+  .rx-seg-noise { background: var(--noise); }
+  .rx-seg-real { background: var(--real); }
+  .rx-line-unmeasured { background: var(--rule-soft); }
+  .rx-scale { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .rx-scale span { font-family: var(--font-num); }
+  .rx-verdict { font-size: 12px; color: var(--ink-2); margin-top: var(--s2); }
+
+  /* ---- 安全拦截：整页替换（§3.1） ---- */
+  #safety-block {
+    padding: 8vh var(--s5);
+  }
+  #safety-block .sb-inner {
+    max-width: 640px;
+    margin: 0 auto;
+    border-left: 3px solid var(--danger);
+    background: var(--danger-bg);
+    border-radius: var(--r-md);
+    padding: var(--s5);
+  }
+  #safety-block .sb-title {
+    font-family: var(--font-classic);
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--danger);
+    margin-bottom: var(--s3);
+  }
+  #safety-block .sb-reason { font-size: 14px; color: var(--ink); margin-bottom: var(--s4); }
+  #safety-block .sb-advice { font-size: 14px; line-height: 1.9; color: var(--ink); }
+  #safety-block .sb-note { font-size: 12.5px; color: var(--muted); margin-top: var(--s4); }
+  #safety-block #sb-back {
+    margin-top: var(--s4);
+    padding: var(--s2) var(--s4);
+    background: transparent;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    border-radius: var(--r-md);
+    cursor: pointer;
+    font-family: var(--font-ui);
+    font-size: 13px;
+  }
+
+  /* ---- 折叠区：推理链 · 图谱 · 取证过程 ---- */
+  #detail-zone {
+    border-top: 1px solid var(--rule-soft);
+    padding-top: var(--s3);
+    margin-bottom: var(--s5);
+  }
+  #detail-zone > summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--muted);
+    transition: color var(--t-collapse) ease;
+  }
+  #detail-zone > summary:hover { color: var(--accent); }
+  #detail-body { padding-top: var(--s4); }
+  #divergence-detail > summary {
+    cursor: pointer;
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-bottom: var(--s5);
+  }
+
+  /* 只说"要不要显示"，不说"显示成什么"——后者归各自的规则管。 */
+  .is-hidden { display: none !important; }
+  .input-row-left { justify-content: flex-start; }
+  .text-field {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 7px 8px;
+    border: 1px solid var(--edge);
+    border-radius: var(--r-md);
+    font-family: inherit;
+    font-size: 12.5px;
+  }
+  .byok-label { font-size: 12px; }
+  #manifest-footer {
+    margin: var(--s5) 0 var(--s3);
+    font-size: 11px;
+    color: var(--muted);
+    text-align: center;
   }
   #complaint {
     width: 100%;
@@ -332,33 +501,109 @@
      三位医家三列，加第四位也不用再改这里。原来是写死的 1fr 1fr，注册
      张锡纯那一轮没跟着改，第三张卡片掉到第二行落单——而"三家并排对照"
      正是这个项目的主张，并排本身是断的比数字错更严重。 */
-  #results {
+  /* ==========================================================================
+     R14 三列集注（docs/DESIGN.md §3.1）
+     ==========================================================================
+     **等宽等高、细线分隔、没有卡片。** 卡片会暗示三家是三个独立的东西，
+     而它们是对同一段主诉的三种读法。列数跟着医家数走（auto-fit），
+     注册第四位医家不用改这里。 */
+  #columns {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0;
+    align-items: stretch;
+    margin-bottom: var(--s5);
   }
   @media (max-width: 780px) {
-    #results { grid-template-columns: 1fr; }
+    #columns { grid-template-columns: 1fr; }
+    /* 单列堆叠时列与列之间的分隔线要横过来，否则三列会连成一片看不出边界 */
+    .col + .col { border-left: none; border-top: 1px solid var(--rule-soft); }
   }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--r-lg);
-    padding: 16px;
+  .col {
+    /* 身份色只在 3px 顶边 + 顶部三行（§3.1 第二条）。--col 由 JS 按
+       `var(--phys-<id>)` 注入，这里不写任何具体色值。 */
+    border-top: 3px solid var(--col);
+    padding: var(--s4) var(--s4) var(--s5);
+    min-width: 0;
   }
-  .card h2 {
-    margin: 0 0 10px;
+  .col + .col { border-left: 1px solid var(--rule-soft); }
+  .col-head { margin-bottom: var(--s4); }
+  .col-name {
+    font-family: var(--font-classic);
     font-size: 17px;
+    font-weight: 600;
+    color: var(--col);
   }
-  .card .field {
+  .col-years, .col-school {
+    font-size: 12px;
+    color: var(--col);
+    opacity: .75;
+    margin-top: 1px;
+  }
+  /* 列内正文一律 --ink：整列染色会让人看颜色而不看内容（§3.1 第二条）。 */
+  .col-body { color: var(--ink); font-size: 13.5px; line-height: 1.7; }
+  .col-syndrome {
+    font-family: var(--font-classic);
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: var(--s3);
+  }
+  .col-principle { margin-bottom: var(--s3); }
+  .col-formula {
+    font-family: var(--font-classic);
+    font-weight: 600;
+    margin-bottom: var(--s3);
+  }
+  .col .field {
     font-size: 13.5px;
-    margin-bottom: 6px;
-    line-height: 1.5;
+    margin-bottom: 4px;
+    line-height: 1.6;
   }
-  .card .field b {
+  .col .field b {
     color: var(--muted);
     font-weight: 500;
-    margin-right: 4px;
+    margin-right: var(--s2);
+  }
+  .herb-fold > summary, .col-refs > summary, .col-reasoning > summary {
+    cursor: pointer;
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-top: var(--s2);
+    transition: color var(--t-collapse) ease;
+  }
+  .herb-fold > summary:hover, .col-refs > summary:hover, .col-reasoning > summary:hover {
+    color: var(--accent);
+  }
+  .col-refs-empty { font-size: 12.5px; color: var(--muted); margin-top: var(--s3); }
+
+  /* ---- 非终态：进度 / 等待 / 信息不足 / 追问 ---- */
+  .col-steps { list-style: none; margin: 0; padding: 0; }
+  .col-steps .step {
+    font-size: 13px;
+    padding: var(--s2) 0;
+    color: var(--noise);
+  }
+  .col-steps .step-done { color: var(--ink-2); }
+  .col-steps .step-done::before { content: "✓ "; }
+  .col-steps .step-active { color: var(--col); font-weight: 600; }
+  .col-steps .step-active::before { content: "▸ "; }
+  .col-steps .step-todo::before { content: "· "; }
+  .col-wait, .col-insufficient { font-size: 13px; color: var(--muted); }
+  .col-insufficient .ins-reason { margin-top: var(--s3); color: var(--ink-2); }
+  .col-ask .ask-q {
+    font-family: var(--font-classic);
+    font-size: 15px;
+    color: var(--ink);
+    margin-bottom: var(--s3);
+  }
+  .col-ask .ask-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: var(--s2) var(--s3);
+    border: 1px solid var(--edge);
+    border-radius: var(--r-md);
+    font-family: inherit;
+    font-size: 13px;
   }
   /* M7：君臣佐使分组里"君药加粗"——不能复用 .field b（那是行首标签的样式，
      颜色是灰的 var(--muted)），君药要的是正文本身加粗、颜色跟其余药材一致，
@@ -633,13 +878,13 @@
     position: fixed; top: 0; right: 0; width: 380px; max-width: 92vw; height: 100vh;
     box-sizing: border-box;
     background: var(--surface); border-left: 1px solid var(--rule); box-shadow: var(--shadow-float);
-    transform: translateX(100%); transition: transform .22s ease-out;
+    transform: translateX(100%); transition: transform var(--t-collapse) ease-out;
     z-index: 50; display: flex; flex-direction: column;
   }
   /* 收起时 visibility:hidden，否则面板只是被 transform 推出视口、键盘
      tab 仍然能走进去（焦点跑到看不见的地方）。transition 里带上
      visibility 才不会让它在滑出动画开始前就消失。 */
-  #evidence-panel { visibility: hidden; transition: transform .22s ease-out, visibility .22s; }
+  #evidence-panel { visibility: hidden; transition: transform var(--t-collapse) ease-out, visibility var(--t-collapse); }
   #evidence-panel.open { transform: translateX(0); visibility: visible; }
   #evidence-head {
     display: flex; min-width: 0; align-items: center; justify-content: space-between;
@@ -818,12 +1063,16 @@
     text-align: center;
   }
   #demo-mode-banner.show { display: block; }
-  /* 原来全文件只有一个 780px 断点、只改了 #results 的列数。画布固定
-     540/520px 高、header/main 固定 24px 内边距，手机上图几乎看不清。 */
+  /* 原来全文件只有一个 780px 断点、只改了三列的列数。画布固定
+     540/520px 高、顶栏/main 固定 24px 内边距，手机上图几乎看不清。 */
   @media (max-width: 640px) {
-    header { padding: 14px 14px 10px; }
-    header h1 { font-size: 19px; }
+    #topbar { padding: var(--s3) var(--s3); }
+    #topbar h1 { font-size: 16px; }
     main { padding: 14px 14px 48px; }
+    /* 首屏居中放大在手机上会把输入框推到屏幕外——窄屏本来就只有一栏，
+       不需要再"居中"。 */
+    .state-first #input-panel { margin-top: var(--s5); padding: var(--s4); }
+    #complaint-body.show { font-size: 21px; }
     #tab-bar { padding: 8px 14px 0; }
     #cy { height: 380px; }
     #gb-cy { height: 360px; }
@@ -836,18 +1085,20 @@
      这一块单独放在文件末尾而不是散进各个规则里，为的是"哪些内容算医学内容"
      这件事能一眼看全——散开之后，新加一个展示医案原文的元素必然会漏掉。
      ============================================================================ */
-  .card,                 /* 三家集注的正文：证型、治法、方名、药名 */
+  .col-body,             /* 三家集注的正文：证型、治法、方名、药名 */
   .ref-excerpt,          /* 医案引文 */
   .ev-raw, .ev-case,     /* 证据侧栏里的原文块 */
   .triage-card,          /* 患者模式的病名与就诊科室 */
   #complaint,            /* 主诉输入：它是"正文"（§3.1） */
+  #complaint-body,       /* 主诉正文（§3.1 最上面那一段 28px） */
   .herb-jun {
     font-family: var(--font-classic);
   }
   /* 医学内容里**嵌着的界面元素**（按钮、标签、表头）要回到黑体——
      它们是系统在说话，不是医家在说话。 */
-  .card button, .card select, .card input,
-  .card .tab-btn, .card .ev-more, .triage-card button {
+  .col button, .col select, .col input,
+  .col .tab-btn, .col .ev-more, .triage-card button,
+  .col-steps, .col-wait, .col-insufficient {
     font-family: var(--font-ui);
   }
   /* 数字与拉丁：指标、剂量、分数 */

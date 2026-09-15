@@ -1043,7 +1043,19 @@ async function loadGraphBrowserData() {
 
 let growToken = 0; // 每次新的生长自增，旧的循环据此提前退出
 
+// 把画布清干净。cy 还没建过时什么都不用做——建一个空的 cytoscape 实例
+// 只是为了清空它，没有意义。
+function clearGraph() {
+  if (cy) cy.elements().remove();
+  hideTooltip();
+}
+
 async function growGraph(graph, { animate = true } = {}) {
+  // graph 为空 = 这一次没有图可画（安全拦截整页替换、或还没问诊）。**清空画布
+  // 并返回，不是抛**：R14 的拦截页要求"不显示图谱"，调用方传 null 表达的正是
+  // 这件事；这里抛 TypeError 的话拦截页会在控制台留一条错，而页面看起来正常
+  // ——正是这个项目一直在防的那种"静默"。
+  if (!graph) { clearGraph(); return; }
   if (!(await ensureCytoscape())) { graphHooks.onError(CYTOSCAPE_MISSING_MSG); return; }
   // B1 的另一半：容器高度跟着医家数走。cy.fit() 最后会把全部内容按同一个
   // 缩放系数塞进 #cy，医家从两位变三位、内容纵向长了一半，容器还是 540px

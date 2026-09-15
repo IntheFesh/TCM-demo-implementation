@@ -233,8 +233,12 @@ def test_request_body_survives_a_page_without_the_selector():
 
 def test_card_html_escapes_hallucinated_case_ids():
     """hallucinated 里的 id 是模型原样吐出来的字符串（core/chain.py 里
-    cited_case_ids 减去检索结果），之前是整个卡片里唯一一处没过 escapeHtml
-    就进 innerHTML 的插值——恰恰因为它是"不可信输出"的警告。"""
+    cited_case_ids 减去检索结果），之前是整列里唯一一处没过 escapeHtml
+    就进 innerHTML 的插值——恰恰因为它是"不可信输出"的警告。
+
+    R14 把 `cardHtml` 改名成 `columnHtml`：三家不再是三张卡片，是三列集注
+    （docs/DESIGN.md §3.1 第一条）。**断言本身一个字没改**，改的只是被调函数
+    的名字——留着旧名字会让下一个人以为外面还包着 .card。"""
     result = {
         "physician": "ye_tianshi", "physician_name": "叶天士",
         "s3": {"syndrome": "脾虚", "reasoning": "r", "treatment_principle": "t",
@@ -242,7 +246,7 @@ def test_card_html_escapes_hallucinated_case_ids():
         "hallucinated": ["<img src=x onerror=alert(1)>"],
         "refs": [],
     }
-    js = f"process.stdout.write(cardHtml({json.dumps(result, ensure_ascii=False)}));"
+    js = f"process.stdout.write(columnHtml({json.dumps(result, ensure_ascii=False)}));"
     out = _run_node(js)
     assert "<img" not in out
     assert "&lt;img src=x onerror=alert(1)&gt;" in out

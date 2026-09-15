@@ -43,6 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core import examples as _examples  # noqa: E402
 from core.progress import Progress  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -63,7 +64,11 @@ FOLLOWUP_PRESENT = ["纳差", "腹胀", "嗳气"]
 # 「胸痹 → 心内科 → 红旗」这条另一个门类的路径。回放的索引是
 # sha256(送进模型的 system 文本)，system 文本里含主诉原文，所以**没录过的主诉在
 # replay 下必然未命中**：这条不加进录制清单，演示到第 5 点就会当场 LLMError。
-TRIAGE_COMPLAINT = "胸闷胸痛，冷汗"
+#
+# R14：值不再写在这里。首屏的三条示例主诉要从后端拿（照抄进 app.js 就是第四份
+# 副本，CLAUDE.md 第 31 条前端小节：写死的常量也算一处实现），于是反过来收口到
+# core/examples.py——名字保留，因为这个文件和它的测试都按这个名字引用它。
+TRIAGE_COMPLAINT = _examples.TRIAGE_COMPLAINT
 
 # 每条主诉的预估调用数，用来在 --dry-run 里报预算。实测量级，不是精确值：
 #   不开 ReAct：S1 1 + S2 1 + 每位医家 S3 1 + 残差 1

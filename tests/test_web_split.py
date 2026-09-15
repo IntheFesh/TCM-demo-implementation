@@ -88,7 +88,9 @@ def test_the_graph_code_went_to_graph_js_and_the_rest_to_app_js():
         assert marker not in app_js, f"{marker} 同时出现在 app.js 里——拆重复了"
     # escapeHtml / sleep 不在这张表里：第 0 项断循环依赖时它们**下沉到了 graph.js**
     # （纯工具没有 UI 归属，放在底层两边都能取，依赖方向才是单向的）。
-    for marker in ("function cardHtml", "function submitConsult", "function renderDivergence"):
+    # cardHtml 在 R14 改名成 columnHtml（三列集注，不再是卡片）；
+    # 这条测的是"问诊页的渲染在 app.js、图谱的渲染在 graph.js"，跟名字无关。
+    for marker in ("function columnHtml", "function submitConsult", "function renderDivergence"):
         assert marker in app_js, f"app.js 里没有 {marker}"
         assert marker not in graph_js, f"{marker} 同时出现在 graph.js 里——拆重复了"
 
@@ -179,6 +181,30 @@ console.log(JSON.stringify({
     assert proc.returncode == 0, f"node 执行失败：\nstdout={proc.stdout}\nstderr={proc.stderr}"
     out = json.loads(proc.stdout)
     assert out == {"error": True, "open": True, "close": True}, f"钩子没在加载时注册：{out}"
+
+
+def test_every_element_the_scripts_look_up_exists_in_the_html():
+    """**R14 靠 Playwright 才抓到这条，所以补一条秒级的。**
+
+    改版时把 `#results` 改名成 `#columns`，`getElementById("results")` 漏改了
+    两处——而那两处是加载时就执行的 `addEventListener`，返回 null 直接抛，
+    **整份 app.js 停在那一行**，页面上什么都不会发生。
+
+    node 测试一个字都测不出来：`DOM_STUB` 是个什么都接住的 Proxy，
+    `getElementById` 永远返回一个能挂监听器的对象。所以判据只能是静态的
+    ——脚本里查的每一个 id，HTML 里都得有。
+    """
+    ids = set(re.findall(r'id="([^"]+)"', load_html()))
+    for name in SCRIPT_FILES:
+        src = _read(name)
+        # 脚本自己拼出来的节点（拦截页那颗"换一条主诉"、追问记录框）当然不在
+        # HTML 里。它们是同一份源码里生成、同一份源码里查的，不会分叉——
+        # 这条测试防的是"HTML 改了名字、JS 没跟着改"。
+        ids |= set(re.findall(r'id="([^"]+)"', src))
+        ids |= set(re.findall(r'\.id = "([^"]+)"', src))
+        used = set(re.findall(r'getElementById\("([^"]+)"\)', src))
+        missing = sorted(used - ids)
+        assert not missing, f"{name} 查了 index.html 里不存在的 id：{missing}"
 
 
 def test_css_carries_the_styles_that_used_to_be_inline():

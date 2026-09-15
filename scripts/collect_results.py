@@ -24,7 +24,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.chain import (  # noqa: E402
+    epsilon_floor_of_query_record, epsilon_values_in_query_record,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 EVAL_DIR = ROOT / "eval"
@@ -272,13 +279,15 @@ def epsilon_by_query(eval_dir: Path = EVAL_DIR) -> list[dict]:
         return []
     rows = []
     for q in (eps.get("epsilon_online") or {}).get("per_query") or []:
-        values = [v for bp in (q.get("by_physician") or {}).values()
-                  for v in (bp.get("values") or [])]
+        # 摊平 per_query[i].by_physician[p].values 这个三层结构的只有一处实现
+        # （core/chain.py）。R14 的前端对照带也要按主诉取地板，那是第二个调用方
+        # ——两处各写一遍推导式，estimate_epsilon 改字段名时必然漏一处。
+        values = epsilon_values_in_query_record(q)
         rows.append({
             "query": q.get("query", ""),
             "skipped": bool(q.get("skipped")),
             "n_values": len(values),
-            "mean": round(sum(values) / len(values), 4) if values else None,
+            "mean": epsilon_floor_of_query_record(q),
             "min": round(min(values), 4) if values else None,
             "max": round(max(values), 4) if values else None,
         })

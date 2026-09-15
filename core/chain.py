@@ -116,6 +116,79 @@ def load_epsilon_layer_means() -> dict:
     }
 
 
+def epsilon_values_in_query_record(record: dict) -> list[float]:
+    """一条 `per_query` 记录里所有 (医家, 重复对) 的 Jaccard 距离，摊平成一个列表。
+
+    **摊平这件事只写这一处。** 它知道 `per_query[i].by_physician[p].values` 这个
+    三层结构；知道这个结构的地方越多，`estimate_epsilon.py` 哪天改字段名就越难
+    改干净。`scripts/collect_results.py::epsilon_by_query`（ε 分层那一节的数）和
+    下面的 `load_epsilon_for_query`（前端对照带上那个 ε）都从这里取。
+    """
+    return [
+        v
+        for bp in (record.get("by_physician") or {}).values()
+        for v in (bp.get("values") or [])
+    ]
+
+
+def epsilon_floor_of_query_record(record: dict) -> float | None:
+    """一条主诉的噪声地板 = 该条下所有距离的均值，跟 `epsilon_online.mean`
+    同一个口径（那个数是全部值的均值），所以逐条的数能直接跟全局均值比大小。
+    没有可用值时是 None，不是 0——0 会被读成"这条主诉重复跑毫无抖动"。"""
+    values = epsilon_values_in_query_record(record)
+    return round(sum(values) / len(values), 4) if values else None
+
+
+def load_epsilon_for_query(query: str) -> dict:
+    """这条主诉自己的噪声地板，取不到就退回全局均值**并说明退了**。
+
+    为什么要逐条而不是一律用全局均值：实测 9 条可用主诉里有 4 条的地板高于全局
+    均值，最高的一条是 0.3954 对 0.2611（DEMO.md 第 1 点讲的就是这件事）。拿全局
+    均值一刀切，这 4 条主诉上的噪声会被当成真实分歧、另外 5 条上的真实分歧会被
+    当成噪声——而前端对照带上那条参考线画的就是这个阈值，画错了整条带子在骗人。
+
+    `scope` 三种取值必须原样传到界面上：
+      query  —— 这条主诉测过，用的是它自己的地板
+      global —— 没测过这条，用的是全局均值，界面上要标「（全局）」
+      none   —— 连 eval/epsilon.json 都没有，界面上写「未测」而不是画一条线
+
+    匹配按主诉原文**逐字相等**：ε 是对某一条特定文本重复跑测出来的，换了标点
+    就是另一条主诉、另一个地板。这跟回放按 system 文本哈希索引是同一个道理，
+    不做模糊匹配——模糊匹配会把 B 条的地板安到 A 条头上，而这种错不会报任何错。
+    """
+    detail = load_epsilon_online_detail() or {}
+    for record in detail.get("per_query") or []:
+        if record.get("query") != query or record.get("skipped"):
+            continue
+        floor = epsilon_floor_of_query_record(record)
+        if floor is not None:
+            return {"value": floor, "scope": "query"}
+        break
+    global_mean = detail.get("mean")
+    if global_mean is None:
+        return {"value": None, "scope": "none"}
+    return {"value": global_mean, "scope": "global"}
+
+
+# 当前正在提问的医家。**ContextVar 而不是参数**：`AskFn` 的契约是
+# `(question) -> str | None`，命令行、患者模拟器、SSE 端点各有一份实现，加一个
+# 参数要同时改三处调用方和它们的测试；而这里要传的信息（谁在问）对 ask_fn 的
+# 语义没有影响，只是给 SSE 端点用来把 need_input 事件路由到对应那一列。
+#
+# 并发下仍然正确：每位医家的 worker 跑在 `contextvars.copy_context().run` 里
+# （见 `_run_physicians_into` 第四条），各自一份独立的 Context，互不串。
+# 全局追问（`run_followup`，在三位医家之前跑）不属于任何一列，取值是 None，
+# 前端据此回落到输入区那个问答框。
+_ASKING_PHYSICIAN: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "asking_physician", default=None,
+)
+
+
+def current_asking_physician() -> tuple[str, str] | None:
+    """(physician_id, 中文名)，或 None 表示不在某位医家的提问上下文里。"""
+    return _ASKING_PHYSICIAN.get()
+
+
 class SafetyVeto(Exception):
     """推理过程中（不是初始主诉里）冒出危重信号时抛出：ReAct 的 ask_user 追问收到的
     回答命中 check_safety。抛异常而不是返回值，是因为发生点在 run_physician 深处，
@@ -429,8 +502,16 @@ def pairwise_divergence(results: list[dict]) -> dict:
         return round(sum(vals) / len(vals), 3) if vals else None
 
     lineage_mean, cross_school_mean = _mean("lineage"), _mean("cross_school")
+    # 全部配对的均值 = "三家平均差异"（docs/DESIGN.md §3.1 对照带右端那个数）。
+    # **跟 ε 同一把尺子**：ε 也是逐条主诉、同一位医家重复跑之间两两距离的均值，
+    # 所以这两个数能直接比大小、能画在同一条参考线上。herb_jaccard 不行——
+    # 它是 n 方交并比（只有三家都用的药才算共同），跟 ε 不是一个口径，
+    # 拿它去跟 ε 比是在比两种不同的东西。
+    all_pair_values = [p["herb_jaccard"] for p in pairs if p["herb_jaccard"] is not None]
     return {
         "pairs": pairs,
+        "pairs_mean": (round(sum(all_pair_values) / len(all_pair_values), 3)
+                       if all_pair_values else None),
         "lineage_mean": lineage_mean,
         "cross_school_mean": cross_school_mean,
         "n_lineage_pairs": sum(1 for p in pairs if p["group"] == "lineage"),
@@ -1251,6 +1332,15 @@ def consult(
         # 0=用药完全一致，1=毫无重叠（n 方交并比，见上）
         "herb_jaccard": round(herb_jaccard, 3) if herb_jaccard is not None else None,
         "shared_herbs": shared_herbs,
+        # R14 对照带要画"共用 ● + 各家独有 ●"。**独有集合在后端算**：判定两味药
+        # 是不是同一味走 core/herbs.py::normalized_herb_set（"炙甘草三钱"和"甘草"
+        # 是同一味），前端拿 s3.herbs 自己做集合差就是第二套匹配实现，
+        # CLAUDE.md 第 31 条撞过三次的正是这件事。
+        "unique_herbs": {
+            r["physician"]: sorted(hs - set.union(*(other for j, other in enumerate(herb_sets) if j != i)))
+            if len(herb_sets) >= 2 else sorted(hs)
+            for i, (r, hs) in enumerate(zip(results, herb_sets))
+        },
         # R1 分层：君臣 = 这个证的核心判断，佐使 = 针对兼夹症状的加减。两个数
         # 分开报才能区分"核心判断一致、只是加减用药不同"（合理的用药灵活性）和
         # "连君臣都对不上"（真分歧）。None = 这一层没数据，见 layer_note。
@@ -1282,6 +1372,11 @@ def consult(
         # 君臣层会低估一致性、卡佐使层会高估发散（实测佐使层抖动大于整方、
         # 君臣层小于整方）。None = 还没跑过带分层的 estimate_epsilon。
         **{f"epsilon_{k}": v for k, v in load_epsilon_layer_means().items()},
+        # R14：对照带上那条参考线画的就是这个阈值，所以它必须是**这条主诉自己的**
+        # 地板，不是全局均值（实测 9 条可用主诉里 4 条的地板高于全局均值，最高的
+        # 一条 0.3954 对 0.2611）。取不到时退回全局均值、把 scope 标成 "global"，
+        # 界面上显示「（全局）」——一个没说明来源的对照基准跟没有对照一样。
+        "epsilon_for_query": load_epsilon_for_query(complaint),
     }
 
     return {

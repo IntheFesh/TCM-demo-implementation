@@ -1462,8 +1462,11 @@ def test_pairwise_divergence_pure_function_edge_cases(monkeypatch):
     assert by_pair[("ye_tianshi", "someone_else")]["herb_jaccard"] == 1.0  # 一边空一边有：毫无重叠
     assert by_pair[("ye_tianshi", "someone_else")]["treatment_principle_same"] is True
     assert out["lineage_mean"] is None  # 唯一的师承内对没有可比的数
+    # R14 新增 pairs_mean（全部配对的均值 = 对照带右端那个"三家平均差异"）。
+    # 空输入下是 None 而不是 0，跟这个函数其余字段一个口径：0 会被读成
+    # "配对之间毫无差异"，而实际是"没有可比的对"。
     assert chain.pairwise_divergence([]) == {
-        "pairs": [], "lineage_mean": None, "cross_school_mean": None,
+        "pairs": [], "pairs_mean": None, "lineage_mean": None, "cross_school_mean": None,
         "n_lineage_pairs": 0, "n_cross_school_pairs": 0, "cross_school_gt_lineage": None,
     }
 
