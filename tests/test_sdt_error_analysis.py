@@ -444,11 +444,17 @@ def test_committed_runlog_backfills_the_runs_that_already_happened():
     assert committed.exists(), "台账文件不见了——先查 .gitignore 的 *.jsonl 例外"
     entries = runlog.read_log(committed)
     counts = runlog.count_test_runs(entries)
-    assert counts["full"] == 3 and counts["partial"] == 1
-    scores = {e["score"] for e in counts["entries"]}
-    assert {21.702, 22.068, 22.833, 27.729} == scores
-    assert all(e.get("backfilled") for e in counts["entries"])
-    assert all("回填" in e.get("source", "") for e in counts["entries"])
+    # 断言只针对**回填的那四条**，不针对全体。原来写的是全体
+    # （`counts["full"] == 3` + `all(backfilled)`），于是 SDT Test 每真跑
+    # 一次这条就红一次——而真跑正是它本该允许发生的事。这个护栏要钉的是
+    # "台账不从 0 开始、回填那四条还在"，不是"从此再也不许跑"。
+    backfilled = [e for e in counts["entries"] if e.get("backfilled")]
+    assert len([e for e in backfilled if not e.get("partial")]) == 3
+    assert len([e for e in backfilled if e.get("partial")]) == 1
+    assert {21.702, 22.068, 22.833, 27.729} == {e["score"] for e in backfilled}
+    assert all("回填" in e.get("source", "") for e in backfilled)
+    # 台账是追加写的，只会变多，不会变少
+    assert counts["full"] >= 3 and counts["partial"] >= 1
 
 
 def test_log_run_only_records_the_test_split(tmp_path):

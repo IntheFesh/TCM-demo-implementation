@@ -27,7 +27,7 @@ python -m scripts.collect_results --check    # 核对 README.md 和 eval/RESULTS
 | 块 | 一句话 | 详细 |
 |---|---|---|
 | 系统构成 | 五层：知识图谱 / RAG / SRC 推理链 / ReAct / 安全双闸 | 下一节 |
-| 外部基准 | SDT Test：chain 22.833 vs baseline 22.068，关安全否决 27.729 | 「外部基准」一节 |
+| 外部基准 | SDT Test：chain 23.173 vs baseline 22.068，关安全否决 27.729 | 「外部基准」一节 |
 | 四种模式 | patient / doctor / student / researcher。**patient 拿不到 `formula_candidates`——那是安全边界，不是功能裁剪**，裁剪在服务端做（键根本不存在，不是存在但为空） | 「四种模式」一节 |
 | 三种后端 | api（开发评测）/ local（自部署）/ replay（演示） | 「三种后端」一节 |
 | 已知混杂与局限 | 12 条，一条都不省 | 「已知混杂与局限」一节 |
@@ -65,12 +65,12 @@ python -m scripts.collect_results --check    # 核对 README.md 和 eval/RESULTS
 
 唯一一个**外部、可跟别人比**的分数。三个数并列，一个都不能省：
 
-- **chain 22.833 / 50**（注入证素分析）`sdt/test_run_log.jsonl:sdt.chain_last=22.833`
+- **chain 23.173 / 50**（注入证素分析）`sdt/test_run_log.jsonl:sdt.chain_last=23.173`
 - **baseline 22.068**（同模型、同三个输出头、**不**注入）`sdt/test_run_log.jsonl:sdt.baseline=22.068`
 - **关掉安全否决 27.729** `sdt/test_run_log.jsonl:sdt.ignore_safety_veto=27.729`
 
-`chain − baseline = +0.765` 才是这条结构化推理链的贡献；只报「我们拿了 22.833」没有基准。
-第三个数是**安全否决的代价**（差 4.90 分），它不是缺陷：
+`chain − baseline = +1.105` 才是这条结构化推理链的贡献；只报「我们拿了 23.173」没有基准。
+第三个数是**安全否决的代价**（差 4.56 分），它不是缺陷：
 
 **被拦的 10/50 条经人工逐条复核，全部为真危重，无一误伤**——蛛网膜下腔出血、
 烧碱灼伤食管吐血 150ml、颅脑外伤昏迷、3 岁患儿高热 40℃、乙脑后遗症昏迷抽搐等。
@@ -161,14 +161,18 @@ demo，它报的每个数都不可信。
 9. **`query_case_graph` 的症状词不匹配**：21 次调用里只有 8 次非空。根因是医案三元组按**原文
    术语**抽取，而模型按**患者主诉的词**去查（「口苦」查不到、同模块的 `check_residual` 却能匹配上）。
    已统一走 `_match_graph_symptoms`，但覆盖面仍受原文术语限制。
-10. **ε 按证型分层**：经典方唯一的证型 ε≈0，可选方多的证型 ε≈0.5（逐条实测 0.0 ~ 0.5099，
-    全局均值 **0.241** `epsilon.json:epsilon_online.mean=0.241`）。所以分歧指标**必须逐条配对
+10. **ε 按证型分层**：逐条实测 0.0 ~ 0.6742，
+    全局均值 **0.2611** `epsilon.json:epsilon_online.mean=0.2611`。所以分歧指标**必须逐条配对
     比较**，拿全局均值一刀切会在 5 条主诉上漏判、4 条上误判（推导见 RESULTS.md「ε 按证型分层」）。
+    ⚠ 分层现象稳定，但**逐条数值本身在重跑之间会大幅变化**（痰饮 0.0 → 0.2278、
+    肝胃气滞 0.5099 → 0.3954），所以 ε 必须跟被它卡的指标同一轮次跑出来。
 11. **MES 盲评未做**，缺一个不依赖自动指标的维度。⏳ 它要人评分，没有任何脚本能替它产出，
     也是训练（阶段五）三个前提里唯一没满足的那个。
 12. **三位医家的数据量极不均衡。** 张锡纯只有 87 条医案、450 条三元组，
-    而叶天士有 29247 条三元组——他那一路的检索质量和 ε 都明显差于另两位
-    （`epsilon.json` 里按医家分层：ye 0.2009 / wu 0.1972 / **zhang 0.3247**）。
+    而叶天士有 29247 条三元组，他那一路的检索质量因此更差。
+    ⚠ **但语料量少不等于 ε 更高**：最新一轮按医家分层是 ye **0.3495** /
+    wu 0.2092 / zhang 0.2247，叶天士反而最不稳定。上一轮（ye 0.2009 / wu 0.1972 /
+    zhang 0.3247）曾把两件事绑在一句话里说，那个关联没有重现，已拆开。
     ⏳ 87 / 450 / 29247 这三个数来自 AutoDL 上的抽取统计，`cases.json` 和
     `case_triples.jsonl` 都不入版本控制，所以在本仓库里核不了。
 
@@ -1161,7 +1165,7 @@ python -m scripts.verify_local_backend        # 退出码 0 = 真的接上了
 ## 训练准备（阶段五 M15/M16，代码和数据就绪，还没训）
 
 **训练的三个前提，两个满足**：E3 ≥ 40%（✅ 0.451 `report_e3.json:e3.change_rate=0.451`）、
-SDT 有基线（✅ chain 22.833 `sdt/test_run_log.jsonl:sdt.chain_last=22.833` vs baseline 22.068 `sdt/test_run_log.jsonl:sdt.baseline=22.068`）、
+SDT 有基线（✅ chain 23.173 `sdt/test_run_log.jsonl:sdt.chain_last=23.173` vs baseline 22.068 `sdt/test_run_log.jsonl:sdt.baseline=22.068`）、
 MES 盲评指出哪个维度弱（⏳ 要人评）。第三条没满足就**没有靶子**
 ——那时候训出来的模型，不知道该拿什么判断它变好了没有。所以现在只准备代码和数据。
 

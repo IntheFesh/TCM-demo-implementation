@@ -77,6 +77,37 @@ def _school(report: dict, field: str):
     return (report.get("school_pairs") or {})[field]
 
 
+def _sdt_score(rows: list[dict], run: dict):
+    """一次跑次的分数。**必须跨两种事件取**。
+
+    台账是两段式的（见 eval/sdt/runlog.py）：`log_run` 在跑完的当下写一条
+    event=run，而那一刻官方计分还没跑，所以那一行的 `score` **按设计就是
+    None**；分数由后来的 `log_scored` 以一条 event=scored 补上。回填进来的
+    头四条是例外——它们的分数直接内联在 run 行里，所以只看 run 行的旧取值器
+    在那四条上一直是对的，掩盖了这个缺陷。
+
+    链接靠 `submission`：两边记的都是同一个 `str(路径)`，是设计好的可链接
+    字段，不靠"位置相邻"去猜（台账是追加写的，中间可以插进别的事件）。
+    同一份提交可以反复算分（log_scored 带 dedupe），取最后一条。
+
+    不这么做的后果不是"这次少一个数"，是**以后每真跑一次 SDT，
+    chain_last 都会变成 None**——护栏会在每次正常使用之后自己失效。
+    """
+    if run.get("score") is not None:
+        return run["score"]
+    scored = [r for r in rows
+              if r.get("event") == "scored"
+              and r.get("submission") == run.get("submission")
+              and r.get("score") is not None]
+    if not scored:
+        # 抛 KeyError 而不是返回 None：evidence_value 会把它接住并如实报成
+        # "这个键取不到"，跟"文件不存在"分开——两者要修的东西不同。
+        raise KeyError(
+            f"跑次 {run.get('submission')!r} 既没有内联分数，也没有对应的 scored 事件"
+        )
+    return scored[-1]["score"]
+
+
 def _sdt_runs(rows: list[dict], solver: str, ignore_safety_veto: bool,
               partial: bool) -> list[dict]:
     """台账是**追加写**的，所以列表顺序就是时间顺序——`chain_first` / `chain_last`
@@ -151,13 +182,13 @@ EVIDENCE: dict[str, tuple[str, object]] = {
         f"{ARCHIVE_2026_09_12}/{E8_JSON}",
         lambda d: d["retriever_mode_effect"]["output_difference_rate"]),
     "sdt.chain_first": (SDT_LEDGER,
-                        lambda rows: _sdt_runs(rows, "chain", False, False)[0]["score"]),
+                        lambda rows: _sdt_score(rows, _sdt_runs(rows, "chain", False, False)[0])),
     "sdt.chain_last": (SDT_LEDGER,
-                       lambda rows: _sdt_runs(rows, "chain", False, False)[-1]["score"]),
+                       lambda rows: _sdt_score(rows, _sdt_runs(rows, "chain", False, False)[-1])),
     "sdt.baseline": (SDT_LEDGER,
-                     lambda rows: _sdt_runs(rows, "baseline", False, False)[0]["score"]),
+                     lambda rows: _sdt_score(rows, _sdt_runs(rows, "baseline", False, False)[0])),
     "sdt.ignore_safety_veto": (SDT_LEDGER,
-                               lambda rows: _sdt_runs(rows, "chain", True, True)[0]["score"]),
+                               lambda rows: _sdt_score(rows, _sdt_runs(rows, "chain", True, True)[0])),
 }
 
 

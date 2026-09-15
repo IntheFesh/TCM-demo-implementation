@@ -36,7 +36,7 @@ SEGMENTS=(
   "1|零调用的验证|0|no|凭据核对 / 本地语料规范化 / 切块验证（要人看原文）/ SDT 失分分析"
   "2|本地模型|2|no|起 vLLM + verify_local_backend（要先装 vllm、下基座）"
   "3|R1 前提：role 填充率|60|YES|**不过就停**——填充率不够，分层 ε 三个数没有意义"
-  "4|R1 验收：噪声地板 ε|215|no|实测 215 次调用 / 1347s（eval/epsilon.json 的 llm_calls）"
+  "4|R1 验收：噪声地板 ε|212|no|实测 212 次调用（eval/epsilon.json 三段 llm_calls：online 145 + s2 37 + extract 30）"
   "5|药理层抽取|2181|YES|六源预过滤后 2151 块（R8 实测，verify_pharmacology_chunks 合计行）+ 6×5 试抽；先 --limit-blocks 5 人工核质量，再全量 --crosscheck"
   "6|录制回放|278|no|record_fixtures（--dry-run 实测 278）+ verify_replay"
   "7|全套评测重跑|1200|no|最贵，放最后：run_eval 四项 + SDT Test（会写台账）"

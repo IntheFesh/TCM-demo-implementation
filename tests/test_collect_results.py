@@ -73,8 +73,11 @@ def _make_eval_dir(tmp_path, *, epsilon=None, e3=None, e8=None, ledger=True):
                                       "graph_mode_caveat": "覆盖率 444/941（47%）"}},
         ensure_ascii=False), encoding="utf-8")
     if ledger:
+        # ledger 可以传一份自定义台账（True = 用默认的 _ledger()）。两段式台账
+        # 那几条测试要往里塞 event=scored 行，光有一个开关不够。
+        rows = _ledger() if ledger is True else ledger
         (d / "sdt" / "test_run_log.jsonl").write_text(
-            "\n".join(json.dumps(r, ensure_ascii=False) for r in _ledger()), encoding="utf-8")
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
     return d
 
 
@@ -98,6 +101,54 @@ def test_sdt_first_and_last_follow_ledger_order_not_timestamps(tmp_path):
     d = _make_eval_dir(tmp_path)
     assert cr.evidence_value("sdt.chain_first", d)[0] == 21.702
     assert cr.evidence_value("sdt.chain_last", d)[0] == 22.833
+
+
+def test_sdt_score_comes_from_the_scored_event_when_the_run_row_has_none(tmp_path):
+    """**两段式台账**：真跑一次留下的 event=run 行，`score` 按设计就是 None
+    （log_run 的注释：分数在这一刻还不知道，由 scored 事件补），分数在后来的
+    event=scored 行上。
+
+    这条钉的是取值器必须跨事件链接。修复前它取的是 run 行的 score，于是
+    **每真跑一次 SDT，chain_last 就变成 None 一次**——护栏在每次正常使用
+    之后自己失效，而回填进来的那四条因为分数内联在 run 行里，一直是绿的、
+    把这个缺陷盖住了。
+    """
+    ledger = _ledger() + [
+        {"event": "run", "split": "Test", "solver": "chain", "score": None,
+         "submission": "out/sdt_chain_v3.txt", "partial": False,
+         "ignore_safety_veto": False, "n_records": 50, "model": "deepseek-chat"},
+        {"event": "scored", "split": "Test", "submission": "out/sdt_chain_v3.txt",
+         "score": 23.173103937264152, "score_kind": "official_automated_score"},
+    ]
+    d = _make_eval_dir(tmp_path, ledger=ledger)
+    assert cr.evidence_value("sdt.chain_last", d)[0] == 23.173103937264152
+    # 前面几条不受影响：内联分数优先，不会被后来的 scored 事件串味
+    assert cr.evidence_value("sdt.chain_first", d)[0] == 21.702
+    assert cr.evidence_value("sdt.baseline", d)[0] == 22.068
+
+
+def test_sdt_score_links_by_submission_not_by_adjacency(tmp_path):
+    """链接靠 submission 字段，不靠"紧挨着的上一条"。台账是追加写的，两条
+    之间可以插进别的事件；按相邻猜会在那时候悄悄取错一份提交的分数。"""
+    ledger = _ledger() + [
+        {"event": "run", "split": "Test", "solver": "chain", "score": None,
+         "submission": "out/A.txt", "partial": False, "ignore_safety_veto": False},
+        {"event": "scored", "split": "Test", "submission": "out/B.txt", "score": 99.9},
+        {"event": "scored", "split": "Test", "submission": "out/A.txt", "score": 23.173},
+    ]
+    d = _make_eval_dir(tmp_path, ledger=ledger)
+    assert cr.evidence_value("sdt.chain_last", d)[0] == 23.173
+
+
+def test_sdt_score_is_none_when_the_run_was_never_scored(tmp_path):
+    """跑了但从没算过分——如实报"取不到"，不退回一个旧分数冒充。"""
+    ledger = _ledger() + [
+        {"event": "run", "split": "Test", "solver": "chain", "score": None,
+         "submission": "out/never_scored.txt", "partial": False,
+         "ignore_safety_veto": False},
+    ]
+    d = _make_eval_dir(tmp_path, ledger=ledger)
+    assert cr.evidence_value("sdt.chain_last", d)[0] is None
 
 
 def test_evidence_value_rejects_a_key_not_in_the_registry(tmp_path):
