@@ -874,16 +874,73 @@
   .triage-card .t-flags { color: var(--danger); font-weight: 600; }
   .triage-card .t-none { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
   /* D1：额度条。平时是一行浅色小字，接近上限或降级时变色。 */
-  #usage-bar {
-    display: none; align-items: center; flex-wrap: wrap; gap: 10px;
-    margin: 10px 0 0; padding: 8px 12px; border-radius: var(--r-lg);
-    border: 1px solid var(--border); background: var(--surface-2);
-    font-size: 12.5px; color: var(--muted);
+/* ---- R17 §5.1：顶栏右侧的额度 chip + BYOK 收起入口 ---- */
+  #quota-chip { display: none; }
+  #quota-chip.show {
+    display: inline-block;
+    font-size: 12px;
+    font-family: var(--font-num);
+    padding: 2px var(--s3);
+    border-radius: var(--r-sm);
+    border: 1px solid var(--rule);
+    color: var(--muted);
   }
-  #usage-bar.show { display: flex; }
-  #usage-bar.warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--caution); }
-  #usage-bar.degraded { background: var(--danger-bg); border-color: var(--danger); color: var(--danger); }
-  #usage-bar .grow { flex: 1 1 auto; min-width: 220px; }
+  /* 80% 预警 → --caution；100% 降级 → --danger。两档颜色对应两件事：
+     "快没了"和"已经换后端了"，合成一种的话第二件事就没有提示。 */
+  #quota-chip.q-warn { color: var(--caution); border-color: var(--caution); background: var(--caution-bg); }
+  #quota-chip.q-degraded { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+
+  /* BYOK：**默认收起成一行小字**（§5.1），不做成弹窗、不拦路。 */
+  #byok-box > summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--muted);
+    list-style: none;
+    transition: color var(--t-collapse) ease;
+  }
+  #byok-box > summary:hover { color: var(--accent); }
+  #byok-box[open] > summary { color: var(--ink-2); }
+  #byok-box .byok-panel {
+    position: absolute;
+    right: var(--s5);
+    z-index: 40;
+    width: min(460px, 92vw);
+    margin-top: var(--s2);
+    padding: var(--s4);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-float);
+    text-align: left;
+  }
+  #byok-box .byok-note { font-size: 12px; color: var(--muted); line-height: 1.7; margin-bottom: var(--s3); }
+  #byok-box #byok-key { flex: 1 1 200px; min-width: 0; padding: 6px 8px; border: 1px solid var(--edge); border-radius: var(--r-md); font-size: 12.5px; }
+  #usage-text { font-size: 12px; color: var(--muted); line-height: 1.7; margin-top: var(--s3); }
+
+  /* ---- 顶栏下方的两条：降级说明、服务未连接 ---- */
+  /* §5.1 第 3 条：降级**不是错误**，是换了个后端继续跑。所以跟演示模式提示
+     同一块版面、同一种"不是警告色"的底。 */
+  #degrade-banner { display: none; }
+  #degrade-banner.show {
+    display: block;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule-soft);
+    color: var(--ink-2);
+    font-size: 12px;
+    padding: 6px 14px;
+    text-align: center;
+  }
+  /* 服务未连接**是**故障，所以这一条用朱砂——跟上面那条刻意分开。 */
+  #offline-banner { display: none; }
+  #offline-banner.show {
+    display: block;
+    background: var(--danger-bg);
+    border-bottom: 1px solid var(--danger);
+    color: var(--danger);
+    font-size: 12px;
+    padding: 6px 14px;
+    text-align: center;
+  }
   #byok-key {
     width: 240px; padding: 5px 8px; font-size: 12px;
     border: 1px solid var(--border); border-radius: var(--r-md);

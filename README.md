@@ -433,6 +433,85 @@ curl -N -X POST http://127.0.0.1:8000/api/consult/stream \
   -d '{"complaint": "胃脘胀痛，食后加重，嗳气泛酸"}'
 ```
 
+## 公开部署（把这个 demo 挂到公网上）
+
+**默认配置不适合直接对外**：`LLM_MODE=api` + 你自己的 key = 任何人都能用你的钱
+跑推理。下面三层是为"挂出去给人点"准备的，三层可以叠加，**一层都不开也能跑，
+只是钱是你出**。
+
+### 三层访问控制（docs/DESIGN.md §5.1）
+
+| 层 | 作用 | 默认 |
+|---|---|---|
+| **BYOK** | 访问者填自己的 key，存 `sessionStorage`，服务端不落盘 | 零成本无上限 |
+| **共享额度** | 不填 key 的用项目的 | 每 IP 5 次问诊/天，全局 200 次/天 |
+| **用量看板** | `/api/usage` + 顶栏「今日约剩 N 次」 | 80% 预警，100% 降级 |
+
+四条硬要求，每一条都有对应的实现位置：
+
+1. **请求前拦截**——被拦的请求不产生费用（`core/usage.py`，问诊开始前先按
+   "这次最少会花几次"预扣，不够就直接拦）
+2. **按 `llm_calls` 计量不是按请求数**——开不开 ReAct 差 3 倍（6 次 vs 20 次），
+   按请求数计量等于给开 ReAct 的人打三折
+3. **超限降级到回放而不是报错**——访问者仍能看到预录主诉的完整效果，
+   顶栏下方一行说明（`--surface-2` 底，**不是警告色**：降级不是错误）
+4. **BYOK 只接受 `sk-` 格式，不做通用代理**
+
+### 六个环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QUOTA_PER_IP_DAILY_CALLS` | `25`（= 5 次问诊 × 每次 5 调用） | 每个 IP 每天的**模型调用**上限 |
+| `QUOTA_GLOBAL_DAILY_CALLS` | `1000`（= 200 次问诊） | 全站每天的模型调用上限，防一个人换 IP 刷爆 |
+| `QUOTA_MAX_TRACKED_IPS` | `5000` | 额度表里最多记多少个 IP。**这是内存保护**：不设上限的话，用海量伪造 IP 发请求能把进程内存撑爆 |
+| `TRUSTED_PROXY_HOPS` | `0` | **默认 0 = 完全不读 `X-Forwarded-For`。** 直接信任 XFF 等于把限额送人——任何人加一个头就换一个"IP"。只有部署在**自己的**反代后面时才设成反代跳数（nginx 一层就是 1），此时从右往左数第 N 跳才是真实客户端；**绝不取最左跳**，最左跳是客户端自己写的 |
+| `FORCE_REPLAY` | 未设 | `1` 强制全站走回放（演示日用）。零成本、断网可用、每次一致 |
+| `LLM_MAX_INFLIGHT` | `6` | 进程内**同时在途**的 LLM 请求数。跟 `MAX_CONCURRENT_CONSULTS`（同时几次问诊）是两件事——4 个问诊槽 × 3 位医家 = 12 路同时打 API 会撞 429 |
+
+### nginx 反代示例
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name tcm.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        # SSE 要的三条：不缓冲、不超时、不降级到 HTTP/1.0
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host $host;
+        # 这一行配合 TRUSTED_PROXY_HOPS=1 使用：nginx 把真实客户端 IP 追加在
+        # XFF 最右侧，服务端从右数第 1 跳取。只加这一行而不设 TRUSTED_PROXY_HOPS
+        # 的话服务端仍然不读 XFF（默认 0），所有人会被算成同一个"IP"。
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+对应的服务端设置：
+
+```bash
+TRUSTED_PROXY_HOPS=1 QUOTA_PER_IP_DAILY_CALLS=25 QUOTA_GLOBAL_DAILY_CALLS=1000 \
+  python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+### BYOK 的安全边界（原话，不要改写）
+
+> 你的 key 只在本次请求中转发给 DeepSeek，不会存储在服务器上。
+> 关闭标签页后即清除。
+
+落地细节：key 存 `sessionStorage`（关标签页就没了），随请求走 `X-LLM-Key` 头，
+**服务端不落盘、不进日志、不进 manifest**。入口在顶栏右侧、默认收起成一行小字
+「用自己的 API key（不限次数）」——不做成弹窗，不在首次进入时拦路。
+
+存之前先验一把：走 `/api/usage/validate-key`，它用 DeepSeek 官方的「查询余额」
+接口（`GET /user/balance`）核，**零 token 消耗**。没有这一步的话，填错 key 的人
+只能靠跑一次问诊才知道，而那一次可能已经走完 S1/S2 才失败。
+
 ## 前端页面
 
 无构建步骤，一个 `web/index.html`，两个页签：
@@ -443,10 +522,22 @@ curl -N -X POST http://127.0.0.1:8000/api/consult/stream \
 结果出来后是六层生长图（症状→证素→病名·证型→方剂→药材，方剂/药材是
 compound 父子节点）+ 各位医家的结论对照 + 分歧度（医家数取自 `core/physicians.py` 注册表，现在是三位）。
 
-**图谱浏览器页**——浏览持久知识图谱（`data/graph.json` 的国标结构层）。初始只
-铺 17 个证型节点，点开才逐步展开它连着的证素/症状（123 个节点一次性铺开是一团
-乱线）；支持按名字搜索、按医家切换 λ1 权重（边的透明度按 λ1 编码）。
-类目证候用菱形节点区分。**页面顶部那段 λ1 说明不是装饰**：它是
+**图谱浏览器页**——浏览持久知识图谱（`data/graph.json` 的国标结构层）。
+R16 起**首屏铺的是证素**（20 个 `../data/graph.json:graph.n_elements=20`），
+点一个证素展开它的证型、点证型展开症状、再点收起；布局是 concentric，
+枢纽在内圈。之前首屏铺 80 个证型方块——证型之间本来就没有边，力导向对一堆
+孤立节点只能摊平，那张图不传达任何东西。
+
+这张图当前的规模：节点 1315 `../data/graph.json:graph.n_nodes=1315`、
+边 3771 `../data/graph.json:graph.n_edges=3771`、
+证候 178 `../data/graph.json:graph.n_syndromes=178`、
+症状 1117 `../data/graph.json:graph.n_symptoms=1117`。
+**这四个数以前没有凭据记号**（它们不在 eval/ 下的任何 report 里），于是
+"重建图谱之后忘了回写"没有任何机制拦得住——而它已经发生过一次（839 → 941）。
+R17 把它们纳入了 `python -m scripts.collect_results --check`。
+
+另外支持按名字搜索、「按门类浏览」下拉（门类就是证候表的 `location`）、
+按医家切换 λ1 权重（边的透明度按 λ1 编码）。类目证候用菱形节点区分。**页面顶部那段 λ1 说明不是装饰**：它是
 `offline/graph_stats.py::lambda1_note()` 按当前这张图的实际内容算出来的，
 两种成因（图里根本没挂医案 / 挂了但医案证型跟国标术语对不上）说的是不同的话，
 前端原样显示、不改写。医案层为空时「国标层/医案层」切换按钮直接不显示，

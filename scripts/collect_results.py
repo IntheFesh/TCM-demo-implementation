@@ -50,6 +50,9 @@ SDT_LEDGER = "sdt/test_run_log.jsonl"
 # git 历史里取回来归档——「修复前 0.335 → 修复后 0.451」是这个项目最有说服力的
 # 叙事之一，两端都该可核，不能一端有文件一端只有一句话。
 ARCHIVE_2026_09_12 = "archive/2026-09-12"
+# 图谱规模的来源不在 eval/ 下。写成相对 eval/ 的路径而不是另起一套机制：
+# 凭据记号里的文件名要能让人直接去开那个文件。
+GRAPH_JSON = "../data/graph.json"
 
 
 def _load_json(path: Path):
@@ -196,7 +199,49 @@ EVIDENCE: dict[str, tuple[str, object]] = {
                      lambda rows: _sdt_score(rows, _sdt_runs(rows, "baseline", False, False)[0])),
     "sdt.ignore_safety_veto": (SDT_LEDGER,
                                lambda rows: _sdt_score(rows, _sdt_runs(rows, "chain", True, True)[0])),
+    # ---- R17：把 SOURCES.md 第 45 条九记的**两个凭据盲区**纳进来 ----
+    #
+    # 盲区一：**图谱规模**。README 和 RESULTS 里写着节点数/边数/证候数/症状数，
+    # 而这几个数一直没有凭据记号——它们不在 eval/ 下的任何 report 里，来源是
+    # data/graph.json 本身。于是「重建图谱之后忘了回写」这件事没有任何机制拦得住，
+    # 而它已经发生过（839 → 941 那次）。
+    #
+    # 路径写成 `../data/graph.json`：凭据记号里的文件名要能让人直接去开那个文件，
+    # 写一个相对 eval/ 的路径比另起一套"这个键的文件在别处"的机制诚实。
+    "graph.n_nodes": (GRAPH_JSON, lambda d: len(d.get("nodes") or [])),
+    "graph.n_edges": (GRAPH_JSON, lambda d: len(d.get("edges") or [])),
+    "graph.n_syndromes": (GRAPH_JSON, lambda d: _count_node_type(d, "syndrome")),
+    "graph.n_symptoms": (GRAPH_JSON, lambda d: _count_node_type(d, "symptom")),
+    "graph.n_elements": (GRAPH_JSON, lambda d: _count_node_type(d, "element")),
+    #
+    # 盲区二：**ε 分层**。这一节的每个数都是从 epsilon.json 的 per_query 现算的
+    # （`epsilon_stratification`），之前只在打印时算一次、没进注册表，
+    # 所以 RESULTS.md 里那一节的数字是手抄的——而这个项目手抄数字漂过三次。
+    "epsilon.stratification.global_mean": (
+        EPSILON_JSON, lambda d: _strat(d)["global_mean"]),
+    "epsilon.stratification.n_queries_used": (
+        EPSILON_JSON, lambda d: _strat(d)["n_queries_used"]),
+    "epsilon.stratification.per_query_mean_min": (
+        EPSILON_JSON, lambda d: _strat(d)["per_query_mean_min"]),
+    "epsilon.stratification.per_query_mean_max": (
+        EPSILON_JSON, lambda d: _strat(d)["per_query_mean_max"]),
+    "epsilon.stratification.n_floor_below_global": (
+        EPSILON_JSON, lambda d: _strat(d)["n_floor_below_global"]),
+    "epsilon.stratification.n_floor_above_global": (
+        EPSILON_JSON, lambda d: _strat(d)["n_floor_above_global"]),
+    "epsilon.stratification.max_over_global": (
+        EPSILON_JSON, lambda d: _strat(d)["max_over_global"]),
 }
+
+
+def _count_node_type(graph: dict, node_type: str) -> int:
+    return sum(1 for n in (graph.get("nodes") or []) if n.get("node_type") == node_type)
+
+
+def _strat(eps: dict) -> dict:
+    """凭据 getter 用的分层算子。算法在 `_stratification_from` 那一处，
+    这里只是把 getter 拿到的 dict 喂进去。"""
+    return _stratification_from(eps, _rows_from_epsilon(eps))
 
 
 def evidence_value(key: str, eval_dir: Path = EVAL_DIR):
@@ -274,14 +319,42 @@ def epsilon_by_query(eval_dir: Path = EVAL_DIR) -> list[dict]:
     `epsilon_online.mean` 同一个口径（那个数是全部 81 个值的均值），所以逐条的数
     跟全局的数可以直接比较、能说"这条的地板是全局均值的几倍"。
     """
-    eps = _load_json(eval_dir / EPSILON_JSON)
+    # 摊平 per_query[i].by_physician[p].values 这个三层结构的只有一处实现
+    # （core/chain.py）。R14 的前端对照带也要按主诉取地板，那是第二个调用方
+    # ——两处各写一遍推导式，estimate_epsilon 改字段名时必然漏一处。
+    return _rows_from_epsilon(_load_json(eval_dir / EPSILON_JSON))
+
+
+def _stratification_from(eps: dict | None, rows: list[dict]) -> dict:
+    """ε 分层的算法本体。**跟读文件分开**：R17 把这几个数纳入凭据注册表，
+    而注册表的 getter 拿到的是已经加载好的 dict——再让它自己去开一次文件，
+    就成了"同一份数据读两遍、两处各自处理文件不存在"。"""
+    if not eps:
+        return {}
+    global_mean = (eps.get("epsilon_online") or {}).get("mean")
+    usable = [r for r in rows if not r["skipped"] and r["mean"] is not None]
+    below = [r for r in usable if r["mean"] < global_mean]
+    above = [r for r in usable if r["mean"] > global_mean]
+    return {
+        "global_mean": global_mean,
+        "n_queries_used": len(usable),
+        "n_skipped": sum(1 for r in rows if r["skipped"]),
+        "per_query_mean_min": min(r["mean"] for r in usable) if usable else None,
+        "per_query_mean_max": max(r["mean"] for r in usable) if usable else None,
+        "n_floor_below_global": len(below),
+        "n_floor_above_global": len(above),
+        "n_floor_zero": sum(1 for r in usable if r["mean"] == 0.0),
+        "max_over_global": (round(max(r["mean"] for r in usable) / global_mean, 2)
+                            if usable and global_mean else None),
+    }
+
+
+def _rows_from_epsilon(eps: dict | None) -> list[dict]:
+    """per_query → 逐条地板的行。摊平仍然走 core/chain.py 那一处。"""
     if not eps:
         return []
     rows = []
     for q in (eps.get("epsilon_online") or {}).get("per_query") or []:
-        # 摊平 per_query[i].by_physician[p].values 这个三层结构的只有一处实现
-        # （core/chain.py）。R14 的前端对照带也要按主诉取地板，那是第二个调用方
-        # ——两处各写一遍推导式，estimate_epsilon 改字段名时必然漏一处。
         values = epsilon_values_in_query_record(q)
         rows.append({
             "query": q.get("query", ""),
@@ -303,24 +376,7 @@ def epsilon_stratification(eval_dir: Path = EVAL_DIR) -> dict:
     （当成真实分歧）。两个方向的条数分开报，不合成一个"错判率"。
     """
     eps = _load_json(eval_dir / EPSILON_JSON)
-    if not eps:
-        return {}
-    global_mean = (eps.get("epsilon_online") or {}).get("mean")
-    rows = [r for r in epsilon_by_query(eval_dir) if not r["skipped"] and r["mean"] is not None]
-    below = [r for r in rows if r["mean"] < global_mean]
-    above = [r for r in rows if r["mean"] > global_mean]
-    return {
-        "global_mean": global_mean,
-        "n_queries_used": len(rows),
-        "n_skipped": sum(1 for r in epsilon_by_query(eval_dir) if r["skipped"]),
-        "per_query_mean_min": min(r["mean"] for r in rows) if rows else None,
-        "per_query_mean_max": max(r["mean"] for r in rows) if rows else None,
-        "n_floor_below_global": len(below),
-        "n_floor_above_global": len(above),
-        "n_floor_zero": sum(1 for r in rows if r["mean"] == 0.0),
-        "max_over_global": (round(max(r["mean"] for r in rows) / global_mean, 2)
-                            if rows and global_mean else None),
-    }
+    return _stratification_from(eps, _rows_from_epsilon(eps))
 
 
 # ---------- --check：核对 RESULTS.md ----------

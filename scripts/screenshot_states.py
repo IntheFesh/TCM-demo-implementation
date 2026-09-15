@@ -49,6 +49,7 @@ PREFIX = {
     "patient": "r15", "patient_high": "r15", "doctor_conflict": "r15",
     "student_highlight": "r15",
     "consult_graph": "r16", "browser_home": "r16", "browser_expanded": "r16",
+    "topbar_byok": "r17", "demo_mode": "r17",
 }
 
 
@@ -302,6 +303,58 @@ STATES = {
           for (const bad of ['柴胡', '黄连', '赭石', '柴胡疏肝散']) {
             if (html.includes(bad)) return 'DOM 里还留着药名/方名 ' + bad;
           }
+          return null;
+        }""",
+    ),
+    # ---- R17：部署层 ----
+    "topbar_byok": (
+        "document.getElementById('byok-box').open = true;"
+        " renderUsage({mode: 'shared', remaining_consults_estimate: 1, warn: true,"
+        "   remaining_calls: 5, ip_limit_calls: 25, since: '2026-09-15T00:00:00Z'});",
+        """() => {
+          const box = document.getElementById('byok-box');
+          const bar = box.getBoundingClientRect();
+          // §5.1：BYOK 在**顶栏里**，不是输入区里、不是弹窗。
+          const top = document.getElementById('topbar').getBoundingClientRect();
+          if (!(bar.top >= top.top - 1 && bar.top <= top.bottom + 1))
+            return 'BYOK 不在顶栏里';
+          if (!box.querySelector('#byok-key')) return '展开之后没有输入框';
+          if (!box.textContent.includes('不会存储在服务器上'))
+            return '安全边界那句原话不在';
+          const chip = document.getElementById('quota-chip');
+          if (!chip.classList.contains('show')) return '额度 chip 没显示';
+          if (!chip.classList.contains('q-warn')) return '80% 没走 warn 档';
+          if (!chip.textContent.includes('今日约剩 1 次')) return '次数没显示';
+          return null;
+        }""",
+    ),
+    "demo_mode": (
+        "renderDemoMode({recorded_at: '2026-09-15T10:00:00Z', model: 'deepseek-v4-pro'});"
+        " renderUsage({mode: 'shared', degraded: true,"
+        "   reason: '站点共享额度已用完，已切换到回放模式：结果来自预先录制的真实推理。'});",
+        """() => {
+          const demo = document.getElementById('demo-mode-banner');
+          const deg = document.getElementById('degrade-banner');
+          if (!demo.classList.contains('show')) return '演示模式提示没显示';
+          if (!demo.textContent.includes('非实时调用')) return '文案不对';
+          if (!deg.classList.contains('show')) return '降级说明没显示';
+          // §5.2：两条都**不是警告色**——降级不是错误，是换了个后端继续跑。
+          for (const [el, name] of [[demo, '演示模式'], [deg, '降级']]) {
+            const bg = getComputedStyle(el).backgroundColor;
+            if (bg === getComputedStyle(document.getElementById('offline-banner')).backgroundColor
+                && bg !== 'rgba(0, 0, 0, 0)')
+              return name + '那一条用了跟"服务未连接"一样的底色';
+          }
+          // 两条都在顶栏下方、主内容之上
+          const top = document.getElementById('topbar').getBoundingClientRect();
+          const main = document.querySelector('main').getBoundingClientRect();
+          for (const [el, name] of [[demo, '演示模式'], [deg, '降级']]) {
+            const r = el.getBoundingClientRect();
+            if (!(r.top >= top.bottom - 1 && r.bottom <= main.top + 1))
+              return name + '那一条不在顶栏下方';
+          }
+          const chip = document.getElementById('quota-chip');
+          if (!chip.classList.contains('q-degraded')) return '额度 chip 没走 degraded 档';
           return null;
         }""",
     ),

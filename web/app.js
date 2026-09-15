@@ -72,14 +72,69 @@ function usageText(u) {
     + `额度自 ${String(u.since || "").slice(0, 16).replace("T", " ")} 起算，服务重启会重置。`;
 }
 
+// R17 §5.1：顶栏右侧那一枚「今日约剩 N 次」。
+//
+// **只有次数，没有句子**：顶栏那一行装不下 usageText() 那三句话，而那三句话
+// 是点开 BYOK 之后要看的（"额度怎么算的、什么时候重置"）。两处各答各的问题，
+// 不是同一份文案裁两次。
+//
+// 返回 null 表示不显示这枚 chip（BYOK 模式下额度跟访问者无关）。
+function quotaChipText(u) {
+  if (!u) return null;
+  if (u.mode === "byok") return "自带 key";
+  if (u.degraded) return "额度已用完";
+  const n = u.remaining_consults_estimate;
+  return n === null || n === undefined ? null : `今日约剩 ${n} 次`;
+}
+
+// 三档状态：normal / warn（80%）/ degraded（100%）。**判据全在服务端算好**
+// （u.warn / u.degraded），前端不自己拿 remaining/limit 再除一遍——除法写两处，
+// 阈值改一次就会有一处忘了改。
+function quotaChipLevel(u) {
+  if (!u || u.mode === "byok") return "normal";
+  if (u.degraded) return "degraded";
+  return u.warn ? "warn" : "normal";
+}
+
 function renderUsage(u) {
-  const bar = document.getElementById("usage-bar");
+  const chip = document.getElementById("quota-chip");
   const text = document.getElementById("usage-text");
-  if (!bar || !text || !u) return;
-  bar.classList.add("show");
-  bar.classList.toggle("degraded", !!u.degraded);
-  bar.classList.toggle("warn", !u.degraded && !!u.warn);
-  text.textContent = usageText(u);
+  if (u && text) text.textContent = usageText(u);
+  if (chip) {
+    const label = quotaChipText(u);
+    chip.textContent = label || "";
+    chip.classList.toggle("show", !!label);
+    for (const level of ["normal", "warn", "degraded"]) {
+      chip.classList.toggle(`q-${level}`, quotaChipLevel(u) === level);
+    }
+  }
+  renderDegradeBanner(u);
+}
+
+// §5.1 第 3 条：**超限降级到回放而不是报错**——访问者仍能看到预录主诉的完整
+// 效果。所以这一行用 --surface-2 底、不是警告色：降级不是错误，是换了个后端
+// 继续跑。原话由服务端给（u.reason），前端不自己编一套——两处措辞不一致时
+// 用户不知道信哪个。
+function degradeBannerText(u) {
+  if (!u || !u.degraded) return null;
+  return u.reason || "站点共享额度已用完，已切换到回放模式：结果来自预先录制的真实推理。";
+}
+
+function renderDegradeBanner(u) {
+  const el = document.getElementById("degrade-banner");
+  if (!el) return;
+  const text = degradeBannerText(u);
+  el.textContent = text || "";
+  el.classList.toggle("show", !!text);
+}
+
+// /health 拿不到 = 后端不在。**要说出来**：一片空白让人以为页面还在加载，
+// 而它已经加载完了，只是点「辨证」会失败。
+function renderOfflineBanner(connected) {
+  const el = document.getElementById("offline-banner");
+  if (!el) return;
+  el.textContent = connected ? "" : "服务未连接：页面已加载，但后端没有响应，现在点「辨证」会失败。";
+  el.classList.toggle("show", !connected);
 }
 
 async function refreshUsage() {
@@ -500,7 +555,7 @@ function injectPhysicianColors(physicians) {
 async function initDemoModeBanner() {
   try {
     const resp = await fetch("/health");
-    if (!resp.ok) return;
+    if (!resp.ok) { renderOfflineBanner(false); return; }
     const health = await resp.json();
     renderDemoMode(health.demo_mode);
     injectPhysicianColors(health.physicians);
@@ -508,10 +563,11 @@ async function initDemoModeBanner() {
     EXAMPLE_COMPLAINTS = health.example_complaints || [];
     renderExamples(EXAMPLE_COMPLAINTS);
     renderConsultLambda1Note(health.lambda1_note);
+    renderOfflineBanner(true);
   } catch (e) {
-    // 网络不通时 fetch 会抛——演示模式的意义之一就是断网可用，所以这里
-    // 只是拿不到提示，不是错误。身份色同理：CSS 里有兜底值，页面不会变成
-    // 透明色，只是三列没有各自的颜色。
+    // 网络不通时 fetch 会抛。身份色有 CSS 兜底、示例主诉不显示——都不致命，
+    // 但**这件事本身要说出来**：页面看起来正常，而点「辨证」一定会失败。
+    renderOfflineBanner(false);
   }
 }
 
@@ -2110,9 +2166,7 @@ document.getElementById("byok-save").addEventListener("click", async () => {
   const input = document.getElementById("byok-key");
   const key = (input.value || "").trim();
   const text = document.getElementById("usage-text");
-  const bar = document.getElementById("usage-bar");
   if (!key) { setByokKey(""); refreshUsage(); return; }
-  bar.classList.add("show");
   text.textContent = "正在验证这把 key（查余额，不消耗 token）…";
   let res = null;
   try {
@@ -2126,7 +2180,6 @@ document.getElementById("byok-save").addEventListener("click", async () => {
   }
   if (res && res.valid === false) {
     // 无效就不存——存下去只会让下一次问诊在 S1 那里失败。
-    bar.classList.add("degraded");
     text.textContent = `${res.reason} 没有保存这把 key。`;
     return;
   }
@@ -2134,12 +2187,10 @@ document.getElementById("byok-save").addEventListener("click", async () => {
   input.value = "";
   if (res && res.valid === null) {
     // 验不了不等于 key 不对（可能是站点到 DeepSeek 的网络问题），如实说，照存。
-    bar.classList.remove("degraded");
     text.textContent = `key 已保存，但没能验证：${res.reason}`;
     return;
   }
   if (res && res.is_available === false) {
-    bar.classList.add("warn");
     text.textContent = `${res.reason} key 已保存，但现在调用会返回 402。`;
     return;
   }

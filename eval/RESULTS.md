@@ -194,6 +194,15 @@ baseline 也是 deepseek-chat 跑的——要说"新模型下 chain 仍然高于
 **全局均值 0.2611。逐条地板 0.0 ~ 0.6742，最高的一条是全局均值的 2.58 倍。**
 一条主诉的地板恰好是 0（食滞证，同一条主诉跑三次，用药集合逐字相同）。
 
+> R17 把 ε 分层从凭据盲区里收了进来——之前这一节的数只在打印时算一次、
+> 手抄进文档，而这个项目手抄数字漂过三次。每个数各自的记号：
+>
+> - 全局均值 0.2611 `epsilon.json:epsilon.stratification.global_mean=0.2611`
+> - 逐条地板下界 0.0 `epsilon.json:epsilon.stratification.per_query_mean_min=0.0`
+> - 逐条地板上界 0.6742 `epsilon.json:epsilon.stratification.per_query_mean_max=0.6742`
+> - 最高一条是全局均值的 2.58 倍 `epsilon.json:epsilon.stratification.max_over_global=2.58`
+> - 可用主诉 9 条 `epsilon.json:epsilon.stratification.n_queries_used=9`
+
 ⚠ **跟上一轮相比，分层现象仍在，但"哪个证型落在哪一档"全变了**：痰饮从 0.0 变成
 0.2278、肝胃气滞从最高的 0.5099 降到第 7 位、湿热中阻从 0.3212 升到最高 0.6742，
 地板为 0 的从 2 条变成 1 条。新旧之间隔着一次 S3 prompt 改动和模型自身的随机性，

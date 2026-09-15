@@ -617,3 +617,89 @@ def test_metric_rows_only_looks_inside_a_table_with_an_evidence_column():
             "| # | 指标 | 凭据 |\n|---|---|---|\n| 3 | E3 | ⏳ 还没跑过 |\n")
     rows = cr.metric_rows(text)
     assert len(rows) == 1 and rows[0].startswith("| 3 |")
+
+
+# ============================================================================
+# R17：两个凭据盲区纳入注册表（SOURCES.md 第 45 条九记的那两个）
+# ============================================================================
+
+
+def test_graph_scale_numbers_are_now_checkable():
+    """**盲区一：图谱规模。** README 和 RESULTS 里写着节点数/边数/证候数/症状数，
+    而这几个数一直没有凭据记号——它们不在 eval/ 下的任何 report 里。于是
+    "重建图谱之后忘了回写"没有任何机制拦得住，而**它已经发生过**（839 → 941）。"""
+    for key in ("graph.n_nodes", "graph.n_edges", "graph.n_syndromes",
+                "graph.n_symptoms", "graph.n_elements"):
+        assert key in cr.EVIDENCE, f"{key} 没进注册表"
+        value, path = cr.evidence_value(key)
+        assert path.exists(), f"{key} 指向的文件不在：{path}"
+        assert isinstance(value, int) and value > 0, f"{key} 取不到数：{value}"
+
+
+def test_graph_counts_match_a_fresh_read_of_the_file():
+    """注册表里的 getter 跟直接数文件必须一致——否则凭据机制本身在骗人。"""
+    import json
+    from pathlib import Path
+    raw = json.loads((Path(cr.ROOT) / "data" / "graph.json").read_text(encoding="utf-8"))
+    assert cr.evidence_value("graph.n_nodes")[0] == len(raw["nodes"])
+    assert cr.evidence_value("graph.n_edges")[0] == len(raw["edges"])
+    assert cr.evidence_value("graph.n_syndromes")[0] == sum(
+        1 for n in raw["nodes"] if n.get("node_type") == "syndrome")
+
+
+def test_epsilon_stratification_numbers_are_now_checkable():
+    """**盲区二：ε 分层。** 这一节的每个数都是从 epsilon.json 的 per_query
+    现算的，之前只在打印时算一次、没进注册表，所以 RESULTS.md 里那一节的数字
+    是手抄的——而这个项目手抄数字漂过三次。"""
+    for key in ("epsilon.stratification.global_mean",
+                "epsilon.stratification.n_queries_used",
+                "epsilon.stratification.per_query_mean_min",
+                "epsilon.stratification.per_query_mean_max",
+                "epsilon.stratification.n_floor_below_global",
+                "epsilon.stratification.n_floor_above_global",
+                "epsilon.stratification.max_over_global"):
+        assert key in cr.EVIDENCE, f"{key} 没进注册表"
+        value, path = cr.evidence_value(key)
+        assert path.exists() and value is not None, f"{key} 取不到：{value}"
+
+
+def test_the_stratification_getter_and_the_printer_agree():
+    """注册表的 getter 和 `epsilon_stratification()` 必须给出同一套数——
+    两条路算同一件事，算法收口在 `_stratification_from` 那一处。"""
+    strat = cr.epsilon_stratification()
+    assert cr.evidence_value("epsilon.stratification.global_mean")[0] == strat["global_mean"]
+    assert cr.evidence_value("epsilon.stratification.n_floor_above_global")[0] \
+        == strat["n_floor_above_global"]
+    assert cr.evidence_value("epsilon.stratification.max_over_global")[0] \
+        == strat["max_over_global"]
+
+
+def test_below_plus_above_never_exceeds_the_usable_count():
+    """分层那两个方向的条数是**算出来的不是估的**（RESULTS.md 那一节的原话）。
+    这条是它们的自洽性：低于 + 高于 ≤ 可用条数（相等的那条两边都不算）。"""
+    strat = cr.epsilon_stratification()
+    assert strat["n_floor_below_global"] + strat["n_floor_above_global"] \
+        <= strat["n_queries_used"]
+
+
+def test_the_docs_actually_use_the_new_keys():
+    """注册表里有、文档里没人用，等于这一轮什么都没做——盲区还是盲区。"""
+    from pathlib import Path
+    root = Path(cr.ROOT)
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    results = (root / "eval" / "RESULTS.md").read_text(encoding="utf-8")
+    assert "graph.n_nodes=" in readme
+    assert "graph.n_symptoms=" in readme
+    assert "epsilon.stratification.global_mean=" in results
+    assert "epsilon.stratification.max_over_global=" in results
+
+
+def test_check_still_passes_with_the_new_marks():
+    """新加的记号本身也要能通过核对——加一批核不过的记号比不加更糟。"""
+    from pathlib import Path
+    root = Path(cr.ROOT)
+    for doc in (root / "eval" / "RESULTS.md", root / "README.md"):
+        result = cr.check(doc.read_text(encoding="utf-8"))
+        assert not result["mismatches"], result["mismatches"]
+        assert not result["unresolved"], result["unresolved"]
+        assert not result["missing_in_line"], result["missing_in_line"]

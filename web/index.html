@@ -23,6 +23,26 @@
     <div class="tb-sub" id="disclaimer-text">教学与研究用途，非诊断工具，不能替代执业医师</div>
   </div>
   <div class="tb-controls">
+    <!-- §5.1：额度看板在顶栏右侧。80% 变 --caution，降级变 --danger，
+         降级的原话由顶栏下方那一行给（它不是错误，是"换了个后端继续跑"）。 -->
+    <span id="quota-chip" role="status" aria-live="polite"></span>
+    <!-- §5.1：BYOK 入口**默认收起成一行小字**，点开才是输入框。
+         不做成弹窗、不在首次进入时拦路——它是给用完额度的人用的后路，
+         不是每个访问者都要先过的一道关。 -->
+    <details id="byok-box">
+      <summary>用自己的 API key（不限次数）</summary>
+      <div class="byok-panel">
+        <div class="byok-note">你的 key 只在本次请求中转发给 DeepSeek，不会存储在服务器上。关闭标签页后即清除。</div>
+        <div class="input-row input-row-left">
+          <label class="byok-label" for="byok-key">API key</label>
+          <input id="byok-key" type="password" autocomplete="off" spellcheck="false"
+                 placeholder="sk-…（只存在本标签页；建议用额度有限的临时 key）" />
+          <button id="byok-save">使用</button>
+          <button id="byok-clear">清除</button>
+        </div>
+        <div id="usage-text"></div>
+      </div>
+    </details>
     <label id="role-select-label" for="role-select">查看模式</label>
     <select id="role-select">
       <option value="researcher" selected>研究者（完整信息）</option>
@@ -41,7 +61,15 @@
   </div>
 </header>
 
+<!-- §5.2：演示模式提示挂在顶栏下方一行，--surface-2 底、不是警告色
+     （它不是错误）。文案从 /health.demo_mode 拼。 -->
 <div id="demo-mode-banner"></div>
+<!-- §5.1 第 3 条：超限降级到回放而不是报错。这一行说明用同一块版面、
+     同一种"不是错误"的底色——降级之后访问者仍能看到预录主诉的完整效果。 -->
+<div id="degrade-banner" role="status" aria-live="polite"></div>
+<!-- /health 拿不到时顶栏显示"服务未连接"，不是一片空白：空白让人以为
+     页面还在加载，而实际上它已经加载完了、只是后端不在。 -->
+<div id="offline-banner" role="status"></div>
 
 <div id="tab-bar">
   <button class="tab-btn active" id="tab-btn-consult" data-tab="consult">问诊</button>
@@ -114,16 +142,6 @@
         <button id="submit-btn">辨证</button>
         <!-- E1：一次问诊是分钟级（v4-pro + ReAct）。取消按钮平时不显示。 -->
         <button id="cancel-btn" class="is-hidden">取消</button>
-      </div>
-      <!-- D1：BYOK + 共享额度 + 用量看板。key 只存 sessionStorage（关标签页就没了），
-           随请求走 X-LLM-Key 头，服务端不落盘、不进日志、不进 manifest。 -->
-      <div id="usage-bar" role="status" aria-live="polite">
-        <span id="usage-text" class="grow"></span>
-        <label class="byok-label" for="byok-key">自带 API key</label>
-        <input id="byok-key" type="password" autocomplete="off" spellcheck="false"
-               placeholder="sk-…（只存在本标签页；建议用额度有限的临时 key）" />
-        <button id="byok-save">使用</button>
-        <button id="byok-clear">清除</button>
       </div>
       <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
            其余模式下压根不摆出来，不是禁用置灰。 -->
