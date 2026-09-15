@@ -7,6 +7,8 @@ import re
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -298,6 +300,40 @@ REASONING_MAX_TOKENS = 16384
 REASONING_MODELS = frozenset({"deepseek-v4-pro"})
 
 
+# DeepSeek 官方错误码表（https://api-docs.deepseek.com/zh-cn/quick_start/error_codes）：
+#   400 格式错误 / 401 认证失败（API key 错）/ 402 余额不足 / 422 参数错误
+#   429 请求速率达到上限 / 500 服务器故障 / 503 服务器繁忙
+# 前四个是**确定性**的：同样的 key、同样的请求体，重试三次结果一模一样，只是把
+# 一次失败变成三次失败加两次退避。429/500/503 才是"等一下可能就好了"。
+# 这个区分在本文件里已有先例——LLMTruncatedError 就是因为"同样的输入会在同一处
+# 再次被截断"而拒绝重试。这里照同一条理由办。
+NON_RETRYABLE_STATUS = {400, 401, 402, 422}
+
+
+class LLMAuthError(LLMError):
+    """认证/余额/请求体这类确定性失败，不重试。
+
+    单独立一个类型是因为**它要说给访问者听**：BYOK 场景下 401 是"你填的 key 不对"、
+    402 是"你的账户余额不足"，这两件事只有访问者能修，而通用的
+    「服务端处理失败（错误编号 xxxx）」会让他去找站点管理员。
+    """
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _status_code_of(exc: Exception) -> int | None:
+    """从 OpenAI SDK 的异常里取 HTTP 状态码。SDK 的 APIStatusError 带
+    .status_code；取不到就返回 None，按可重试处理（宁可多试一次）。"""
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
 class LLMBackend(ABC):
     """后端基类。**重试/校验/错误回灌只在这里实现一份**，子类只实现 `_complete`
     这个"单次原始调用"。
@@ -547,7 +583,14 @@ class LLMBackend(ABC):
                     deadline=self.timeouts().deadline, **kwargs,
                 )
             except Exception as e:  # noqa: BLE001 - 传输类错误：超时/非零退出/API 异常
-                # 这一类没有"上一次输出"可回灌——回灌上一轮的陈旧 raw 或空串只会让
+                # 401/402/422 这类确定性失败直接抛，不进重试（见 NON_RETRYABLE_STATUS
+                # 上面那段注释）。**这一条对 BYOK 尤其要紧**：访问者填错一个 key，
+                # 原来要等三次往返加两次退避，最后拿到一条看不出是自己 key 的
+                # 通用错误。
+                status = _status_code_of(e)
+                if status in NON_RETRYABLE_STATUS:
+                    raise LLMAuthError(_auth_error_message(status, e), status) from e
+                # 其余没有"上一次输出"可回灌——回灌上一轮的陈旧 raw 或空串只会让
                 # 模型收到文不对题的纠错指令。原样重试，但重试前先退避一下。
                 last_error = e
                 if attempt < self.MAX_ATTEMPTS - 1:
@@ -1124,6 +1167,82 @@ class VLLMInProcessBackend(LLMBackend):
         return outputs[0].outputs[0].text or ""
 
 
+class ByokBackend(OpenAICompatBackend):
+    """访问者自带 key（D1 第一层）。
+
+    key **只活在这一次请求里**：存在实例上、随请求结束一起回收，不写环境变量
+    （环境变量是进程级的，两个并发请求会互相串 key）、不落盘、不进日志、不进
+    manifest。`model_name()` / 超时 / 重试语义全部继承，唯一的差别就是这把 key。
+    """
+
+    def __init__(self, api_key: str) -> None:
+        super().__init__()
+        self._byok_key = api_key
+
+    def _api_key(self) -> str | None:
+        return self._byok_key
+
+
+def _auth_error_message(status: int | None, exc: Exception) -> str:
+    """给访问者看的原话。**不含 key**——异常里本来也没有（SDK 不把 Authorization
+    头放进异常），这里也绝不去把它拼进来。"""
+    if status == 401:
+        return "API key 认证失败（HTTP 401）：这把 key 不正确或已失效。"
+    if status == 402:
+        return "账户余额不足（HTTP 402）：这把 key 对应的账户需要充值后才能继续调用。"
+    if status == 422:
+        return f"请求参数被服务端拒绝（HTTP 422）：{exc}"
+    return f"请求被服务端拒绝（HTTP {status}）：{exc}"
+
+
+def check_api_key(api_key: str, base_url: str | None = None, timeout: float = 10.0) -> dict:
+    """用官方的「查询余额」接口验一把 key，**不消耗任何 token**。
+
+    GET {base}/user/balance，Authorization: Bearer <key>，返回
+    `is_available`（这个账户还能不能调 API）+ `balance_infos[]`
+    （currency / total_balance / granted_balance / topped_up_balance，都是字符串）。
+    见 https://api-docs.deepseek.com/zh-cn/api/get-user-balance
+
+    为什么要有这个：没有它，访问者只能靠"跑一次问诊"来知道 key 行不行，而那一次
+    可能已经走完 S1/S2 才失败。返回里**绝不回显 key**。
+    """
+    import httpx
+
+    base = (base_url or os.environ.get("LLM_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+    # LLM_BASE_URL 允许带 /v1（OpenAI 兼容路径），而 /user/balance 挂在根上。
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    try:
+        resp = httpx.get(
+            f"{base}/user/balance",
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001 - 网络问题跟 key 无效是两回事，要分开说
+        return {"valid": None, "reason": f"验证请求没发出去（{type(e).__name__}）：{e}"}
+
+    if resp.status_code == 401:
+        return {"valid": False, "reason": _auth_error_message(401, None)}
+    if resp.status_code != 200:
+        return {"valid": None, "reason": f"验证接口返回 HTTP {resp.status_code}，无法判定。"}
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return {"valid": None, "reason": "验证接口返回的不是 JSON，无法判定。"}
+
+    infos = body.get("balance_infos") or []
+    return {
+        "valid": True,
+        "is_available": bool(body.get("is_available")),
+        # 只回余额，不回 key
+        "balances": [
+            {"currency": i.get("currency"), "total_balance": i.get("total_balance")}
+            for i in infos
+        ],
+        "reason": "" if body.get("is_available") else "key 有效，但这个账户当前没有可用余额。",
+    }
+
+
 def get_backend() -> LLMBackend:
     """按 LLM_MODE 环境变量返回后端实例，默认 api。"""
     mode = os.environ.get("LLM_MODE", "api")
@@ -1145,6 +1264,25 @@ def get_backend() -> LLMBackend:
 _llm_singleton: LLMBackend | None = None
 _llm_lock = threading.Lock()
 
+# 逐请求的后端覆盖。ContextVar 而不是 thread-local：FastAPI 的同步端点跑在
+# anyio 线程池里、上下文会被复制过去；但**裸 threading.Thread 不继承**，
+# /api/consult/stream 的 worker 必须自己显式带上（见 api/main.py 里的
+# _run_with_backend）。
+_llm_override: ContextVar["LLMBackend | None"] = ContextVar("_llm_override", default=None)
+
+
+@contextmanager
+def use_llm(backend: "LLMBackend | None"):
+    """在这个上下文里 get_llm() 返回指定后端。backend 为 None 时不覆盖。"""
+    if backend is None:
+        yield
+        return
+    token = _llm_override.set(backend)
+    try:
+        yield
+    finally:
+        _llm_override.reset(token)
+
 
 def get_llm() -> LLMBackend:
     """惰性单例。模块底部不创建全局实例，避免模块导入时就要求环境变量齐全。
@@ -1153,6 +1291,12 @@ def get_llm() -> LLMBackend:
     从这个对象问：两个线程各建一份、在途请求引用着不同的那份，同一批评测里
     两条记录就可能标着不同的后端。
     """
+    override = _llm_override.get()
+    if override is not None:
+        # 逐请求覆盖（D1）：BYOK 用访问者自己的 key，超额降级用 ReplayBackend。
+        # 覆盖走 ContextVar 而不是改单例——单例是进程级的，两个并发请求会互相
+        # 串后端（一个用自己的 key、另一个跟着一起用）。
+        return override
     global _llm_singleton
     if _llm_singleton is None:
         with _llm_lock:

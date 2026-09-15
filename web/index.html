@@ -452,6 +452,26 @@
   .triage-card .t-label { color: var(--muted); font-size: 12px; margin-right: 6px; }
   .triage-card .t-flags { color: #B91C1C; font-weight: 600; }
   .triage-card .t-none { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  /* D1：额度条。平时是一行浅色小字，接近上限或降级时变色。 */
+  #usage-bar {
+    display: none; align-items: center; flex-wrap: wrap; gap: 10px;
+    margin: 10px 0 0; padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: #fbfbfd;
+    font-size: 12.5px; color: var(--muted);
+  }
+  #usage-bar.show { display: flex; }
+  #usage-bar.warn { background: var(--warn-bg); border-color: var(--warn-border); color: #7a4a12; }
+  #usage-bar.degraded { background: #FEF2F2; border-color: #B91C1C; color: #7F1D1D; }
+  #usage-bar .grow { flex: 1 1 auto; min-width: 220px; }
+  #byok-key {
+    width: 240px; padding: 5px 8px; font-size: 12px;
+    border: 1px solid var(--border); border-radius: 6px;
+    font-family: ui-monospace, monospace;
+  }
+  #byok-save, #byok-clear {
+    background: none; border: 1px solid var(--border); color: var(--text);
+    padding: 5px 10px; font-size: 12px; border-radius: 6px; cursor: pointer;
+  }
   #cancel-btn {
     background: none;
     color: var(--danger);
@@ -775,6 +795,16 @@
            整个页面。取消按钮平时不显示，跑起来才出现。 -->
       <button id="cancel-btn" style="display:none;">取消</button>
     </div>
+    <!-- D1：BYOK + 共享额度 + 用量看板。key 只存 sessionStorage（关标签页就没了），
+         随请求走 X-LLM-Key 头，服务端不落盘、不进日志、不进 manifest。 -->
+    <div id="usage-bar" role="status" aria-live="polite">
+      <span id="usage-text" class="grow"></span>
+      <label for="byok-key" style="font-size:12px;">自带 API key</label>
+      <input id="byok-key" type="password" autocomplete="off" spellcheck="false"
+             placeholder="sk-…（只存在本标签页；建议用额度有限的临时 key）" />
+      <button id="byok-save">使用</button>
+      <button id="byok-clear">清除</button>
+    </div>
     <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
          其余模式下这两个字段不出现——不是禁用置灰，是压根不摆出来，跟
          patient/doctor 模式后端字段裁剪同一条"不该看到的东西不摆出来"的
@@ -809,6 +839,7 @@
     <span id="gb-search-status"></span>
     <select id="gb-physician-select"></select>
     <button class="ghost-btn" id="gb-layer-toggle" hidden>切换到医案层</button>
+    <button class="ghost-btn" id="gb-more" hidden>加载更多证型</button>
     <button class="ghost-btn" id="gb-reset-btn">重置视图</button>
   </div>
   <div id="gb-panel">
@@ -853,6 +884,64 @@ const Y_MIN = 60, Y_MAX = 620;
 const HERB_GAP = 26;
 
 let cy = null;
+
+// ---------- D1：BYOK + 共享额度 + 用量看板 ----------
+//
+// key 存 sessionStorage 不存 localStorage：关掉标签页就没了。localStorage 会一直
+// 留在这台机器上，而这是个公开 demo，很可能有人在共用的电脑上填过 key。
+// 传输走 X-LLM-Key 请求头不走请求体：请求体在很多地方会被整条记进日志。
+//
+// ⚠ **但 sessionStorage 不是安全存储**：同源的任何脚本都读得到它，页面上只要
+// 出现一次 XSS，这把 key 就跟着走了。选它是因为在"不落服务端"和"刷新页面不用
+// 重填"之间它是最不坏的一档，不是因为它安全。输入框旁边的提示原话照实说
+// "只存在本标签页"，不写"安全保存"这类会让人放心的措辞。真正的防线是
+// **这把 key 应该是访问者专门为试用这个 demo 建的、额度有限的 key**。
+const BYOK_STORAGE_KEY = "tcm_byok_key";
+
+function getByokKey() {
+  try { return sessionStorage.getItem(BYOK_STORAGE_KEY) || ""; } catch (e) { return ""; }
+}
+function setByokKey(v) {
+  try {
+    if (v) sessionStorage.setItem(BYOK_STORAGE_KEY, v);
+    else sessionStorage.removeItem(BYOK_STORAGE_KEY);
+  } catch (e) { /* 隐私模式下 sessionStorage 可能不可用，退化成这次不带 key */ }
+}
+function authHeaders(base) {
+  const h = Object.assign({}, base || {});
+  const k = getByokKey();
+  if (k) h["X-LLM-Key"] = k;
+  return h;
+}
+
+function usageText(u) {
+  if (!u) return "";
+  if (u.mode === "byok") return "正在使用你自己的 API key，不占用站点额度。";
+  // 降级的原话由服务端给，前端不自己编一套——两处措辞不一致时用户不知道信哪个。
+  if (u.degraded) return u.reason;
+  // "次数"是服务端按 calls_per_consult 折算好的，前端不再自己算一份。
+  return `站点共享额度：今日约剩 ${u.remaining_consults_estimate} 次问诊`
+    + `（${u.remaining_calls}/${u.ip_limit_calls} 次模型调用；开 ReAct 约消耗 3 倍）。`
+    + `额度自 ${String(u.since || "").slice(0, 16).replace("T", " ")} 起算，服务重启会重置。`;
+}
+
+function renderUsage(u) {
+  const bar = document.getElementById("usage-bar");
+  const text = document.getElementById("usage-text");
+  if (!bar || !text || !u) return;
+  bar.classList.add("show");
+  bar.classList.toggle("degraded", !!u.degraded);
+  bar.classList.toggle("warn", !u.degraded && !!u.warn);
+  text.textContent = usageText(u);
+}
+
+async function refreshUsage() {
+  try {
+    const resp = await fetch("/api/usage", { headers: authHeaders() });
+    if (!resp.ok) return;
+    renderUsage(await resp.json());
+  } catch (e) { /* 看板拿不到不影响问诊本身，静默 */ }
+}
 
 // ---------- C1：cytoscape 加载兜底 ----------
 //
@@ -1454,7 +1543,7 @@ function ensureCanvas() {
 // 画布，不是一次性把 123 个节点全铺开——那样会是一团看不出结构的乱线。
 
 let gbCy = null;
-let gbGraphData = null;         // GET /api/graph 的原始响应，一次性拿全量，之后全部本地过滤/展开
+let gbGraphData = null;         // 已经从服务端拿到的那部分图（第一页 + 展开/搜索并进来的）
 let gbIndex = null;             // { nodeById, edgesByNode }，拿到数据后建一次，避免每次展开都线性扫全部边
 let gbVisibleIds = new Set();   // 当前画布上已经显示的节点 id
 let gbCurrentPhysician = null;
@@ -1631,40 +1720,79 @@ function gbAddNodes(nodeIds) {
   document.getElementById("gb-empty-hint").hidden = gbVisibleIds.size > 0;
 }
 
-function gbExpandNode(nodeId) {
-  const edges = gbIndex.edgesByNode.get(nodeId) || [];
-  const neighborIds = new Set();
-  for (const e of edges) {
-    const { source, target } = e.data;
-    neighborIds.add(source === nodeId ? target : source);
+// F1：展开改成问服务端。
+// 原来是在本地全量邻接表上展开——图一分页，本地就没有全量邻接表了，展开会
+// **静默只展开"恰好在本页里"的那部分**。那不是没找到，是没找过，比报错更误导。
+async function gbFetchInto(url, statusText) {
+  const status = document.getElementById("gb-search-status");
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    gbMergeGraph(data.graph);
+    if (status && statusText) status.textContent = statusText(data.page);
+    return data;
+  } catch (err) {
+    if (status) status.textContent = `加载失败：${err.message || err}`;
+    return null;
   }
-  gbAddNodes([...neighborIds]);
 }
 
-function gbSearch(query) {
+// 把服务端发来的一页并进本地缓存 + 画布。gbIndex 从"全图索引"变成"已加载的
+// 那部分的缓存"——语义变了但形状没变，gbBuildIndex() 仍是唯一一处建索引的地方。
+function gbMergeGraph(graph) {
+  if (!graph) return;
+  for (const n of graph.nodes || []) {
+    if (!gbIndex.nodeById.has(n.data.id)) gbGraphData.graph.nodes.push(n);
+    gbIndex.nodeById.set(n.data.id, n);
+  }
+  const seen = new Set(gbGraphData.graph.edges.map((e) => e.data.id));
+  for (const e of graph.edges || []) {
+    if (seen.has(e.data.id)) continue;
+    seen.add(e.data.id);
+    const { source, target } = e.data;
+    if (!gbIndex.edgesByNode.has(source)) gbIndex.edgesByNode.set(source, []);
+    if (!gbIndex.edgesByNode.has(target)) gbIndex.edgesByNode.set(target, []);
+    gbIndex.edgesByNode.get(source).push(e);
+    gbIndex.edgesByNode.get(target).push(e);
+    gbGraphData.graph.edges.push(e);
+  }
+  gbAddNodes((graph.nodes || []).map((n) => n.data.id));
+}
+
+async function gbExpandNode(nodeId) {
+  await gbFetchInto(
+    `/api/graph/neighbors?node=${encodeURIComponent(nodeId)}&limit=${GB_MAX_NEW_NODES}`,
+    (page) => page.truncated
+      ? `这个节点有 ${page.total} 个关联，只展开了前 ${page.returned} 个`
+      : `展开了 ${page.returned} 个关联节点`
+  );
+}
+
+async function gbSearch(query) {
   const status = document.getElementById("gb-search-status");
   const q = (query || "").trim();
   if (gbCy) gbCy.nodes().removeClass("gb-search-hit");
   if (!q) { status.textContent = ""; return; }
-  const matches = gbGraphData.graph.nodes.filter((n) => (n.data.label || "").includes(q));
-  if (!matches.length) {
-    status.textContent = "未找到匹配节点";
-    return;
-  }
-  // F3：命中数原来不设限，在扩表后的图上搜一个"痛"字能命中几百个症状，
-  // 全部一次性加进画布 + 跑力导向 = 卡死。如实报出总数，只画前 N 个。
-  const shown = matches.slice(0, GB_MAX_NEW_NODES);
-  status.textContent = matches.length > shown.length
-    ? `找到 ${matches.length} 个匹配节点，只显示前 ${shown.length} 个`
-    : `找到 ${matches.length} 个匹配节点`;
-  gbAddNodes(shown.map((n) => n.data.id));
-  const matchedIds = new Set(shown.map((n) => n.data.id));
+  // F1：搜索也改成问服务端。本地只有已加载的那部分，在本地搜等于"只在画布上
+  // 已经有的东西里找"——搜不到的时候用户会以为图里没有，其实是没搜过。
+  const found = await gbFetchInto(
+    `/api/graph/search?q=${encodeURIComponent(q)}&limit=${GB_MAX_NEW_NODES}`,
+    (page) => page.total === 0
+      ? "未找到匹配节点"
+      : (page.truncated
+          ? `找到 ${page.total} 个匹配节点，只显示前 ${page.returned} 个`
+          : `找到 ${page.total} 个匹配节点`)
+  );
+  if (!found || !found.page.total) return;
+  const matches = found.graph.nodes;
+  const matchedIds = new Set(matches.map((n) => n.data.id));
   const eles = gbCy.nodes().filter((ele) => matchedIds.has(ele.id()));
   eles.addClass("gb-search-hit");
   gbCy.animate({ fit: { eles, padding: 40 } }, { duration: 300 });
 }
 
-function gbToggleLayer() {
+async function gbToggleLayer() {
   gbShowCaseLayer = !gbShowCaseLayer;
   document.getElementById("gb-layer-toggle").textContent =
     gbShowCaseLayer ? "切换到国标层" : "切换到医案层";
@@ -1676,14 +1804,17 @@ function gbToggleLayer() {
     }
     return;
   }
-  const toReveal = [];
-  for (const id of gbVisibleIds) {
-    for (const e of gbIndex.edgesByNode.get(id) || []) {
-      const other = e.data.source === id ? e.data.target : e.data.source;
-      if (gbIndex.nodeById.get(other)?.data.node_type === "case") toReveal.push(other);
-    }
-  }
-  gbAddNodes(toReveal);
+  // 医案层直接按类型取一页，不再"从可见节点展开出 case 邻居"。后者在这个项目上
+  // 恒为空：case -evidences-> syndrome 的边实测是 0 条（医案用「胃阳虚」「悬饮」，
+  // 国标用「肝胃不和证」，两套术语体系对不上——就是 λ1 恒为 0 那件事）。
+  // 按邻居找等于永远显示不出医案层。
+  await gbFetchInto(
+    `/api/graph?node_types=case&limit=${GB_MAX_NEW_NODES}`,
+    (page) => page.next_cursor !== null
+      ? `医案层共 ${page.total} 条，显示前 ${page.returned} 条。`
+        + `它们跟国标层之间没有边——这正是 λ1 恒为 0 的原因，不是没加载出来。`
+      : `医案层 ${page.returned} 条`
+  );
 }
 
 function gbResetView() {
@@ -1698,17 +1829,38 @@ function gbResetView() {
   const layerBtn = document.getElementById("gb-layer-toggle");
   if (layerBtn) layerBtn.textContent = "切换到医案层";
 
-  const syndromeIds = gbGraphData.graph.nodes
-    .filter((n) => n.data.node_type === "syndrome")
-    .map((n) => n.data.id);
-  // F2：原来一次性把全部证型加进画布再跑 cose。sandbox 里 17 条没问题，
-  // AutoDL 上已经是 337 条，教材扩完是 1444 条——几百个互不相连的节点跑
-  // 力导向会把浏览器卡住，而且铺开也看不出结构。
-  const shown = syndromeIds.slice(0, GB_INITIAL_SYNDROMES);
-  gbSetHint(syndromeIds.length > shown.length
-    ? `证型共 ${syndromeIds.length} 条，先显示 ${shown.length} 条——用上方搜索框定位，或点节点展开关联的证素/症状`
+  // F1：重置 = 重新取第一页，不是从本地全量里切一刀（本地已经没有全量了）。
+  gbCursor = 0;
+  gbMergeGraph(gbGraphData.graph);
+  gbRenderMoreButton();
+  gbSetHint(gbTotalSyndromes > gbVisibleIds.size
+    ? `证型共 ${gbTotalSyndromes} 条，先显示 ${gbVisibleIds.size} 条——用搜索框定位、点节点展开关联，或点"加载更多证型"`
     : "点击节点展开关联的证素/症状，或用上方搜索框定位");
-  gbAddNodes(shown);
+}
+
+// F1：翻页状态。cursor 是位置偏移，服务端按 networkx 的插入顺序切片，
+// build_graph 是确定性写入的，所以同一份 graph.json 上这个顺序稳定。
+let gbCursor = 0;
+let gbTotalSyndromes = 0;
+
+function gbRenderMoreButton() {
+  const btn = document.getElementById("gb-more");
+  if (!btn) return;
+  const more = gbTotalSyndromes > 0 && gbCursor !== null && gbCursor < gbTotalSyndromes;
+  btn.hidden = !more;
+  if (more) btn.textContent = `加载更多证型（还有 ${gbTotalSyndromes - gbCursor} 条）`;
+}
+
+async function gbLoadMoreSyndromes() {
+  if (gbCursor === null) return;
+  const data = await gbFetchInto(
+    `/api/graph?node_types=syndrome&limit=${GB_INITIAL_SYNDROMES}&cursor=${gbCursor}`,
+    (page) => `又加载了 ${page.returned} 条证型`
+  );
+  if (!data) return;
+  gbCursor = data.page.next_cursor;
+  gbTotalSyndromes = data.page.total;
+  gbRenderMoreButton();
 }
 
 function renderGbLambda1Note(note) {
@@ -1760,12 +1912,17 @@ async function loadGraphBrowserData() {
     return;
   }
   try {
-    const resp = await fetch("/api/graph");
+    // F1：**不再一次拿全图**。原来这里拉的是整张 data/graph.json——注释当年
+    // 写的是"123 个节点、377 条边，一次装得下"，AutoDL 上现在是 2256/3771，
+    // 教材五本扩完还要再翻几倍。现在只取第一页证型，其余靠展开/搜索/加载更多。
+    const resp = await fetch(`/api/graph?node_types=syndrome&limit=${GB_INITIAL_SYNDROMES}`);
     if (!resp.ok) {
       const text = await resp.text();
       throw new Error(`服务返回错误（HTTP ${resp.status}）：${text}`);
     }
     gbGraphData = await resp.json();
+    gbCursor = gbGraphData.page ? gbGraphData.page.next_cursor : null;
+    gbTotalSyndromes = gbGraphData.page ? gbGraphData.page.total : 0;
     gbBuildIndex();
     renderGbLambda1Note(gbGraphData.lambda1_note);
     renderGbStats(gbGraphData.stats);
@@ -1793,6 +1950,7 @@ function switchTab(tab) {
 
 document.getElementById("tab-btn-consult").addEventListener("click", () => switchTab("consult"));
 document.getElementById("tab-btn-graph-browser").addEventListener("click", () => switchTab("graph-browser"));
+document.getElementById("gb-more").addEventListener("click", gbLoadMoreSyndromes);
 document.getElementById("gb-search-btn").addEventListener("click", () => gbSearch(document.getElementById("gb-search").value));
 document.getElementById("gb-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") gbSearch(e.target.value);
@@ -3262,7 +3420,7 @@ async function submitConsult() {
     const resp = await fetch("/api/consult/stream", {
       method: "POST",
       signal: currentAbort.signal,
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       // 检索模式跟着这一次请求走，不去调什么"服务端设置"接口——服务端的
       // RETRIEVER_MODE 是进程级的，改它会影响同时在跑的别人的请求。
       // 空字符串 = 用默认，这时候不带这个字段（不是传 ""，那是个非法模式名）。
@@ -3277,7 +3435,10 @@ async function submitConsult() {
     let errorDetail = null;
     await readSSE(resp, (name, data) => {
       armWatchdog(); // 每收到一条事件就把空闲计时归零
+      if (name === "usage") { renderUsage(data); return; }
       if (name === "stream_id") {
+        // 额度状态搭在第一帧里：降级到回放要在推理开始之前让人知道。
+        if (data.usage) renderUsage(data.usage);
         currentStreamId = data.stream_id;
       } else if (name === "need_input") {
         showNeedInput(data.question);
@@ -3319,11 +3480,64 @@ async function submitConsult() {
     btn.textContent = "辨证";
     status.textContent = "";
     currentStreamId = null;
+    refreshUsage();
   }
 }
 
 initDemoModeBanner();
 document.getElementById("submit-btn").addEventListener("click", submitConsult);
+// 存之前先验一把：走服务端的 /api/usage/validate-key，它用 DeepSeek 官方的
+// 「查询余额」接口（GET /user/balance）核，**零 token 消耗**。没有这一步的话，
+// 填错 key 的人只能靠跑一次问诊才知道——而那一次可能已经走完 S1/S2 才失败。
+document.getElementById("byok-save").addEventListener("click", async () => {
+  const input = document.getElementById("byok-key");
+  const key = (input.value || "").trim();
+  const text = document.getElementById("usage-text");
+  const bar = document.getElementById("usage-bar");
+  if (!key) { setByokKey(""); refreshUsage(); return; }
+  bar.classList.add("show");
+  text.textContent = "正在验证这把 key（查余额，不消耗 token）…";
+  let res = null;
+  try {
+    const resp = await fetch("/api/usage/validate-key", {
+      method: "POST",
+      headers: { "X-LLM-Key": key },
+    });
+    res = await resp.json();
+  } catch (e) {
+    res = { valid: null, reason: `验证请求没发出去：${e.message || e}` };
+  }
+  if (res && res.valid === false) {
+    // 无效就不存——存下去只会让下一次问诊在 S1 那里失败。
+    bar.classList.add("degraded");
+    text.textContent = `${res.reason} 没有保存这把 key。`;
+    return;
+  }
+  setByokKey(key);
+  input.value = "";
+  if (res && res.valid === null) {
+    // 验不了不等于 key 不对（可能是站点到 DeepSeek 的网络问题），如实说，照存。
+    bar.classList.remove("degraded");
+    text.textContent = `key 已保存，但没能验证：${res.reason}`;
+    return;
+  }
+  if (res && res.is_available === false) {
+    bar.classList.add("warn");
+    text.textContent = `${res.reason} key 已保存，但现在调用会返回 402。`;
+    return;
+  }
+  const b = (res && res.balances && res.balances[0]) || null;
+  await refreshUsage();
+  if (b) {
+    document.getElementById("usage-text").textContent +=
+      `　（key 可用，余额 ${b.total_balance} ${b.currency}）`;
+  }
+});
+document.getElementById("byok-clear").addEventListener("click", () => {
+  setByokKey("");
+  document.getElementById("byok-key").value = "";
+  refreshUsage();
+});
 document.getElementById("cancel-btn").addEventListener("click", () => {
   if (!currentAbort) return;
   cancelledByUser = true;

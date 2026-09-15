@@ -12,6 +12,8 @@ test_herb_grouping.py 同一个模式。
 """
 import json
 import subprocess
+
+from tests.node_script import js_tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -50,7 +52,7 @@ def _banner(divergence: dict | None) -> str:
     script = html.split("<script>")[-1].split("</script>")[0]
     tail = ("\nconsole.log(JSON.stringify(divergenceBannerText("
             + json.dumps(divergence, ensure_ascii=False) + ")));")
-    proc = subprocess.run(["node", "-e", DOM_STUB + script + tail],
+    proc = subprocess.run(["node", js_tmp(DOM_STUB + script + tail)],
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, f"node 执行失败：\nstdout={proc.stdout}\nstderr={proc.stderr}"
     return json.loads(proc.stdout.strip())

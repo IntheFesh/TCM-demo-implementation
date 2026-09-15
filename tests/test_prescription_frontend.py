@@ -11,6 +11,8 @@ Playwright（见模块报告的截图）——这里测的是"给定状态，渲
 """
 import json
 import subprocess
+
+from tests.node_script import js_tmp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,7 +31,7 @@ def _run_node(js_tail: str) -> str:
     html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     script = html.split("<script>")[-1].split("</script>")[0]
     proc = subprocess.run(
-        ["node", "-e", DOM_STUB + script + "\n" + js_tail],
+        ["node", js_tmp(DOM_STUB + script + "\n" + js_tail)],
         capture_output=True, text=True, timeout=30,
     )
     assert proc.returncode == 0, f"node 执行失败：\nstdout={proc.stdout}\nstderr={proc.stderr}"

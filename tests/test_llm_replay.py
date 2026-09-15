@@ -9,6 +9,8 @@ fixture 文件。
 """
 import json
 import subprocess
+
+from tests.node_script import js_tmp
 from pathlib import Path
 
 import pytest
@@ -528,7 +530,7 @@ def _demo_text(demo_mode) -> str | None:
     script = html.split("<script>")[-1].split("</script>")[0]
     tail = ("\nconsole.log(JSON.stringify(demoModeText("
             + json.dumps(demo_mode, ensure_ascii=False) + ")));")
-    proc = subprocess.run(["node", "-e", DOM_STUB + script + tail],
+    proc = subprocess.run(["node", js_tmp(DOM_STUB + script + tail)],
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, f"node 失败：\n{proc.stdout}\n{proc.stderr}"
     return json.loads(proc.stdout.strip())

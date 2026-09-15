@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -23,7 +23,9 @@ from core.audit import append_audit
 from core.chain import consult, explained_symptoms
 from core.diseases import get_disease, triage_advice
 from core.herbs import is_western_drug, strip_dose_and_parens
-from core.llm import get_llm
+from core.llm import ByokBackend, LLMAuthError, check_api_key, get_llm, use_llm
+from core.react import react_enabled
+from core import usage as usage_mod
 from core.physicians import PHYSICIANS, resolve_physician_id
 from core.prescription import compute_herb_diffs, format_pharmacy_text
 from core.safety_output import assess_formula_safety
@@ -212,26 +214,55 @@ def _persistent_graph_to_cytoscape(store) -> dict:
     直接 **data 展开会把 cytoscape 期待的边端点字段 source 覆盖掉。这里改名
     成 data_source，把 source/target 这两个字段名让给端点。
     """
-    nodes = []
-    for node_id, data in store.g.nodes(data=True):
-        node_data = {"id": node_id, "label": data.get("name", node_id)}
-        for k, v in data.items():
-            if k != "name":
-                node_data[k] = v
-        nodes.append({"data": node_data})
-
-    edges = []
-    for src, dst, key, data in store.g.edges(keys=True, data=True):
-        edge_data = {"id": f"{src}::{dst}::{key}", "source": src, "target": dst}
-        for k, v in data.items():
-            edge_data["data_source" if k == "source" else k] = v
-        edges.append({"data": edge_data})
-
+    nodes = [_node_payload(nid, d) for nid, d in store.g.nodes(data=True)]
+    edges = [_edge_payload(u, v, k, d) for u, v, k, d in store.g.edges(keys=True, data=True)]
     return {"nodes": nodes, "edges": edges}
 
 
+def _node_payload(node_id: str, data: dict) -> dict:
+    node_data = {"id": node_id, "label": data.get("name", node_id)}
+    for k, v in data.items():
+        if k != "name":
+            node_data[k] = v
+    return {"data": node_data}
+
+
+def _edge_payload(src: str, dst: str, key, data: dict) -> dict:
+    edge_data = {"id": f"{src}::{dst}::{key}", "source": src, "target": dst}
+    for k, v in data.items():
+        edge_data["data_source" if k == "source" else k] = v
+    return {"data": edge_data}
+
+
+def _require_store():
+    store = get_graph_store()
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail=_public_text(f"未找到 {GRAPH_PATH}。先跑 offline/build_graph.py 建图谱骨架。"),
+        )
+    return store
+
+
+def _node_ids_of_types(store, node_types: str | None) -> list[str]:
+    """按 node_type 过滤并**保持 networkx 的插入顺序**——分页游标是位置偏移，
+    顺序一变，翻页就会漏掉或重复。build_graph 是确定性写入的，所以这个顺序
+    在同一份 graph.json 上是稳定的。"""
+    wanted = {t.strip() for t in (node_types or "").split(",") if t.strip()}
+    out = []
+    for nid, d in store.g.nodes(data=True):
+        if wanted and d.get("node_type") not in wanted:
+            continue
+        out.append(nid)
+    return out
+
+
 @app.get("/api/graph")
-def api_graph() -> dict:
+def api_graph(
+    node_types: str | None = None,
+    limit: int = 0,
+    cursor: int = 0,
+) -> dict:
     """图谱浏览器页签用的持久知识图谱（data/graph.json 的国标结构层，跟
     /api/consult 里 to_graph() 产出的单次问诊图是两回事）。
 
@@ -245,16 +276,40 @@ def api_graph() -> dict:
     要么是压根没挂医案，要么是挂了医案但证型体系跟国标对不上），只有一处
     实现，前端原样显示，不弱化也不省略。
     """
-    store = get_graph_store()
-    if store is None:
-        raise HTTPException(
-            status_code=503,
-            detail=_public_text(f"未找到 {GRAPH_PATH}。先跑 offline/build_graph.py 建图谱骨架。"),
-        )
-
+    store = _require_store()
     stats = compute_stats(store)
+
+    # limit=0 = 全量，**跟分页之前逐字节一样**（旧客户端和
+    # test_graph_endpoint_matches_real_store_counts 都依赖这个默认）。
+    # 分页是显式 opt-in：前端传 limit，服务端才切页。
+    if limit and limit > 0:
+        ids = _node_ids_of_types(store, node_types)
+        total = len(ids)
+        offset = max(int(cursor), 0)
+        page_ids = ids[offset:offset + limit]
+        keep = set(page_ids)
+        graph = {
+            "nodes": [_node_payload(nid, store.g.nodes[nid]) for nid in page_ids],
+            # 只发两端都在本页里的边——跟前端 gbAddNodes 的规则同一条，
+            # 不在这里另写一套"半条边"的语义。
+            "edges": [
+                _edge_payload(u, v, k, d)
+                for u, v, k, d in store.g.edges(keys=True, data=True)
+                if u in keep and v in keep
+            ],
+        }
+        nxt = offset + len(page_ids)
+        page = {"limit": limit, "cursor": offset, "returned": len(page_ids),
+                "total": total, "next_cursor": nxt if nxt < total else None,
+                "node_types": node_types}
+    else:
+        graph = _persistent_graph_to_cytoscape(store)
+        page = {"limit": 0, "cursor": 0, "returned": len(graph["nodes"]),
+                "total": len(graph["nodes"]), "next_cursor": None, "node_types": None}
+
     return {
-        "graph": _persistent_graph_to_cytoscape(store),
+        "graph": graph,
+        "page": page,
         "has_case_layer": stats["node_type_counts"].get("case", 0) > 0,
         "lambda1_note": lambda1_note(stats),
         "physicians": [
@@ -266,6 +321,225 @@ def api_graph() -> dict:
             "edge_type_counts": stats["edge_type_counts"],
         },
     }
+
+
+@app.get("/api/graph/neighbors")
+def api_graph_neighbors(node: str, limit: int = 200) -> dict:
+    """展开一个节点的邻居。
+
+    分页之后**必须有这个端点**：原来前端一次拿全图、在本地邻接表上展开，
+    图一分页本地就没有全量邻接表了，展开会静默只展开"恰好在本页里"的那部分。
+    无向看待（进边出边都算）——图谱浏览器展示的是关联，不是流向。
+    """
+    store = _require_store()
+    if not store.g.has_node(node):
+        raise HTTPException(status_code=404, detail=_public_text(f"图里没有这个节点：{node}"))
+
+    seen: dict[str, dict] = {}
+    edges = []
+    for u, v, k, d in store.g.edges(node, keys=True, data=True):
+        edges.append(_edge_payload(u, v, k, d))
+        seen.setdefault(v, store.g.nodes[v])
+    for u, v, k, d in store.g.in_edges(node, keys=True, data=True):
+        edges.append(_edge_payload(u, v, k, d))
+        seen.setdefault(u, store.g.nodes[u])
+    seen.pop(node, None)
+
+    total = len(seen)
+    picked = list(seen.items())[:max(limit, 0)] if limit and limit > 0 else list(seen.items())
+    keep = {nid for nid, _ in picked} | {node}
+    return {
+        "graph": {
+            "nodes": [_node_payload(nid, d) for nid, d in picked],
+            "edges": [e for e in edges
+                      if e["data"]["source"] in keep and e["data"]["target"] in keep],
+        },
+        "page": {"limit": limit, "returned": len(picked), "total": total,
+                 "truncated": len(picked) < total},
+    }
+
+
+@app.get("/api/graph/search")
+def api_graph_search(q: str, limit: int = 100, node_types: str | None = None) -> dict:
+    """按标签子串搜节点。
+
+    跟 neighbors 同一条理由：分页之后前端手里没有全量 label 了，本地搜只能搜到
+    已经画出来的那些——那不是"没找到"，是"没找过"，比报错更误导。
+    `total` 如实报命中总数，`returned` 是实际发回的条数，前端据此显示
+    "命中 N 条，只显示前 M 条"。
+    """
+    store = _require_store()
+    needle = (q or "").strip()
+    if not needle:
+        return {"graph": {"nodes": [], "edges": []},
+                "page": {"limit": limit, "returned": 0, "total": 0, "truncated": False}}
+
+    wanted = {t.strip() for t in (node_types or "").split(",") if t.strip()}
+    hits = []
+    for nid, d in store.g.nodes(data=True):
+        if wanted and d.get("node_type") not in wanted:
+            continue
+        if needle in str(d.get("name", nid)):
+            hits.append((nid, d))
+
+    total = len(hits)
+    picked = hits[:max(limit, 0)] if limit and limit > 0 else hits
+    keep = {nid for nid, _ in picked}
+    return {
+        "graph": {
+            "nodes": [_node_payload(nid, d) for nid, d in picked],
+            "edges": [_edge_payload(u, v, k, d)
+                      for u, v, k, d in store.g.edges(keys=True, data=True)
+                      if u in keep and v in keep],
+        },
+        "page": {"limit": limit, "returned": len(picked), "total": total,
+                 "truncated": len(picked) < total},
+    }
+
+
+# 受信反代跳数。**默认 0 = 完全不读 X-Forwarded-For**，只用 TCP 对端地址。
+# MDN 写得很明确：任何跟安全相关的 XFF 用法（限流、基于 IP 的访问控制）只能用
+# 受信代理添加的那些地址，用不可信的值会导致限流被绕过、内存耗尽等后果
+# （https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For）。
+# 而**最左那一跳恰恰是客户端自己能写的**——取最左等于把限流的 key 交给攻击者：
+#     for i in $(seq 1 10000); do curl -H "X-Forwarded-For: $RANDOM.$RANDOM.1.1" …; done
+# 每一条都算成新 IP，按 IP 的额度形同虚设。
+# 部署在 N 层受信反代后面时把这个值设成 N，代码从**右**数第 N 跳取。
+TRUSTED_PROXY_HOPS = max(int(os.environ.get("TRUSTED_PROXY_HOPS", "0") or 0), 0)
+
+# 不同 IP 桶的上限。同样来自上面那条 MDN 警告里的"内存耗尽"：轮换 IP 的请求会让
+# 账本里的 dict 一直长。超过上限之后新来的都归进一个共用桶——宁可让少数人互相
+# 挤额度，也不让进程被撑爆。
+MAX_TRACKED_IPS = max(int(os.environ.get("QUOTA_MAX_TRACKED_IPS", "5000") or 0), 1)
+
+
+def _normalize_ip(raw: str) -> str | None:
+    """校验并归一化。伪造的值**可能根本不是 IP**（MDN 专门提醒过这点），
+    所以先 parse；IPv6 归一到 /64——一个普通家宽用户手上就有整个 /64，
+    不归一等于 IPv6 客户端天然免限流。"""
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    if ip.version == 6:
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
+
+
+def _client_ip(request: Request) -> str:
+    """额度按 IP 分的 key。
+
+    默认只用 TCP 对端地址（`request.client.host`）。部署在反代后面时对端是反代，
+    所有访问者会被算成同一个人——那时候才设 `TRUSTED_PROXY_HOPS=N`，从右数第 N 跳取。
+    **绝不取最左跳**，理由见上面 TRUSTED_PROXY_HOPS 的注释。
+
+    即便配对了跳数，按 IP 限额也只是**防误伤**（让正常访问者各自计数），
+    不是不可绕过的安全边界（同一个人换 IP 就是新额度）。真正兜底的是全局限额，
+    那一条伪造不了。这句话要留着，不要让人误以为按 IP 限额是安全边界。
+    """
+    peer = _normalize_ip(request.client.host) if request.client else None
+    if TRUSTED_PROXY_HOPS <= 0:
+        return peer or "unknown"
+    hops = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+    # 从右数第 TRUSTED_PROXY_HOPS 跳：右边那些是受信反代自己追加的，再往左就是
+    # 客户端能写的部分。链比预期短说明请求没经过那么多层反代（可能是直连），
+    # 这时候退回对端地址，而不是去信一个位置对不上的值。
+    idx = len(hops) - TRUSTED_PROXY_HOPS
+    if idx < 0 or idx >= len(hops):
+        return peer or "unknown"
+    return _normalize_ip(hops[idx]) or peer or "unknown"
+
+
+def _byok_key(raw: str | None) -> str | None:
+    """访问者自带的 key 从请求头来，**不从请求体来**：请求体在很多地方会被
+    完整记进日志/追踪，头字段至少不会跟着 payload 一起被打出来。"""
+    if not raw:
+        return None
+    key = raw.strip()
+    return key or None
+
+
+def _gate(request: Request, raw_key: str | None):
+    """闸门：决定这一次用哪个后端，并预占额度。
+
+    **只读账本、不碰模型**，所以被拦下来的请求是零成本的——这是 D1 的核心判据，
+    不是把请求跑完再看花了多少。返回 (decision, backend, token)；backend 为 None
+    表示用进程默认后端（共享额度那条路），token 为 None 表示不需要结算。
+    """
+    ledger = usage_mod.get_ledger()
+    ip = ledger.bucket_for(_client_ip(request), MAX_TRACKED_IPS)
+    key = _byok_key(raw_key)
+    decision = ledger.decide(ip, has_own_key=key is not None)
+
+    if decision.mode == "byok":
+        return decision, ByokBackend(key), None
+    if decision.mode == "replay":
+        from core.llm_replay import ReplayBackend
+
+        return decision, ReplayBackend(), None
+
+    estimate = usage_mod.estimate_calls(react_enabled(), len(PHYSICIANS))
+    return decision, None, ledger.reserve(ip, estimate)
+
+
+def _settle(token: int | None, outcome: dict | None) -> None:
+    """按 manifest 里的真实 llm_calls 结算。
+
+    outcome 为 None 分两种情况，**不能混为一谈**：
+      · 根本没跑起来（并发位满、闸门本身抛了）→ `_refund()`，一次调用都没发生
+      · 跑起来了但拿不到 manifest（客户端中途断开、中途抛异常）→ 走这里的
+        `release()`：钱已经花了，只是数不清，按预占记账，不退。
+        按 0 退的话，开着流跑一半关掉就等于白嫖。
+    """
+    if token is None:
+        return
+    ledger = usage_mod.get_ledger()
+    if not outcome:
+        ledger.release(token)
+        return
+    calls = int((outcome.get("manifest") or {}).get("llm_calls") or 0)
+    ledger.settle(token, calls)
+
+
+def _refund(token: int | None) -> None:
+    """一次模型都没调，预占全额退还。"""
+    if token is not None:
+        usage_mod.get_ledger().settle(token, 0)
+
+
+def _usage_block(request: Request, decision) -> dict:
+    ledger = usage_mod.get_ledger()
+    snap = ledger.snapshot(ledger.bucket_for(_client_ip(request), MAX_TRACKED_IPS))
+    snap["mode"] = decision.mode
+    snap["reason"] = decision.reason
+    snap["degraded"] = decision.degraded
+    return snap
+
+
+@app.post("/api/usage/validate-key")
+def api_validate_key(x_llm_key: str | None = Header(default=None)) -> dict:
+    """用 DeepSeek 官方的「查询余额」接口验一把访问者填的 key，**零 token 消耗**。
+
+    没有这个端点的话，填错 key 的人只能靠跑一次问诊才知道——而那一次可能已经
+    走完 S1/S2。返回里不回显 key。
+    """
+    key = _byok_key(x_llm_key)
+    if not key:
+        raise HTTPException(status_code=400, detail="没有收到 key。")
+    return check_api_key(key)
+
+
+@app.get("/api/usage")
+def api_usage(request: Request, x_llm_key: str | None = Header(default=None)) -> dict:
+    """用量看板。**不消耗任何额度**（decide 只读账本），前端可以随时轮询。"""
+    ledger = usage_mod.get_ledger()
+    decision = ledger.decide(
+        ledger.bucket_for(_client_ip(request), MAX_TRACKED_IPS),
+        has_own_key=_byok_key(x_llm_key) is not None,
+    )
+    return _usage_block(request, decision)
 
 
 def _acquire_consult_slot() -> threading.BoundedSemaphore:
@@ -283,10 +557,27 @@ def _acquire_consult_slot() -> threading.BoundedSemaphore:
 
 
 @app.post("/api/consult")
-def api_consult(req: ConsultRequest) -> dict:
-    slots = _acquire_consult_slot()
+def api_consult(
+    req: ConsultRequest,
+    request: Request,
+    response: Response,
+    x_llm_key: str | None = Header(default=None),
+) -> dict:
+    decision, backend, token = _gate(request, x_llm_key)
     try:
-        outcome = consult(req.complaint, retriever_mode=req.retriever_mode)
+        slots = _acquire_consult_slot()
+    except HTTPException:
+        # 并发位满 → 503。这条路上一次模型都没调，预占必须退还，否则每一次
+        # 503 都会把估算永久挂在账上，并发一满额度就被慢慢吃光。
+        _refund(token)
+        raise
+    outcome = None
+    try:
+        with use_llm(backend):
+            outcome = consult(req.complaint, retriever_mode=req.retriever_mode)
+    except LLMAuthError as e:
+        # 见 stream 里那条注释：这一类要说给访问者听。
+        raise HTTPException(status_code=502, detail=str(e)) from e
     except ValueError as e:
         # 模式名不认识 = 请求写错了，是 400 不是 500。只有这一种 ValueError 能
         # 从 consult() 冒到这里（consult 开头就校验了 retriever_mode，其余路径
@@ -294,6 +585,14 @@ def api_consult(req: ConsultRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
         slots.release()
+        _settle(token, outcome)
+    # 额度状态走**响应头**，不进响应体：响应体的形状有一条逐字节契约测试守着
+    # （test_researcher_role_response_matches_pre_m6_shape_byte_for_byte），
+    # 而且额度是"站点计量"、不是"这次问诊的结果"，混进结果体会让两件事纠缠。
+    # 完整看板在 GET /api/usage。
+    snap = _usage_block(request, decision)
+    response.headers["X-Usage-Mode"] = decision.mode
+    response.headers["X-Usage-Remaining-Calls"] = str(snap["remaining_calls"])
     return _consult_response(outcome, role=req.role)
 
 
@@ -506,29 +805,49 @@ def _sse(event: str, data: dict) -> str:
 
 
 @app.post("/api/consult/stream")
-def api_consult_stream(req: ConsultRequest) -> StreamingResponse:
+def api_consult_stream(
+    req: ConsultRequest,
+    request: Request,
+    x_llm_key: str | None = Header(default=None),
+) -> StreamingResponse:
     """retriever_mode 跟 /api/consult 一样逐请求传下去。模式名不认识时这条
     路径不回 400 而是发一个 error 事件——不是漏了，是刻意：模式合法性只在
     core.chain.consult() 一处校验（对着 ALLOWED_MODES），在这里再判一次等于
     把同一个判断连同错误文案实现两遍。worker 里 consult() 抛的 ValueError 会
     被兜成 error 事件，消息跟 400 那条完全一样，前端的 error 分支照样能显示。
     """
-    slots = _acquire_consult_slot()
+    decision, backend, token = _gate(request, x_llm_key)
+    usage_snapshot = _usage_block(request, decision)
+    try:
+        slots = _acquire_consult_slot()
+    except HTTPException:
+        _refund(token)
+        raise
     stream = _ConsultStream(secrets.token_urlsafe(12), slots)
     with _streams_lock:
         _streams[stream.stream_id] = stream
 
     def worker() -> None:
+        outcome = None
         try:
-            outcome = consult(
-                req.complaint,
-                ask_fn=stream.ask,
-                on_step=stream.emit,
-                retriever_mode=req.retriever_mode,
-            )
+            # use_llm 必须在**这个线程里**进——ContextVar 会被 anyio 的线程池
+            # 复制，但裸 threading.Thread 不继承；在外面进、这里就是默认后端，
+            # BYOK 的 key 和超额降级都会静默失效。
+            with use_llm(backend):
+                outcome = consult(
+                    req.complaint,
+                    ask_fn=stream.ask,
+                    on_step=stream.emit,
+                    retriever_mode=req.retriever_mode,
+                )
             stream.events_q.put(("done", _consult_response(outcome, role=req.role)))
         except StreamClosed:
             pass  # 客户端已断开，没人读了，正常提前结束
+        except LLMAuthError as e:
+            # 401/402 是访问者自己能修的（key 不对、余额不足），必须说清楚，
+            # 不能裹进"服务端处理失败（错误编号 xxxx）"里让人去找站点管理员。
+            # 异常里不含 key（SDK 不把 Authorization 头放进异常）。
+            stream.events_q.put(("error", {"detail": str(e)}))
         except ValueError as e:
             # 跟 /api/consult 的 400 同一类：请求本身写错（模式名不认识），
             # 消息是给用户看的、不含内部信息，原样发
@@ -538,13 +857,18 @@ def api_consult_stream(req: ConsultRequest) -> StreamingResponse:
             # 挂在那不动，什么错误信息都拿不到。
             stream.events_q.put(("error", {"detail": _public_error_detail(e)}))
         finally:
+            _settle(token, outcome)
             stream.finish()
 
     threading.Thread(target=worker, daemon=True).start()
 
     async def gen() -> AsyncIterator[str]:
         try:
-            yield _sse("stream_id", {"stream_id": stream.stream_id})
+            # 额度状态**搭在第一帧里**发，不另起一帧：超额降级到 replay 时，
+            # 用户该在推理开始之前就知道自己看到的是回放，而不是等结果出来才
+            # 发现对不上；而另起一帧会改事件顺序，那个顺序有契约测试守着
+            # （test_stream_id_arrives_first_then_progress_then_done）。
+            yield _sse("stream_id", {"stream_id": stream.stream_id, "usage": usage_snapshot})
             while True:
                 try:
                     name, data = stream.events_q.get_nowait()

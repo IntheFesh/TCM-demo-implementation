@@ -2,6 +2,8 @@
 M5 起还验证 compound 节点的 parent 引用有效（同样归 assert_graph_edges_valid 管）。"""
 import json
 import subprocess
+
+from tests.node_script import js_tmp
 from pathlib import Path
 
 from api.main import assert_graph_edges_valid, to_graph
@@ -254,7 +256,7 @@ def _build_evidence_index(data: dict) -> dict:
         + "\nbuildEvidenceIndex(" + json.dumps(data, ensure_ascii=False) + ");"
         + "\nprocess.stdout.write(JSON.stringify(Object.keys(EVIDENCE)));"
     )
-    proc = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["node", js_tmp(js)], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, f"node 执行失败：\nstdout={proc.stdout}\nstderr={proc.stderr}"
     return json.loads(proc.stdout)
 

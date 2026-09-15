@@ -10,6 +10,8 @@ AutoDL 上注册张锡纯并抽完他的 cases.json 之后进行。
 """
 import json
 import subprocess
+
+from tests.node_script import js_tmp
 from pathlib import Path
 
 import pytest
@@ -201,7 +203,7 @@ def _run_western_drugs_html(s3: dict) -> str:
         + script
         + "\nprocess.stdout.write(westernDrugsHtml(" + json.dumps(s3, ensure_ascii=False) + "));"
     )
-    proc = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["node", js_tmp(js)], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, f"node 执行失败：\nstdout={proc.stdout}\nstderr={proc.stderr}"
     return proc.stdout
 

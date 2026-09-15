@@ -93,9 +93,18 @@ def test_normalize_is_idempotent_second_run_changes_nothing(tmp_path, capsys):
 def test_reupload_identical_is_deleted_and_different_is_a_conflict(tmp_path, capsys):
     _seed(tmp_path / "data", tmp_path / "books")
     assert _run(tmp_path) == 0
-    # 又上传了一次、内容一样 → 删掉根目录那份
-    _make_docx(tmp_path / "data" / ORIGINAL_NAMES["李可医案.docx"],
-               ["脑瘤头痛案", "处方：海藻 30g 甘草 10g 附子 15g 半夏 12g", "宫颈癌案，泄泻。"])
+    # 又上传了一次、内容一样 → 删掉根目录那份。
+    # **必须 copy 字节，不能重新 _make_docx 一份**：python-docx 会把生成时刻写进
+    # docProps/core.xml 的 created/modified，而 zip 条目本身的时间戳粒度是 2 秒。
+    # 重新生成的那份只有在跟第一次落在同一个 2 秒窗口里才逐字节相同——快机器上
+    # 恰好总是相同，慢机器或负载高时就跨窗口，脚本据此如实报"冲突"退出 1，
+    # 测试红在 `assert _run(tmp_path) == 0`。这是测试的写法问题，不是脚本的 bug。
+    # 下面 test_584_duplicate_rules 里"逐字节相同"那一步用的就是 copy 字节，
+    # 这里跟它对齐。
+    _make_docx(tmp_path / "data" / "__probe.docx", ["x"])  # 保证 python-docx 可用
+    (tmp_path / "data" / "__probe.docx").unlink()
+    (tmp_path / "data" / ORIGINAL_NAMES["李可医案.docx"]).write_bytes(
+        (tmp_path / "data" / "local_corpora" / "李可医案.docx").read_bytes())
     assert _run(tmp_path) == 0
     assert not (tmp_path / "data" / ORIGINAL_NAMES["李可医案.docx"]).exists()
     assert "逐字节相同，删掉根目录这份重复" in capsys.readouterr().out
