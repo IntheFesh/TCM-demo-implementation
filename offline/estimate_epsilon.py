@@ -43,7 +43,7 @@ from core.batch import classify_llm_failure, warn_if_failure_rate_high
 from core.progress import Progress
 from core.chain import consult, infer_elements, normalize
 from core.herbs import normalized_herb_set, role_partitioned_herb_sets
-from core.llm import get_llm
+from core.llm import get_llm, s3_thinking, thinking_by_step
 from core.physicians import PHYSICIANS
 from core.safety import check_safety
 from core.setstats import aggregate_stats, pairwise_jaccard_stats
@@ -52,6 +52,20 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_QUERIES_PATH = ROOT / "tests" / "queries.txt"
 DEFAULT_CASES_PATH = ROOT / "cases.json"
 DEFAULT_OUT_PATH = ROOT / "eval" / "epsilon.json"
+# R19：**ε 按思考设置分文件存。**
+#
+# README 早就写了「关掉 S3 思考跑出来的数字跟默认配置下的不可比」，manifest 也
+# 带这句警告——但 ε 一直只有一个文件名。关掉思考重跑一次，
+# `eval/epsilon.json` 就被另一套设置的数**原地覆盖**了，而 RESULTS.md 里那些
+# 凭据记号指向的还是这个文件名：数变了、记号没变、`--check` 照样绿。
+#
+# 分文件名（`epsilon.json` / `epsilon_s3_disabled.json`）之后两套数并列存在，
+# 才谈得上「按思考设置对照」。默认那套仍然叫 epsilon.json——改名会让既有的
+# 一批凭据记号全部失效。
+OUT_PATH_BY_S3_THINKING = {
+    "enabled": DEFAULT_OUT_PATH,
+    "disabled": ROOT / "eval" / "epsilon_s3_disabled.json",
+}
 DEFAULT_N_REPEATS = 3
 DEFAULT_N_SAMPLES = 10
 # 固定种子：epsilon_extract 的抽样要可复现（同一份 cases.json 重跑应当抽到同样
@@ -462,11 +476,64 @@ def _report_layers(online: dict, layers: dict) -> None:
               "平均药味数这两个对照数是不是解释了它）")
 
 
-def main(argv: list[str] | None = None) -> None:
+def resolve_out_path(out: Path | None, thinking: str) -> Path:
+    """`--out` 没传时按思考设置取文件名。
+
+    未知的设置值（s3_thinking() 已经把它兜到默认值了，这里是双保险）落回默认路径
+    而不是拼一个 `epsilon_s3_<乱码>.json`——那种文件名没人知道是什么。
+    """
+    if out is not None:
+        return out
+    return OUT_PATH_BY_S3_THINKING.get(thinking, DEFAULT_OUT_PATH)
+
+
+def refuse_cross_thinking_overwrite(out: Path, thinking: str, force: bool) -> str | None:
+    """要覆盖的那份文件是不是用**别的**思考设置跑出来的。是就返回一句拒绝理由。
+
+    这道闸门防的是一件已经具备发生条件的事：RESULTS.md 里有一批凭据记号写的是
+    `epsilon.json:epsilon_online.mean=…`。关掉 S3 思考重跑一次、覆盖掉同一个
+    文件名，记号里的文件名和键名都没变、`--check` 照样绿——而那个数已经换了
+    一套设置。两套数不可比（README 那句话、manifest.comparability_warning 那句话
+    都在说这件事），并到一个文件名下就等于把这件事藏起来了。
+
+    旧文件没有 `s3_thinking` 字段（R19 之前跑的）时**放行**：那时候还没有这个
+    概念，拿一个缺失字段当"设置不同"拦下来只会让人以为闸门坏了。但要说一句。
+    """
+    if force or not out.exists():
+        return None
+    try:
+        prev = json.loads(out.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    prev_thinking = prev.get("s3_thinking")
+    if prev_thinking is None:
+        print(f"[epsilon] {out.name} 是 R19 之前跑的（没有 s3_thinking 字段），"
+              f"这次按 {thinking} 覆盖它。", file=sys.stderr)
+        return None
+    if prev_thinking == thinking:
+        return None
+    return (
+        f"拒绝覆盖：{out} 是 S3_THINKING={prev_thinking} 跑出来的，这次是 {thinking}。\n"
+        f"两套设置的 ε 不可比（README「S3_THINKING」那一行、manifest 的 "
+        f"comparability_warning 都在说这件事），覆盖之后 eval/RESULTS.md 里指向这个\n"
+        f"文件的凭据记号会悄悄换成另一套设置的数，而记号本身没变、--check 照样绿。\n"
+        f"要么别传 --out（按设置自动分文件：{OUT_PATH_BY_S3_THINKING[thinking]}），"
+        f"要么明确 --force。"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="估算三层噪声地板，写 eval/epsilon.json")
     ap.add_argument("--queries-path", type=Path, default=DEFAULT_QUERIES_PATH)
     ap.add_argument("--cases-path", type=Path, default=DEFAULT_CASES_PATH)
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT_PATH)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="默认按 S3_THINKING 取（enabled → eval/epsilon.json，"
+                         "disabled → eval/epsilon_s3_disabled.json）。"
+                         "两套设置的数不可比，所以不共用一个文件名")
+    ap.add_argument("--force", action="store_true",
+                    help="允许覆盖一份用**不同**思考设置跑出来的 epsilon.json"
+                         "（默认拒绝：覆盖之后 RESULTS.md 的凭据记号指向的数就换了"
+                         "一套设置，而记号本身没变、--check 照样绿）")
     ap.add_argument("--n-repeats", type=int, default=DEFAULT_N_REPEATS)
     ap.add_argument("--n-samples", type=int, default=DEFAULT_N_SAMPLES,
                      help="epsilon_extract 抽样的医案条数")
@@ -474,6 +541,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--skip-extract", action="store_true", help="跳过 epsilon_extract 这一层")
     ap.add_argument("--dry-run", action="store_true", help="只打印将要发起的调用数，不真跑")
     args = ap.parse_args(argv)
+    args.out = resolve_out_path(args.out, s3_thinking())
 
     if not args.queries_path.exists():
         raise FileNotFoundError(f"未找到 {args.queries_path}")
@@ -493,8 +561,9 @@ def main(argv: list[str] | None = None) -> None:
           f"  合计≈{est['total']}")
 
     if args.dry_run:
+        print(f"\n落盘会写到 {args.out}（S3_THINKING={s3_thinking()}）")
         print("\n--dry-run：不发起任何调用。确认无误后去掉这个参数重跑。")
-        return
+        return 0
 
     t0 = time.time()
     print("\n=== epsilon_online ===")
@@ -549,6 +618,10 @@ def main(argv: list[str] | None = None) -> None:
         "epsilon_extract": extract,
         "model": llm.model_name(),
         "backend": llm.backend_id(),
+        # 思考设置写进文件里，跟 model/backend 平级：它跟换模型同级地影响可比性
+        # （core/llm.py::thinking_by_step 的文档字符串原话）。
+        "s3_thinking": s3_thinking(),
+        "thinking_by_step": thinking_by_step(),
         "prompt_version": "v1",
         "cases_sha256": None,
         "comparability_warning": llm.comparability_warning(),
@@ -561,11 +634,16 @@ def main(argv: list[str] | None = None) -> None:
         out["cases_sha256"] = hashlib.sha256(args.cases_path.read_bytes()).hexdigest()[:12]
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    guard = refuse_cross_thinking_overwrite(args.out, out["s3_thinking"], args.force)
+    if guard:
+        print(guard, file=sys.stderr)
+        return 1
     args.out.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n已写出 {args.out}")
+    print(f"\n已写出 {args.out}（S3_THINKING={out['s3_thinking']}）")
     if out["comparability_warning"]:
         print(f"【警告】{out['comparability_warning']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

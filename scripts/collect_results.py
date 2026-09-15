@@ -38,7 +38,14 @@ EVAL_DIR = ROOT / "eval"
 DEFAULT_RESULTS_MD = EVAL_DIR / "RESULTS.md"
 # README 里的评测数字也要能被核。**同一套凭据记号，同一个核对器**——README 手抄一份
 # 数字出来漂了，跟 RESULTS.md 漂了是同一个问题，不该有两套机制。
-DEFAULT_CHECK_PATHS = (DEFAULT_RESULTS_MD, ROOT / "README.md")
+# R19：**四份文档，同一个核对器。**
+# 加进来的两份是九轮总报告（R19 那一行的五个数）和 DEMO.md。
+# DEMO.md 原来声称"这份 DEMO 不复制数字"，而它实际引了 4 个指标值
+# （ε 全局均值、SDT 开关安全闸的两个分、旧检索层的差异率）——声称和实际对不上，
+# 是 R19 写 tests/test_docs_numbers.py 时用注册表里的真值去搜出来的。
+# 现在那 4 个数各带凭据记号，声称改成"讲解里必须出现的数每个都带凭据"。
+DEFAULT_CHECK_PATHS = (DEFAULT_RESULTS_MD, ROOT / "README.md",
+                       ROOT / "docs" / "R11-R19_report.md", ROOT / "DEMO.md")
 
 EPSILON_JSON = "epsilon.json"
 E3_JSON = "report_e3.json"
@@ -56,6 +63,14 @@ GRAPH_JSON = "../data/graph.json"
 # R18-F：药理层两个文件从 data/ 挪进 data/standard/（进版本控制）之后，
 # 「本草 10248 条 / 方剂 3737 条」这两个数第一次有了可机读的凭据——
 # 之前它们只写在 RESULTS.md 的表格里、是手抄的（这个项目手抄数字漂过三次）。
+# R19：关掉 S3 思考那一套 ε 单独一个文件（offline/estimate_epsilon.py 的
+# OUT_PATH_BY_S3_THINKING）。两套数不可比，所以是两个凭据键、不是同一个键的
+# 两次取值——同一个键会让 RESULTS.md 里那一格说不清它报的是哪套设置。
+# R19：沙盒里能真量的那几个性能数（scripts/bench_sandbox.py 落盘）。
+# 它们进注册表的理由跟 graph.json 那几个一样：来源是数据文件本身、
+# 不在任何 report 里，手抄就一定会漂。
+BENCH_SANDBOX_JSON = "bench/sandbox.json"
+EPSILON_S3_DISABLED_JSON = "epsilon_s3_disabled.json"
 MATERIA_MEDICA_JSONL = "../data/standard/materia_medica.jsonl"
 FORMULARY_JSONL = "../data/standard/formulary.jsonl"
 
@@ -242,6 +257,32 @@ EVIDENCE: dict[str, tuple[str, object]] = {
     # 它们跟 graph.json 同一个形状：来源是数据文件本身，不是 eval/ 下的 report。
     "pharmacology.n_materia_medica": (MATERIA_MEDICA_JSONL, len),
     "pharmacology.n_formulary": (FORMULARY_JSONL, len),
+    #
+    # R19：思考设置这一维。`epsilon.json` 里新增的 `s3_thinking` 也进注册表——
+    # 「这个 ε 是哪套设置跑的」跟 ε 本身一样需要凭据，只写在正文里会跟数字脱钩。
+    "epsilon_online.s3_thinking": (EPSILON_JSON, lambda d: d.get("s3_thinking")),
+    "epsilon_s3_disabled.mean": (
+        EPSILON_S3_DISABLED_JSON, lambda d: d["epsilon_online"]["mean"]),
+    "epsilon_s3_disabled.p95": (
+        EPSILON_S3_DISABLED_JSON, lambda d: d["epsilon_online"]["p95"]),
+    "epsilon_s3_disabled.llm_calls": (
+        EPSILON_S3_DISABLED_JSON, lambda d: d["epsilon_online"]["llm_calls"]),
+    "epsilon_s3_disabled.s3_thinking": (
+        EPSILON_S3_DISABLED_JSON, lambda d: d.get("s3_thinking")),
+    #
+    # R19：性能对照表那一节的每个数。没量过的键**不在文件里**（bench_sandbox
+    # 不带 --all 时就不会有 pytest_*/playwright_*），那时这里如实报「键取不到」
+    # ——跟"量了得到 0"分开。
+    "bench.import_api_main_s": (BENCH_SANDBOX_JSON, lambda d: d["import_api_main_s"]),
+    "bench.health_p50_ms_five": (BENCH_SANDBOX_JSON, lambda d: d["health_p50_ms_five"]),
+    "bench.health_p50_ms_three": (BENCH_SANDBOX_JSON, lambda d: d["health_p50_ms_three"]),
+    "bench.pytest_passed": (BENCH_SANDBOX_JSON, lambda d: d["pytest_passed"]),
+    "bench.pytest_skipped": (BENCH_SANDBOX_JSON, lambda d: d["pytest_skipped"]),
+    "bench.pytest_failed": (BENCH_SANDBOX_JSON, lambda d: d["pytest_failed"]),
+    "bench.pytest_wall_s": (BENCH_SANDBOX_JSON, lambda d: d["pytest_wall_s"]),
+    "bench.playwright_states_passed": (
+        BENCH_SANDBOX_JSON, lambda d: d["playwright_states_passed"]),
+    "bench.playwright_wall_s": (BENCH_SANDBOX_JSON, lambda d: d["playwright_wall_s"]),
 }
 
 
@@ -439,9 +480,10 @@ def metric_rows(text: str) -> list[str]:
     """
     rows: list[str] = []
     in_metric_table = False
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("|") and "凭据" in stripped and "---" not in stripped:
+        if _is_metric_table_header(lines, i):
             in_metric_table = True
             continue
         if not stripped.startswith("|"):
@@ -450,6 +492,28 @@ def metric_rows(text: str) -> list[str]:
         if in_metric_table and _NUMBERED_ROW_RE.match(line):
             rows.append(line)
     return rows
+
+
+# 分隔行：`|---|---|` 这种。markdown 允许 `:---:` 对齐写法，所以只要求有 `---`。
+_SEPARATOR_ROW_RE = re.compile(r"^\|[\s:|-]*-{3,}[\s:|-]*\|?\s*$")
+
+
+def _is_metric_table_header(lines: list[str], i: int) -> bool:
+    """第 i 行是不是「带凭据列的那张表」的**表头**。
+
+    判据第三次收紧（前两次见 metric_rows 的文档字符串）：原来是"这一行含「凭据」
+    就算表头"，而 R19 写九轮总报告时撞到了——正文单元格里提到「两个凭据盲区
+    纳入注册表」、「性能对照表进凭据注册表」的那两行被当成了表头，于是它们**后面**
+    那张「上机 ⏳ 清单」整张表都被当成指标表，5 行报成漏标凭据。
+    表头的结构特征是**下一行是分隔行**（`|---|---|`），正文行没有这个特征。
+    """
+    stripped = lines[i].strip()
+    if not (stripped.startswith("|") and "凭据" in stripped):
+        return False
+    if "---" in stripped:          # 自己就是分隔行
+        return False
+    nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+    return bool(_SEPARATOR_ROW_RE.match(nxt))
 
 
 def check_md_json_sync(eval_dir: Path = EVAL_DIR) -> list[dict]:

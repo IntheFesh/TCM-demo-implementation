@@ -3,9 +3,17 @@
 #
 #   bash scripts/run_onsite.sh --dry-run     # 只打清单和预估调用数/成本，什么都不跑
 #   bash scripts/run_onsite.sh               # 从段 0 开始
-#   bash scripts/run_onsite.sh --from 4      # 断了之后从段 4 继续
+#   bash scripts/run_onsite.sh --resume      # 从**第一个还没成功过**的段继续
+#   bash scripts/run_onsite.sh --status      # 只看每段跑到哪了，不跑
+#   bash scripts/run_onsite.sh --from 4      # 硬指定从段 4 继续
 #   bash scripts/run_onsite.sh --only 3      # 只跑某一段
 #   bash scripts/run_onsite.sh --yes         # 跳过两处人工卡点（无人值守时用，慎用）
+#
+# R19：`--resume` 跟 `--from` 的区别是「谁记得断在哪」。`--from` 要人自己记住
+# ——而这套东西跑几个小时、中间会换终端、容器也可能被回收，"我记得是段 5 挂的"
+# 这件事本身就是故障点。每段跑完把退出码写进 ONSITE_STATE（一行一段），
+# `--resume` 读它，从第一个不是 0 的段接着跑。**已经成功的段不会重跑**——
+# 段 5 是最贵的一段，重跑一次两千多次调用。
 #
 # 设计上的三条：
 #   1. **一段失败不影响后面的段**。段与段之间只有"先后"没有"依赖崩塌"——
@@ -31,6 +39,78 @@ cd "$(dirname "$0")/.."
 # 不是用来报销的。
 YUAN_PER_CALL=0.0055
 
+# 每段的退出码落在这里，一行 `段号<TAB>退出码<TAB>结束时间`。
+# 放 out/ 下（gitignore）而不是仓库里：它是这台机器这一次跑的状态，不是项目内容。
+# 路径可以用环境变量覆盖，测试就是靠这个把它指到 tmp_path 的。
+ONSITE_STATE="${ONSITE_STATE:-out/onsite_state.tsv}"
+
+# 记一段的结果。**同一段重跑要覆盖旧记录**，不是追加——追加的话 --resume 读到
+# 的是第一次那条（失败的那条），已经修好重跑成功也还会再跑一遍。
+record_segment() {
+  local n="$1" rc="$2"
+  mkdir -p "$(dirname "$ONSITE_STATE")"
+  local tmp="${ONSITE_STATE}.tmp"
+  if [ -f "$ONSITE_STATE" ]; then
+    grep -v -P "^${n}\t" "$ONSITE_STATE" > "$tmp" 2>/dev/null || true
+  else
+    : > "$tmp"
+  fi
+  printf '%s\t%s\t%s\n' "$n" "$rc" "$(date -Is)" >> "$tmp"
+  sort -n -o "$ONSITE_STATE" "$tmp"
+  rm -f "$tmp"
+}
+
+# 某段上次的退出码；没记录过回 `none`。
+segment_state() {
+  [ -f "$ONSITE_STATE" ] || { echo none; return; }
+  local line
+  line=$(grep -P "^$1\t" "$ONSITE_STATE" 2>/dev/null | tail -1) || true
+  [ -n "$line" ] || { echo none; return; }
+  echo "$line" | cut -f2
+}
+
+# --resume 的起点：第一个"上次不是退出码 0"的段（没记录也算）。
+# 全都是 0 时回一个比最大段号还大的数——那时 --resume 什么都不跑，
+# 并且下面会**说出来**，不是静默跑完 0 段。
+first_unfinished_segment() {
+  for row in "${SEGMENTS[@]}"; do
+    IFS='|' read -r n _ _ _ _ <<< "$row"
+    [ "$(segment_state "$n")" = "0" ] || { echo "$n"; return; }
+  done
+  echo 99
+}
+
+print_status() {
+  echo "段  名称                     上次退出码  结束时间"
+  echo "--------------------------------------------------------------------------"
+  for row in "${SEGMENTS[@]}"; do
+    IFS='|' read -r n name _ _ _ <<< "$row"
+    local st line when
+    st=$(segment_state "$n")
+    when="—"
+    if [ -f "$ONSITE_STATE" ]; then
+      line=$(grep -P "^${n}\t" "$ONSITE_STATE" 2>/dev/null | tail -1) || true
+      [ -n "$line" ] && when=$(echo "$line" | cut -f3)
+    fi
+    case "$st" in
+      none) st="还没跑过" ;;
+      0) st="0（成功）" ;;
+      10) st="10（人工在卡点中止）" ;;
+      *) st="$st（失败）" ;;
+    esac
+    printf "%-3s %-24s %-11s %s\n" "$n" "$name" "$st" "$when"
+  done
+  echo "--------------------------------------------------------------------------"
+  echo "状态文件：$ONSITE_STATE"
+  local nxt
+  nxt=$(first_unfinished_segment)
+  if [ "$nxt" = "99" ]; then
+    echo "九段都是退出码 0。--resume 不会跑任何段。"
+  else
+    echo "--resume 会从段 $nxt 开始。"
+  fi
+}
+
 # 段号|名称|预估调用数|人工卡点|一句话
 # 「预估调用数」那一格可以写 `auto:<文件>`：跑的时候由 scripts/onsite_plan.py 从那份
 # 文件现读（段 4 = eval/epsilon.json 三段 llm_calls 之和）。段 4 原来写死 215，ε 重跑
@@ -49,10 +129,12 @@ SEGMENTS=(
 
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
-DRY_RUN=0; FROM=0; ONLY=""; ASSUME_YES=0
+DRY_RUN=0; FROM=0; ONLY=""; ASSUME_YES=0; RESUME=0; STATUS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    --resume) RESUME=1 ;;
+    --status) STATUS=1 ;;
     --from) FROM="${2:?--from 要一个段号}"; shift ;;
     --only) ONLY="${2:?--only 要一个段号}"; shift ;;
     --yes|-y) ASSUME_YES=1 ;;
@@ -61,6 +143,17 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# --resume 和 --from 一起传是自相矛盾的（一个说"读状态文件"，一个说"我指定"）。
+# 直接拒绝而不是挑一个赢——挑一个赢的话，传错的人不会知道自己被忽略了。
+if [ "$RESUME" = "1" ] && [ "$FROM" != "0" ]; then
+  echo "--resume 和 --from 不能一起传：前者从状态文件算起点，后者是你指定起点。" >&2
+  exit 2
+fi
+if [ "$RESUME" = "1" ] && [ -n "$ONLY" ]; then
+  echo "--resume 和 --only 不能一起传。" >&2
+  exit 2
+fi
 
 # 段表里「预估调用数」那一格 → 一个整数。`auto:<文件>` 交给 scripts/onsite_plan.py
 # 现读（bash 和 tests/test_run_onsite.py 调的是同一个 resolve_calls，不各数一遍）。
@@ -194,9 +287,18 @@ seg_3() {
 }
 
 seg_4() {
+  # 默认设置（S3_THINKING=enabled）那一套，落 eval/epsilon.json。
   python -m offline.estimate_epsilon --n-repeats 3 || return 1
   echo "--- 判据：ε_core < ε_online < ε_adjunct（不成立就如实报，不调参去凑）---"
   python -m scripts.collect_results | sed -n '/ε 分层/,/^$/p'
+  # R19：**关掉思考再跑一套**，落 eval/epsilon_s3_disabled.json。
+  # 两套数不可比（README「S3_THINKING」那一行），所以是并列的两个文件、两组凭据键，
+  # 不是同一个文件覆盖一次。跑这一套的意义是回答「思考模式值不值那几十倍的时间」
+  # ——只有一套数的时候这个问题连提都提不出来。
+  # `|| true`：这一套挂了不该让段 4 整段算失败，默认那一套已经落盘了。
+  echo "--- 再跑一套：S3_THINKING=disabled（并列对照，不覆盖上面那套）---"
+  S3_THINKING=disabled python -m offline.estimate_epsilon --n-repeats 3 || \
+    echo "（disabled 那一套没跑成。默认那一套已落盘，段 4 不因此算失败。）"
 }
 
 seg_5() {
@@ -276,10 +378,36 @@ run_segment() {
   echo "--------------------------------------------------------------------------"
   echo "[段 $n] $name    结束 $(date -Is)    退出码 $rc"
   RESULTS+=("$n|$name|$rc")
+  # 落盘**在这里**而不是在汇总时统一写：汇总写的话，容器被回收/终端被关掉就
+  # 一个字都没留下——而"跑了三小时之后断了"恰恰是这件事要解决的场景。
+  record_segment "$n" "$rc"
   return 0   # **一段失败不影响后面的段**，见文件头第 1 条
 }
 
+if [ "$STATUS" = "1" ]; then
+  print_status
+  exit 0
+fi
+
 print_plan
+
+# --resume 的起点**在 --dry-run 之前算**：`--resume --dry-run` 要能回答
+# "它会从哪一段开始"——那正是开跑前最想知道的一件事。算在后面的话这两个参数
+# 一起传时只打清单、不说起点。
+if [ "$RESUME" = "1" ]; then
+  FROM=$(first_unfinished_segment)
+  echo
+  print_status
+  if [ "$FROM" = "99" ]; then
+    # **说出来**：九段都成功过时 --resume 不跑任何段，静默退出会被当成"跑完了"。
+    echo
+    echo "--resume：没有需要续跑的段。要重跑某一段用 --only <段号>。"
+    exit 0
+  fi
+  echo
+  echo "--resume：从段 $FROM 开始（段 0..$((FROM - 1)) 上次都是退出码 0，不重跑）。"
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
   echo
   echo "--dry-run：什么都没跑。去掉这个参数开始。"
@@ -307,6 +435,12 @@ for r in "${RESULTS[@]}"; do
   printf "  段 %-2s %-24s 退出码 %s\n" "$n" "$name" "$rc"
   [ "$rc" = "0" ] || failed=1
 done
-[ "$failed" = "0" ] && echo "全部段退出码 0。" || \
-  echo "有段没跑成——看上面是哪一段，对照 docs/onsite_troubleshooting.md，然后 --from <段号> 续跑。"
+if [ "$failed" = "0" ]; then
+  echo "全部段退出码 0。"
+else
+  echo "有段没跑成。对照 docs/onsite_troubleshooting.md 修掉，然后："
+  echo "    bash scripts/run_onsite.sh --resume"
+  echo "它从第一个没成功的段接着跑，**已经成功的段不重跑**（段 5 重跑一次两千多次调用）。"
+  echo "状态记在 $ONSITE_STATE，用 --status 能单独看。"
+fi
 exit "$failed"

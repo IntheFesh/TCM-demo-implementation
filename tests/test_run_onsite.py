@@ -122,7 +122,15 @@ def test_a_failing_segment_does_not_stop_the_later_ones():
     所以 run_segment 末尾无条件 `return 0`，而不是 `set -e` 掉整个脚本。"""
     text = SCRIPT.read_text(encoding="utf-8")
     assert "set -e\n" not in text and "set -euo" not in text
-    assert re.search(r"RESULTS\+=\(.*\)\n\s*return 0", text), "run_segment 末尾要无条件 return 0"
+    # 判据改成「run_segment 的**最后一条语句**是无条件 return 0」。
+    # 原来写的是 `RESULTS+=(...)` 紧接着 `return 0` 的正则——R19 在两者之间插了
+    # 一句 record_segment（每段的退出码要落盘，见 --resume），正则就不匹配了。
+    # 这不是放松：盯着"函数末尾是不是无条件 return 0"比盯着"它前一行是什么"
+    # 更贴近这条约束本身。
+    body = text[text.index("run_segment() {"):]
+    body = body[:body.index("\n}\n")]
+    last = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")][-1]
+    assert last.startswith("return 0"), f"run_segment 末尾不是无条件 return 0，是：{last}"
 
 
 def test_dry_run_prints_the_plan_and_runs_nothing():

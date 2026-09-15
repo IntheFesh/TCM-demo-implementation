@@ -105,9 +105,10 @@ A 和 C 是 `tests/queries.txt` 的第 1、10 条；B 是专门为第 5 点加�
   不会编一个假基准
 - **这里要讲透的一句**：ε 是同一条主诉、同一位医家连跑三次的用药差异，也就是
   模型自己的抖动。分歧度超过它才算「两位名医意见不同」，否则只是系统在抖。
-  而且 ε 是**逐条配对**比的——这条主诉的 ε 是 0.3954，高于全局均值 0.2611
-  （9 条可用主诉里有 4 条是这样），拿全局均值一刀切会把它的噪声误判成分歧
-  （推导见 `eval/RESULTS.md`）
+  而且 ε 是**逐条配对**比的——这条主诉的 ε 是 0.3954（逐条那张表里的一行，
+  见 `eval/RESULTS.md` 的「ε 按证型分层」一节），
+  高于全局均值 0.2611 `epsilon.json:epsilon_online.mean=0.2611`（9 条里有 4 条这样）。
+  拿全局均值一刀切会把它的噪声误判成分歧
 
 ### 第 2 点：六层图 + 方剂框（40s，复用第 1 点的图）
 
@@ -179,7 +180,9 @@ python -c "from core.audit import verify_audit_chain; print(verify_audit_chain()
   拦截之后整个问诊页的 DOM 里搜不到 `herb`/`formula`，也搜不到任何药名
 - 页面上有一颗「换一条主诉」——打断彻底不等于把人困在这一页
 - 可以补一句：SDT Test 上被拦的 **10/50** 条经人工逐条复核**全部为真危重，无一误伤**；
-  关掉这道闸门分数从 23.173 涨到 27.729——**那 4.56 分就是安全的代价，我们认**
+  关掉这道闸门分数从 23.173 `sdt/test_run_log.jsonl:sdt.chain_last=23.173`
+  涨到 27.729 `sdt/test_run_log.jsonl:sdt.ignore_safety_veto=27.729`
+  ——**那 4.56 分就是安全的代价，我们认**
 
 ### 第 7 点：现场消融（30s）
 
@@ -189,8 +192,9 @@ python -c "from core.audit import verify_audit_chain; print(verify_audit_chain()
   三个替代方案，挑一个：
   1. 这一点单独切到 `api` 后端跑（要网络和 key）
   2. 提前在 `api` 下把两个模式各提交一次，开两个标签页现场对照
-  3. **不真跑，直接报数**：四种模式的输出差异率 **0.437**
-     `report_e8.json:e8.output_difference_rate=0.437`（旧检索层下是 0.366）——
+  3. **不真跑，直接报数**：四种模式的输出差异率
+     **0.437** `report_e8.json:e8.output_difference_rate=0.437`；
+     旧检索层下是 0.366 `archive/2026-09-12/report_e8.json:archive.e8.output_difference_rate=0.366`——
      这个数本身就说明「换检索模式，输出真的会变」
 - 这台沙箱连不上 huggingface hub，`dense`/`hybrid` 会**直接报 `retrieval_error`
   而不是静默降级**；`bm25`/`graph` 不需要网络。`graph` 要先跑过
@@ -311,7 +315,10 @@ cat eval/report.md
 是不是回放），**一份报告里混了两个后端会在那一行大声报出来**。
 
 各组数的当前值、对照和 caveat 只维护在 [`eval/RESULTS.md`](eval/RESULTS.md) 一处，
-这份 DEMO 不复制数字。要当场证明那份汇总没有手抄错：
+这份 DEMO **不另维护一份**。讲解里必须出现的那几个数（第 1 点的 ε、第 6 点的
+安全代价、第 7 点的检索差异率）**每一个都带凭据记号**，跟 RESULTS.md 和 README
+走同一个核对器——R19 之前它们是手抄的，而这份文档自己声称"不复制数字"，
+两件事对不上。要当场证明三份文档都没有手抄错：
 
 ```bash
 python -m scripts.collect_results --check     # 退出码 0 = RESULTS.md 引用的数跟文件一致

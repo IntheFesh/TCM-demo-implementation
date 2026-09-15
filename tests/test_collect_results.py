@@ -604,9 +604,15 @@ def test_repo_readme_evidence_all_checks_out():
     assert result["checked"] >= 9      # 少了说明 README 里的凭据记号被删掉了
 
 
-def test_default_check_paths_cover_both_documents():
-    assert len(cr.DEFAULT_CHECK_PATHS) == 2
-    assert {p.name for p in cr.DEFAULT_CHECK_PATHS} == {"RESULTS.md", "README.md"}
+def test_default_check_paths_cover_all_four_documents():
+    """R19 从两份扩到四份（**有意的契约变更**）：原断言是 `== 2` 和
+    `{"RESULTS.md", "README.md"}`。加进来的是 `docs/R11-R19_report.md`
+    （九轮表里 R19 那一行的五个数）和 `DEMO.md`（它引的 4 个指标值原来是手抄的，
+    而它自己写着"不复制数字"）。同一套凭据记号、同一个核对器——
+    一份文档手抄一份数字出来漂了，跟 RESULTS.md 漂了是同一个问题。"""
+    assert len(cr.DEFAULT_CHECK_PATHS) == 4
+    assert {p.name for p in cr.DEFAULT_CHECK_PATHS} == {
+        "RESULTS.md", "README.md", "R11-R19_report.md", "DEMO.md"}
 
 
 def test_metric_rows_only_looks_inside_a_table_with_an_evidence_column():
