@@ -3006,3 +3006,128 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     **八、验证。** 全套 **2251 → 2279**（+28：bench 脚本 18、DESIGN 结构 10），6 skipped，
     ruff 干净，`grep -c "= Field(min_length=1" core/schemas.py` 仍 **31 处**（这一轮没碰
     `schemas.py`），`collect_results --check` 退出码 0。
+
+53. **R12：三个性能杠杆（三医家并发 / embedding 磁盘缓存 / 思考模式按步控制）+ 两个必须
+    配套的闸（LLM 在途并发、建图一条命令）+ 测试内存。**
+
+    **零、先修 R11 基准工具的两个静默失败**（用户发现，我复现确认）。
+
+    ① `bench_consult` 跑空却报成功。`consult()` 把"检索不可用"放进返回值的
+    `retrieval_error` **而不是抛异常**——那是它对的设计（HTTP 调用方要拿到一句人话，
+    不是 500），但 `run_once` 的 try/except 因此什么也接不住。实测默认参数：
+    `ok=True llm_calls=2 events=['s1_done','s2_done','followup_done','physician_start']`
+    ——三位医家一个都没跑，照样打印「1/1 次跑成功」。**一份 `ok: true` 的报告会被直接
+    引用，比崩掉危险得多。** 修法：新增 `invalid_reason()` 判三种"跑了但不能用"
+    （检索不可用 / 被安全否决 / 信息不足）+ 医家数对不上；另外假后端 + 仓库没有
+    `cases.json` 时**自动装合成医案**并在输出里标 `fake_cases_auto`，不再要求跑的人
+    记得加 `--fake-cases`。
+
+    ② `bench_startup` 缺 sentence_transformers 直接 ModuleNotFoundError——而这个脚本
+    存在的意义之一就是"在什么都没装好的机器上也能告诉你缺什么"。改成捕获 ImportError
+    写进 `encoder_note`，退出码非 0 但报告照样产出。
+
+    **一、三医家并发（`_run_physicians_into`）。** 四条约束各有测试：
+
+    - **`results` 仍按注册表顺序**（前端三列按它排、分歧度两两配对按它取），所以按
+      `PHYSICIANS` 的顺序去取 future，不用 `as_completed` 的顺序。
+    - **事件会交错、结果不会。** `physician_start`/`physician_done`/`react_step`/
+      `s3_start` 由各自的线程发，前端必须按事件里的 `physician` 字段路由
+      （`react_step` 原来只带中文名，这一轮补了 id——只给中文名的话路由就得在前端做
+      一次名字→id 反查，那正是第 31 条禁止的第二处实现）。
+    - **安全否决取消其余线程**：`threading.Event` + 包在 `on_step` 外面的一层检查，
+      别的线程在下一次发事件时退出。**不用 `future.cancel()`**——那只能取消还没开始跑
+      的任务，而三位医家是同时开跑的，一个都取消不掉。
+    - **ContextVar 必须显式传进 worker**（`copy_context().run`）。`use_llm()` 的逐请求
+      后端覆盖（BYOK、超额降级到回放）走的正是 ContextVar，而它**不会**自动跟着
+      `ThreadPoolExecutor` 的线程走——不传的话 worker 里 `get_llm()` 拿到进程单例，
+      访问者的 key 没被用上、额度照扣，**而且一声不响**。
+
+    追问渠道改成串行（`_serialize_ask`）：`ask_fn` 背后是一个人，`_ConsultStream.ask`
+    的 `_pending` 也是"每个问题一条队列"的形状，两位医家同时提问会把前一位的队列覆盖掉，
+    前一位于是永远等不到答案、直到 300 秒超时。
+
+    **二、在途并发闸（`LLM_MAX_INFLIGHT`，默认 6）。** 跟 `MAX_CONCURRENT_CONSULTS`
+    是两件事，并发之后两者**相乘**：4 个问诊槽 × 3 位医家 = 12 路同时打 API。
+    只留一个闸拦不住——把问诊槽降到 2 会让排队变长而每次仍开 3 路，把医家改回串行
+    等于放弃这一轮的全部收益。
+
+    **这里踩了一个坑，写完当天就被既有测试抓到**：第一版把信号量放在**工作线程**里，
+    于是墙钟超时之后被丢下的那个 daemon 线程**永远不还许可**——攒够 6 次挂死，整个
+    进程的 LLM 调用全部死锁。`tests/test_llm_timeout.py` 里那几条"故意挂住"的用例
+    立刻红了。现在许可**在主线程取、join 一返回就还**：语义从"同时在飞的调用数"变成
+    "同时在等的调用数"，代价是超时后短暂可能超限（紧跟着的 `abort_in_flight()` 会掐掉
+    连接），**拿"短暂超限"换"永不死锁"，这个取舍没有第二个答案**。
+
+    退避从固定 1s/2s 改成 **1s/2s/4s ± 20% 抖动**：指数是因为 429 说明对面正忙，
+    线性等一秒多半还是 429；抖动是因为三位医家现在**同时**出发，一起撞 429 就会一起
+    在同一时刻重试。重试按 429 / 超时 / 其它三类分开记进 `manifest.retries`——三种的
+    处置完全不同（降并发 / 查网络 / 改 prompt），合成一个数就没法处置。
+
+    **三、embedding 磁盘缓存。** 指纹 = 模型名 + 条数 + **被编码文本的 sha256**。
+    取文本的 sha 而不是 `cases.json` 的整文件 sha：编码的输入就是这些文本，文件里改一个
+    跟检索无关的字段会让文件 sha 变而编码结果一字节不变——那样每次都白编码，缓存等于没有。
+    **模型不管命不命中都要加载**：缓存省的是"给全部语料编码"（941 条），而 `search()`
+    每次都要给查询编码。坏缓存 / 行数对不上一律重编码**并吼一声**——静默回退比慢更糟，
+    人以为缓存生效了，而"启动还是 135 秒"没有任何输出能解释。
+
+    **加缓存当天踩到的第二个坑**：`tests/test_concurrency_init.py` 立刻红了——上一条
+    测试写的缓存让下一条**跳过编码**，于是那几条专门测"编码进行中并发读取"的用例永远
+    等不到 `encode` 被调用。所以缓存做成可关（`EMBEDDING_CACHE=0`），conftest 整个会话
+    关掉；要测缓存本身的用例自己指到 tmp_path 再打开。
+
+    **四、思考模式按步控制（`STEP_THINKING` 一张表，唯一实现）。** S1/S2/追问/残差/
+    ReAct 一律 `disabled`，S3 默认 `enabled` + `reasoning_effort=high`（`S3_THINKING`
+    可整体关）。两个后果都要按步处理：① 抽取类步骤开思考又慢又没增益；②
+    **思考模式下 temperature 不生效**——这正是 v4-pro"同样输入不同输出"的根因，也就是
+    ε 和 fixture 可复现性一起失效的原因。所以 `thinking="enabled"` 时**不传**
+    temperature（传了会让 manifest 里那个值看起来像生效了的实验条件），
+    `manifest.temperature_effective` **按步分别记**——各步设置不同，写成一个标量就得挑
+    一步代表全体，那是在报告里埋一句不准确的话。关掉 S3 思考会触发
+    `comparability_warning`，跟换模型同级。
+
+    **五、建图一条命令（`build_graph --all`）。** 建图 → graph_stats（**写回**医家层
+    权重）→ build_element_index 是一件事；单跑第一步现在会打一条黄字警告，点名三个
+    具体后果（λ1 全为 0 / 追问后验退化成先验 / graph 检索不可用）**而且都不报错**。
+    任一步失败退出码非 0——"图建好了但权重没写回"这种半成品比彻底失败更危险。
+
+    **六、测试内存（`real_embedding` marker）。** 无卡模式 2GB 上全量测试实测 34% 被
+    OOM 杀掉（退出码 137，只留一个 `Killed`）。默认所有用例走 conftest 里的确定性假
+    编码器（8 维、按字符码点算、已归一化），标了 marker 的才真加载 400MB 模型。
+    段 0 的全量测试相应分两段跑，中间 `sleep 20` 让上一段的进程真正退干净。
+
+    **七、并发暴露的三类既有测试问题**（都是有意的契约变更，逐条写在各自的 docstring 里）：
+
+    - **写死的全局事件序列**：`test_stream_events.py` 三处 `assert names == [...]`。
+      并发下这种断言**必然不稳定**——写辅助函数之前实测过：同一条测试连跑三次，有一次
+      红、两次绿，这种"有时绿"比一直红更糟。改成"全局前缀有序 + 每位医家的子序列有序"。
+    - **按线程名归属**：`test_retriever_mode.py` 的并发不串味测试原来按
+      `threading.current_thread().name` 认 consult 身份，而检索现在发生在 `physician_*`
+      工作线程里，直接 `KeyError`。改用 ContextVar 标记——**这同时把"ContextVar 有没有
+      传进 worker"也一起钉住了**，一举两得。
+    - **假后端里的共享可变状态**：`ReActFakeLLM._react_step` 是一个全局计数器，两个线程
+      交替加会让一位医家跑 3 步、另一位跑 1 步。改成按医家分桶。**这是假后端在建模
+      "一次只有一位医家"，真后端每次调用是无状态的**，不是产品代码的问题。
+
+    **八、并发的机器可验证据**（`bench_consult --backend fake --repeat 3 --fake-cases 3
+    --fake-latency 1.0`，沙盒实测）：
+
+    | 读数 | 改前 | 改后 | 含义 |
+    |---|---|---|---|
+    | `llm_calls` | 5 | 5 | 没有多跑也没有少跑 |
+    | `s3_sum` | 3.0473 | 3.0678 | 总工作量**不变**——这是"没有偷偷少干活"的证据 |
+    | `s3_wall` | 3.0473 | **1.0335** | S3 这一段的墙钟，掉到最慢那位附近 |
+    | `s3_slowest` | 1.0200 | 1.0248 | 最慢的那一位 |
+    | 一次问诊总耗时 | 5.05 | 3.04 | S1 1s + S2 1s + S3 1s（假后端，非真机） |
+
+    **只看 wall 变小是不够的**：那样"某位医家被跳过了"跟"三位并发"长得一模一样。
+    sum 不变 + llm_calls 不变 + 三位医家都有结果，三条一起才成立。
+
+    **九、真机 ⏳**：`bash scripts/run_onsite.sh --only 8`。预期不开 ReAct 一次问诊
+    394.6 s → ≤ 90 s（docs/DESIGN.md §9 的预算），启动 135 s → 热启动 ≤ 20 s。
+    **这一轮沙盒里量不到真数**：没有真实语料、没有 API key、模型也下不动。
+
+    **十、验证。** 全套 **2279 → 2335**（+56：并发 11、在途 6、缓存 9、思考 15、
+    建图 5、marker 5、bench 补的 4、退避抖动 1），6 skipped，
+    `pytest -m "not real_embedding"` 单独跑通（2334 passed / 1 deselected），
+    ruff 干净，`grep -c "= Field(min_length=1" core/schemas.py` 仍 **31 处**
+    （这一轮没碰 `schemas.py`），`collect_results --check` 退出码 0。

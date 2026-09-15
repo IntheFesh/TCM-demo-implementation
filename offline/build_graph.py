@@ -20,6 +20,7 @@ treated_by / realized_by / contains / evidences / practiced_by 边留给 K2 及�
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 from pathlib import Path
 
@@ -281,6 +282,11 @@ def main(argv: list[str] | None = None) -> None:
         "--cases-path", type=Path, default=Path("cases.json"),
         help="医案 cases.json 路径；存在则挂入 case 节点，传 --cases-path /dev/null 可跳过",
     )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="建完图接着跑 graph_stats（写回医家层权重）和 build_element_index（证素索引）"
+             "——这三步是一件事，漏一步不报错但会静默退化",
+    )
     args = parser.parse_args(argv)
 
     defs = load_syndrome_definitions(args.standard_path)
@@ -339,6 +345,37 @@ def main(argv: list[str] | None = None) -> None:
     print(f"完全未覆盖（严格 + 宽泛都对不上）：{coverage['broad_uncovered']}")
 
     print(f"\n已写出 {args.out}")
+
+    if args.all:
+        _run_downstream()
+    else:
+        # **只建图不跑后两步是一个静默退化的坑**（SOURCES.md 记过）：graph_stats 的
+        # 名字听起来像只读统计，实际会把 weight_by_physician 写回图；不跑它，追问的
+        # 贝叶斯后验会退化成先验而**不报任何错**。build_element_index 同理——不跑，
+        # graph 检索模式拿不到 element_index.json，只在真正切到那个模式时才炸。
+        print("\n⚠ 只跑了建图这一步。graph_stats（写回医家层权重）和 "
+              "build_element_index（证素索引）没跑：λ1 会全为 0、追问的后验会退化成"
+              "先验、graph 检索模式不可用，**而且都不报错**。三步一起跑用 --all。",
+              file=sys.stderr)
+
+
+def _run_downstream() -> None:
+    """建图之后的两步。任一步失败就退出码非 0——"图建好了但权重没写回"这种半成品
+    状态比彻底失败更危险：后面每一步都能跑，只是结果悄悄退化。"""
+    from offline import build_element_index, graph_stats
+
+    for label, entry in (("graph_stats（写回医家层权重）", graph_stats.main),
+                         ("build_element_index（证素索引）", build_element_index.main)):
+        print(f"\n=== {label} ===")
+        try:
+            entry([])
+        except SystemExit as e:  # argparse/脚本自己退出，非 0 就是失败
+            if e.code not in (0, None):
+                print(f"✗ {label} 退出码 {e.code}，后面的步骤不再跑", file=sys.stderr)
+                raise
+        except Exception as e:  # noqa: BLE001 - 哪一步挂的要说清楚，不能只甩一个栈
+            print(f"✗ {label} 失败：{type(e).__name__}: {e}", file=sys.stderr)
+            raise
 
 
 if __name__ == "__main__":

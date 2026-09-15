@@ -202,9 +202,9 @@ demo，它报的每个数都不可信。
 python -m offline.split_cases                  # 1. 原文 → 医案粗段
 python -m offline.extract_cases                # 2. 粗段 → cases.json（要真实 LLM）
 #    3. 第三位医家要先注册进 core/physicians.py（id 小写下划线），再抽他的医案
-python -m offline.build_graph                  # 4. cases.json → data/graph.json
-python -m offline.graph_stats                  # 5. ⚠ 见下，**漏跑不报错但后验会退化**
-python -m offline.build_element_index          # 6. 证素 → 医案倒排索引（graph 检索要它）
+python -m offline.build_graph --all             # 4-6. 建图 + graph_stats + 证素索引
+#    ↑ 三步是一件事，`--all` 一次跑完。**不加 --all 只跑第一步**，后两步漏跑不报错
+#      但会静默退化（见下），所以单独跑 build_graph 时它会打一条黄字警告
 python -m offline.extract_case_triples         # 7. 医案 → 三元组（要真实 LLM）
 python -m offline.build_syndrome_textbook \
     --md-path /tmp/tcmds/十四五教材/中医内科学.md \
@@ -266,6 +266,9 @@ cp .env.example .env
 | `EVAL_MODE` | `1` **只**让安全否决不中止链路（检查照跑、命中原因照记进 `safety_flag`），给评测量化"安全否决花了多少分"用。默认关，demo 的拦截红线不受影响；不要在对外演示的机器上打开——开着时页面顶部会有一条红色横幅提示，结果不会静默照常显示 |
 | `WARMUP_TIMEOUT_SECONDS` | 启动预热（加载 embedding 模型 + 编码语料）最多等这么久，默认 120；超过就先开始服务，预热在后台继续、首个问诊会等它。连不上 huggingface 的机器预热会卡在下载重试上，不设上限的话服务一分多钟都不监听端口 |
 | `MAX_CONCURRENT_CONSULTS` | 同时进行的问诊数上限（`/api/consult` 与 `/api/consult/stream` 合计），默认 4。满了立刻 503 + `Retry-After: 10`，不排队。这是部署侧的进程级设置，跟逐请求的 `retriever_mode` 不是一回事 |
+| `LLM_MAX_INFLIGHT` | 进程内**同时在途**的 LLM 请求数上限，默认 6。**跟 `MAX_CONCURRENT_CONSULTS` 是两件事**：那个限"同时几次问诊"，这个限"同时几个请求打到模型"。R12 三位医家改成并发之后两者相乘——4 个问诊槽 × 3 位医家 = 12 路同时打 API，会撞 DeepSeek 的速率限制（429）。只留一个闸拦不住 |
+| `S3_THINKING` | S3（按医家开方）开不开思考模式，`enabled`（默认，配 `reasoning_effort=high`）/ `disabled`。S1/S2/追问/ReAct **一律关思考**（结构化抽取，思考无增益却慢几十倍），这张表在 `core/llm.py::STEP_THINKING`。⚠ **关掉 S3 思考跑出来的数字跟默认配置下的不可比**，`manifest.comparability_warning` 会带上这句话；另外**思考模式下 temperature 不生效**，所以 `manifest.temperature_effective` 按步分别记 |
+| `EMBEDDING_CACHE` / `EMBEDDING_CACHE_DIR` | 语料向量的磁盘缓存：`0` 关掉，或指定目录（默认 `data/cache/`，已 gitignore）。命中判据是模型名 + 语料条数 + **被编码文本的 sha256** 三者全等；缓存省的是"给全部语料编码"那一段，模型本身不管命不命中都要加载（查询要用它） |
 | `LOW_DISCRIMINATION_CUTOFF` | `0` 关闭（默认开）：检索到的候选之间没有真实区分度（top-1 与 top-k 原始相似度差 < 0.03）时只保留 top-1，避免塞几条弱相关候选进 prompt 稀释信号。这条不确定是不是净收益，做成开关是为了能跑两遍对比（`consult()` 返回的每位医家结果带 `low_discrimination` 标记） |
 
 > **检索模式不是环境变量。** `RETRIEVER_MODE` 仍然存在（离线脚本/单机评测用），
@@ -486,8 +489,7 @@ indicates（症状→证素）边算一个四层收缩权重——医家层 → 
 `is_cardinal`）保证任何数据量下权重都有定义。跑法：
 
 ```bash
-python -m offline.build_graph
-python -m offline.graph_stats
+python -m offline.build_graph --all    # 建图 + 写回权重 + 建证素索引，一次跑完
 ```
 
 `core/tools.py`（智能体工具层）里的 `query_graph`、`check_residual`、

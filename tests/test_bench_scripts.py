@@ -72,9 +72,17 @@ def test_consult_bench_runs_with_a_fake_backend_and_writes_a_complete_report(tmp
 
 
 def test_every_call_records_the_arguments_it_actually_received(tmp_path):
-    """基准报的是**观测到的**参数，不是假设的。R11 还没做思考模式按步控制，
-    所以 thinking / reasoning_effort 现在恒为 None——那是事实不是缺失；R12 把它们
-    传进 `_complete` 之后，这个脚本不用改一行就会报出真值。"""
+    """基准报的是**观测到的**参数，不是假设的。
+
+    **R12 起断言翻过来了，这正是 R11 那条 docstring 预言的**：R11 写的是
+    "thinking/reasoning_effort 现在恒为 None，是事实不是缺失；R12 传下去之后这个脚本
+    不用改一行就会报出真值"。现在真值出来了，于是断言从"恒为 None"改成"按步取值
+    跟 `thinking_for()` 一致"——脚本一行没改，改的是它观测到的世界。
+
+    顺带钉住按步控制真的生效了：S1/S2 关思考、S3 开思考 + effort=high。
+    """
+    from core.llm import thinking_for
+
     report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2")
     calls = report["runs"][0]["calls"]
     assert calls, "一次调用都没记到"
@@ -82,8 +90,15 @@ def test_every_call_records_the_arguments_it_actually_received(tmp_path):
         for key in ("seq", "schema", "physician", "elapsed_s", "max_tokens",
                     "temperature", "thinking", "reasoning_effort", "usage", "error"):
             assert key in call, key
-        assert call["thinking"] is None and call["reasoning_effort"] is None
     assert [c["seq"] for c in calls] == list(range(1, len(calls) + 1))
+
+    by_schema = {c["schema"]: c for c in calls}
+    assert by_schema["S1Normalize"]["thinking"] == thinking_for("s1")["thinking"] == "disabled"
+    assert by_schema["S2Elements"]["thinking"] == "disabled"
+    s3_calls = [c for c in calls if c["schema"].startswith("S3")]
+    assert s3_calls, "没有 S3 调用"
+    for call in s3_calls:
+        assert call["thinking"] == "enabled" and call["reasoning_effort"] == "high"
 
 
 def test_repeat_does_not_let_one_run_record_another_runs_calls(tmp_path):
@@ -115,19 +130,28 @@ def test_fake_cases_make_s3_actually_run_for_every_physician(tmp_path):
     assert report["config"]["fake_cases"] == 2 * len(PHYSICIANS)
 
 
-def test_s3_wall_and_s3_sum_are_both_reported_and_equal_while_serial(tmp_path):
-    """这两个数是 R12 三医家并发的**验收判据**：sum 是总共干了多少活、wall 是这一段
-    占了多少墙钟。R11 还是串行，所以 wall ≈ sum；并发之后 wall 应该掉到最慢那位附近，
-    而 sum 不变——sum 不变正是"没有偷偷少干活"的证据。
+def test_s3_wall_drops_to_the_slowest_physician_while_sum_stays(tmp_path):
+    """**R12 三医家并发的验收判据。** sum 是总共干了多少活、wall 是这一段占了多少
+    墙钟、slowest 是最慢的那一位。
 
-    这条断言在 R12 之后**会变**（那时 wall < sum），那是有意的契约变更，不是回归。
+    **这是有意的契约变更**：R11 写的这条断言是 `wall ≈ sum`（那时串行，docstring 里
+    就写明了"R12 之后会变"）。并发之后判据翻过来：
+      · `wall ≈ slowest`——三位医家真的在同时跑；
+      · `sum ≈ 3 × latency` 不变——**sum 不变正是"没有偷偷少干活"的证据**，
+        只看 wall 变小的话，"某位医家被跳过了"跟"三位并发"长得一模一样。
+
+    latency 取 0.3 秒：够大到线程启动开销（毫秒级）不会淹掉信号，够小到测试仍是秒级。
     """
     report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2",
-                          "--fake-latency", "0.05")
+                          "--fake-latency", "0.3")
+    from core.physicians import PHYSICIANS
+
     step = report["runs"][0]["by_step"]
     assert {"s3_sum", "s3_wall", "s3_slowest"} <= set(step)
-    assert step["s3_wall"] == pytest.approx(step["s3_sum"], abs=0.05)
-    assert step["s3_slowest"] < step["s3_sum"]
+    assert step["s3_sum"] == pytest.approx(0.3 * len(PHYSICIANS), abs=0.15)
+    assert step["s3_wall"] == pytest.approx(step["s3_slowest"], abs=0.15)
+    assert step["s3_wall"] < step["s3_sum"] * 0.6, (
+        f"并发之后 S3 的墙钟应该远小于总工作量：wall={step['s3_wall']} sum={step['s3_sum']}")
 
 
 def test_summary_counts_and_averages_the_runs(tmp_path):
@@ -217,3 +241,80 @@ def test_startup_bench_reports_a_missing_cases_json_instead_of_crashing(tmp_path
     assert code == 1
     assert "FileNotFoundError" in (report["error"] or "")
     assert report["segments_s"]["construct"] is not None
+
+# ---------- 第 0 项：R11 基准工具的两个静默失败 ----------
+
+
+def test_a_run_with_no_physician_results_is_not_reported_as_ok(tmp_path, monkeypatch):
+    """**跑空必须 ok:false。** `consult()` 把"检索不可用"放进返回值的 `retrieval_error`
+    而不是抛异常，于是 `run_once` 的 try/except 什么也没接住——三位医家一个都没跑，
+    基准照样打印「1/1 次跑成功」。这种失败比崩掉危险得多：崩了会有人看，而一份
+    `ok: true` 的报告会被直接引用。
+
+    修复前实测（`--backend fake`，仓库里没有 cases.json）：
+        ok= True llm_calls= 2 events= ['s1_done','s2_done','followup_done','physician_start']
+    """
+    from core import retrieval
+    from core.retrieval_hybrid import HybridRetriever
+
+    missing = tmp_path / "没有这个文件.json"
+    monkeypatch.setattr(retrieval, "_retriever_singleton", None)
+    monkeypatch.setattr(retrieval.DenseRetriever.__init__, "__defaults__", (missing,))
+    monkeypatch.setattr(HybridRetriever.__init__, "__defaults__", (missing,))
+
+    out = tmp_path / "empty.json"
+    code = bench_consult.main(["--backend", "fake", "--repeat", "1",
+                               "--no-auto-fake-cases", "--out", str(out)])
+    report = json.loads(out.read_text(encoding="utf-8"))
+    run = report["runs"][0]
+    assert run["ok"] is False, "三位医家一个都没跑，却报了成功"
+    assert "检索" in (run["error"] or "") or "医家" in (run["error"] or "")
+    assert code == 1, "有跑失败时退出码必须非 0"
+
+
+def test_a_valid_fake_run_makes_exactly_five_calls(tmp_path):
+    """**llm_calls == 5 才算一次有效的基准**：S1 + S2 + 三位医家各一次 S3。
+    少于 5 就说明有医家没跑到，这份数据不能用来比并发前后的耗时。"""
+    from core.physicians import PHYSICIANS
+
+    report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "3")
+    run = report["runs"][0]
+    assert run["ok"] is True, run["error"]
+    assert run["llm_calls"] == 2 + len(PHYSICIANS) == 5
+    assert len(run["by_step"]["s3_by_physician"]) == len(PHYSICIANS)
+
+
+def test_startup_bench_reports_a_missing_sentence_transformers_instead_of_crashing(
+        tmp_path, monkeypatch):
+    """`instrument_encoder` 原来无条件 import sentence_transformers，缺这个包直接
+    ModuleNotFoundError——而这个脚本存在的意义之一就是"在什么都没装好的机器上也能
+    告诉你缺什么"。装不上就如实写进报告，不是崩掉。"""
+    import sys
+
+    # sys.modules[name] = None 会让 import 抛 ImportError，等价于"这台机器没装"
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+    out = tmp_path / "startup.json"
+    code = bench_startup.main(["--out", str(out), "--skip-import"])
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert "sentence_transformers" in (report["encoder_note"] or "")
+    assert report["segments_s"]["model_load"] is None
+    assert code == 1  # 量不到就是量不到，退出码要能看出来
+
+
+def test_fake_backend_installs_synthetic_cases_when_the_repo_has_none(tmp_path, monkeypatch):
+    """**不该要求跑的人记得加 `--fake-cases`。** 假后端 + 没有 cases.json 是沙盒里的
+    常态，这时自动装合成医案并在输出里标明，比让人拿到一份只有 S1/S2 的"成功"报告好。
+    自动装了就必须能从报告里看出来——`fake_cases` 非 0 且 `fake_cases_auto` 为真。"""
+    from core import retrieval
+    from core.physicians import PHYSICIANS
+    from core.retrieval_hybrid import HybridRetriever
+
+    missing = tmp_path / "没有这个文件.json"
+    monkeypatch.setattr(retrieval, "_retriever_singleton", None)
+    monkeypatch.setattr(retrieval.DenseRetriever.__init__, "__defaults__", (missing,))
+    monkeypatch.setattr(HybridRetriever.__init__, "__defaults__", (missing,))
+
+    report = _run_consult(tmp_path, "--repeat", "1")
+    assert report["config"]["fake_cases_auto"] is True
+    assert report["config"]["fake_cases"] == 3 * len(PHYSICIANS)
+    assert report["runs"][0]["llm_calls"] == 5

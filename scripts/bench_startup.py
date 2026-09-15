@@ -65,14 +65,24 @@ class _Stopwatch:
             self.add(name, time.perf_counter() - t0)
 
 
-def instrument_encoder(watch: _Stopwatch) -> None:
-    """把 `sentence_transformers.SentenceTransformer` 换成一层计时壳。
+def instrument_encoder(watch: _Stopwatch) -> str | None:
+    """把 `sentence_transformers.SentenceTransformer` 换成一层计时壳。装不上就如实
+    返回一句话，**不崩**。
 
     `_load()` 里是 `from sentence_transformers import SentenceTransformer`——函数内
     import 每次都会去模块属性上取，所以在这里替换模块属性就能拦到，不需要碰
     core/retrieval.py。
+
+    **为什么不能让 ImportError 冒出去**：这个脚本存在的意义之一就是"在什么都没装好的
+    机器上也能告诉你缺什么"。原来这里无条件 import，缺包直接 ModuleNotFoundError，
+    连已经量到的 import 段也一起丢了——那正好是它该报告而不是该崩的情形。
     """
-    import sentence_transformers as st
+    try:
+        import sentence_transformers as st
+    except ImportError as e:
+        return (f"这台机器上 import sentence_transformers 失败（{e}）："
+                "model_load / encode 两段量不到，检索层也起不来。"
+                "装了它再跑，或者用 --self-test 只验这个脚本自己。")
 
     real_cls = st.SentenceTransformer
 
@@ -87,6 +97,7 @@ def instrument_encoder(watch: _Stopwatch) -> None:
         return model
 
     st.SentenceTransformer = timed_ctor
+    return None
 
 
 def install_self_test(n_cases: int) -> Path:
@@ -169,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     watch = _Stopwatch()
     synthetic = args.self_test > 0
     cases_path = install_self_test(args.self_test) if synthetic else None
-    instrument_encoder(watch)
+    encoder_note = instrument_encoder(watch)
 
     import_error = None
     if not args.skip_import:
@@ -194,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         "cases_path": str(cases_path) if cases_path else None,
         "config": {"self_test": args.self_test, "repeat": args.repeat,
                    "skip_import": args.skip_import},
+        "encoder_note": encoder_note,
         "segments_s": {name: watch.seconds.get(name) for name in SEGMENTS},
         "runs": runs,
         "import_error": import_error,
@@ -215,8 +227,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ 量不到检索层：{error}", file=sys.stderr)
     if import_error:
         print(f"✗ import api.main 失败：{import_error}", file=sys.stderr)
+    if encoder_note:
+        print(f"✗ {encoder_note}", file=sys.stderr)
     print(f"→ {out}")
-    return 0 if (error is None and import_error is None) else 1
+    return 0 if (error is None and import_error is None and encoder_note is None) else 1
 
 
 if __name__ == "__main__":

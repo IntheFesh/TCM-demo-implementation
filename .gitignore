@@ -66,3 +66,8 @@ data/local_corpora/李可医案.txt
 # 看出它不是真的。脚本按后端给文件名前缀，这两条就是按前缀分的。
 eval/bench/consult_fake_*.json
 eval/bench/startup_synthetic_*.json
+
+# R12 语料向量的磁盘缓存。**不进版本控制**：它从版本控制里的输入（cases.json +
+# 模型名）能完全重算，而且文件名里带了输入的 sha——重算一定得到同一份。
+# 存它是为了省启动时的编码时间，不是为了留证据。
+data/cache/

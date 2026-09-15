@@ -626,10 +626,33 @@ class _FlakyThenOk(LLMBackend):
         return '{"ok": true, "note": "x"}'
 
 
-def test_transport_retry_backs_off_1s_then_2s():
+def _within_jitter(actual: float, base: float) -> bool:
+    return base * (1 - LLMBackend.RETRY_JITTER) <= actual <= base * (1 + LLMBackend.RETRY_JITTER)
+
+
+def test_transport_retry_backs_off_exponentially_with_jitter():
+    """**R12 起判据从"等于 1.0/2.0"改成"落在 1.0/2.0 的 ±20% 区间里"**，
+    这是有意的契约变更：三位医家改成并发之后是**同时**出发的，一起撞 429 就会一起
+    在同一时刻重试，形成一波波同步冲击。抖动把它们错开——而带抖动的等待时间按定义
+    就不可能等于一个定值，原来那条断言在新契约下**必然**是错的。
+    它钉的另外两件事没变、仍然钉着：退避是递增的、只退避两次。"""
     b = _FlakyThenOk(n_fail=2)
     assert b.generate(system="s", user="u", schema=Tiny).ok is True
-    assert b.sleeps == [1.0, 2.0]
+    assert len(b.sleeps) == 2
+    assert _within_jitter(b.sleeps[0], 1.0), b.sleeps
+    assert _within_jitter(b.sleeps[1], 2.0), b.sleeps
+    assert b.sleeps[1] > b.sleeps[0], "退避必须是递增的"
+
+
+def test_backoff_is_not_always_the_same_number():
+    """抖动要真的抖：连跑 12 次拿到的 24 个等待时间里，第一次退避不该全是同一个数。
+    （抖动写成常数 0 的话上面那条区间断言照样绿，这条才抓得到。）"""
+    firsts: set[float] = set()
+    for _ in range(12):
+        b = _FlakyThenOk(n_fail=2)
+        b.generate(system="s", user="u", schema=Tiny)
+        firsts.add(round(b.sleeps[0], 6))
+    assert len(firsts) > 1, f"12 次退避全是同一个数，抖动没生效：{firsts}"
 
 
 def test_no_backoff_after_the_last_attempt():
@@ -637,7 +660,8 @@ def test_no_backoff_after_the_last_attempt():
     b = _FlakyThenOk(n_fail=3)
     with pytest.raises(LLMError):
         b.generate(system="s", user="u", schema=Tiny)
-    assert b.sleeps == [1.0, 2.0]
+    assert len(b.sleeps) == 2
+    assert _within_jitter(b.sleeps[0], 1.0) and _within_jitter(b.sleeps[1], 2.0)
 
 
 def test_validation_errors_retry_immediately_without_backoff():

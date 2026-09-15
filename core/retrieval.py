@@ -1,16 +1,53 @@
 """医案检索层：给定患者症状，在某位医家的医案库里检索最相关的参考医案。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
 import threading
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
 from pathlib import Path
 
 from core.schemas import CaseRecord
 
 CASES_PATH = Path(__file__).resolve().parent.parent / "cases.json"
+
+# 稠密检索用的编码模型。**只此一处写它的名字**：缓存的命中判据里带着模型名，
+# 两处写就会出现"换了模型但缓存 key 没跟着换"——那是静默拿旧模型的向量去比新模型
+# 编出来的查询，结果全错而且不报任何错。
+EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+# 语料向量的磁盘缓存目录。**进 .gitignore**：它是从版本控制里的输入（cases.json +
+# 模型名）能完全重算出来的产物，而且指纹里带了输入的 sha，重算一定得到同一份。
+_DEFAULT_EMBEDDING_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
+
+
+def embedding_cache_dir() -> Path | None:
+    """这次用哪个缓存目录；None = 这次不用缓存。
+
+    两个环境变量：`EMBEDDING_CACHE=0` 整体关掉，`EMBEDDING_CACHE_DIR` 换个地方。
+    **关得掉这件事本身是必需的**：`tests/conftest.py` 把它关掉，否则
+    ① 测试会往仓库的 data/cache/ 里写东西；
+    ② 更糟——上一条测试写的缓存会让下一条测试跳过编码，于是"编码过程中并发读取"
+    这类**专门测编码时序**的用例永远等不到 encode 被调用。这个坑是加缓存当天就
+    踩到的（tests/test_concurrency_init.py 立刻变红）。
+    """
+    if (os.environ.get("EMBEDDING_CACHE") or "").strip() in ("0", "false", "off"):
+        return None
+    override = os.environ.get("EMBEDDING_CACHE_DIR")
+    return Path(override) if override else _DEFAULT_EMBEDDING_CACHE_DIR
+
+
+def _sentence_transformers_version() -> str | None:
+    """写进缓存元信息，方便日后排查"换了库版本向量就对不上了"这类事。
+    取不到就是 None，不编。"""
+    try:
+        import sentence_transformers
+
+        return getattr(sentence_transformers, "__version__", None)
+    except ImportError:
+        return None
 
 # 检索相似度下限。实测正常匹配在 0.85-0.90，低于 0.70 基本是"库里没有相关案子"，
 # 此时给空列表比塞三条不相关的更诚实。这是两位医家、839 条医案时校准的固定值，
@@ -271,6 +308,9 @@ class DenseRetriever(Retriever):
 
         self._model = None  # 惰性加载，避免 import 阶段就下载/加载模型
         self._embeddings = None  # 惰性编码，随 _model 一起初始化
+        # 这次的向量是从磁盘缓存读的还是现编的。给 scripts/bench_startup.py 和
+        # 测试用——"缓存有没有生效"必须能从外面看出来，不能只靠看耗时猜。
+        self.embeddings_from_cache: bool | None = None
         # **每个实例一把锁，不是类属性。** 这把锁保护的是 self._model /
         # self._embeddings——per-instance 的状态，锁的作用域就该是 per-instance。
         # 原来它是类属性（进程级），后果是**一个实例的编码会挡住另一个实例的编码**：
@@ -302,19 +342,88 @@ class DenseRetriever(Retriever):
                 return
             self._load()
 
+    def _cache_key(self) -> str:
+        """这份语料 + 这个模型的指纹。三样东西全等才算命中：模型名、条数、
+        **被编码的那些文本本身的 sha256**。
+
+        指纹取的是 `self._case_texts` 而不是 `cases.json` 的整文件 sha：编码的输入
+        就是这些文本，`cases.json` 里改一个跟检索无关的字段（比如补一条 raw）会让
+        文件 sha 变、而编码结果一个字节都不会变——那样每次都白编码一遍，缓存等于没有。
+        反过来，只要编码输入变了这个指纹必然变，不存在"该失效却没失效"。
+        """
+        digest = hashlib.sha256("\x00".join(self._case_texts).encode("utf-8")).hexdigest()
+        return f"{EMBEDDING_MODEL.replace('/', '_')}_{digest[:12]}_{len(self._case_texts)}"
+
+    def _read_cache(self, key: str):
+        """读缓存，读不出来一律返回 None 并说明原因——**静默回退比慢更糟**：
+        人以为缓存生效了，实际每次都在重新编码，而"启动还是 135 秒"这件事
+        没有任何输出能解释。"""
+        cache_dir = embedding_cache_dir()
+        if cache_dir is None:
+            return None
+        path = cache_dir / f"embeddings_{key}.npy"
+        if not path.exists():
+            return None
+        try:
+            import numpy as np
+
+            cached = np.load(path)
+        except Exception as e:  # noqa: BLE001 - 缓存坏了就重编码，不能让它把服务拖垮
+            print(f"[retrieval] embedding 缓存 {path.name} 读不出来（{e}），这次重新编码",
+                  file=sys.stderr)
+            return None
+        if cached.shape[0] != len(self._case_texts):
+            # 指纹里已经带了条数，走到这里说明文件被人换过。宁可重编码也不用它：
+            # 行数对不上意味着 self._cases 和向量的下标错位，那是**静默给错结果**。
+            print(f"[retrieval] embedding 缓存 {path.name} 的行数 {cached.shape[0]} 跟语料"
+                  f"{len(self._case_texts)} 条对不上，这次重新编码", file=sys.stderr)
+            return None
+        return cached
+
+    def _write_cache(self, key: str, embeddings) -> None:
+        cache_dir = embedding_cache_dir()
+        if cache_dir is None:
+            return
+        try:
+            import numpy as np
+
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            np.save(cache_dir / f"embeddings_{key}.npy", embeddings)
+            (cache_dir / f"embeddings_{key}.json").write_text(json.dumps({
+                "model": EMBEDDING_MODEL,
+                "n_cases": len(self._case_texts),
+                "key": key,
+                "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "sentence_transformers": _sentence_transformers_version(),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as e:
+            # 只读挂载、磁盘满：写不了缓存不影响这次跑，下次照样重编码。
+            print(f"[retrieval] embedding 缓存写不出去（{e}），不影响本次检索", file=sys.stderr)
+
     def _load(self) -> None:
         from sentence_transformers import SentenceTransformer
 
         # 先在局部变量里把两样东西都建好，再按 _model → _embeddings 的顺序发布。
         # _ensure_encoded 的锁外快路径只认 _embeddings，它最后一个写入，
         # 别的线程看到它非 None 时 _model 一定已经就位。
-        model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-        # 复用 __init__ 里已经算好、过滤过的 self._case_texts，不重新调用
-        # _case_to_text——两处算出不一致的文本会让 self._cases 和 self._embeddings
-        # 的下标错位（P0-6 引入的过滤逻辑只在 __init__ 跑一次，这里必须认它）。
-        embeddings = model.encode(
-            self._case_texts, normalize_embeddings=True, convert_to_numpy=True
-        )
+        #
+        # **模型不管命不命中缓存都要加载**：缓存省掉的是"给全部语料编码"这一段
+        # （941 条，实测占启动耗时的大头），而 search() 每次都要给**查询**编码，
+        # 那一步没有模型不行。省的是 O(语料) 不是 O(1)。
+        model = SentenceTransformer(EMBEDDING_MODEL)
+        key = self._cache_key()
+        embeddings = self._read_cache(key)
+        if embeddings is None:
+            # 复用 __init__ 里已经算好、过滤过的 self._case_texts，不重新调用
+            # _case_to_text——两处算出不一致的文本会让 self._cases 和 self._embeddings
+            # 的下标错位（P0-6 引入的过滤逻辑只在 __init__ 跑一次，这里必须认它）。
+            embeddings = model.encode(
+                self._case_texts, normalize_embeddings=True, convert_to_numpy=True
+            )
+            self._write_cache(key, embeddings)
+            self.embeddings_from_cache = False
+        else:
+            self.embeddings_from_cache = True
         self._model = model
         self._embeddings = embeddings
 

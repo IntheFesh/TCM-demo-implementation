@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -300,6 +301,147 @@ REASONING_MAX_TOKENS = 16384
 REASONING_MODELS = frozenset({"deepseek-v4-pro"})
 
 
+# ---------- 思考模式按步控制（R12） ----------
+#
+# DeepSeek 的推理模型**默认开思考**（`thinking.type=enabled`，effort=high）。这带来
+# 两个后果，都要按步处理：
+#   ① 慢且贵：S1（症状标准化）和 S2（证素推断）是结构化抽取，思考对它们没有增益，
+#      却让每次调用从两三秒变成几十秒；
+#   ② **思考模式下 temperature 不生效**——这正是 v4-pro "同样输入不同输出"的根因，
+#      也就是 ε（噪声地板）和 fixture 可复现性一起失效的原因。
+#
+# 所以：抽取类的步骤一律关思考；真正需要推理的 S3（按医家开方）默认开，
+# 但留一个环境变量能整体关掉，好让"关思考版本"作为一组独立的对照数字去跑。
+#
+# **这张表是唯一的一处实现**：各调用点自己写 `thinking="disabled"` 的话，日后加一个
+# 步骤必然漏掉，而漏掉的表现是"那一步莫名慢十倍"，没人会想到是这个原因。
+STEP_THINKING: dict[str, str] = {
+    "s1": "disabled",
+    "s2": "disabled",
+    "followup": "disabled",
+    "residual": "disabled",
+    "react": "disabled",
+    "s3": "enabled",
+}
+S3_THINKING_DEFAULT = "enabled"
+S3_REASONING_EFFORT = "high"
+
+
+def s3_thinking() -> str:
+    """S3 这一步开不开思考。`S3_THINKING=disabled` 关掉——**关掉之后跑出来的数字
+    跟默认配置下的不可比**，manifest 会带上这句话。"""
+    value = (os.environ.get("S3_THINKING") or S3_THINKING_DEFAULT).strip().lower()
+    if value not in ("enabled", "disabled"):
+        print(f"[llm] S3_THINKING={value!r} 只认 enabled / disabled，"
+              f"这次按默认 {S3_THINKING_DEFAULT} 处理", file=sys.stderr)
+        return S3_THINKING_DEFAULT
+    return value
+
+
+def thinking_for(step: str) -> dict[str, str | None]:
+    """某一步该传的思考参数，直接 `**` 进 `generate()`。
+
+    未知的 step 名不静默走默认值，而是吼一声——拼错一个步骤名的表现是"那一步
+    悄悄用了别的设置"，跟没设一样看不出来。
+    """
+    if step not in STEP_THINKING:
+        print(f"[llm] thinking_for({step!r})：没有这个步骤，按不指定处理（走 API 默认）。"
+              f"可用：{sorted(STEP_THINKING)}", file=sys.stderr)
+        return {"thinking": None, "reasoning_effort": None}
+    mode = s3_thinking() if step == "s3" else STEP_THINKING[step]
+    return {
+        "thinking": mode,
+        "reasoning_effort": S3_REASONING_EFFORT if mode == "enabled" else None,
+    }
+
+
+def thinking_by_step() -> dict[str, str]:
+    """整次跑的思考设置，写进 manifest。**换了这张表 = 数字不可比**，跟换模型同级。"""
+    return {step: (s3_thinking() if step == "s3" else mode)
+            for step, mode in STEP_THINKING.items()}
+
+
+# 进程内**同时在途**的 LLM 调用数上限。**跟 MAX_CONCURRENT_CONSULTS 是两件事**：
+# 那个限"同时进行几次问诊"，这个限"同时打到模型的请求数"。R12 三位医家改成并发
+# 之后两者会相乘——4 个问诊槽 × 3 位医家 = **12 路同时打 API**，稳稳撞上 DeepSeek
+# 的速率限制（429）。只留一个闸拦不住：把问诊槽降到 2 会让排队变长而每次问诊仍然
+# 开 3 路，把医家改回串行又等于放弃这一轮的全部收益。
+DEFAULT_MAX_INFLIGHT = 6
+_inflight_sem: threading.BoundedSemaphore | None = None
+_inflight_limit: int | None = None
+_inflight_lock = threading.Lock()
+
+
+def llm_max_inflight() -> int:
+    """当前的在途上限。每次现读环境变量——上限是部署侧设置，不是逐请求行为开关，
+    读环境变量没问题（跟 MAX_CONCURRENT_CONSULTS 同一条理由）。"""
+    raw = os.environ.get("LLM_MAX_INFLIGHT")
+    if not raw:
+        return DEFAULT_MAX_INFLIGHT
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        print(f"[llm] LLM_MAX_INFLIGHT={raw!r} 不是正整数，按默认 {DEFAULT_MAX_INFLIGHT} 处理",
+              file=sys.stderr)
+        return DEFAULT_MAX_INFLIGHT
+    return value
+
+
+def inflight_semaphore() -> threading.BoundedSemaphore:
+    """在途闸。上限变了就重建——上限只在进程启动或测试里变，重建时可能有调用在飞，
+    那一次的计数会丢，这是知道并接受的代价：为一个只在启动时读的值维护一套可变
+    信号量不值得。"""
+    global _inflight_sem, _inflight_limit
+    limit = llm_max_inflight()
+    with _inflight_lock:
+        if _inflight_sem is None or _inflight_limit != limit:
+            _inflight_sem = threading.BoundedSemaphore(limit)
+            _inflight_limit = limit
+        return _inflight_sem
+
+
+# 这一次问诊/这一批跑的重试统计。ContextVar 而不是模块级计数器：并发的两次问诊
+# 各自要拿到自己的数，一个全局计数器会把别人的重试算到自己头上。放的是**可变字典**，
+# 所以并发医家线程（走 copy_context）里加的数，父线程读得到——ContextVar 拷贝的是
+# 引用不是内容。
+_retry_stats: ContextVar[dict | None] = ContextVar("_retry_stats", default=None)
+
+
+def new_retry_stats() -> dict:
+    """给这一次调用链开一份新的重试统计并装进 ContextVar，返回那个字典本身。
+    调用方（consult）拿着它写进 manifest。"""
+    stats = {"total": 0, "rate_limited": 0, "timeout": 0, "other": 0}
+    _retry_stats.set(stats)
+    return stats
+
+
+def current_retry_stats() -> dict | None:
+    """这一次调用链到此为止的重试统计；没开过统计就是 None。manifest 从这里取，
+    调用方不用把它一路当参数传下去——传参会让每个 `_build_manifest` 调用点都得记得
+    带上它，漏一处就是那条路径上的 manifest 少一个字段。"""
+    stats = _retry_stats.get()
+    return dict(stats) if stats is not None else None
+
+
+def _record_retry(error: BaseException) -> None:
+    """记一次重试。分三类而不是只记总数：429（该降并发）、超时（该查网络或调超时）、
+    其它（多半是模型输出格式问题）——这三种的处置完全不同，合成一个数就没法处置。"""
+    stats = _retry_stats.get()
+    if stats is None:
+        return
+    status = _status_code_of(error)
+    if status == 429:
+        kind = "rate_limited"
+    elif isinstance(error, TimeoutError):
+        kind = "timeout"
+    else:
+        kind = "other"
+    stats["total"] = stats.get("total", 0) + 1
+    stats[kind] = stats.get(kind, 0) + 1
+
+
 # DeepSeek 官方错误码表（https://api-docs.deepseek.com/zh-cn/quick_start/error_codes）：
 #   400 格式错误 / 401 认证失败（API key 错）/ 402 余额不足 / 422 参数错误
 #   429 请求速率达到上限 / 500 服务器故障 / 503 服务器繁忙
@@ -351,8 +493,23 @@ class LLMBackend(ABC):
     # 只对传输错误退避：校验错误是模型输出格式不对，回灌错误信息立刻重问才有
     # 意义，等一秒不会让它答得更对。之前是零间隔立刻重试，429 会变成三个
     # 连续的 429。测试里把它 monkeypatch 成 (0, 0)，不真等。
-    RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0)
+    #
+    # **R12 起是指数 + 抖动**：1s / 2s / 4s，各带 ±20% 的随机扰动。指数是因为
+    # 429 说明对面正忙，线性等一秒多半还是 429；抖动是因为三位医家现在是**同时**
+    # 出发的，一起撞 429 就会一起在同一时刻重试，形成一波一波的同步冲击
+    # （thundering herd）——把它们错开是并发之后才需要的事。
+    RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+    RETRY_JITTER = 0.2
     _sleep = staticmethod(time.sleep)  # 留个缝给测试换掉，不真睡
+    _random = staticmethod(random.uniform)  # 同上：测试要能固定抖动
+
+    def _backoff_seconds(self, attempt: int) -> float:
+        """第 attempt 次重试前等多久。测试把 RETRY_BACKOFF_SECONDS 设成 (0, 0) 时
+        这里返回 0（0 的 ±20% 还是 0），所以离线测试不会真的睡。"""
+        base = self.RETRY_BACKOFF_SECONDS[min(attempt, len(self.RETRY_BACKOFF_SECONDS) - 1)]
+        if base <= 0:
+            return 0.0
+        return base * (1.0 + self._random(-self.RETRY_JITTER, self.RETRY_JITTER))
 
     def timeouts(self) -> CallTimeouts:
         """本次调用生效的超时。环境变量优先：`LLM_TIMEOUT_SECONDS`，兼容旧名
@@ -427,17 +584,33 @@ class LLMBackend(ABC):
             except BaseException as e:  # noqa: BLE001 - 原样带回主线程再抛
                 result["error"] = e
 
-        worker = threading.Thread(target=_run, name="llm-call", daemon=True)
-        worker.start()
-        worker.join(timeout=deadline)
-        if worker.is_alive():
-            self.abort_in_flight()
-            raise LLMCallTimeout(
-                f"一次 LLM 调用超过 {deadline:.0f} 秒墙钟上限还没返回"
-                f"（backend={self.backend_id()}, model={self.model_name()}）。"
-                "HTTP 读超时管的是单次 socket 读，对方细水长流地吐字节时不会触发，"
-                "所以这里从外面封一个上限。调大用 LLM_TIMEOUT_SECONDS。"
-            )
+        # 在途闸**在主线程取、在主线程放**，不放在工作线程里。第一版放在工作线程里，
+        # 结果是：墙钟超时之后工作线程被丢下不管（daemon），它手里那个许可就**永远
+        # 不会还**——攒够 LLM_MAX_INFLIGHT 次挂死，整个进程的 LLM 调用全部死锁。
+        # 写完这一版立刻被 tests/test_llm_timeout.py 里那几条"故意挂住"的用例抓到。
+        #
+        # 现在的语义是"同时**等待**的调用数"：join 一返回就还许可，哪怕那个被丢下的
+        # 工作线程还在飞。代价是超时之后短暂地可能超过上限——但紧跟着的
+        # `abort_in_flight()` 会把连接池掐掉、让那次读死掉，所以窗口很短。
+        # 拿"短暂超限"换"永不死锁"，这个取舍没有第二个答案。
+        #
+        # 排队的时间不算进墙钟预算：许可是在 join 开始**之前**取的，取到才开表。
+        sem = inflight_semaphore()
+        sem.acquire()
+        try:
+            worker = threading.Thread(target=_run, name="llm-call", daemon=True)
+            worker.start()
+            worker.join(timeout=deadline)
+            if worker.is_alive():
+                self.abort_in_flight()
+                raise LLMCallTimeout(
+                    f"一次 LLM 调用超过 {deadline:.0f} 秒墙钟上限还没返回"
+                    f"（backend={self.backend_id()}, model={self.model_name()}）。"
+                    "HTTP 读超时管的是单次 socket 读，对方细水长流地吐字节时不会触发，"
+                    "所以这里从外面封一个上限。调大用 LLM_TIMEOUT_SECONDS。"
+                )
+        finally:
+            sem.release()
         if "error" in result:
             raise result["error"]  # type: ignore[misc]
         return str(result.get("value", ""))
@@ -594,8 +767,8 @@ class LLMBackend(ABC):
                 # 模型收到文不对题的纠错指令。原样重试，但重试前先退避一下。
                 last_error = e
                 if attempt < self.MAX_ATTEMPTS - 1:
-                    backoff = self.RETRY_BACKOFF_SECONDS
-                    self._sleep(backoff[min(attempt, len(backoff) - 1)])
+                    _record_retry(e)
+                    self._sleep(self._backoff_seconds(attempt))
                 continue
             last_raw = raw
             stripped = strip_code_fence(raw)
@@ -732,16 +905,29 @@ class OpenAICompatBackend(LLMBackend):
         max_tokens: int | None = None,
         schema: type[BaseModel] | None = None,
         physician: str | None = None,
+        thinking: str | None = None,
+        reasoning_effort: str | None = None,
         **kwargs,
     ) -> str:
         # schema / physician 在这一层如实忽略：云端 API 既没有 guided_decoding
         # 也没有 LoRA adapter 可切。**不能转给 SDK**——多一个它不认的关键字
         # 参数就是 TypeError（这也是这两个参数为什么是显式形参、不塞 kwargs）。
+        extra_body: dict = {}
+        if thinking is not None:
+            extra_body["thinking"] = {"type": thinking}
+        extra: dict = {"extra_body": extra_body} if extra_body else {}
+        if reasoning_effort is not None:
+            extra["reasoning_effort"] = reasoning_effort
+        # **思考模式下 temperature 不生效**（DeepSeek 文档）。既然不生效就不传：
+        # 传了会让 manifest 里那个 temperature 看起来像是生效了的实验条件，
+        # 而"同样输入不同输出"正是被这个误解坑过一次的地方。
+        if thinking != "enabled":
+            extra["temperature"] = temperature
         resp = self.client.chat.completions.create(
             model=self._request_model_name(),
             messages=messages,
-            temperature=temperature,
             response_format={"type": "json_object"},
+            **extra,
             # 默认值见 _default_max_tokens()（推理模型要更大，理由在那儿）。
             # 调用方（generate() 的 max_tokens 参数）能覆盖它——不是全局调高，
             # 是某个 prompt 明确知道自己需要更大上限时单独传（比如 S5 一张方子的

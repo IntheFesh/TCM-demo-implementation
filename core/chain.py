@@ -14,18 +14,30 @@ S1 必须只跑一次：如果对每位医家各跑一次，两次输出的症�
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import sys
+import threading
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 from pathlib import Path
 
 from core import herbs as _herbs
 from core.diseases import get_disease, match_disease
 from core.elements import LOCATIONS, NATURES
-from core.llm import get_llm, load_prompt, render
+from core.llm import (
+    current_retry_stats,
+    get_llm,
+    load_prompt,
+    new_retry_stats,
+    render,
+    s3_thinking,
+    thinking_by_step,
+    thinking_for,
+)
 from core.followup import (
     AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
 )
@@ -242,7 +254,10 @@ def explained_symptoms(s1: S1Normalize, s2: S2Elements, residual: dict | None = 
 def normalize(complaint: str) -> S1Normalize:
     prompt = load_prompt("s1_normalize")
     system = render(prompt["system"], complaint=complaint)
-    return get_llm().generate(system=system, user="", schema=S1Normalize)
+    # 关思考：S1 是结构化抽取，思考对它没有增益却让每次调用从两三秒变成几十秒；
+    # 而且思考模式下 temperature 不生效，正是 fixture 与 ε 不可复现的根因。
+    return get_llm().generate(system=system, user="", schema=S1Normalize,
+                              **thinking_for("s1"))
 
 
 def infer_elements(s1: S1Normalize) -> S2Elements:
@@ -265,7 +280,8 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
         tongue=s1.tongue or "未记",
         pulse=s1.pulse or "未记",
     )
-    return get_llm().generate(system=s2_system, user="", schema=S2Elements)
+    return get_llm().generate(system=s2_system, user="", schema=S2Elements,
+                              **thinking_for("s2"))
 
 
 def _search_cases(
@@ -553,8 +569,11 @@ def run_physician(
     # adapter，vLLM server 按请求切换）。传的是 id 不是中文名——SOURCES.md
     # 第 31 条那个坑：id 和中文名混用会让按 id 索引的东西恒空。云端后端
     # （DeepSeek）如实忽略它，见 core/llm.py::LLMBackend._complete 的文档。
+    # S3 是这条链上唯一真正需要推理的一步，默认开思考（S3_THINKING 可整体关掉，
+    # 关掉之后跑出来的数字跟默认配置不可比——manifest 会带上这句话）。
     s3 = get_llm().generate(
         system=s3_system, user="", schema=s3_schema, physician=physician,
+        **thinking_for("s3"),
     )
 
     # X2 输出侧安全（M2 起覆盖五条规则，见 core/safety_output.assess_formula_safety
@@ -575,6 +594,7 @@ def run_physician(
         )
         s3 = get_llm().generate(
             system=retry_system, user="", schema=s3_schema, physician=physician,
+            **thinking_for("s3"),
         )
         for cand in s3.formula_candidates:
             cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
@@ -661,6 +681,21 @@ def cases_sha256() -> str | None:
     return hashlib.sha256(cp.read_bytes()).hexdigest()[:12]
 
 
+def _comparability_warning(llm) -> str | None:
+    """后端自己的可比性警告 + 思考设置非默认时的那一句，拼成一条。
+
+    两者是同一类事实——"这次跑的条件跟报告里那些数字的条件不一样"——所以合并成
+    一个字段，而不是再加一个 `thinking_warning` 让引用方记得同时看两处。
+    """
+    parts = [llm.comparability_warning()]
+    if s3_thinking() != "enabled":
+        parts.append(
+            "S3_THINKING=disabled：S3 这一步关掉了思考模式。**关思考跑出来的数字跟"
+            "默认配置（S3 开思考 + effort=high）下的不可比**，并列报出，不要相减。")
+    joined = " ".join(p for p in parts if p)
+    return joined or None
+
+
 def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
@@ -673,7 +708,22 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) ->
         "model": llm.model_name(),
         "backend": llm.backend_id(),
         # 非默认后端时非 None。带着走，报告里就不会漏标"这个数不可比"。
-        "comparability_warning": llm.comparability_warning(),
+        # **思考设置也算一种"换了实验条件"**：S3 关掉思考会明显更快、结果也会变，
+        # 那是另一组数，不能跟默认配置下的数混着引（跟换模型同级）。
+        "comparability_warning": _comparability_warning(llm),
+        # 每一步开不开思考。换了这张表 = 数字不可比，所以它跟 model 一样是 manifest
+        # 的一等字段，不是可选的调试信息。
+        "thinking_by_step": thinking_by_step(),
+        # **不写成一个标量**：思考模式下 temperature 不生效，而各步的思考设置不同，
+        # 所以"这次跑的 temperature 是多少"本来就没有单一答案。写一个标量就得挑一步
+        # 来代表全体，那是在报告里埋一句不准确的话。
+        "temperature_effective": {
+            step: (None if mode == "enabled" else 0.0)
+            for step, mode in thinking_by_step().items()
+        },
+        # 这次问诊里发生了几次重试、分别是什么原因（429 / 超时 / 其它）。
+        # None = 这条路径没开统计（离线脚本直接调 run_physician 之类）。
+        "retries": current_retry_stats(),
         # 本地后端 + 配了 LORA_DIR 时是那个目录，否则 None（= 这一轮跑的是
         # 基座模型 / 根本没有 adapter 这回事）。manifest 这一层记"adapter 是
         # 从哪来的"，具体哪位医家实际挂了哪个 adapter 记在各自的结果里
@@ -744,6 +794,126 @@ def run_residual(s1: S1Normalize, s2: S2Elements) -> dict | None:
     }
 
 
+class _PhysicianCancelled(Exception):
+    """某位医家的线程因为别人触发了安全否决而被取消。不是错误，不往上报。"""
+
+
+def _serialize_ask(ask_fn: AskFn | None) -> AskFn | None:
+    """把追问渠道串行化。**并发之后这是必须的**：`ask_fn` 背后是一个人（或患者
+    模拟器），同一时刻只可能回答一个问题；`_ConsultStream.ask` 的 `_pending` 也是
+    "每个问题一条队列、同一时刻只有一条"的形状——两位医家同时提问，后一位会把前一位
+    的队列覆盖掉，前一位于是永远等不到答案、直到 300 秒超时。
+
+    代价是三位医家的追问变成排队（最坏 3×超时），跟并发之前的总时长一样——**追问
+    本来就不是能并行的事**，这里并发省的是 LLM 调用的等待，不是人的思考时间。
+    """
+    if ask_fn is None:
+        return None
+    lock = threading.Lock()
+
+    def ask(question: str) -> str | None:
+        with lock:
+            return ask_fn(question)
+
+    return ask
+
+
+def _run_physicians_into(
+    results: list[dict], s1: S1Normalize, s2: S2Elements, *,
+    use_react: bool, followup, ask_fn: AskFn | None, bypass: bool,
+    on_step: StepFn | None, retriever_mode: str | None, refs_mode: str,
+    emit,
+) -> None:
+    """三位医家**并发**跑 S3，结果按 `PHYSICIANS` 的插入顺序追加进 `results`。
+
+    改并发的理由：一次问诊 6 次调用里有 3 次是各位医家的 S3，串行时它们是
+    3×单次耗时（真机实测约 198 秒 / 394.6 秒总耗时的一半）。三位医家之间没有任何
+    数据依赖——S1/S2 是全局跑一次、共用的（CLAUDE.md 明令 S1 只能跑一次），
+    每位医家各自检索、各自开方。
+
+    四条约束，每一条都有对应的测试：
+
+    **一、`results` 的顺序仍按注册表。** 这是契约：前端三列按它排、分歧度两两配对
+    按它取。并发下完成顺序是乱的，所以这里按 `PHYSICIANS` 的顺序去取 future 的结果，
+    不用 `as_completed` 的顺序。
+
+    **二、事件会交错，`results` 不会。** `physician_start`/`physician_done` 由各自的
+    线程发，叶天士的 done 完全可能排在张锡纯的 start 后面。前端必须按事件里的
+    `physician` 字段路由（docs/DESIGN.md §4.7 的订正）。"结果有序"和"事件有序"是
+    两件事。
+
+    **三、安全否决要取消其余线程。** ReAct 追问问出危重症状时，被拦截的请求不产出
+    任何方药——已经跑完的医家结果也不返回（这是改并发之前就有的语义，不许变松）。
+    取消靠一个 `threading.Event` + 包在 `on_step` 外面的一层检查：别的线程在下一次
+    发事件时抛 `_PhysicianCancelled` 退出。**不用 `future.cancel()`**——那只能取消
+    还没开始跑的任务，而三位医家是同时开跑的，一个都取消不掉。
+
+    **四、ContextVar 必须传进 worker。** `use_llm()` 的逐请求后端覆盖走的是
+    ContextVar（BYOK、降级到回放都靠它），而 ContextVar **不会**自动跟着
+    `ThreadPoolExecutor` 的线程走——不显式 `copy_context().run` 的话，worker 里
+    `get_llm()` 拿到的是进程单例，BYOK 静默失效、访问者的 key 没被用上、额度照扣。
+    每个 worker 一份独立的拷贝：一个 `Context` 只能被 `run` 一次。
+    """
+    physicians = list(PHYSICIANS.items())
+    cancel = threading.Event()
+    ask = _serialize_ask(ask_fn)
+
+    def worker_on_step(name: str, data: dict) -> None:
+        if cancel.is_set():
+            raise _PhysicianCancelled()
+        if on_step is not None:
+            on_step(name, data)
+
+    def work(physician: str, info: dict) -> dict:
+        if cancel.is_set():
+            raise _PhysicianCancelled()
+        worker_on_step("physician_start",
+                       {"physician": physician, "physician_name": info["name"]})
+        r = run_physician(
+            s1, s2, physician, info["name"], use_react=use_react,
+            followup=followup, ask_fn=ask, bypass_safety=bypass,
+            on_step=worker_on_step if on_step is not None else None,
+            retriever_mode=retriever_mode, refs_mode=refs_mode,
+        )
+        worker_on_step("physician_done", {
+            "physician": physician, "physician_name": info["name"],
+            "syndrome": r["s3"].syndrome, "herbs": r["s3"].herbs,
+        })
+        return r
+
+    futures: dict[str, object] = {}
+    with ThreadPoolExecutor(max_workers=len(physicians),
+                            thread_name_prefix="physician") as pool:
+        for physician, info in physicians:
+            # 每个 worker 一份独立的 Context 拷贝（见上面第四条）
+            futures[physician] = pool.submit(
+                contextvars.copy_context().run, work, physician, info)
+        # 先用完成顺序扫一遍，只为**尽早**置位取消：否决发生得越早，别人白花的
+        # 调用越少。真正的结果收集在下面按注册表顺序做。
+        for fut in as_completed(futures.values()):
+            if isinstance(fut.exception(), SafetyVeto):
+                cancel.set()
+
+    veto: SafetyVeto | None = None
+    failure: BaseException | None = None
+    for physician, _info in physicians:
+        exc = futures[physician].exception()
+        if exc is None:
+            results.append(futures[physician].result())
+        elif isinstance(exc, SafetyVeto):
+            veto = veto or exc
+        elif isinstance(exc, _PhysicianCancelled):
+            continue
+        else:
+            # 一位医家的真实失败（LLMError 之类）不该被别人的成功盖掉，也不该
+            # 被吞掉：按注册表顺序取第一个，跟串行时"第一个失败的抛出来"一致。
+            failure = failure or exc
+    if veto is not None:
+        raise veto
+    if failure is not None:
+        raise failure
+
+
 def consult(
     complaint: str,
     use_react: bool | None = None,
@@ -791,6 +961,10 @@ def consult(
     返回值里带一句人话的 retrieval_error，不是异常也不是 500。
     """
     _t0 = time.time()
+    # 这一次问诊的重试统计。ContextVar 里放一个可变字典，并发的医家线程（走
+    # copy_context）加的数父线程读得到；manifest 从 current_retry_stats() 取，
+    # 不用把它一路当参数传到每个 _build_manifest 调用点。
+    new_retry_stats()
 
     def emit(name: str, **data) -> None:
         if on_step is not None:
@@ -940,16 +1114,11 @@ def consult(
         }
     results = []
     try:
-        for physician, info in PHYSICIANS.items():
-            emit("physician_start", physician=physician, physician_name=info["name"])
-            r = run_physician(
-                s1, s2, physician, info["name"], use_react=use_react,
-                followup=followup, ask_fn=ask_fn, bypass_safety=bypass, on_step=on_step,
-                retriever_mode=retriever_mode, refs_mode=refs_mode,
-            )
-            results.append(r)
-            emit("physician_done", physician=physician, physician_name=info["name"],
-                 syndrome=r["s3"].syndrome, herbs=r["s3"].herbs)
+        _run_physicians_into(
+            results, s1, s2, use_react=use_react, followup=followup, ask_fn=ask_fn,
+            bypass=bypass, on_step=on_step, retriever_mode=retriever_mode,
+            refs_mode=refs_mode, emit=emit,
+        )
     except SafetyVeto as veto:
         # ReAct 追问问出了危重症状：跟初始主诉命中同一道否决，已经跑完的医家结果
         # 也不返回——被拦截的请求不产出任何方药。

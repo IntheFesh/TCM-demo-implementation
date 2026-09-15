@@ -55,6 +55,10 @@ DEFAULT_COMPLAINT = "胃脘胀痛，食后加重，嗳气泛酸，每因情志�
 # 假跑的结果里，写成无意义的 "x" 会让人分不清"这是假数据"还是"模型真答了这个"。
 FAKE_TEXT = "基准测试假数据"
 
+# 自动装合成医案时每位医家给几条。3 条够让检索返回 top-3、S3 有东西可引，
+# 再多只是拖慢构造，对耗时没有影响（检索在这条路径上是毫秒级的内存计算）。
+AUTO_FAKE_CASES_PER_PHYSICIAN = 3
+
 
 # ---------- 从 pydantic schema 造一个最小合法实例 ----------
 
@@ -332,6 +336,33 @@ class StepTimer:
 # ---------- 主流程 ----------
 
 
+def invalid_reason(result: dict | None) -> str | None:
+    """这次 consult 的结果能不能当性能基准用。不能就返回一句话说明为什么。
+
+    **存在的理由**：`consult()` 把"检索不可用"放进返回值的 `retrieval_error` 而不是
+    抛异常（那是它对的设计——HTTP 调用方要拿到一句人话，不是 500），于是 `run_once`
+    的 try/except 什么都接不住：三位医家一个都没跑，基准照样打印「1/1 次跑成功」。
+    一份 `ok: true` 的报告会被直接引用，比崩掉危险得多。
+
+    三种"跑了但不能用"：检索不可用、被安全否决、信息不足——它们都不产生 S3，而 S3
+    正是这个基准要量的那一段。
+    """
+    if result is None:
+        return "consult() 没有返回结果"
+    if result.get("retrieval_error"):
+        return f"检索不可用，三位医家都没跑：{result['retrieval_error']}"
+    if result.get("rejected"):
+        return f"被安全否决，不产生方药，不能当性能基准：{result.get('reject_reason')}"
+    if result.get("insufficient"):
+        return f"信息不足，没跑到 S3：{result.get('insufficient_reason')}"
+    from core.physicians import PHYSICIANS
+
+    got = len(result.get("results") or [])
+    if got != len(PHYSICIANS):
+        return f"只有 {got}/{len(PHYSICIANS)} 位医家跑出了结果"
+    return None
+
+
 def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
              backend) -> dict:
     from core.chain import consult
@@ -351,6 +382,8 @@ def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
     finally:
         recorder.restore()
     elapsed = time.perf_counter() - t0
+    if error is None:
+        error = invalid_reason(result)
     manifest = (result or {}).get("manifest") or {}
     return {
         "ok": error is None,
@@ -409,6 +442,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--retriever-mode", default=None)
     ap.add_argument("--fake-cases", type=int, default=0, metavar="N",
                     help="没有 cases.json 时给每位医家造 N 条合成医案，好让 S3 真的跑起来")
+    ap.add_argument("--no-auto-fake-cases", dest="auto_fake_cases", action="store_false",
+                    help="关掉「假后端 + 没有 cases.json 时自动装合成医案」这个默认行为")
+    ap.set_defaults(auto_fake_cases=True)
     ap.add_argument("--out", default=None, help="默认 eval/bench/<时间戳>.json")
     args = ap.parse_args(argv)
 
@@ -417,7 +453,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     backend = build_backend(args.backend, args.fake_latency)
-    n_fake_cases = install_fake_cases(args.fake_cases) if args.fake_cases > 0 else 0
+    # 假后端 + 仓库里没有 cases.json = 沙盒里的常态。这时自动装合成医案，比让人拿到
+    # 一份"只跑了 S1/S2 却标着成功"的报告好——但**必须在输出里标出来**（fake_cases_auto），
+    # 不然这份报告跟真语料跑出来的长得一模一样。
+    from core.retrieval import CASES_PATH
+
+    auto = (args.fake_cases == 0 and args.auto_fake_cases
+            and args.backend == "fake" and not CASES_PATH.exists())
+    n_per_physician = args.fake_cases or (AUTO_FAKE_CASES_PER_PHYSICIAN if auto else 0)
+    n_fake_cases = install_fake_cases(n_per_physician) if n_per_physician > 0 else 0
     runs = [run_once(args.complaint, args.react, args.retriever_mode, backend)
             for _ in range(args.repeat)]
     report = {
@@ -431,6 +475,7 @@ def main(argv: list[str] | None = None) -> int:
             "backend_arg": args.backend,
             "fake_latency_s": args.fake_latency,
             "fake_cases": n_fake_cases,
+            "fake_cases_auto": auto,
         },
         "backend": {
             "id": backend.backend_id(),

@@ -105,7 +105,14 @@ gate() {   # $1 = 段号, $2 = 这一步要人确认什么
 }
 
 seg_0() {
-  python -m pytest tests/ -q || return 1
+  # **全量测试分两段跑。** 无卡模式 2GB 上一次跑完实测 34% 被 OOM 杀掉（退出码 137，
+  # 只留一个 `Killed`，看不出是哪条测试）。根因是一批用例会把 400MB 的
+  # sentence-transformers 模型真加载进来。现在默认全部走假编码器，只有标了
+  # `@pytest.mark.real_embedding` 的才真加载——把那几条单独放一段跑，中间 sleep 20
+  # 让上一段的进程真正退干净、内存被回收。
+  python -m pytest tests/ -q -m "not real_embedding" || return 1
+  sleep 20
+  python -m pytest tests/ -q -m real_embedding || return 1
   ruff check . || return 1
   python -m scripts.collect_results --check || return 1
   echo "--- 环境变量（期望：没有上次调试留下的残留）---"

@@ -23,7 +23,7 @@ import re
 from typing import Callable
 
 from core.followup import fast_mode_enabled
-from core.llm import LLMError, get_llm, load_prompt, render
+from core.llm import LLMError, get_llm, load_prompt, render, thinking_for
 from core.physicians import resolve_physician_id
 from core.schemas import ReActStep, ReActStepRecord, ReActTrace
 from core.tools import TOOLS, run_tool, tools_manifest
@@ -208,7 +208,11 @@ def run_react(
             return
         r = records[-1]
         on_step("react_step", {
-            "physician_name": name, "step": r.step, "action": r.action,
+            # physician（id）跟 physician_name（中文名）都带上：并发之后前端按 id 路由
+            # 到对应的列（docs/DESIGN.md §4.7 订正），中文名只用来显示。只给中文名的话
+            # 路由就得在前端做一次名字→id 的反查——那正是第 31 条禁止的第二处实现。
+            "physician": physician_id, "physician_name": name,
+            "step": r.step, "action": r.action,
             "thought": (r.thought or "")[:80], "note": r.note,
         })
 
@@ -227,8 +231,11 @@ def run_react(
             # physician_id 传下去是给本地后端选 LoRA adapter 用的（阶段五每位
             # 医家一个）：ReAct 的每一步也是这位医家在推理，不是通用步骤。
             # 云端后端如实忽略这个参数，见 core/llm.py::LLMBackend._complete。
+            # 关思考：ReAct 的每一步是"选哪个工具、填什么参数"这种结构化决策，
+            # 步数上限本来就把探索空间压得很小，思考带来的增益远不抵它的耗时。
             out: ReActStep = get_llm().generate(
                 system=system, user="", schema=ReActStep, physician=physician_id,
+                **thinking_for("react"),
             )
             llm_calls += 1
         except LLMError as e:

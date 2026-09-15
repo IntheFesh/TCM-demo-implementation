@@ -1,5 +1,6 @@
 """core/chain.py 的离线测试：用假 LLM 后端和假检索器，不需要网络。"""
 import json
+import threading
 from core import chain
 from core.retrieval import Retriever
 from core.schemas import (
@@ -762,15 +763,30 @@ class ReActFakeLLM(FakeLLM):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.s3_systems: list[str] = []
-        self._react_step = 0
+        # **每位医家一个步数计数器，不是一个全局的。** R12 三位医家改成并发之后
+        # 一个全局计数器会被两个线程交替加：叶天士第二次进来可能看到的是吴鞠通加过
+        # 的奇数，于是又查一次图谱、跑出 3 步，而吴鞠通只跑 1 步。这是**假后端**
+        # 在建模"一次只有一位医家"——真后端每次调用是无状态的，不存在这个问题。
+        # 按 system 里出现的医家名分桶，跟 FakeLLM 分发 S3 用的是同一个判据。
+        self._react_step: dict[str, int] = {}
+        self._react_lock = threading.Lock()
+
+    def _react_bucket(self, system: str) -> str:
+        for physician_name in self.s3_by_physician:
+            if physician_name in system:
+                return physician_name
+        return "<未知医家>"
 
     def generate(self, system, user, schema, temperature=0.0, **kwargs):
         from core.schemas import ReActStep
 
         if schema is ReActStep:
             self.calls.append("ReActStep")
-            self._react_step += 1
-            if self._react_step % 2 == 1:
+            bucket = self._react_bucket(system)
+            with self._react_lock:
+                self._react_step[bucket] = self._react_step.get(bucket, 0) + 1
+                step = self._react_step[bucket]
+            if step % 2 == 1:
                 return ReActStep(thought="先看看证素对应哪些证候",
                                  action="query_graph", action_input={"node": "纳呆"})
             return ReActStep(thought="够了", action="finish")
@@ -809,7 +825,10 @@ def test_react_receives_physician_id_not_only_chinese_name(monkeypatch):
 
     monkeypatch.setattr(chain, "run_react", spy)
     chain.consult("纳差乏力", use_react=True)
-    assert seen == [("叶天士", "ye_tianshi"), ("吴鞠通", "wu_jutong")]
+    # **R12 起比集合不比列表**：三位医家改成并发之后，谁先进 run_react 是不确定的。
+    # 这条钉的是"每位医家都拿到了自己的 id、而且是 id 不是中文名"，跟顺序无关——
+    # 原来写成列表只是因为那时是串行的，不是因为顺序是契约。
+    assert sorted(seen) == sorted([("叶天士", "ye_tianshi"), ("吴鞠通", "wu_jutong")])
 
 
 def test_react_off_by_default_leaves_s3_prompt_untouched(monkeypatch):

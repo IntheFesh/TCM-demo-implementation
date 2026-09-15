@@ -54,6 +54,83 @@ def _ensure_graph_json(tmp_path_factory):
     mp.undo()
 
 
+class _DeterministicEncoder:
+    """8 维、按字符码点算出来的假句向量。确定性、零依赖、不联网、不占内存。
+
+    **不是为了测检索质量**（那需要真模型，标 `@pytest.mark.real_embedding`），
+    是为了让绝大多数测试**根本不加载 400MB 的模型**：无卡模式 2GB 上实测全量测试
+    有 34% 被 OOM 杀掉（退出码 137，只留一个 `Killed`，看不出是哪条测试）。
+    真正需要真模型的用例自己标记，其余一律走这个。
+    """
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def encode(self, texts, **_kwargs):
+        import numpy as np
+
+        if isinstance(texts, str):
+            texts = [texts]
+        rows = []
+        for text in texts:
+            vec = np.array([sum(ord(c) for c in text[i::8]) % 97 + 1 for i in range(8)],
+                           dtype="float32")
+            rows.append(vec / np.linalg.norm(vec))
+        return np.array(rows, dtype="float32")
+
+
+@pytest.fixture(autouse=True)
+def _fake_embedding_model(request, monkeypatch):
+    """默认把 `sentence_transformers.SentenceTransformer` 换成假编码器。
+
+    标了 `@pytest.mark.real_embedding` 的用例跳过这层替换，用真模型。判据写在
+    marker 上而不是"文件名里有 embedding 就用真的"：哪些用例真的需要真模型是用例
+    自己知道的事，从外面猜必然猜错。
+
+    自己装 fake sentence_transformers 的用例（tests/test_concurrency_init.py）不受
+    影响：它们的 monkeypatch 在用例体里执行，排在这条 autouse 之后，后写的赢。
+    """
+    if request.node.get_closest_marker("real_embedding"):
+        return
+    import sys
+    import types
+
+    module = sys.modules.get("sentence_transformers")
+    if module is None:
+        try:
+            import sentence_transformers as module  # noqa: PLC0415
+        except ImportError:
+            # 这台机器压根没装：塞一个桩，好让 `from sentence_transformers import ...`
+            # 能过——不这么做的话"没装这个库"会把一批本来跟它无关的测试一起拖红。
+            module = types.ModuleType("sentence_transformers")
+            monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+    monkeypatch.setattr(module, "SentenceTransformer", _DeterministicEncoder, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _disable_embedding_cache():
+    """**整个测试会话关掉语料向量的磁盘缓存。**
+
+    两个理由，第二个是加缓存当天就踩到的：
+    ① 测试不该往仓库的 `data/cache/` 里写东西；
+    ② 上一条测试写的缓存会让下一条测试**跳过编码**，于是
+       `tests/test_concurrency_init.py` 那几条专门测"编码进行中并发读取"的用例
+       永远等不到 encode 被调用，直接超时红掉。
+
+    要测缓存本身的用例（tests/test_embedding_cache.py）自己用 monkeypatch 把
+    `EMBEDDING_CACHE_DIR` 指到 tmp_path 再打开，不依赖这里的默认值。
+    """
+    import os
+
+    before = os.environ.get("EMBEDDING_CACHE")
+    os.environ["EMBEDDING_CACHE"] = "0"
+    yield
+    if before is None:
+        os.environ.pop("EMBEDDING_CACHE", None)
+    else:
+        os.environ["EMBEDDING_CACHE"] = before
+
+
 @pytest.fixture(autouse=True)
 def _isolate_runtime_env(monkeypatch):
     # EVAL_MODE 会让安全否决不中止、RETRIEVER_MODE 会改检索默认路——都是

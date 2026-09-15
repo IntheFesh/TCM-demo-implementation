@@ -47,6 +47,33 @@ def test_on_step_absent_does_not_change_anything(monkeypatch):
     chain.consult("纳差乏力")  # 不传 on_step，不抛异常即通过
 
 
+def _prefix_and_per_physician(events):
+    """把事件流拆成「全局前缀」和「每位医家各自的子序列」。
+
+    **R12 起必须这么断言，这是有意的契约变更**：三位医家改成并发之后，
+    `physician_start` / `react_step` / `s3_start` / `physician_done` 在时间线上会
+    交错（叶天士的 done 完全可能排在吴鞠通的 start 后面），一条写死的全局顺序在
+    并发下**必然**不稳定——写这条辅助函数之前实测过：同一条测试连跑几次，有时
+    碰巧跟串行顺序一样、有时不一样，这种"有时绿"比一直红更糟。
+
+    它原来钉的其实是两件事，两件都没变，所以判据拆成两条：
+    ① 全局前缀（S1 → S2 → 追问）仍然有序、仍然排在所有医家事件之前；
+    ② 每位医家自己的子序列仍然是 start →（react_step…）→ s3_start → done。
+    （docs/DESIGN.md §4.7 的订正写的就是这条：前端必须按 `physician` 字段路由，
+    不许假设顺序。）
+    """
+    names = [e[0] for e in events]
+    physician_events = {"physician_start", "react_step", "s3_start", "physician_done"}
+    first = next(i for i, n in enumerate(names) if n in physician_events)
+    per_physician: dict[str, list[str]] = {}
+    for name, data in events[first:]:
+        assert name in physician_events, f"医家事件之间混进了 {name}"
+        pid = data.get("physician")
+        assert pid, f"{name} 事件没带 physician 字段——并发之后前端没法路由"
+        per_physician.setdefault(pid, []).append(name)
+    return names[:first], per_physician
+
+
 def test_on_step_emits_expected_sequence_without_react(monkeypatch):
     """不开 ReAct、没有提问渠道（ask_fn=None）时的最简路径：s1 -> s2 -> 追问结束
     （no_answer，0 轮）-> 两位医家各 physician_start -> s3_start -> physician_done。
@@ -56,12 +83,11 @@ def test_on_step_emits_expected_sequence_without_react(monkeypatch):
     events = []
     outcome = chain.consult("纳差乏力", on_step=lambda name, data: events.append((name, data)))
 
-    names = [e[0] for e in events]
-    assert names == [
-        "s1_done", "s2_done", "followup_done",
-        "physician_start", "s3_start", "physician_done",
-        "physician_start", "s3_start", "physician_done",
-    ]
+    prefix, per_physician = _prefix_and_per_physician(events)
+    assert prefix == ["s1_done", "s2_done", "followup_done"]
+    assert set(per_physician) == {"ye_tianshi", "wu_jutong"}
+    for pid, seq in per_physician.items():
+        assert seq == ["physician_start", "s3_start", "physician_done"], (pid, seq)
 
     s1_data = events[0][1]
     assert s1_data["symptoms"] == outcome["s1"].symptoms
@@ -70,10 +96,14 @@ def test_on_step_emits_expected_sequence_without_react(monkeypatch):
     assert followup_data["stopped_by"] == "no_answer"  # 没传 ask_fn
     assert followup_data["rounds"] == 0
 
+    # 并发之后谁先发 start 是不确定的，能钉的是"两位都发了、各发一次"。
+    # **结果的顺序仍是注册表顺序**（下面 outcome["results"] 那条）——"结果有序"
+    # 是契约（前端三列按它排），"事件有序"并发之后不再成立，两件事。
     phys_starts = [e[1]["physician"] for e in events if e[0] == "physician_start"]
     phys_dones = [e[1]["physician"] for e in events if e[0] == "physician_done"]
-    assert phys_starts == ["ye_tianshi", "wu_jutong"]
-    assert phys_dones == ["ye_tianshi", "wu_jutong"]
+    assert sorted(phys_starts) == ["wu_jutong", "ye_tianshi"]
+    assert sorted(phys_dones) == ["wu_jutong", "ye_tianshi"]
+    assert [r["physician"] for r in outcome["results"]] == ["ye_tianshi", "wu_jutong"]
     # physician_done 带的证型/用药要跟 outcome["results"] 里真实的一致，
     # 不能是"发了个事件"但内容对不上
     ye_done = next(e[1] for e in events if e[0] == "physician_done" and e[1]["physician"] == "ye_tianshi")
@@ -98,17 +128,21 @@ def test_on_step_react_step_events_are_interleaved_between_start_and_s3(monkeypa
     chain.consult("纳差乏力", use_react=True,
                   on_step=lambda name, data: events.append((name, data)))
 
-    names = [e[0] for e in events]
-    # ReActFakeLLM 每位医家跑 2 步（查一次 + finish），两位医家各自应该是
-    # physician_start, react_step, react_step, s3_start, physician_done
-    assert names == [
-        "s1_done", "s2_done", "followup_done",
-        "physician_start", "react_step", "react_step", "s3_start", "physician_done",
-        "physician_start", "react_step", "react_step", "s3_start", "physician_done",
-    ]
-    react_events = [e[1] for e in events if e[0] == "react_step"]
-    assert [r["physician_name"] for r in react_events] == ["叶天士", "叶天士", "吴鞠通", "吴鞠通"]
-    assert [r["step"] for r in react_events] == [1, 2, 1, 2]
+    prefix, per_physician = _prefix_and_per_physician(events)
+    assert prefix == ["s1_done", "s2_done", "followup_done"]
+    # ReActFakeLLM 每位医家跑 2 步（查一次 + finish）。**这一条是这个测试的核心**：
+    # 并发只让医家之间交错，医家**内部**"先取证、再开方"的顺序一点没变。
+    for pid, seq in per_physician.items():
+        assert seq == ["physician_start", "react_step", "react_step",
+                       "s3_start", "physician_done"], (pid, seq)
+    steps: dict[str, list[int]] = {}
+    names_seen: dict[str, str] = {}
+    for name, data in events:
+        if name == "react_step":
+            steps.setdefault(data["physician"], []).append(data["step"])
+            names_seen[data["physician"]] = data["physician_name"]
+    assert steps == {"ye_tianshi": [1, 2], "wu_jutong": [1, 2]}
+    assert names_seen == {"ye_tianshi": "叶天士", "wu_jutong": "吴鞠通"}
 
 
 def test_on_step_reports_residual_when_triggered(monkeypatch):
@@ -183,16 +217,19 @@ def test_on_step_emits_full_sequence_when_one_physician_has_empty_retrieval(monk
     events = []
     outcome = chain.consult("纳差乏力", on_step=lambda name, data: events.append((name, data)))
 
-    names = [e[0] for e in events]
-    assert names == [
-        "s1_done", "s2_done", "followup_done",
-        "physician_start", "s3_start", "physician_done",
-        "physician_start", "s3_start", "physician_done",
-    ]
+    prefix, per_physician = _prefix_and_per_physician(events)
+    assert prefix == ["s1_done", "s2_done", "followup_done"]
+    assert set(per_physician) == {"ye_tianshi", "wu_jutong"}
+    for pid, seq in per_physician.items():
+        assert seq == ["physician_start", "s3_start", "physician_done"], (pid, seq)
+    # 并发之后谁先发 start 是不确定的，能钉的是"两位都发了、各发一次"。
+    # **结果的顺序仍是注册表顺序**（下面 outcome["results"] 那条）——"结果有序"
+    # 是契约（前端三列按它排），"事件有序"并发之后不再成立，两件事。
     phys_starts = [e[1]["physician"] for e in events if e[0] == "physician_start"]
     phys_dones = [e[1]["physician"] for e in events if e[0] == "physician_done"]
-    assert phys_starts == ["ye_tianshi", "wu_jutong"]
-    assert phys_dones == ["ye_tianshi", "wu_jutong"]
+    assert sorted(phys_starts) == ["wu_jutong", "ye_tianshi"]
+    assert sorted(phys_dones) == ["wu_jutong", "ye_tianshi"]
+    assert [r["physician"] for r in outcome["results"]] == ["ye_tianshi", "wu_jutong"]
 
     # 确认吴鞠通那一支确实走的是检索为空这条路径，不是碰巧凑对了序列——
     # 序列完整不能靠巧合证明，要靠"真的触发了这条路径"来证明

@@ -10,6 +10,7 @@
 就失去意义。consult 只负责把这个错误翻译成人话（retrieval_error），
 不负责把它变成"换个模式跑完当作成功"。
 """
+import contextvars
 import threading
 
 import pytest
@@ -156,6 +157,15 @@ def test_concurrent_consults_do_not_leak_modes(monkeypatch):
 
     用 barrier 强制两个线程真的在同一时刻都停在 search() 里——不这么做的话
     两次调用很可能一前一后串行发生，就算实现真的在写全局状态也测不出来。
+
+    **R12 起归属方式换了，这是有意的契约变更**：原来按 `threading.current_thread().name`
+    把一次 search 归到哪个 consult，那成立的前提是"consult 全程跑在调用它的那根线程上"。
+    三位医家改成并发之后检索发生在 `physician_*` 工作线程里，按线程名归属会直接
+    `KeyError: 'T-bm25'`。改用一个 ContextVar 标记 consult 的身份——**这同时把
+    ContextVar 有没有传进 worker 也一起钉住了**：`_run_physicians_into` 若忘了
+    `copy_context().run`，worker 里读到的就是默认值 `None`，这条会红。
+    （`use_llm()` 的 BYOK 覆盖走的正是同一个机制，静默失效的后果是访问者的 key
+    没被用上、额度照扣。）
     """
     from core.physicians import PHYSICIANS as REG
 
@@ -169,11 +179,18 @@ def test_concurrent_consults_do_not_leak_modes(monkeypatch):
     seen_lock = threading.Lock()
     cases = _fake_cases()
 
+    consult_tag: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+        "consult_tag", default=None)
+
     class BarrierRetriever(Retriever):
         def search(self, query, physician, k=3, min_score=0.0, **kwargs):
             mode = kwargs.get("mode")
+            tag = consult_tag.get()
+            assert tag is not None, (
+                "ContextVar 没有传进医家工作线程——use_llm() 的逐请求覆盖（BYOK、"
+                "降级到回放）走的是同一个机制，这里读不到就等于那些也全都静默失效了")
             with seen_lock:
-                seen.setdefault(threading.current_thread().name, []).append(mode)
+                seen.setdefault(tag, []).append(mode)
             if physician == "ye_tianshi":
                 # 第一位医家的检索处等两边都到齐，制造真正的同时在飞状态
                 barrier.wait()
@@ -185,6 +202,7 @@ def test_concurrent_consults_do_not_leak_modes(monkeypatch):
 
     def run(mode: str):
         try:
+            consult_tag.set(f"T-{mode}")
             chain.consult("纳差乏力", retriever_mode=mode)
         except BaseException as e:  # noqa: BLE001 - 线程里的异常不会自动冒泡，收上来在主线程断言
             errors.append(e)
