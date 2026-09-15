@@ -1023,6 +1023,13 @@ def _compute_triage(results: list[dict]) -> dict | None:
         return None
     chosen = max(candidates, key=lambda d: urgency_rank.get(d.triage_urgency, -1))
     return {
+        # R15：病名要下发。§3.5 的患者形态第一行就是「可能属于 <病名>」，
+        # 而这个名字是 get_disease() 核实过、在 M4 参考表里的那个——前端
+        # 从 results[].s3.disease 自己取会拿到模型原样吐出来的字符串，
+        # 那个字符串可能根本不在表里（_compute_triage 正是靠这一点决定
+        # 返回 None 的）。一个没核实过的病名摆在患者看的第一行上，
+        # 比不摆更危险。
+        "disease": chosen.name,
         "dept": chosen.triage_dept,
         "urgency": chosen.triage_urgency,
         "red_flags": list(chosen.red_flags),

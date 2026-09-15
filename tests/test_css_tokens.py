@@ -210,10 +210,15 @@ def test_no_animation_outside_the_three_tokens(css, body):
     R14 抓到的就是这一处：证据侧栏的滑入写死 `.22s`，值恰好等于 --t-highlight
     但语义是"展开/折叠"，两边都说得通——这正是为什么要用令牌而不是数值。
     """
-    durations = re.findall(r"transition[^;{]*?:\s*[^;{]*?(\d*\.?\d+m?s)", body)
+    durations = re.findall(r"(?:transition|animation)[^;{]*?:\s*[^;{]*?(\d*\.?\d+m?s)", body)
     hard = [d for d in durations if not d.startswith(".001")]
     assert not hard, f"规则里写死了动效时长（应当用 --t-* 令牌）：{sorted(set(hard))}"
-    assert "@keyframes" not in css, "§2.4 之外不许再加 keyframes 动画"
+    # **至多一个 @keyframes。** §2.4 的三处动效里只有"处方校验滑入"需要位移
+    # （另外两处是 opacity/color 过渡，transition 就够）。第二个 keyframes
+    # 意味着有人加了第四种动效——那正是这条断言要拦的。
+    assert css.count("@keyframes") <= 1, (
+        f"§2.4 只允许三处动效，其中只有一处需要 keyframes，现在有 "
+        f"{css.count('@keyframes')} 个")
 
 
 def test_reduced_motion_is_respected(css):

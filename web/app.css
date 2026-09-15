@@ -297,6 +297,44 @@
   .rx-scale span { font-family: var(--font-num); }
   .rx-verdict { font-size: 12px; color: var(--ink-2); margin-top: var(--s2); }
 
+  /* ---- 患者模式的独立形态（§3.5） ----
+     整页一块，不是三列的裁剪版。红旗症状在首屏、不折叠——折叠起来的急救
+     信息等于没有。 */
+  #patient-view .pv-inner {
+    max-width: 680px;
+    margin: 0 auto var(--s6);
+    padding: var(--s6);
+    border: 1px solid var(--rule-soft);
+    border-radius: var(--r-lg);
+    background: var(--surface);
+  }
+  #patient-view .pv-lead { font-size: 13px; color: var(--muted); margin-bottom: var(--s4); }
+  #patient-view .pv-row { display: flex; gap: var(--s4); align-items: baseline; margin-bottom: var(--s3); }
+  #patient-view .pv-label { font-size: 13px; color: var(--muted); flex: 0 0 4.5em; }
+  #patient-view .pv-value { font-family: var(--font-classic); font-size: 28px; color: var(--ink); }
+  #patient-view .pv-rule { border: none; border-top: 1px solid var(--rule-soft); margin: var(--s5) 0; }
+  /* 朱砂色标题（§3.5）。红旗列表本身用 --ink：整块染红会把"哪几条"淹掉，
+     而要看的正是那几条。 */
+  #patient-view .pv-flags-title {
+    color: var(--danger);
+    font-weight: 600;
+    font-size: 15px;
+    margin-bottom: var(--s3);
+  }
+  #patient-view .pv-flags { margin: 0; padding-left: 1.2em; font-size: 15px; line-height: 2; color: var(--ink); }
+  #patient-view .pv-gated {
+    background: var(--danger-bg);
+    border-left: 3px solid var(--danger);
+    color: var(--danger);
+    padding: var(--s3) var(--s4);
+    border-radius: var(--r-md);
+    font-size: 13.5px;
+  }
+  #patient-view .pv-care { font-size: 13.5px; color: var(--ink-2); }
+  #patient-view .pv-care-empty, #patient-view .pv-none { color: var(--muted); }
+  #patient-view .pv-none { font-size: 14px; line-height: 1.8; margin: var(--s4) 0; }
+  #patient-view .pv-note { font-size: 12.5px; color: var(--muted); margin-top: var(--s5); line-height: 1.7; }
+
   /* ---- 安全拦截：整页替换（§3.1） ---- */
   #safety-block {
     padding: 8vh var(--s5);
@@ -630,7 +668,28 @@
     border-radius: var(--r-md);
     margin: 8px 0;
     font-weight: 600;
+    /* §3.3 交互序列第 5 步：加甘草 + 海藻，配伍禁忌红条**从上方滑入 160ms**。
+       §2.4 允许的三处动效之三（处方校验滑入 --t-warn）。为什么要动效：这条
+       红条是在医生打字的**过程中**出现的（400ms 防抖后自动校验），没有位移
+       的话它凭空出现在表格下方，医生的视线还在表格里，很容易完全错过。 */
+    animation: rx-warn-slide var(--t-warn) ease-out;
   }
+  /* 唯一一处 keyframes。§2.4 允许三处动效，这是"处方校验滑入"那一处。 */
+  @keyframes rx-warn-slide {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: none; }
+  }
+  .safety-thermal { animation: rx-warn-slide var(--t-warn) ease-out; }
+  .rx-safety-idle { font-size: 12px; color: var(--muted); margin: 4px 0; }
+  /* 「未发现问题」走语义色 --verified（有出处可核），不另起一个绿。 */
+  .rx-safety-ok { font-size: 12px; color: var(--verified); margin: 4px 0; }
+  .rx-reject-title { color: var(--caution); font-weight: 600; }
+  .rx-reject-item { font-size: 12.5px; margin-top: 2px; }
+  .rx-section-title { margin-top: 8px; }
+  .rx-formula-fields .rx-doses { width: 50px; }
+  .rx-formula-fields .rx-usage { width: 220px; }
+  .rx-audit-id { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .ev-phys { font-weight: 600; margin-bottom: 6px; }
   /* 「参西用药」是医家特征展示，不是警告——刻意用青蓝，跟 .hallucination-warning
      的红、.safety-thermal 的橙分开，避免读成"这里有问题"。 */
   .western-drugs {
@@ -1091,6 +1150,7 @@
   .triage-card,          /* 患者模式的病名与就诊科室 */
   #complaint,            /* 主诉输入：它是"正文"（§3.1） */
   #complaint-body,       /* 主诉正文（§3.1 最上面那一段 28px） */
+  #patient-view .pv-value,  /* 患者形态的病名与科室（§3.5 的 28px 宋体） */
   .herb-jun {
     font-family: var(--font-classic);
   }

@@ -343,8 +343,13 @@ function buildStylesheet() {
     // 层叠顺序，医家配色规则在下面的循环里还会追加），这样 .gt-faded 的
     // opacity 会盖过医家配色规则设的任何值——同一条"选中/拦截红框必须盖过
     // 医家色"的道理（见下面 node[?selected] 的注释），淡化同样必须盖过颜色。
-    { selector: "node.gt-faded", style: { opacity: 0.15 } },
-    { selector: "edge.gt-faded", style: { opacity: 0.06 } },
+    // R15：淡化到 **0.25**（总纲 §3.4 写死的值），不是 0.15/0.06。
+    // 0.15 太狠——被淡掉的节点几乎看不见，"高亮一条路径"就变成了"只剩一条
+    // 路径"，而学生要看的恰恰是"这条路径在整张图里的位置"。两个数字统一成
+    // 一个 FADED_OPACITY：节点和边淡成不同的程度没有任何理由，只会让边先
+    // 消失、节点还在，图看起来像断了。
+    { selector: "node.gt-faded", style: { opacity: FADED_OPACITY } },
+    { selector: "edge.gt-faded", style: { opacity: FADED_OPACITY } },
   ];
   for (const [phys, color] of Object.entries(PHYSICIAN_COLORS)) {
     style.push({
@@ -515,6 +520,14 @@ function hideTooltip(tooltipId = "graph-tooltip") {
 // "症状牵动的下一个推理结论"，而且层3方剂本身是 compound 父节点，视觉上已经
 // 把它的药材整体框在一起了，框被高亮时药材跟着看得见，不需要再单独判它在不在
 // 路径上——四步链路的字面意思到"方剂"为止（对齐任务描述原文），不是五步。
+// 总纲 §3.4：点症状三跳高亮到方剂层，**其余 0.25 透明度、220ms**。
+// 两个数字都只定义一处：cytoscape 的样式表和 CSS 是两套系统，同一个视觉
+// 约定在两边各写一遍，改一边另一边不会报错、只会看起来不一样。
+const FADED_OPACITY = 0.25;
+// 220ms 跟 CSS 的 --t-highlight 是同一个约定。cytoscape 读不到 CSS 变量，
+// 所以这里只能是个数字——但它必须跟令牌同值，有一条测试钉住这件事。
+const HIGHLIGHT_MS = 220;
+
 function computeHighlightPath(nodes, edges, startId) {
   const highlighted = new Set([startId]);
   let frontier = new Set([startId]);
@@ -543,9 +556,17 @@ let highlightedSymptomId = null;
 
 function applyPathHighlight(nodeIds, edgeIds) {
   if (!cy) return;
-  cy.nodes().forEach((n) => n.toggleClass("gt-faded", !nodeIds.has(n.id())));
+  // 淡化要有过渡（§2.4 允许的三处动效之一：路径高亮 220ms）。瞬间切换的话
+  // "哪些被淡掉了"这件事没有任何视觉线索，整张图像是换了一张。
+  cy.nodes().forEach((n) => {
+    n.style("transition-property", "opacity");
+    n.style("transition-duration", `${HIGHLIGHT_MS}ms`);
+    n.toggleClass("gt-faded", !nodeIds.has(n.id()));
+  });
   cy.edges().forEach((e) => {
     const key = `${e.data("source")}::${e.data("target")}`;
+    e.style("transition-property", "opacity");
+    e.style("transition-duration", `${HIGHLIGHT_MS}ms`);
     e.toggleClass("gt-faded", !edgeIds.has(key));
   });
 }

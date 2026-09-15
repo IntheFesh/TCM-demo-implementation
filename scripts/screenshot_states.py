@@ -41,6 +41,15 @@ VIEWPORT = {"width": 1440, "height": 900}
 
 COMPLAINT = "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。"
 
+# 每种状态属于哪一轮。截图文件名带轮次前缀是为了"这张图是哪一轮的验收物"
+# 一眼可查——R14 的五种状态和 R15 的三种角色形态在同一个目录里。
+PREFIX = {
+    "first": "r14", "running": "r14", "insufficient": "r14",
+    "followup": "r14", "blocked": "r14", "done": "r14",
+    "patient": "r15", "patient_high": "r15", "doctor_conflict": "r15",
+    "student_highlight": "r15",
+}
+
 
 def _herb(name, role, dose):
     return {"name": name, "role": role, "dose": dose, "dose_unit": "g",
@@ -102,6 +111,76 @@ DIVERGENCE = {
 }
 
 GRAPH = {"nodes": [], "edges": [], "dropped_edges": 0}
+
+# 学生模式的三跳高亮要一张真有层次的图：症状 → 证素 → 证型 → 方剂。
+# 节点少但层齐——高亮判据看的是"淡化了几个"，不是"图有多大"。
+STUDENT_GRAPH = {
+    "nodes": [
+        {"data": {"id": "sym::胃脘胀痛", "label": "胃脘胀痛", "layer": 0}},
+        {"data": {"id": "sym::口苦", "label": "口苦", "layer": 0}},
+        {"data": {"id": "el::肝郁", "label": "肝郁", "layer": 1}},
+        {"data": {"id": "el::湿热", "label": "湿热", "layer": 1}},
+        {"data": {"id": "syn::ye_tianshi", "label": "肝胃不和证", "layer": 2,
+                  "phys": "ye_tianshi"}},
+        {"data": {"id": "syn::wu_jutong", "label": "肝胆湿热证", "layer": 2,
+                  "phys": "wu_jutong"}},
+        {"data": {"id": "formula::ye_tianshi::柴胡疏肝散", "label": "柴胡疏肝散",
+                  "layer": 3, "phys": "ye_tianshi", "source": "classic"}},
+        {"data": {"id": "formula::wu_jutong::龙胆泻肝汤", "label": "龙胆泻肝汤",
+                  "layer": 3, "phys": "wu_jutong", "source": "classic"}},
+    ],
+    "edges": [
+        {"data": {"source": "sym::胃脘胀痛", "target": "el::肝郁"}},
+        {"data": {"source": "sym::口苦", "target": "el::湿热"}},
+        {"data": {"source": "el::肝郁", "target": "syn::ye_tianshi"}},
+        {"data": {"source": "el::湿热", "target": "syn::wu_jutong"}},
+        {"data": {"source": "syn::ye_tianshi", "target": "formula::ye_tianshi::柴胡疏肝散"}},
+        {"data": {"source": "syn::wu_jutong", "target": "formula::wu_jutong::龙胆泻肝汤"}},
+    ],
+    "dropped_edges": 0,
+}
+
+# 患者模式：后端在 role=patient 时摘掉 divergence、摘掉 s3 的方剂/药材字段、
+# refs 清空，另外下发 triage / food_therapy / patent_medicines。这里照那个形状造。
+PATIENT_PAYLOAD = {
+    "results": [{"physician": r["physician"], "physician_name": r["physician_name"],
+                 "s3": {"syndrome": r["s3"]["syndrome"],
+                        "treatment_principle": r["s3"]["treatment_principle"],
+                        "reasoning": r["s3"]["reasoning"], "cited_case_ids": [],
+                        "note": None, "selected": 0},
+                 "refs": [], "hallucinated": [], "safety_output": {"flagged": False}}
+                for r in RESULTS],
+    "graph": {"nodes": [n for n in STUDENT_GRAPH["nodes"] if n["data"]["layer"] <= 2],
+              "edges": [e for e in STUDENT_GRAPH["edges"]
+                        if not e["data"]["target"].startswith("formula::")],
+              "dropped_edges": 0},
+    "rejected": False, "reject_reason": None, "retrieval_error": None,
+    "insufficient": False, "insufficient_reason": None, "safety_flag": None,
+    "followup": None, "residual": None, "demo_mode": None, "manifest": None,
+    "triage": {"disease": "胃痛", "dept": "消化内科", "urgency": "medium",
+               "red_flags": ["疼痛剧烈持续不缓解", "痛引肩背或颈部",
+                             "伴冷汗、面色苍白", "呕血或解黑便"],
+               "advice": "胃痛类症状，建议就诊消化内科，建议近期就诊"},
+    "food_therapy": [], "patent_medicines": [],
+}
+
+# 紧急度高：食疗与中成药一律不给（闸门在服务端 _apply_medication_gate）。
+PATIENT_HIGH_PAYLOAD = {
+    **PATIENT_PAYLOAD,
+    "triage": {**PATIENT_PAYLOAD["triage"], "disease": "胸痹", "dept": "心血管内科",
+               "urgency": "high",
+               "advice": "胸痹类症状需要提高警惕，建议就诊心血管内科，建议尽快就诊"},
+}
+
+# 医生模式：甘草 + 海藻 = 十八反，后端校验回这个形状。
+DOCTOR_SAFETY = {
+    "incompatible": [["甘草", "海藻"]],
+    "dose_violations": [],
+    "thermal_warning": None,
+    "decoction_missing": [],
+    "toxic_herbs": ["半夏"],
+    "blocking": True,
+}
 
 DONE_PAYLOAD = {
     "results": RESULTS, "divergence": DIVERGENCE, "graph": GRAPH,
@@ -180,6 +259,102 @@ STATES = {
           return null;
         }""",
     ),
+    # ---- R15：三种角色形态 ----
+    "patient": (
+        "document.getElementById('role-select').value = 'patient';"
+        " renderComplaintBody(COMPLAINT); renderConsultResult(PATIENT_PAYLOAD);",
+        """() => {
+          const pv = document.getElementById('patient-view');
+          if (pv.hidden) return '患者形态没显示';
+          if (document.querySelectorAll('#columns .col').length !== 0)
+            return '患者模式还摆着三列——那是裁剪版，不是独立形态';
+          const flags = pv.querySelectorAll('.pv-flags li');
+          if (flags.length !== 4) return '红旗症状不是 4 条，是 ' + flags.length;
+          // 红旗必须在首屏、不折叠：既不许藏在 <details> 里，也不许被推到
+          // 首屏之外（900px 视口）。
+          if (pv.querySelector('.pv-flags-title').closest('details'))
+            return '红旗被折叠了';
+          const y = flags[flags.length - 1].getBoundingClientRect().bottom;
+          if (y > 900) return '最后一条红旗掉到首屏外了（' + Math.round(y) + 'px）';
+          const html = pv.innerHTML;
+          for (const bad of ['柴胡', '黄连', '赭石', '柴胡疏肝散']) {
+            if (html.includes(bad)) return '患者形态里出现了药名/方名 ' + bad;
+          }
+          if (!html.includes('消化内科') || !html.includes('胃痛'))
+            return '病名或科室没显示';
+          // 患者形态里不该再顶一个紧凑版导诊框——那是"三列裁剪版 + 导诊面板"
+          // 的老形状（总纲 §1 的 F5）。
+          if (document.getElementById('triage-box').classList.contains('show'))
+            return '患者模式还顶着一个导诊框，又变回裁剪版了';
+          return null;
+        }""",
+    ),
+    "patient_high": (
+        "document.getElementById('role-select').value = 'patient';"
+        " renderComplaintBody('胸闷胸痛，冷汗'); renderConsultResult(PATIENT_HIGH_PAYLOAD);",
+        """() => {
+          const pv = document.getElementById('patient-view');
+          if (!pv.querySelector('.pv-gated')) return 'high 没有走"不给用药建议"那条';
+          if (pv.querySelector('.pv-care')) return 'high 还显示了食疗/中成药栏';
+          return null;
+        }""",
+    ),
+    "doctor_conflict": (
+        "document.getElementById('role-select').value = 'doctor';"
+        " updateDoctorFieldsVisibility();"
+        " renderComplaintBody(COMPLAINT); renderConsultResult(DONE_PAYLOAD);"
+        " DOCTOR_STATE.ye_tianshi.herb_items.push({name:'海藻',dose:9,dose_unit:'g',"
+        "   processing:null,decoction:null,role:'佐',function_in_formula:null});"
+        " DOCTOR_STATE.ye_tianshi.safety = DOCTOR_SAFETY;"
+        " renderDoctorTable('ye_tianshi'); renderDoctorSafety('ye_tianshi');"
+        " DOCTOR_STATE.ye_tianshi.exportError = {message:'该方存在拦截级安全问题，拒绝导出。',"
+        "   problems:['配伍禁忌：甘草 反/畏 海藻']};"
+        " renderDoctorExportPanel('ye_tianshi');",
+        """() => {
+          const col = document.querySelector('.col[data-physician="ye_tianshi"]');
+          if (!col.querySelector('.doctor-disclaimer')) return '免责条没出现';
+          const warn = col.querySelector('.safety-incompatible');
+          if (!warn || !warn.textContent.includes('海藻')) return '配伍红条没出现';
+          if (!col.querySelector('.safety-thermal')) return '毒性药材条没出现';
+          const btn = col.querySelector('[data-rx-export]');
+          if (!btn) return '导出按钮不见了';
+          // §3.3：**导出被拒绝时不要禁用按钮**——禁用按钮不告诉人为什么。
+          if (btn.disabled) return '导出被拒时按钮被禁用了';
+          const box = col.querySelector('.rx-override-box');
+          if (!box) return '拒绝原因框没出现';
+          if (!box.querySelector('textarea')) return '没有"坚持导出的理由"输入框';
+          return null;
+        }""",
+    ),
+    "student_highlight": (
+        "document.getElementById('role-select').value = 'student';"
+        " renderComplaintBody(COMPLAINT);"
+        " renderConsultResult({...DONE_PAYLOAD, graph: STUDENT_GRAPH});",
+        """async () => {
+          await new Promise(r => setTimeout(r, 1200));
+          if (!cy) return '画布没建起来';
+          handleSymptomClick('sym::胃脘胀痛');
+          await new Promise(r => setTimeout(r, 400));
+          const faded = cy.nodes('.gt-faded').map(n => n.id());
+          const lit = cy.nodes().not('.gt-faded').map(n => n.id());
+          // 三跳：症状 → 证素 → 证型 → 方剂。起点那条链全亮，另一条链全淡。
+          for (const id of ['sym::胃脘胀痛', 'el::肝郁', 'syn::ye_tianshi',
+                            'formula::ye_tianshi::柴胡疏肝散']) {
+            if (!lit.includes(id)) return id + ' 应该亮着，实际被淡化了';
+          }
+          for (const id of ['sym::口苦', 'el::湿热', 'syn::wu_jutong',
+                            'formula::wu_jutong::龙胆泻肝汤']) {
+            if (!faded.includes(id)) return id + ' 应该被淡化，实际亮着';
+          }
+          const op = cy.$('#' + CSS.escape('sym::口苦')).style('opacity');
+          if (Math.abs(parseFloat(op) - 0.25) > 0.001)
+            return '淡化透明度不是 0.25，是 ' + op;
+          // §3.4 第三条：学生模式推理过程默认展开
+          const open = document.querySelector('.col-reasoning[open]');
+          if (!open) return '学生模式推理过程没有默认展开';
+          return null;
+        }""",
+    ),
     # 第六张：终态。不在 §3.1 的五种状态表里（那张表列的是"非终态怎么办"），
     # 但三列集注 + 用药对照带这两个 R14 的主要交付物只有在这张图上看得见。
     "done": (
@@ -234,12 +409,20 @@ def run(only: str | None, wait_ms: int) -> int:
                 errors: list[str] = []
                 page.on("pageerror", lambda e: errors.append(str(e)))
                 page.goto(f"http://127.0.0.1:{port}/app/index.html", wait_until="networkidle")
-                page.evaluate(f"window.DONE_PAYLOAD = {json.dumps(DONE_PAYLOAD, ensure_ascii=False)};"
-                              f"window.COMPLAINT = {json.dumps(COMPLAINT, ensure_ascii=False)};")
+                # 把这一批构造好的响应体注进页面的全局作用域，setup 脚本直接引用。
+                for var, value in (("DONE_PAYLOAD", DONE_PAYLOAD),
+                                   ("PATIENT_PAYLOAD", PATIENT_PAYLOAD),
+                                   ("PATIENT_HIGH_PAYLOAD", PATIENT_HIGH_PAYLOAD),
+                                   ("STUDENT_GRAPH", STUDENT_GRAPH),
+                                   ("DOCTOR_SAFETY", DOCTOR_SAFETY),
+                                   ("COMPLAINT", COMPLAINT)):
+                    page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
                 page.evaluate(setup)
                 page.wait_for_timeout(wait_ms)
-                out = OUT_DIR / f"r14_{name}.png"
+                out = OUT_DIR / f"{PREFIX[name]}_{name}.png"
                 page.screenshot(path=str(out), full_page=True)
+                # 判据可能是 async（学生模式要等动画跑完）。page.evaluate 会
+                # 自动 await 返回的 Promise，两种写法都能用同一行接。
                 verdict = page.evaluate(f"({check})()")
                 if verdict:
                     failures.append(f"{name}：{verdict}")

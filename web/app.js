@@ -301,7 +301,7 @@ function evidenceSectionHtml(s) {
   }
 
   return `<div class="ev-sec">
-    <div style="font-weight:600;color:${escapeHtml(s.color || "#333")};margin-bottom:6px;">${escapeHtml(s.physician_name)}</div>
+    <div class="ev-phys" style="color: ${escapeHtml(s.color || "var(--ink)")};">${escapeHtml(s.physician_name)}</div>
     ${rows.join("")}
   </div>`;
 }
@@ -552,6 +552,16 @@ function renderTriage(data) {
   if (!box) return;
   // triage 这个键只在 patient/doctor 角色下存在。researcher/student 拿不到，
   // 这时整个面板不出现——不是显示一个空框。
+  //
+  // R15：**患者模式不走这个面板**。§3.5 的整页形态里病名/科室/红旗已经是主角，
+  // 再在上面顶一个紧凑版导诊框，就又变回"三列的裁剪版 + 一个导诊面板"
+  // ——那正是总纲 §1 点名的 F5。医生模式仍然用它：医生要的是一眼扫过的
+  // 紧急度提示，不是占半屏的大字。
+  if (getSelectedRole() === "patient") {
+    box.innerHTML = "";
+    box.classList.remove("show");
+    return;
+  }
   if (!data || !("triage" in data)) {
     box.innerHTML = "";
     box.classList.remove("show");
@@ -800,7 +810,7 @@ function rxSafetyHtml(safety, error) {
   if (error) {
     return `<div class="safety-incompatible">⚠ 安全校验没能完成（${escapeHtml(error)}）：这不等于"没问题"，请重试或检查服务端。</div>`;
   }
-  if (!safety) return `<div style="font-size:12px;color:var(--muted);margin:4px 0;">尚未校验</div>`;
+  if (!safety) return `<div class="rx-safety-idle">尚未校验</div>`;
   const blocks = [];
   if (safety.incompatible && safety.incompatible.length) {
     blocks.push(`<div class="safety-incompatible">⚠ 配伍禁忌：${safety.incompatible.map((p) => `${escapeHtml(p[0])} 反/畏 ${escapeHtml(p[1])}`).join("；")}</div>`);
@@ -817,7 +827,10 @@ function rxSafetyHtml(safety, error) {
   if (safety.toxic_herbs && safety.toxic_herbs.length) {
     blocks.push(`<div class="safety-thermal">含毒性药材：${escapeHtml(safety.toxic_herbs.join("、"))}</div>`);
   }
-  if (!blocks.length) blocks.push(`<div style="font-size:12px;color:#2f7d4f;margin:4px 0;">✓ 未发现问题</div>`);
+  // 「未发现问题」是**语义色 --verified**（有出处可核），不是另起一个绿。
+  // R15 之前这里写死 #2f7d4f——一个只在这一处出现的绿，没人回答得了它跟
+  // 别处的绿是不是同一件事（总纲 §7 第 7 条：色只承担语义）。
+  if (!blocks.length) blocks.push(`<div class="rx-safety-ok">✓ 未发现问题</div>`);
   return blocks.join("");
 }
 
@@ -832,10 +845,10 @@ function doctorSectionHtml(physician, mode) {
   // 实现」，这次撞的是文案而不是逻辑，但道理一样），这里改成调用它。
   return `
     <div class="doctor-disclaimer">${escapeHtml(describeDisclaimer("doctor"))}</div>
-    <div class="label" style="margin-top:8px;">医生编辑处方——${escapeHtml(state.name)}</div>
+    <div class="label rx-section-title">医生编辑处方——${escapeHtml(state.name)}</div>
     <div class="rx-formula-fields">
-      <label>剂数　<input type="number" data-rx-phys="${physician}" data-rx-field="doses_count" value="${state.doses_count != null ? state.doses_count : ""}" style="width:50px" /></label>
-      <label>用法　<input type="text" data-rx-phys="${physician}" data-rx-field="usage" value="${escapeHtml(state.usage || "")}" style="width:220px" /></label>
+      <label>剂数　<input type="number" class="rx-doses" data-rx-phys="${physician}" data-rx-field="doses_count" value="${state.doses_count != null ? state.doses_count : ""}" /></label>
+      <label>用法　<input type="text" class="rx-usage" data-rx-phys="${physician}" data-rx-field="usage" value="${escapeHtml(state.usage || "")}" /></label>
     </div>
     <div class="rx-table-wrap">
     <table class="rx-table">
@@ -903,36 +916,41 @@ async function runValidate(physician) {
   renderDoctorSafety(physician);
 }
 
-function renderDoctorExportPanel(physician) {
-  const el = document.getElementById(`rx-export-panel-${physician}`);
-  const state = DOCTOR_STATE[physician];
-  if (!el || !state) return;
-
+// 拼 HTML 和写 DOM 拆开：这一段是九步序列里最后两步（拒绝 → 填理由 → 成功），
+// 而它原来只有"写进 DOM"这一种形态，测试没法看到它拼出了什么
+// （`DOM_STUB` 是个 Proxy，写进去的 innerHTML 读不回来）。
+// 拆成纯函数之后跟本文件其余部分（columnHtml / rxSafetyHtml / rxCompareHtml）
+// 一个形状，测试直接对返回值断言。
+function doctorExportPanelHtml(state, physician) {
+  if (!state) return "";
   if (state.exportResult) {
-    el.innerHTML = `<div class="rx-pharmacy-text">${escapeHtml(state.exportResult.text)}</div>
-      <div style="font-size:11px;color:var(--muted);margin-top:4px;">审计编号：${escapeHtml(state.exportResult.audit_id)}</div>`;
-    return;
+    return `<div class="rx-pharmacy-text">${escapeHtml(state.exportResult.text)}</div>
+      <div class="rx-audit-id">审计编号：${escapeHtml(state.exportResult.audit_id)}</div>`;
   }
   if (state.exportError) {
     const message = state.exportError.message || "该方存在拦截级安全问题，拒绝导出。";
     const problems = state.exportError.problems || null;
     if (problems) {
-      // safety.blocking 为真：给出问题清单 + override_reason 输入框，
-      // 医生填了非空理由才能"坚持导出"——这条理由会进审计日志，是"明知
-      // 有问题仍坚持"唯一的书面记录，所以这里的文案要说清楚这一点，
-      // 不能只是一个不起眼的确认框。
-      el.innerHTML = `<div class="rx-override-box">
-        <div style="color:#8a4b12;font-weight:600;">⚠ ${escapeHtml(message)}</div>
-        ${problems.map((p) => `<div style="font-size:12.5px;margin-top:2px;">· ${escapeHtml(p)}</div>`).join("")}
+      // safety.blocking 为真：给出问题清单 + override_reason 输入框，医生填了
+      // 非空理由才能"坚持导出"——这条理由会进审计日志，是"明知有问题仍坚持"
+      // 唯一的书面记录，所以文案要说清楚这一点，不能只是一个不起眼的确认框。
+      return `<div class="rx-override-box">
+        <div class="rx-reject-title">⚠ ${escapeHtml(message)}</div>
+        ${problems.map((x) => `<div class="rx-reject-item">· ${escapeHtml(x)}</div>`).join("")}
         <textarea id="rx-override-input-${physician}" placeholder="填写坚持导出的理由（必填，将原样记入审计日志，医师对该理由负责）"></textarea>
         <button type="button" class="rx-export-btn" data-rx-confirm-export="${physician}">坚持导出</button>
       </div>`;
-    } else {
-      el.innerHTML = `<div class="rx-override-box"><div style="color:#8a4b12;">⚠ ${escapeHtml(message)}</div></div>`;
     }
-    return;
+    return `<div class="rx-override-box"><div class="rx-reject-title">⚠ ${escapeHtml(message)}</div></div>`;
   }
-  el.innerHTML = "";
+  return "";
+}
+
+function renderDoctorExportPanel(physician) {
+  const el = document.getElementById(`rx-export-panel-${physician}`);
+  const state = DOCTOR_STATE[physician];
+  if (!el || !state) return;
+  el.innerHTML = doctorExportPanelHtml(state, physician);
 }
 
 async function runExport(physician) {
@@ -1063,9 +1081,30 @@ function updateDoctorFieldsVisibility() {
   if (row) row.classList.toggle("is-hidden", getSelectedRole() !== "doctor");
 }
 
+// R15 第四条：**角色切换不刷新页面、不重新问诊，但已有结果要按新角色重新
+// 请求后端。**
+//
+// 为什么不能前端切换显示：patient 的字段裁剪是一条安全边界
+// （api/main.py::_filter_s3_for_role + to_graph(role="patient") 整段跳过方剂/
+// 药材层）。researcher 那份响应体里带着全部药名，切到 patient 只是"前端不画"
+// ——一次「检查元素」就能把它们全看回来，这个角色的意义就没了。
+//
+// 为什么不是"什么都不做、等用户自己重新点辨证"：那是 R15 之前的行为，
+// DEMO.md 第 4 点为此专门写了一句"切下拉不会就地生效，必须重新提交"——
+// 一个需要靠文档解释的交互就是设计没做完。
+//
+// 代价说清楚：重新请求 = 重新走一次完整推理 = 真实 LLM 调用。**没有偷偷花钱**
+// ——切换后页面立刻进 running 状态、进度条走起来、取消按钮出现，跟手动点
+// 「辨证」看到的完全一样。replay 模式下这一次是命中 fixture、零调用。
+let LAST_COMPLAINT = "";
+
 document.getElementById("role-select").addEventListener("change", () => {
   updateDisclaimer();
   updateDoctorFieldsVisibility();
+  // 还没问过、或正在跑：没有"已有结果"可重取，什么都不做。
+  if (!LAST_COMPLAINT || currentAbort) return;
+  document.getElementById("complaint").value = LAST_COMPLAINT;
+  submitConsult();
 });
 updateDisclaimer();
 updateDoctorFieldsVisibility();
@@ -1098,6 +1137,7 @@ function showSafetyBlock(reason) {
   const page = document.getElementById("consult-page");
   const block = document.getElementById("safety-block");
   clearColumns();
+  hidePatientView();
   document.getElementById("rx-compare").innerHTML = "";
   if (typeof renderGraph === "function") renderGraph(null);
   block.innerHTML = safetyBlockHtml(reason);
@@ -1349,6 +1389,75 @@ function setColumnStep(physician, step) {
   renderColumnsPlaceholder((pid) => columnRunningHtml(pid, COLUMN_PROGRESS[pid] || "s1"));
 }
 
+// ============================================================================
+// R15：患者模式的独立形态（docs/DESIGN.md §3.5）
+// ============================================================================
+//
+// **整个界面形态不同，不是三列的裁剪版。** 患者要的是"我该去哪个科、什么情况
+// 必须马上走"，不是三位古代医家的辨证异同——把三列裁一裁给他看，等于让他自己
+// 从一堆他读不懂的东西里找那两句有用的。
+//
+// 三条硬规矩：
+//   一、**红旗症状必须在首屏、不能折叠**。折叠起来的急救信息等于没有。
+//   二、`triage_urgency = high` 时不显示任何食疗与中成药建议。这条闸门在服务端
+//       （`_apply_medication_gate`），这里只是不去暗示它本该有内容。
+//   三、病名取 `triage.disease`（get_disease 核实过的那个），**不取
+//       `results[].s3.disease`**——后者是模型原样吐出来的字符串，可能根本不在
+//       参考表里。一个没核实过的病名摆在患者看的第一行上，比不摆更危险。
+
+function patientRowHtml(label, value) {
+  return `<div class="pv-row"><span class="pv-label">${escapeHtml(label)}</span>`
+    + `<span class="pv-value">${escapeHtml(value)}</span></div>`;
+}
+
+function patientViewHtml(data) {
+  const t = (data && data.triage) || null;
+  if (!t) {
+    // 没有导诊依据时如实说，不编一个科室出来。这跟后端 _compute_triage
+    // 返回 None 的理由是同一条：宁可说"不知道"，不给一个猜的科室。
+    return `<div class="pv-inner">
+      <div class="pv-lead">根据你描述的症状</div>
+      <div class="pv-none">系统没能把这些症状对应到参考病名表里的任何一条，所以这里不给科室建议——不是没有问题，是这套系统这次判断不了。症状持续或加重请直接就医。</div>
+      <div class="pv-note">这不是诊断。中医辨证需要面诊，这里只帮你判断该看哪个科。</div>
+    </div>`;
+  }
+  const flags = t.red_flags || [];
+  const flagList = flags.length
+    ? `<div class="pv-flags-title">出现以下情况请立即就医：</div>
+       <ul class="pv-flags">${flags.map((f) => `<li>${escapeHtml(f)}</li>`).join("")}</ul>`
+    : "";
+  const gated = t.urgency === "high";
+  const food = (data.food_therapy || []).length;
+  const otc = (data.patent_medicines || []).length;
+  const care = gated
+    ? `<div class="pv-gated">这类症状紧急度高，按安全规则这里不提供任何用药或食疗建议，请尽快就医。</div>`
+    : (food || otc)
+      ? `<div class="pv-care">可参考的调养：食疗 ${food} 条、中成药 ${otc} 条</div>`
+      : `<div class="pv-care pv-care-empty">食疗与中成药数据尚未接入，此处暂无内容——不是"没有可用的"，是这一块还没做。</div>`;
+  return `<div class="pv-inner urgency-${escapeHtml(t.urgency || "low")}">
+    <div class="pv-lead">根据你描述的症状</div>
+    ${patientRowHtml("可能属于", t.disease || "（未能对应到参考病名）")}
+    ${patientRowHtml("建议就诊", t.dept || "具体科室建议现场分诊")}
+    <hr class="pv-rule" />
+    ${flagList}
+    <hr class="pv-rule" />
+    ${care}
+    <div class="pv-note">这不是诊断。中医辨证需要面诊，这里只帮你判断该看哪个科。</div>
+  </div>`;
+}
+
+function renderPatientView(data) {
+  const el = document.getElementById("patient-view");
+  if (!el) return;
+  el.innerHTML = patientViewHtml(data);
+  el.hidden = false;
+}
+
+function hidePatientView() {
+  const el = document.getElementById("patient-view");
+  if (el) { el.hidden = true; el.innerHTML = ""; }
+}
+
 // ---------- R14：一列集注 ----------
 //
 // **不是卡片。** 三家是对同一段主诉的三种读法（docs/DESIGN.md §3.1 第一条），
@@ -1571,6 +1680,7 @@ function buildConsultRequestBody(complaint) {
 
 function renderConsultResult(data) {
   resetSecondaryPanels();
+  hidePatientView();
   if (data.rejected) {
     // 安全拦截：**整页替换**（§3.1）。不是在三列上面加个红横幅——总纲的原话是
     // "什么都标红会训练用户忽略标红"，这个系统只在真危重时打断，所以打断必须
@@ -1651,7 +1761,17 @@ function renderConsultResult(data) {
   // （医生编辑的是自己的一份拷贝，不直接改问诊响应）。
   initDoctorState(data.results);
   setConsultState("done");
-  renderColumns(data.results, getSelectedRole());
+  // R15：患者模式是**另一种形态**，不是三列的裁剪版（§3.5）。两块互斥——
+  // 不是把三列渲染出来再用 CSS 藏起来：藏起来的东西仍然在 DOM 里，而 patient
+  // 的字段裁剪是一条安全边界（api/main.py::_filter_s3_for_role），
+  // 前端再把裁剪过的空壳摆出来只会让人以为"这次没开出方"。
+  if (getSelectedRole() === "patient") {
+    document.getElementById("columns").innerHTML = "";
+    renderPatientView(data);
+  } else {
+    hidePatientView();
+    renderColumns(data.results, getSelectedRole());
+  }
   renderFollowup(data.followup);
   renderGraph(data.graph);
 }
@@ -1866,6 +1986,8 @@ async function submitConsult() {
   // R14：主诉从"输入框里的字"升格成页面正文（§3.1 布局图最上面那一段），
   // 输入区同时从居中放大收到底部。整页替换的拦截页如果还开着，先收起来。
   hideSafetyBlock();
+  hidePatientView();
+  LAST_COMPLAINT = complaint;
   renderComplaintBody(complaint);
   setConsultState("running");
   resetColumnProgress();
