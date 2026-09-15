@@ -31,12 +31,15 @@ cd "$(dirname "$0")/.."
 YUAN_PER_CALL=0.0055
 
 # 段号|名称|预估调用数|人工卡点|一句话
+# 「预估调用数」那一格可以写 `auto:<文件>`：跑的时候由 scripts/onsite_plan.py 从那份
+# 文件现读（段 4 = eval/epsilon.json 三段 llm_calls 之和）。段 4 原来写死 215，ε 重跑
+# 成 212 之后剧本、说明文字、测试断言三处同时过期——现读就不会再有这种过期。
 SEGMENTS=(
   "0|环境自检|0|no|零成本：pytest / ruff / 环境变量残留 / 数据文件齐不齐"
   "1|零调用的验证|0|no|凭据核对 / 本地语料规范化 / 切块验证（要人看原文）/ SDT 失分分析"
   "2|本地模型|2|no|起 vLLM + verify_local_backend（要先装 vllm、下基座）"
   "3|R1 前提：role 填充率|60|YES|**不过就停**——填充率不够，分层 ε 三个数没有意义"
-  "4|R1 验收：噪声地板 ε|212|no|实测 212 次调用（eval/epsilon.json 三段 llm_calls：online 145 + s2 37 + extract 30）"
+  "4|R1 验收：噪声地板 ε|auto:eval/epsilon.json|no|预估调用数**现读** eval/epsilon.json（三段 llm_calls 之和）——ε 一重跑这个数就变，不写死"
   "5|药理层抽取|2181|YES|六源预过滤后 2151 块（R8 实测，verify_pharmacology_chunks 合计行）+ 6×5 试抽；先 --limit-blocks 5 人工核质量，再全量 --crosscheck"
   "6|录制回放|278|no|record_fixtures（--dry-run 实测 278）+ verify_replay"
   "7|全套评测重跑|1200|no|最贵，放最后：run_eval 四项 + SDT Test（会写台账）"
@@ -57,12 +60,22 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# 段表里「预估调用数」那一格 → 一个整数。`auto:<文件>` 交给 scripts/onsite_plan.py
+# 现读（bash 和 tests/test_run_onsite.py 调的是同一个 resolve_calls，不各数一遍）。
+resolve_calls() {
+  case "$1" in
+    auto:*) python3 -m scripts.onsite_plan --calls "$1" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 print_plan() {
   local total=0
   echo "段  名称                     预估调用  人工卡点  说明"
   echo "--------------------------------------------------------------------------"
   for row in "${SEGMENTS[@]}"; do
     IFS='|' read -r n name calls gate note <<< "$row"
+    calls=$(resolve_calls "$calls")
     total=$((total + calls))
     printf "%-3s %-24s %8s  %-8s  %s\n" "$n" "$name" "$calls" "$gate" "$note"
   done
@@ -100,6 +113,32 @@ seg_0() {
   for f in cases.json data/graph.json data/element_index.json data/case_triples.jsonl; do
     [ -e "$f" ] && echo "  ✓ $f" || echo "  ✗ $f 缺失（后面依赖它的段会失败）"
   done
+  echo "--- LLM_MODEL 服务端还认不认（**不是 LLM 调用**，查 /models 清单，零成本）---"
+  # R10 的教训：deepseek-chat 已下线，拿它发请求得到的是 **HTTP 200 + 空响应体**，
+  # 不是 404。症状是"每次调用空串 → 校验失败 → 重试三次 → LLMError"，一整段的钱
+  # 白花，而错误信息里看不出根因在模型名上。这里在花第一分钱之前就把它挡掉。
+  python3 - <<'PY' || return 1
+import json, os, urllib.request
+base = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
+want = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+req = urllib.request.Request(
+    f"{base}/models",
+    headers={"Authorization": f"Bearer {os.environ.get('LLM_API_KEY', '')}"})
+try:
+    names = [m["id"] for m in json.load(urllib.request.urlopen(req, timeout=15))["data"]]
+except Exception as e:  # noqa: BLE001
+    # 查不到不算失败：没网/没 key/本地后端都会走到这里，而这一段是"零成本自检"，
+    # 不该因为查不到一个清单就把后面几段拦住。
+    print(f"  ⚠ 查不到模型清单（{e}）——跳过这一项。本地后端或没配 key 时正常")
+    raise SystemExit(0)
+if want in names:
+    print(f"  ✓ LLM_MODEL={want} 在服务端清单里（清单：{names}）")
+    raise SystemExit(0)
+print(f"  ✗ LLM_MODEL={want} **不在**服务端清单里：{names}")
+print("    后面每一次调用都会返回 HTTP 200 + 空响应体（deepseek-chat 下线时就是这个"
+      "表现），整段的钱白花。改 .env 的 LLM_MODEL 再跑。")
+raise SystemExit(1)
+PY
 }
 
 seg_1() {

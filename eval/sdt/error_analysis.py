@@ -81,7 +81,8 @@ def selection_stats(rows: list[dict]) -> dict:
         # **单个选项的边际代价**：一个错选值多少分 vs 一个漏选值多少分。
         # 总量会被次数带偏（错选 30 个、漏选 3 个，总量当然错选大），这两个数
         # 才直接回答 prompt 该不该说"宁可不选"——如果一个漏选比一个错选更贵，
-        # 现在 prompt 里那句「拿不准的宁可不选」就是反着的。
+        # 那就该让模型"拿不准的也选上"（R10 起 prompt 已经是这个方向；R10 之前
+        # 写的是「拿不准的宁可不选」，实测证明那是反的）。
         per_task[task]["cost_per_wrong_pick"] = (
             per_task[task]["recoverable_from_dropping_wrong"] / per_task[task]["n_wrong_picks"]
             if per_task[task]["n_wrong_picks"] else None
@@ -351,8 +352,10 @@ def print_report(analysis: dict) -> None:
           f"　一个漏选 {'不适用（没有漏选）' if per_missed is None else f'{per_missed:+.4f}'}"
           f"（{c['n_wrong_picks']} 个错选 / {c['n_missed_picks']} 个漏选）")
     if per_wrong is not None and per_missed is not None and per_missed > per_wrong:
-        print("  ⚠ **一个漏选比一个错选更贵** —— prompt 里现在那句「拿不准的宁可不选」"
-              "方向是反的，宁可不选反而在丢分。这条要跟上面的主因判据一起看："
+        print("  ⚠ **一个漏选比一个错选更贵** —— 选择策略应当偏向「拿不准的也选上」。"
+              "R10 起 prompts/v1/sdt_select.yaml 已经是这个方向（实测 14.11 vs 2.77 分）；"
+              "哪天有人把它改回「拿不准的宁可不选」，那句话方向是反的、在主动丢分。"
+              "这条要跟上面的主因判据一起看："
               "主因判据说的是总量该往哪边改，这一行说的是那句话本身对不对。")
     print(f"  判据：{v['reason']}")
     print("  （这两个数不是「作弊后能拿多少分」，是定位失分方向的边际量。"

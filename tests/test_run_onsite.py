@@ -16,20 +16,30 @@ SCRIPT = ROOT / "scripts" / "run_onsite.sh"
 DOC = ROOT / "docs" / "onsite_troubleshooting.md"
 
 
-def _segments() -> list[tuple[str, str, int, str, str]]:
-    """从脚本的 SEGMENTS 数组解析出段表。**测试读的就是脚本里那一份**，
-    不在测试里另抄一份——抄一份就会漂。"""
+def _segment_rows() -> list[tuple[str, str, str, str, str]]:
+    """从脚本的 SEGMENTS 数组解析出段表**原文**（「预估调用数」那一格不解析，
+    可能是 `auto:<文件>`）。**测试读的就是脚本里那一份**，不在测试里另抄一份
+    ——抄一份就会漂。"""
     text = SCRIPT.read_text(encoding="utf-8")
     block = re.search(r"SEGMENTS=\(\n(.*?)\n\)", text, re.S)
     assert block, "脚本里找不到 SEGMENTS 数组"
     rows = []
     for line in block.group(1).splitlines():
-        line = line.strip().strip('"')
-        if not line:
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        n, name, calls, gate, note = line.split("|")
-        rows.append((n, name, int(calls), gate, note))
+        n, name, calls, gate, note = line.strip('"').split("|")
+        rows.append((n, name, calls, gate, note))
     return rows
+
+
+def _segments() -> list[tuple[str, str, int, str, str]]:
+    """同上，但「预估调用数」解析成整数——解析走 `scripts/onsite_plan.resolve_calls`，
+    跟剧本里 `resolve_calls()` 调的是同一个实现，不在测试里另算一遍。"""
+    from scripts.onsite_plan import resolve_calls
+
+    return [(n, name, resolve_calls(calls), gate, note)
+            for n, name, calls, gate, note in _segment_rows()]
 
 
 def test_script_is_valid_bash():
@@ -129,16 +139,39 @@ def test_unknown_argument_fails_loudly():
     assert out.returncode == 2 and "未知参数" in out.stderr
 
 
-def test_epsilon_segment_estimate_comes_from_the_measured_run():
-    """段 4 的 215 次不是拍脑袋：`eval/epsilon.json` 里三段 llm_calls 之和。
-    哪天那份文件重跑了、数变了，这条会红——那时候要改的是剧本里的估算。"""
+def test_epsilon_segment_estimate_is_read_from_the_file_not_written_down():
+    """段 4 的预估调用数**不许写死**，必须是 `auto:eval/epsilon.json`。
+
+    **这是一次有意的契约变更**（R10），不是把断言改绿：原来这条断言「剧本里写的数
+    == epsilon.json 三段 llm_calls 之和」，两边都是数，文件一重跑（AutoDL 实测 212，
+    仓库里这份是 215）就红，而红的时候要改的是剧本里那个写死的数——换成 212 之后
+    下次重跑再红一次。所以判据从"两个数相等"改成"剧本那一格根本没有数"。
+
+    两条断言分别钉住：
+    1. 那一格是 `auto:eval/epsilon.json`——剧本里没有这个数字的副本；
+    2. 解析出来的值等于文件里三段 llm_calls 之和——现读的确实是这份文件、这几段，
+       不是碰巧给了个数（只有第 1 条的话，读法写错也发现不了）。
+    """
     import json
 
     d = json.loads((ROOT / "eval" / "epsilon.json").read_text(encoding="utf-8"))
     measured = sum((d.get(k) or {}).get("llm_calls") or 0
                    for k in ("epsilon_online", "epsilon_s2", "epsilon_extract"))
+    raw4 = [r for r in _segment_rows() if r[0] == "4"][0]
+    assert raw4[2] == "auto:eval/epsilon.json", f"段 4 的预估又被写死成 {raw4[2]}"
     seg4 = [r for r in _segments() if r[0] == "4"][0]
-    assert seg4[2] == measured, f"剧本写 {seg4[2]}，epsilon.json 实测 {measured}"
+    assert seg4[2] == measured, f"现读得到 {seg4[2]}，epsilon.json 三段之和 {measured}"
+
+
+def test_no_segment_estimate_duplicates_a_number_that_lives_in_a_file():
+    """说明文字里也不许再抄一遍那个现读的数——R10 之前段 4 的说明写「实测 215 次
+    调用」，跟段表那一格同时过期。判据：`auto:` 的那些段，说明里不出现它的当前值。"""
+    for n, name, calls, _gate, note in _segment_rows():
+        if not calls.startswith("auto:"):
+            continue
+        from scripts.onsite_plan import resolve_calls
+
+        assert str(resolve_calls(calls)) not in note, f"段 {n}（{name}）的说明里抄了这个数"
 
 
 def test_record_segment_estimate_matches_the_record_plan():
@@ -149,6 +182,25 @@ def test_record_segment_estimate_matches_the_record_plan():
     planned = sum(s.estimated_calls for s in rf.build_plan())
     seg6 = [r for r in _segments() if r[0] == "6"][0]
     assert seg6[2] == planned, f"剧本写 {seg6[2]}，录制清单是 {planned}"
+
+
+def test_segment_zero_checks_the_model_is_still_served():
+    """**段 0 要在花第一分钱之前挡掉"模型名已下线"。** R10 的实测：deepseek-chat
+    下线之后拿它发请求得到的是 HTTP 200 + 空响应体（不是 404），症状是每次调用空串
+    → 校验失败 → 重试三次 → LLMError，一整段的钱白花，而错误信息里看不出根因。
+
+    这条只解析脚本文本（真查清单要网络，`tests/` 不许联网）：段 0 里要有查 /models
+    的那段、要能区分"查不到"（跳过，不算失败）和"清单里没有它"（`SystemExit(1)`）。
+    三个分支的真实行为在沙盒里用一个本地假服务端跑过，见 SOURCES.md 第 51 条。
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    seg0 = text[text.index("seg_0() {"):text.index("seg_1() {")]
+    assert "/models" in seg0, "段 0 没有查模型清单"
+    assert "LLM_MODEL" in seg0 and "SystemExit(1)" in seg0
+    assert "跳过这一项" in seg0, "查不到清单必须跳过而不是拦住后面所有段"
+    # 零调用这件事要保住：查清单不是 LLM 调用，段 0 的预估仍然是 0
+    seg0_row = [r for r in _segments() if r[0] == "0"][0]
+    assert seg0_row[2] == 0
 
 
 # ---------- 失败预案 ----------
