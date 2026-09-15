@@ -13,8 +13,9 @@
 #      最后汇总，不在中途 `set -e` 掉整个脚本。
 #   2. **段序按「依赖 + 成本」排，依赖优先**：零调用的先跑（免费的先把能发现的问题
 #      发现掉）；段 5 药理层抽取（R8 实测后是最贵的一段）必须在段 6 录制、段 7 评测
-#      之前——core/tools.py 读它落盘的 data/materia_medica.jsonl；没有段依赖的
-#      全套评测放最后。
+#      之前——core/tools.py 读它落盘的 data/materia_medica.jsonl；全套评测（最贵）
+#      排在录制之后；段 8 性能基准放最末，因为它量的必须是"跑完前面所有段之后的
+#      这套系统"（开 ReAct 的那一次基准在段 5 之前跑出来的是"数据文件不存在"的耗时）。
 #   3. **两处人工卡点**（段 3 role 填充率、段 5 抽取质量）**必须停下来等人确认**。
 #      这两处一路冲到底的代价是：闸门没过就往下跑，后面几百次调用全部白花。
 #
@@ -42,7 +43,8 @@ SEGMENTS=(
   "4|R1 验收：噪声地板 ε|auto:eval/epsilon.json|no|预估调用数**现读** eval/epsilon.json（三段 llm_calls 之和）——ε 一重跑这个数就变，不写死"
   "5|药理层抽取|2181|YES|六源预过滤后 2151 块（R8 实测，verify_pharmacology_chunks 合计行）+ 6×5 试抽；先 --limit-blocks 5 人工核质量，再全量 --crosscheck"
   "6|录制回放|278|no|record_fixtures（--dry-run 实测 278）+ verify_replay"
-  "7|全套评测重跑|1200|no|最贵，放最后：run_eval 四项 + SDT Test（会写台账）"
+  "7|全套评测重跑|1200|no|最贵的一段：run_eval 四项 + SDT Test（会写台账）"
+  "8|性能基准|38|no|bench_startup 冷/热各一次（0 调用）+ bench_consult 不开 ReAct ×3、开 ReAct ×1"
 )
 
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -86,7 +88,8 @@ print_plan() {
   echo "来源是 README 里 record_fixtures 那条「约 272 次 ¥1.5」——量级估算，不是账单）"
   echo
   echo "段 0/1 零调用，先跑它们：免费的问题先发现掉。段 5 最贵，但段 6/7 要用它落盘的"
-  echo "药理层数据（core/tools.py 读 data/materia_medica.jsonl），所以它在两者之前；段 7 放最后。"
+  echo "药理层数据（core/tools.py 读 data/materia_medica.jsonl），所以它在两者之前。"
+  echo "段 7 是最贵的一段；段 8 性能基准排在最后，因为它量的必须是跑完前面所有段之后的这套系统。"
 }
 
 gate() {   # $1 = 段号, $2 = 这一步要人确认什么
@@ -220,6 +223,20 @@ seg_7() {
   fi
 }
 
+seg_8() {
+  # **放最后不是因为贵，是因为它量的必须是"跑完前面所有段之后的这套系统"**：
+  # core/tools.py 读段 5 落盘的 data/materia_medica.jsonl，开 ReAct 的那一次基准在
+  # 段 5 之前跑出来的是"工具返回数据文件不存在"的耗时，跟真实形态不是一回事。
+  echo "--- 启动耗时：冷（第一次进程） ---"
+  python -m scripts.bench_startup || return 1
+  echo "--- 启动耗时：热（第二次进程，R12 起应命中 embedding 磁盘缓存） ---"
+  python -m scripts.bench_startup || return 1
+  echo "--- 一次问诊，不开 ReAct ×3（预算 ≤ 90s，见 docs/DESIGN.md §9） ---"
+  python -m scripts.bench_consult --backend real --repeat 3 --no-react || return 1
+  echo "--- 一次问诊，开 ReAct ×1（预算 ≤ 240s） ---"
+  python -m scripts.bench_consult --backend real --repeat 1 --react
+}
+
 run_segment() {
   local n="$1" name="$2" gate_flag="$3"
   echo
@@ -247,6 +264,7 @@ run_segment() {
        fi ;;
     6) seg_6 || rc=$? ;;
     7) seg_7 || rc=$? ;;
+    8) seg_8 || rc=$? ;;
   esac
   echo "--------------------------------------------------------------------------"
   echo "[段 $n] $name    结束 $(date -Is)    退出码 $rc"

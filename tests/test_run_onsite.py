@@ -52,7 +52,7 @@ def test_segment_numbers_are_contiguous_and_unique():
 
 
 def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents():
-    """段序按「依赖 + 成本」排：零调用的先跑（免费的问题先发现掉），最贵的放最后
+    """段序按「依赖 + 成本」排：零调用的先跑（免费的问题先发现掉），最贵的排在后面
     ——**但依赖优先于成本**。R8 之前这里断言"最后一段是最贵的"，那时段 5 写的是
     拍的 500；R8 按真实数据算出段 5 是 2167（六源预过滤后 2137 块 + 试抽），比段 7
     的 1200 贵，而段 5 不能挪到最后：`core/tools.py` 读 data/materia_medica.jsonl，
@@ -67,10 +67,20 @@ def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents(
     i_record = next(i for i, n in enumerate(names) if "录制" in n)
     i_eval = next(i for i, n in enumerate(names) if "评测" in n)
     assert i_pharm < i_record < i_eval, "药理层抽取必须在录制和评测之前（core/tools.py 读它的产出）"
-    assert i_eval == len(rows) - 1, "全套评测必须是最后一段"
     calls = [r[2] for r in rows]
     # 不被依赖的段里（录制、评测），评测是最贵的那个
     assert calls[i_eval] > calls[i_record]
+    # **R11 起最后一段不再是全套评测，是性能基准**——这是有意的契约变更，不是把断言改绿。
+    # 原断言是 `i_eval == len(rows) - 1`（"全套评测必须是最后一段"），它当初钉的其实是
+    # "最贵的那一段放最后，前面的段挂了也不至于先把钱花光"。段 8 性能基准只有 38 次调用，
+    # 不违反那个本意；而它必须排在段 5 之后有硬依据：core/tools.py 读段 5 落盘的
+    # data/materia_medica.jsonl，开 ReAct 的那一次基准在段 5 之前量到的是"工具返回
+    # 数据文件不存在"的耗时，跟真实形态不是同一个系统。所以判据改成两条：
+    # 评测仍是最贵的一段，且性能基准在它之后。
+    i_bench = next(i for i, n in enumerate(names) if "性能基准" in n)
+    assert calls[i_eval] > calls[i_bench], "不被依赖的三段里，评测仍该是最贵的那个"
+    assert i_bench == len(rows) - 1, "性能基准必须是最后一段"
+    assert i_pharm < i_bench, "性能基准必须在药理层抽取之后（开 ReAct 那次要读它的产出）"
 
 
 def test_exactly_two_human_gates_and_they_are_segments_3_and_5():
