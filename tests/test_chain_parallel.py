@@ -17,7 +17,9 @@ from tests.test_chain import FakeLLM, FakeRetriever, _fake_cases
 @pytest.fixture(autouse=True)
 def _three_physicians(monkeypatch):
     """用真实注册表的全部医家跑，不裁剪——并发的收益和风险都随医家数变化。"""
-    from core.physicians import PHYSICIANS as REG
+    from core.physicians import physicians_enabled as _enabled
+
+    REG = _enabled()
 
     monkeypatch.setattr(chain, "PHYSICIANS", dict(REG))
 
@@ -28,7 +30,9 @@ def _s3(name: str) -> S3Syndrome:
 
 
 def _setup(monkeypatch, llm=None):
-    from core.physicians import PHYSICIANS as REG
+    from core.physicians import physicians_enabled as _enabled
+
+    REG = _enabled()
 
     fake = llm or FakeLLM({info["name"]: _s3(pid) for pid, info in REG.items()})
     monkeypatch.setattr(chain, "get_llm", lambda: fake)
@@ -97,7 +101,9 @@ def test_max_workers_follows_the_registry_size(monkeypatch):
         return real_pool(*args, **kwargs)
 
     monkeypatch.setattr(chain, "ThreadPoolExecutor", spy)
-    from core.physicians import PHYSICIANS as REG
+    from core.physicians import physicians_enabled as _enabled
+
+    REG = _enabled()
 
     four = dict(REG)
     four["li_ke"] = {"name": "李可", "book": "李可医案", "years": "1930-2013",
@@ -201,7 +207,9 @@ def test_context_vars_reach_the_worker_threads(monkeypatch):
     `copy_context().run` 的话，worker 里 `get_llm()` 拿到的是进程单例——访问者的
     key 没被用上、额度照扣，而且**一声不响**。"""
     import core.llm as llm_mod
-    from core.physicians import PHYSICIANS as REG
+    from core.physicians import physicians_enabled as _enabled
+
+    REG = _enabled()
 
     override = FakeLLM({info["name"]: _s3("来自覆盖后端") for info in REG.values()})
     singleton = FakeLLM({info["name"]: _s3("来自进程单例") for info in REG.values()})

@@ -27,7 +27,9 @@ from core.herbs import is_western_drug, strip_dose_and_parens
 from core.llm import ByokBackend, LLMAuthError, check_api_key, get_llm, use_llm
 from core.react import react_enabled
 from core import usage as usage_mod
-from core.physicians import PHYSICIANS, resolve_physician_id
+from core.physicians import (
+    PHYSICIANS, physicians_all, physicians_enabled, resolve_physician_id,
+)
 from core.prescription import compute_herb_diffs, format_pharmacy_text
 from core.safety_output import assess_formula_safety
 from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, S1Normalize
@@ -187,8 +189,11 @@ async def health() -> dict:
         "physicians": [
             {"id": pid, "name": info["name"], "years": info["years"],
              "school": info["school"], "color": info["color"],
-             "color_bg": info["color_bg"]}
-            for pid, info in PHYSICIANS.items()
+             "color_bg": info["color_bg"], "enabled": info.get("enabled", True)}
+            # **全部**医家，带 enabled 标记：三列只摆 enabled 的，而「参考医家」
+            # 引用区要摆 enabled=False 的——前端两处各取所需，但只拉一次。
+            # 只下发 enabled 的话前端就没法给李可的引用块上色、显示姓名。
+            for pid, info in physicians_all(PHYSICIANS).items()
         ],
         # example_complaints：R14 首屏的三条可点击示例。**下发而不是写死在
         # app.js 里**——CLAUDE.md 第 31 条前端小节写明"写死的常量也算一处实现"，
@@ -356,7 +361,9 @@ def api_graph(
         "lambda1_note": lambda1_note(stats),
         "physicians": [
             {"id": pid, "name": info["name"], "color": info["color"]}
-            for pid, info in PHYSICIANS.items()
+            # 图谱浏览器的 λ1 医家下拉：全部医家。李可/王云启的医案也挂在图上，
+            # 下拉里没有他们等于看不到他们那部分边的权重。
+            for pid, info in physicians_all(PHYSICIANS).items()
         ],
         "stats": {
             "node_type_counts": stats["node_type_counts"],
@@ -535,7 +542,8 @@ def _gate(request: Request, raw_key: str | None):
 
         return decision, ReplayBackend(), None
 
-    estimate = usage_mod.estimate_calls(react_enabled(), len(PHYSICIANS))
+    # 额度预扣按**参与集注**的医家数算：一次问诊只跑他们。
+    estimate = usage_mod.estimate_calls(react_enabled(), len(physicians_enabled(PHYSICIANS)))
     return decision, None, ledger.reserve(ip, estimate)
 
 
@@ -981,7 +989,9 @@ def _serialize_residual(residual: dict | None) -> dict | None:
 
 
 def _serialize_result(r: dict) -> dict:
-    info = PHYSICIANS.get(r["physician"], {})
+    # 按 id 查元数据（姓名/配色）用全表：结果里只会有 enabled 的医家，
+    # 但这个函数也被「参考医家」引用区的序列化复用。
+    info = physicians_all(PHYSICIANS).get(r["physician"], {})
     return {
         "physician": r["physician"],
         "physician_name": r["physician_name"],

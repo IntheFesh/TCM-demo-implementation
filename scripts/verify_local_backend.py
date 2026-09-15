@@ -39,7 +39,7 @@ from core.llm import (
     get_backend,
     load_prompt,
 )
-from core.physicians import PHYSICIANS
+from core.physicians import PHYSICIANS, physicians_all
 from core.react import MAX_STEPS
 from core.schemas import S3Syndrome
 
@@ -105,7 +105,8 @@ def _check_lora() -> list[str]:
         print("LoRA：LORA_DIR 未设置 → 跑基座模型（阶段五的 adapter 还没训时就是这样）")
         return []
     problems = []
-    for pid in PHYSICIANS:
+    # LoRA 按医家热切换要覆盖全部注册医家——enabled=False 的也各有一份 adapter。
+    for pid in physicians_all(PHYSICIANS):
         try:
             path = _resolve_lora_path(lora_dir, pid)
         except LLMError as e:

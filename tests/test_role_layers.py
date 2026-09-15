@@ -29,7 +29,9 @@ def _pin_two_physicians(monkeypatch):
     不钉的话注册表里的第三位医家（张锡纯）会走 FakeLLM 的兜底响应（党参/白术、
     没有 role），分层全变 None、herb_jaccard 变 1.0，测试测的就不是它想测的东西了。
     需要三位医家的那条测试自己把这个覆盖回去。"""
-    from core.physicians import PHYSICIANS as REG
+    from core.physicians import physicians_enabled as _enabled
+
+    REG = _enabled()
 
     monkeypatch.setattr(chain, "PHYSICIANS", {k: REG[k] for k in ("ye_tianshi", "wu_jutong")})
 
@@ -235,7 +237,9 @@ def test_herb_jaccard_is_unchanged_by_role_annotation(monkeypatch):
 def test_herb_jaccard_stays_the_nway_intersection_over_union(monkeypatch):
     """算法本身钉住：n 方交并比，不是两两平均、不是分层的任何一个数。
     三位医家、故意让 n 方值（0.75）跟两两均值（0.667）不同。"""
-    from core.physicians import PHYSICIANS as REAL
+    from core.physicians import physicians_enabled as _enabled
+
+    REAL = _enabled()
 
     monkeypatch.setattr(chain, "PHYSICIANS", REAL)
     herbs = {"ye_tianshi": [("半夏", "君"), ("茯苓", "佐")],

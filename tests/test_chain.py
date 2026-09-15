@@ -22,7 +22,9 @@ def _pin_two_physicians(monkeypatch):
     """这里的期望值（llm_calls == 4、S3 跑 2 次、FakeLLM 按「叶天士/吴鞠通」分发）都
     写死在两位医家上。注册张锡纯之后（HANDOFF 步骤 3）registry 变成三位，这些测试
     会整批红——那不是 bug，是测试写死了医家数。钉住两位，让 registry 增长与测试解耦。"""
-    from core.physicians import PHYSICIANS as REG
+    from core.physicians import physicians_enabled as _enabled
+
+    REG = _enabled()
 
     two = {k: REG[k] for k in ("ye_tianshi", "wu_jutong")}
     monkeypatch.setattr(chain, "PHYSICIANS", two)
@@ -1374,7 +1376,9 @@ def _s3_with_herbs(pid, herbs, tp="健脾益气"):
 def test_pairwise_divergence_three_physicians_separates_lineage_from_cross_school(monkeypatch):
     """对着真实注册表（三位、两个学派）跑：三对各自的 Jaccard、分组、生年差，
     师承内均值 / 跨学派均值并列，判据 cross_school_gt_lineage 报出。"""
-    from core.physicians import PHYSICIANS as REAL_PHYSICIANS
+    from core.physicians import physicians_enabled as _enabled
+
+    REAL_PHYSICIANS = _enabled()
 
     assert len(REAL_PHYSICIANS) == 3 and len({i["school"] for i in REAL_PHYSICIANS.values()}) == 2
 
@@ -1488,7 +1492,9 @@ def test_consult_runs_every_registered_physician_not_just_the_pinned_two(monkeyp
     core.physicians.PHYSICIANS 的真实内容跑，期望值也从它动态算，不写死
     "叶天士/吴鞠通"这两个名字——这样 registry 涨到几位，这条测试都还在真的
     验证 consult() 会不会漏跑或多跑某个医家，而不是永远只测两位那条老路径。"""
-    from core.physicians import PHYSICIANS as REAL_PHYSICIANS
+    from core.physicians import physicians_enabled as _enabled
+
+    REAL_PHYSICIANS = _enabled()
 
     assert len(REAL_PHYSICIANS) >= 2  # 这条测试的意义建立在"确实不止一位医家"上
 

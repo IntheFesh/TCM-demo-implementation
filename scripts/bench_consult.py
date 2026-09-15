@@ -163,12 +163,13 @@ def install_fake_cases(n_per_physician: int) -> int:
     这一轮用的是合成语料，不会被当成真机数字。
     """
     from core import retrieval
-    from core.physicians import PHYSICIANS
+    from core.physicians import PHYSICIANS, physicians_enabled
     from core.retrieval import Retriever
     from core.schemas import CaseRecord
 
     cases: list[CaseRecord] = []
-    for pid in PHYSICIANS:
+    # 基准测的是一次问诊的耗时，一次问诊只跑参与集注的那几位。
+    for pid in physicians_enabled(PHYSICIANS):
         for i in range(n_per_physician):
             cases.append(CaseRecord(
                 case_id=f"{pid}-bench-{i:03d}", case_group_id=f"{pid}-bench-g{i:03d}",
@@ -355,11 +356,12 @@ def invalid_reason(result: dict | None) -> str | None:
         return f"被安全否决，不产生方药，不能当性能基准：{result.get('reject_reason')}"
     if result.get("insufficient"):
         return f"信息不足，没跑到 S3：{result.get('insufficient_reason')}"
-    from core.physicians import PHYSICIANS
+    from core.physicians import PHYSICIANS, physicians_enabled
 
     got = len(result.get("results") or [])
-    if got != len(PHYSICIANS):
-        return f"只有 {got}/{len(PHYSICIANS)} 位医家跑出了结果"
+    n = len(physicians_enabled(PHYSICIANS))
+    if got != n:
+        return f"只有 {got}/{n} 位医家跑出了结果"
     return None
 
 

@@ -30,11 +30,11 @@ def iter_segment_files(limit: int | None = None):
     MANIFEST.json）——之前按"是目录就遍历"能跑对只是因为那些目录里碰巧没有
     .json，local_corpora/MANIFEST.json 一出现就会被当成粗段读进来。
     """
-    from core.physicians import PHYSICIANS
+    from core.physicians import PHYSICIANS, physicians_all
 
     count = 0
     for physician_dir in sorted(p for p in DATA_ROOT.iterdir()
-                                if p.is_dir() and p.name in PHYSICIANS):
+                                if p.is_dir() and p.name in physicians_all(PHYSICIANS)):
         for seg_path in sorted(physician_dir.glob("*.json")):
             if limit is not None and count >= limit:
                 return

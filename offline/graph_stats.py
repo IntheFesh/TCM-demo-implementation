@@ -23,7 +23,7 @@ from pathlib import Path
 
 from core.graph.store import NetworkXStore
 from core.graph.weights import apply_weights
-from core.physicians import PHYSICIANS, schools
+from core.physicians import PHYSICIANS, physicians_all, schools
 
 GRAPH_PATH = Path(__file__).resolve().parent.parent / "data" / "graph.json"
 
@@ -104,7 +104,9 @@ def compute_stats(store: NetworkXStore) -> dict:
 
     isolated = [n for n in g.nodes() if g.degree(n) == 0]
 
-    lambda1_by_physician: dict[str, list[float]] = {pid: [] for pid in PHYSICIANS}
+    # 统计覆盖全部医家（含 enabled=False 的）：λ1 回答的是「这条边有多少医案
+    # 支持」，而李可/王云启的医案是真的挂在图上的。
+    lambda1_by_physician: dict[str, list[float]] = {pid: [] for pid in physicians_all(PHYSICIANS)}
     for _, _, data in g.edges(data=True):
         if data.get("edge_type") != "indicates":
             continue

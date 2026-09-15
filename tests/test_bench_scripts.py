@@ -122,7 +122,9 @@ def test_repeat_does_not_let_one_run_record_another_runs_calls(tmp_path):
 def test_fake_cases_make_s3_actually_run_for_every_physician(tmp_path):
     """没有 cases.json 时检索层一开口就 RetrievalUnavailable，三位医家的 S3 一次都不跑
     ——那样量到的只有 S1/S2，而 R12 要验的正是 S3 那一段。"""
-    from core.physicians import PHYSICIANS
+    from core.physicians import physicians_enabled
+
+    PHYSICIANS = physicians_enabled()
 
     report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2")
     by_physician = report["runs"][0]["by_step"]["s3_by_physician"]
@@ -150,7 +152,9 @@ def test_s3_wall_drops_to_the_slowest_physician_while_sum_stays(tmp_path):
       wall / sum      ≈ 1/N ± 0.25    并发；串行时这个比值是 1.0
       wall / slowest  <= 1.5          墙钟没有明显超过最慢的那一位
     """
-    from core.physicians import PHYSICIANS
+    from core.physicians import physicians_enabled
+
+    PHYSICIANS = physicians_enabled()
 
     latency, n = 0.3, len(PHYSICIANS)
     report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2",
@@ -317,7 +321,9 @@ def test_a_run_with_no_physician_results_is_not_reported_as_ok(tmp_path, monkeyp
 def test_a_valid_fake_run_makes_exactly_five_calls(tmp_path):
     """**llm_calls == 5 才算一次有效的基准**：S1 + S2 + 三位医家各一次 S3。
     少于 5 就说明有医家没跑到，这份数据不能用来比并发前后的耗时。"""
-    from core.physicians import PHYSICIANS
+    from core.physicians import physicians_enabled
+
+    PHYSICIANS = physicians_enabled()
 
     report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "3")
     run = report["runs"][0]
@@ -348,7 +354,9 @@ def test_fake_backend_installs_synthetic_cases_when_the_repo_has_none(tmp_path, 
     常态，这时自动装合成医案并在输出里标明，比让人拿到一份只有 S1/S2 的"成功"报告好。
     自动装了就必须能从报告里看出来——`fake_cases` 非 0 且 `fake_cases_auto` 为真。"""
     from core import retrieval
-    from core.physicians import PHYSICIANS
+    from core.physicians import physicians_enabled
+
+    PHYSICIANS = physicians_enabled()
     from core.retrieval_hybrid import HybridRetriever
 
     missing = tmp_path / "没有这个文件.json"

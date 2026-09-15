@@ -20,7 +20,7 @@ num_schools 变成 2（A2 加入第二学派）之后自动切回常规四层公
 from __future__ import annotations
 
 from core.graph.store import NetworkXStore
-from core.physicians import PHYSICIANS, schools
+from core.physicians import PHYSICIANS, physicians_all, schools
 
 DEFAULT_K = 5
 
@@ -133,7 +133,8 @@ def apply_weights(store: NetworkXStore, K: int = DEFAULT_K) -> None:
         for pid in pids:
             physician_of[pid] = school
 
-    counts_by_physician = {pid: count_support(store, pid) for pid in PHYSICIANS}
+    # 图谱医案层要**全部**医家：李可/王云启的医案照样挂进图、照样数支持度。
+    counts_by_physician = {pid: count_support(store, pid) for pid in physicians_all(PHYSICIANS)}
 
     totals_by_physician: dict[str, dict[str, int]] = {}
     for pid, counts in counts_by_physician.items():
@@ -172,7 +173,7 @@ def apply_weights(store: NetworkXStore, K: int = DEFAULT_K) -> None:
         weight_by_physician: dict[str, float] = {}
         lambda1_by_physician: dict[str, float] = {}
 
-        for pid in PHYSICIANS:
+        for pid in physicians_all(PHYSICIANS):
             school = physician_of[pid]
             n_d = counts_by_physician[pid].get(pair, 0)
             w_d = _conditional_weight(n_d, totals_by_physician[pid].get(sym_name, 0))

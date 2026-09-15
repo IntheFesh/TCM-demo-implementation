@@ -41,7 +41,7 @@ from core.llm import (
 from core.followup import (
     AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
 )
-from core.physicians import PHYSICIANS
+from core.physicians import PHYSICIANS, physicians_enabled
 from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
 from core.retrieval import adaptive_min_score, apply_low_discrimination_cutoff, get_retriever
 from core.retrieval_hybrid import ALLOWED_MODES
@@ -935,7 +935,10 @@ def _run_physicians_into(
     `get_llm()` 拿到的是进程单例，BYOK 静默失效、访问者的 key 没被用上、额度照扣。
     每个 worker 一份独立的拷贝：一个 `Context` 只能被 `run` 一次。
     """
-    physicians = list(PHYSICIANS.items())
+    # R18：只遍历参与集注的那几位。李可/王云启 enabled=False——他们的语料进
+    # 检索、进训练、进「参考医家」区，但**不占列**：塞进三列会同时坏掉版面
+    # 和对照设计（学派维度被稀释成「每人一个学派」）。
+    physicians = list(physicians_enabled(PHYSICIANS).items())
     cancel = threading.Event()
     ask = _serialize_ask(ask_fn)
 

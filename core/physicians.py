@@ -19,6 +19,8 @@ PHYSICIANS: dict[str, dict] = {
         "school": "温病",
         "color": "#2C5F5A",  # 青黛 —— 温病轻清
         "color_bg": "#E6EFED",
+        "enabled": True,
+        "source": "data/ye_tianshi/*.json（《临证指南医案》，公有领域）",
     },
     "wu_jutong": {
         "name": "吴鞠通",
@@ -27,6 +29,8 @@ PHYSICIANS: dict[str, dict] = {
         "school": "温病",
         "color": "#9C6B16",  # 黄芩 —— 苦辛通降
         "color_bg": "#F4EDDF",
+        "enabled": True,
+        "source": "data/wu_jutong/*.json（《吴鞠通医案》，公有领域）",
     },
     "zhang_xichun": {
         "name": "张锡纯",
@@ -35,8 +39,80 @@ PHYSICIANS: dict[str, dict] = {
         "school": "衷中参西",
         "color": "#8A4736",  # 赭石 —— 他最标志的药就是生赭石，三条医案里出现三次
         "color_bg": "#F2E7E3",
+        "enabled": True,
+        "source": "books/584-医学衷中参西录.txt（公有领域）",
+    },
+    # ---- R18：注册但**不参与集注**（enabled=False）----
+    #
+    # 三列集注的三位是温病 × 2 + 衷中参西 × 1，这个组合是 λ2（学派层）能不能
+    # 成立的对照设计。李可、王云启都是现当代肿瘤方向，塞进三列会同时坏掉两件事：
+    # 版面（四列/五列并排读不了）和对照（学派维度被稀释成"每人一个学派"）。
+    #
+    # 但他们的语料**要进检索、进训练、进图谱医案层、进「参考医家」引用区**——
+    # 用户的原话是"李可医案非常重要"。所以是 enabled=False 而不是不注册：
+    # 注册了才有唯一的 id、才有统一的 name→id 解析、才能被 search_cases 按
+    # physician 查到。
+    #
+    # **years / school 是 None，不是猜的。** 两份语料的前言/书名页里都没有生卒年
+    # 和学派归属（王云启那份的「代序」说的是"省级名中医""湖湘中医文化"、
+    # 学术思想列了七八条，那是文字描述不是一个可用于配对的离散学派标签）。
+    # 按 CLAUDE.md 的一贯做法：查不到就留空，不编——`pairwise_divergence` 见到
+    # 任一方没有 school 会把这一对判成 "unknown"，那是对的，比给一个猜的学派
+    # 然后让它去参与"跨学派分歧大于师承内"的统计好得多。
+    "li_ke": {
+        "name": "李可",
+        "book": "李可医案（肿瘤案汇编）",
+        "years": None,
+        "school": None,
+        # 石绿。不在总纲 §2.1 的三家身份色里——那三个是集注三列的，这两位
+        # 不占列，只在「参考医家」引用区出现，需要一个能跟三家区分开的色。
+        "color": "#4A6B4E",
+        "color_bg": "#E8EEE8",
+        "enabled": False,
+        "source": "data/local_corpora/李可医案.txt（用户上传，版权受限，不随仓库分发）",
+    },
+    "wang_yunqi": {
+        "name": "王云启",
+        "book": "王云启治癌验案录",
+        "years": None,
+        "school": None,
+        "color": "#5B5470",  # 藤紫
+        "color_bg": "#EAE8EF",
+        "enabled": False,
+        "source": "data/local_corpora/王云启医案.txt（用户上传，版权受限，不随仓库分发）",
     },
 }
+
+
+def physicians_enabled(registry: dict[str, dict] | None = None) -> dict[str, dict]:
+    """参与三列集注的医家。**遍历 PHYSICIANS 的地方一律改走这个入口**——
+    chain / 前端三列 / 评测 / 训练各自写一遍 `if info["enabled"]` 的话，
+    漏掉一处的后果是某条路径悄悄多算了两位医家：分歧度会把李可和三家一起算
+    n 方交并比（那个数直接失去意义），ε 的对照基准也跟着变。
+
+    CLAUDE.md「同一概念的匹配逻辑只能有一处实现」：这里的"同一概念"是
+    「谁算集注的一员」。
+
+    `registry` 参数：调用方传自己模块里那个 `PHYSICIANS` 名字。看起来多余
+    （不传也读同一个 dict），但它让**既有的测试打桩方式继续有效**——全项目
+    有近百条测试用 `monkeypatch.setattr(某模块, "PHYSICIANS", {...})` 换一个
+    两位医家的小注册表。不接这个参数的话，这些桩全部失效：函数读的是
+    `core.physicians` 自己的那份，桩打在别的模块上。
+
+    **筛选逻辑仍然只有这一处**，调用方传的只是数据。"""
+    return {pid: info for pid, info in (registry if registry is not None else PHYSICIANS).items()
+            if info.get("enabled", True)}
+
+
+def physicians_all(registry: dict[str, dict] | None = None) -> dict[str, dict]:
+    """全部注册医家，含 enabled=False 的。检索语料、训练导出、图谱医案层、
+    「参考医家」引用区走这个——**它们要的是"这个 id 合法吗、他的语料在哪"**，
+    跟"他算不算集注的一员"是两个问题。
+
+    两个入口都存在的意义就在这儿：调用方必须显式选一个，而选的时候就得想清楚
+    自己问的是哪个问题。`PHYSICIANS` 本身仍然公开（注册表是数据），但**新增
+    的遍历一律走这两个函数之一，不要在别处自己 filter**。"""
+    return dict(registry if registry is not None else PHYSICIANS)
 
 
 def resolve_physician_id(value: str | None) -> str | None:

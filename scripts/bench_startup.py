@@ -109,10 +109,10 @@ def install_self_test(n_cases: int) -> Path:
     import numpy as np
 
     from core import retrieval
-    from core.physicians import PHYSICIANS
+    from core.physicians import PHYSICIANS, physicians_enabled
 
     cases = []
-    for pid in PHYSICIANS:
+    for pid in physicians_enabled(PHYSICIANS):
         for i in range(n_cases):
             cases.append({
                 "case_id": f"{pid}-bench-{i:04d}", "case_group_id": f"{pid}-bench-g{i:04d}",
