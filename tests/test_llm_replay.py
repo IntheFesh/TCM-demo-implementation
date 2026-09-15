@@ -10,8 +10,8 @@ fixture 文件。
 import json
 import subprocess
 
-from tests.node_script import js_tmp
 from pathlib import Path
+from tests.web_harness import DOM_STUB_OFFLINE, js_tmp, load_app_js
 
 import pytest
 from pydantic import BaseModel, Field
@@ -514,23 +514,13 @@ def test_verify_replay_returns_2_when_nothing_is_recorded(tmp_path, monkeypatch,
 
 # ---------- 7. 前端那行小字 ----------
 
-DOM_STUB = """
-const anyNode = new Proxy(function(){}, {
-  get: () => anyNode, set: () => true, apply: () => anyNode, construct: () => anyNode,
-});
-globalThis.document = anyNode;
-globalThis.window = anyNode;
-globalThis.cytoscape = anyNode;
-globalThis.fetch = () => Promise.reject(new Error("no net"));
-"""
 
 
 def _demo_text(demo_mode) -> str | None:
-    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-    script = html.split("<script>")[-1].split("</script>")[0]
+    script = load_app_js()
     tail = ("\nconsole.log(JSON.stringify(demoModeText("
             + json.dumps(demo_mode, ensure_ascii=False) + ")));")
-    proc = subprocess.run(["node", js_tmp(DOM_STUB + script + tail)],
+    proc = subprocess.run(["node", js_tmp(DOM_STUB_OFFLINE + script + tail)],
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, f"node 失败：\n{proc.stdout}\n{proc.stderr}"
     return json.loads(proc.stdout.strip())

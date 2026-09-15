@@ -290,14 +290,24 @@ INPROC_TIMEOUTS = CallTimeouts(connect=1800.0, read=1800.0, write=1800.0, pool=1
 # DeepSeek 默认 4096 token：S0 抽多病人粗段的 JSON 会被截断，截断的 JSON 回灌重试
 # 也只会以同样方式再截断三次。所以非推理模型给到 8192。
 DEFAULT_MAX_TOKENS = 8192
-# 推理模型（deepseek-v4-pro）要另算：**max_tokens 同时盖住不可见的 reasoning
-# tokens**，不是只盖可见输出。2026-09-15 实测「你好」这一句就花了 45 个 token、
+# 开着思考的那一次调用要另算：**max_tokens 同时盖住不可见的 reasoning tokens**，
+# 不是只盖可见输出。2026-09-15 实测「你好」这一句就花了 45 个 token、
 # 其中 36 个是 reasoning；8192 下 S3 的可见输出在 2081 字符处被砍断——而 8192 这个
 # 数字看起来完全够用，所以症状是"输出莫名截断"，看不出跟推理有关。
-REASONING_MAX_TOKENS = 16384
-# 已知的推理模型。**按名字判**：服务端不给"这是不是推理模型"这个字段，而这件事
-# 只影响一个默认值、猜错的代价是上限偏大或偏小（`LLM_MAX_TOKENS` 能覆盖），
-# 不值得为它加一次探测调用。新模型上线时往这里加一行。
+#
+# **R13 从 16384 提到 32768。** R10 定 16384 时思考是整次调用一个设置；R12 把它改成
+# **按步**之后，16384 就成了"S3 一步既要装推理过程又要装完整方药"的上限，而别的步
+# （关了思考）白白拿着用不到的额度。DeepSeek 文档给的默认是：不设 max_tokens 时
+# 非思考 8K、**思考 64K**（effort=max 时 128K）——我们原来定的比 API 自己的默认低
+# 四倍，等于把截断风险集中到了唯一开思考的那一步上。取 64K 的一半：既远离截断，
+# 又保留"输出失控时还能被发现"这个上限本来的作用。
+THINKING_MAX_TOKENS = 32768
+# 旧名保留一轮：R10–R12 的文档和 SOURCES 里引用的是这个名字。值跟着新名字走，
+# 不留一个"看起来还在、其实早就不是那个数"的常量。
+REASONING_MAX_TOKENS = THINKING_MAX_TOKENS
+# 已知的推理模型。**只在"这次调用没说开不开思考"时用它兜底**：那时走的是 API 自己
+# 的默认，而推理模型的 API 默认就是开思考。按名字判是因为服务端不给这个字段，
+# 猜错的代价只是上限偏大或偏小（`LLM_MAX_TOKENS` 能覆盖）。新模型上线时加一行。
 REASONING_MODELS = frozenset({"deepseek-v4-pro"})
 
 
@@ -531,24 +541,29 @@ class LLMBackend(ABC):
             return self.TIMEOUTS
         return self.TIMEOUTS.with_seconds(seconds)
 
-    def _default_max_tokens(self) -> int:
+    def _default_max_tokens(self, thinking: str | None = None) -> int:
         """这次调用没有显式传 max_tokens 时用多少。`LLM_MAX_TOKENS` 优先。
-        **放在基类**：每个后端都要回答这个问题，各写一份的话"推理模型要更大"
-        这条会只在其中一个后端上生效。
+        **放在基类**：每个后端都要回答这个问题，各写一份的话这条会只在其中一个
+        后端上生效。
 
-        **推理模型要更大**：它的 max_tokens 同时盖住不可见的 reasoning tokens，
-        所以 8192 留给可见输出的远不止少一点点——2026-09-15 实测 deepseek-v4-pro
-        在 8192 下 S3 的输出在 2081 字符处被砍断。这一档是把推理模型的**可见**
-        输出上限拉回到跟非推理模型同一个量级，不是"推理模型更强所以给更多"。
+        **按这次调用的 thinking 设置分档，不是按模型名。** 开着思考时 max_tokens
+        同时盖住不可见的 reasoning tokens，所以 8192 留给可见输出的远不止少一点点
+        （2026-09-15 实测 deepseek-v4-pro 在 8192 下 S3 的输出在 2081 字符处被砍断）。
+        R12 把思考改成**按步**设之后，按模型名分档就错了：关了思考的 S1/S2/追问/
+        ReAct 白拿大额度，而唯一开思考的 S3 反倒要用同一个数去装推理过程 + 完整方药。
 
-        判据放在代码里而不是让人去 .env 里记一个数：一个"必须手动设对、否则
-        静默截断"的环境变量迟早有一次会忘，而忘了的代价是一整段的钱。
+        `thinking=None` 表示这次没指定、走 API 自己的默认——推理模型的 API 默认就是
+        开思考，所以那时按"开"给；非推理模型按"关"给。
+
+        判据放在代码里而不是让人去 .env 里记一个数：一个"必须手动设对、否则静默
+        截断"的环境变量迟早有一次会忘，而忘了的代价是一整段的钱。
         """
         env = os.environ.get("LLM_MAX_TOKENS")
         if env:
             return int(env)
-        return (REASONING_MAX_TOKENS if self.model_name() in REASONING_MODELS
-                else DEFAULT_MAX_TOKENS)
+        if thinking is None:
+            thinking = "enabled" if self.model_name() in REASONING_MODELS else "disabled"
+        return THINKING_MAX_TOKENS if thinking == "enabled" else DEFAULT_MAX_TOKENS
 
     def abort_in_flight(self) -> None:
         """墙钟超时之后清理这个后端里挂着的东西。默认什么都不做；
@@ -785,8 +800,12 @@ class LLMBackend(ABC):
                     # 会走各后端自己的默认值"（比如 OpenAICompatBackend 走
                     # LLM_MAX_TOKENS，或 _default_max_tokens()）——原来直接打
                     # "max_tokens=None" 容易让人以为配置丢了，去查环境变量，其实哪儿都没错。
+                    # 带上 thinking：同一个后端在"开思考"和"关思考"两种情形下默认
+                    # 上限差四倍，只报一个数字看不出这次走的是哪一档。
+                    call_thinking = kwargs.get("thinking")
                     max_tokens_desc = (
-                        f"未设置（走后端默认值 {self._default_max_tokens()}）"
+                        f"未设置（走后端默认值 {self._default_max_tokens(call_thinking)}，"
+                        f"thinking={call_thinking}）"
                         if max_tokens is None else str(max_tokens)
                     )
                     raise LLMTruncatedError(
@@ -928,11 +947,12 @@ class OpenAICompatBackend(LLMBackend):
             messages=messages,
             response_format={"type": "json_object"},
             **extra,
-            # 默认值见 _default_max_tokens()（推理模型要更大，理由在那儿）。
+            # 默认值见 _default_max_tokens()：按**这次调用的 thinking 设置**分档。
             # 调用方（generate() 的 max_tokens 参数）能覆盖它——不是全局调高，
             # 是某个 prompt 明确知道自己需要更大上限时单独传（比如 S5 一张方子的
             # 多条「含」关系）。
-            max_tokens=max_tokens if max_tokens is not None else self._default_max_tokens(),
+            max_tokens=(max_tokens if max_tokens is not None
+                        else self._default_max_tokens(thinking)),
             **kwargs,
         )
         content = resp.choices[0].message.content or ""
@@ -1312,8 +1332,11 @@ class VLLMInProcessBackend(LLMBackend):
 
     def _sampling_params(
         self, temperature: float, max_tokens: int | None,
-        schema: type[BaseModel] | None,
+        schema: type[BaseModel] | None, thinking: str | None = None,
     ):
+        """thinking 只用来挑默认的 max_tokens：进程内 vLLM 跑的是本地基座，
+        没有"思考模式"这个开关，但**上限该给多少仍然取决于调用方这一步要不要
+        长输出**——所以参数照收，语义是"这一步的预算档位"。"""
         from vllm import SamplingParams  # 延迟 import
 
         guided = None
@@ -1323,7 +1346,8 @@ class VLLMInProcessBackend(LLMBackend):
             guided = GuidedDecodingParams(json=schema.model_json_schema())
         return SamplingParams(
             temperature=temperature,
-            max_tokens=max_tokens if max_tokens is not None else self._default_max_tokens(),
+            max_tokens=(max_tokens if max_tokens is not None
+                        else self._default_max_tokens(thinking)),
             guided_decoding=guided,
         )
 
@@ -1332,11 +1356,16 @@ class VLLMInProcessBackend(LLMBackend):
         max_tokens: int | None = None,
         schema: type[BaseModel] | None = None,
         physician: str | None = None,
+        thinking: str | None = None,
+        reasoning_effort: str | None = None,
         **kwargs,
     ) -> str:
+        # thinking / reasoning_effort 显式接住：本地基座没有这个开关，但**不能塞进
+        # **kwargs**——它们会被原样转给 vllm 的 chat()，那是一个 TypeError。
+        # thinking 仍然影响默认的 max_tokens 档位（见 _sampling_params 的文档）。
         outputs = self._engine.chat(
             messages,
-            sampling_params=self._sampling_params(temperature, max_tokens, schema),
+            sampling_params=self._sampling_params(temperature, max_tokens, schema, thinking),
             lora_request=self._lora_request(physician),
             **kwargs,
         )

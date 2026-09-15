@@ -11,8 +11,8 @@ AutoDL 上注册张锡纯并抽完他的 cases.json 之后进行。
 import json
 import subprocess
 
-from tests.node_script import js_tmp
 from pathlib import Path
+from tests.web_harness import js_tmp, load_app_js
 
 import pytest
 
@@ -184,8 +184,7 @@ def test_western_drug_overlap_reported_separately(monkeypatch):
 def _run_western_drugs_html(s3: dict) -> str:
     """用 node 执行 index.html 里那整份 <script>，再调它的 westernDrugsHtml。
     测的是真实上线的那份代码，不是在测试里另抄一份实现。"""
-    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-    script = html.split("<script>")[-1].split("</script>")[0]
+    script = load_app_js()
     # 最小 DOM 桩：脚本末尾有 document.getElementById(...).addEventListener 这类
     # 加载期绑定，裸 node 会 ReferenceError。用 Proxy 吸收掉任意 DOM 调用，这样
     # 跑的仍然是整份真实脚本（顺带能抓到它的语法/加载期运行时错误），而不是把

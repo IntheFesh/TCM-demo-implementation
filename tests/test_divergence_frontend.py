@@ -13,19 +13,11 @@ test_herb_grouping.py 同一个模式。
 import json
 import subprocess
 
-from tests.node_script import js_tmp
 from pathlib import Path
+from tests.web_harness import DOM_STUB, js_tmp, load_app_js
 
 ROOT = Path(__file__).resolve().parent.parent
 
-DOM_STUB = """
-const anyNode = new Proxy(function(){}, {
-  get: () => anyNode, set: () => true, apply: () => anyNode, construct: () => anyNode,
-});
-globalThis.document = anyNode;
-globalThis.window = anyNode;
-globalThis.cytoscape = anyNode;
-"""
 
 # 两位医家、君臣一致佐使全不同——实测形状（叶天士三次重复里君臣骨架全在、
 # 变的全是佐使）。三个 ε 都有值，才能判断哪一层超出了自己的地板。
@@ -48,8 +40,7 @@ BASE = {
 
 
 def _banner(divergence: dict | None) -> str:
-    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-    script = html.split("<script>")[-1].split("</script>")[0]
+    script = load_app_js()
     tail = ("\nconsole.log(JSON.stringify(divergenceBannerText("
             + json.dumps(divergence, ensure_ascii=False) + ")));")
     proc = subprocess.run(["node", js_tmp(DOM_STUB + script + tail)],

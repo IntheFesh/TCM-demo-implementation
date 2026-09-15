@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, ValidationError
 from core.llm import (
     DEFAULT_MAX_TOKENS,
     REASONING_MAX_TOKENS,
+    THINKING_MAX_TOKENS,
     REASONING_MODELS,
     ClaudeCLIBackend,
     LLMBackend,
@@ -739,16 +740,73 @@ def test_openai_backend_max_tokens_falls_back_to_env_var_when_not_passed(monkeyp
 # ---------- _default_max_tokens：推理模型要更大 ----------
 
 
-def test_default_max_tokens_is_bigger_for_a_reasoning_model(monkeypatch):
-    """**推理模型的 max_tokens 同时盖住不可见的 reasoning tokens。** 2026-09-15
-    实测 deepseek-v4-pro 在 8192 下 S3 的可见输出在 2081 字符处被砍断——而 8192
-    看起来完全够，所以症状是"输出莫名截断"，看不出跟推理有关。对照：非推理模型
-    同一条路径仍然是 8192，这一档不是全局调高。"""
+def test_default_max_tokens_follows_this_calls_thinking_setting(monkeypatch):
+    """**R13 起按这次调用的 thinking 设置分档，不再按模型名。**
+
+    R12 把思考改成**按步**设之后，按模型名分档就错了：S1/S2/追问/残差/ReAct 关了
+    思考却仍然拿 16384（用不上，但无害），而 S3 是唯一开思考的一步，16384 要同时
+    装 reasoning tokens 和可见输出——**截断风险全部压到了 S3 一步上**。
+    DeepSeek 文档：不设 max_tokens 时非思考默认 8K、思考默认 64K（effort=max 时
+    128K），我们给思考模式定的上限比 API 自己的默认低四倍。
+    """
     monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
     monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
-    assert OpenAICompatBackend()._default_max_tokens() == REASONING_MAX_TOKENS == 16384
+    b = OpenAICompatBackend()
+    assert b._default_max_tokens(thinking="disabled") == DEFAULT_MAX_TOKENS == 8192
+    assert b._default_max_tokens(thinking="enabled") == THINKING_MAX_TOKENS == 32768
+
+
+def test_unspecified_thinking_falls_back_to_the_model_default(monkeypatch):
+    """不传 thinking = 走 API 自己的默认。推理模型的 API 默认就是开思考，
+    所以这时要按"开思考"给上限——按"关思考"给会在这条路径上继续截断。
+    非推理模型的 API 默认是不思考，给 8192。"""
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    assert OpenAICompatBackend()._default_max_tokens() == THINKING_MAX_TOKENS
     monkeypatch.setenv("LLM_MODEL", "some-non-reasoning-model")
-    assert OpenAICompatBackend()._default_max_tokens() == DEFAULT_MAX_TOKENS == 8192
+    assert OpenAICompatBackend()._default_max_tokens() == DEFAULT_MAX_TOKENS
+
+
+def test_the_request_gets_the_thinking_sized_budget(monkeypatch):
+    """上面两条测的是那个方法，这条测它真的被接到请求上了——S3 那一次
+    （thinking=enabled）拿到的必须是 32768，不是 8192。"""
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kw):
+            captured.update(kw)
+
+            class R:
+                choices = [type("C", (), {"message": type("M", (), {"content": '{"ok":true,"note":"n"}'})()})]
+            return R()
+
+    class FakeClient:
+        class chat:
+            completions = FakeCompletions()
+
+    b = OpenAICompatBackend()
+    b._client = FakeClient()
+    b._complete([{"role": "user", "content": "x"}], 0.0, thinking="enabled")
+    assert captured["max_tokens"] == THINKING_MAX_TOKENS
+    captured.clear()
+    b._complete([{"role": "user", "content": "x"}], 0.0, thinking="disabled")
+    assert captured["max_tokens"] == DEFAULT_MAX_TOKENS
+
+
+def test_the_old_reasoning_constant_now_tracks_the_thinking_one(monkeypatch):
+    """**R13 契约变更**：R10 加的 `REASONING_MAX_TOKENS`（16384，按模型名分档）
+    被 `THINKING_MAX_TOKENS`（32768，按这次调用的 thinking 设置分档）取代。
+    旧名保留一轮但**值跟着新名字走**——留一个"看起来还在、其实早就不是那个数"的
+    常量比删掉它更糟，引用它的 SOURCES 第 52/53 条会静默失真。
+
+    对照仍在：关思考时同一条路径仍然是 8192，这一档不是全局调高。"""
+    assert REASONING_MAX_TOKENS == THINKING_MAX_TOKENS == 32768
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    b = OpenAICompatBackend()
+    assert b._default_max_tokens(thinking="disabled") == DEFAULT_MAX_TOKENS == 8192
 
 
 def test_the_default_model_is_one_of_the_reasoning_models():
@@ -823,7 +881,9 @@ def test_truncation_error_names_the_default_it_actually_used(monkeypatch):
 
     with pytest.raises(LLMTruncatedError) as e:
         Truncating().generate(system="s", user="u", schema=Tiny)
-    assert f"未设置（走后端默认值 {REASONING_MAX_TOKENS}）" in str(e.value)
+    # 报错里同时带上 thinking：同一个后端在两种情形下默认上限差四倍，
+    # 只报一个数字看不出这次走的是哪一档。
+    assert f"未设置（走后端默认值 {THINKING_MAX_TOKENS}，thinking=None）" in str(e.value)
 
 
 def test_claude_cli_complete_accepts_and_ignores_max_tokens(monkeypatch):

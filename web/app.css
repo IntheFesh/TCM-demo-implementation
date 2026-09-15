@@ -1,0 +1,839 @@
+/* ============================================================================
+   设计令牌（docs/DESIGN.md §2.1–2.4）。**全部颜色的唯一定义处**：
+   这个文件里除了下面这一段 :root 和 @font-face，其它地方不许出现 #RRGGBB
+   （tests/test_css_tokens.py 钉住）。理由是总纲 §7 第 7 条——色只承担语义，
+   而"语义"这件事只有在颜色集中定义时才看得出来；散落在 700 行规则里的 62 个
+   十六进制值没有任何人能回答"这个灰跟那个灰是不是同一件事"。
+   ============================================================================ */
+
+/* 字体：CDN 取 Noto，**必须带 font-display: swap** —— 默认的 block 会在取不到时
+   留最多 3 秒空白，而这个项目要能断网演示（回放模式的全部意义就在这里）。
+   每个 --font-* 变量的栈里 CDN 字体后面都跟着系统栈，断网时直接落到系统字体，
+   页面不出现空白期。 */
+@font-face {
+  font-family: "Noto Serif SC";
+  font-style: normal; font-weight: 400; font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@latest/chinese-simplified-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Noto Serif SC";
+  font-style: normal; font-weight: 600; font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@latest/chinese-simplified-600-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Noto Sans SC";
+  font-style: normal; font-weight: 400; font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@latest/chinese-simplified-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Noto Sans SC";
+  font-style: normal; font-weight: 500; font-display: swap;
+  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@latest/chinese-simplified-500-normal.woff2") format("woff2");
+}
+
+  :root {
+    /* ---- 基础色（§2.1）---- */
+    --paper:      #F2F3EF;   /* 底：草木灰白，微绿调。不是米白，避开模板色 */
+    --surface:    #FFFFFF;   /* 卡面 */
+    --surface-2:  #FAFBF8;   /* 次级面：折叠区、表格斑马纹 */
+    --ink:        #1E211C;   /* 正文：暖黑，不是蓝黑也不是 #111 */
+    --ink-2:      #4A4E46;   /* 次要文字 */
+    --muted:      #7C8076;   /* 辅助说明、单位、出处 */
+    --rule:       #D8DBD2;   /* 分隔线 */
+    --rule-soft:  #E8EAE4;   /* 弱分隔 */
+
+    /* ---- 语义色（§2.1）。带颜色 = 属于某位医家，或者在报警 ---- */
+    --danger:     #B3261E;   /* 朱砂。配伍禁忌、危重拦截 */
+    --danger-bg:  #FBEAE8;
+    --caution:    #8A6D1F;   /* 毒性药材、剂量警告 */
+    --caution-bg: #F7F1DF;
+    --verified:   #2C5F5A;   /* 有出处可核（复用青黛） */
+
+    /* ---- 分歧读数专用（§2.1）---- */
+    --noise:      #B9BDB3;   /* ε 噪声地板的参考线 */
+    --real:       #1E211C;   /* 超出噪声地板的真实差异 */
+
+    /* ---- 三家身份色：**这里只占位，值由 app.js 从 /health 注入** ---- */
+    /* 唯一来源是 core/physicians.py（§2.1 的订正 + CLAUDE.md 第 31 条前端小节：
+       写死的常量也算一处实现）。在 CSS 里写死的话，注册表加第四位医家时这里
+       不会跟着长出来，新医家在界面上就没有颜色——这个坑已经踩过一次。
+       每个 var() 都带兜底值，接口挂了页面不至于变成透明色。 */
+    --ye: var(--ink);      --ye-bg: var(--surface-2);
+    --wu: var(--ink);      --wu-bg: var(--surface-2);
+    --zhang: var(--ink);   --zhang-bg: var(--surface-2);
+
+    /* ---- 字体（§2.2）：宋体说中医的话，黑体说系统的话 ---- */
+    --font-classic: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", "Noto Serif CJK SC", serif;
+    --font-ui:      "Noto Sans SC", "Source Han Sans SC", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    --font-num:     "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    /* 唯一该用等宽的地方：药房格式文本（§3.3——它要对齐） */
+    --font-mono:    ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    /* ---- 间距（§2.3）：8 档 ---- */
+    --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+    --s5: 24px; --s6: 32px; --s7: 48px; --s8: 64px;
+
+    /* ---- 圆角（§2.3）：**按层级区分，不是所有元素一个值**
+       （所有元素同一个圆角是通用模板最明显的特征之一）---- */
+    --r-sm: 3px;   /* 标签、徽章 */
+    --r-md: 6px;   /* 按钮、输入框 */
+    --r-lg: 10px;  /* 卡片 */
+
+    /* ---- 边框（§2.3）：**不用阴影做层次**，用底色和边框 ---- */
+    --edge:      1px solid var(--rule);
+    --edge-soft: 1px solid var(--rule-soft);
+    /* 唯一允许的阴影：浮层（tooltip、侧栏） */
+    --shadow-float: 0 2px 16px rgba(30, 33, 28, .10);
+
+    /* ---- 动效（§2.4）：只有三处，都是回应用户动作的 ---- */
+    --t-collapse: 180ms;  /* 展开/折叠 */
+    --t-highlight: 220ms; /* 路径高亮 */
+    --t-warn: 160ms;      /* 处方校验反馈滑入 */
+
+    /* ---- 旧名 → 新令牌的别名。R13 拆分那一轮保留：700 行规则引用的是旧名，
+       一次性全改会把"换色"和"换结构"两件事混进同一个 diff，出了问题分不开。
+       新写的规则一律用上面的新名。---- */
+    --bg: var(--paper);
+    --panel: var(--surface);
+    --border: var(--rule);
+    --text: var(--ink);
+    --accent: var(--verified);      /* 交互强调复用青黛：色只承担语义，不另起一个蓝 */
+    --warn-bg: var(--caution-bg);
+    --warn-border: var(--caution);
+
+    /* ---- 总纲 §2.1 没有定义的一处：医生模式免责条的紫底（§3.3 只说"紫底"）。
+       保留现值，不自己发明一个"总纲色"——等 R15 打磨医生模式时定稿。---- */
+    --purple-bg: #EFE7FB;
+    --purple-border: #8B6FD9;
+    --purple-text: #4B2E9E;
+  }
+
+  /* §2.4：尊重 prefers-reduced-motion，此时全部动效改为瞬时。 */
+  @media (prefers-reduced-motion: reduce) {
+    :root { --t-collapse: 0ms; --t-highlight: 0ms; --t-warn: 0ms; }
+    *, *::before, *::after {
+      animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important; scroll-behavior: auto !important;
+    }
+  }
+  * { box-sizing: border-box; }
+  /* 只给屏幕阅读器的文字：处方表最后一列是操作按钮列，表头不该是空的。 */
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    /* §2.2：**黑体是界面外壳的字**。医学内容走 --font-classic（见下面那一块）——
+       衬线的是中医的话，非衬线的是系统的话。 */
+    font-family: var(--font-ui);
+  }
+  header {
+    padding: 20px 24px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    margin: 0 0 4px;
+    font-size: 22px;
+    font-weight: 600;
+  }
+  header .disclaimer {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 20px 24px 60px;
+  }
+  #graph-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    padding: 8px;
+    margin-bottom: 16px;
+  }
+  #cy {
+    width: 100%;
+    /* M7：540（原 460）——方剂框内药材纵向堆叠的可用空间不够，视觉密度偏紧凑
+       （M5 报告标注、M7 一起调），配合 computeLayout() 里放宽的药材间距一起改，
+       两处任何一处单独改都解决不了问题：容器矮，间距再大也会被 cy.fit() 缩回去。 */
+    height: 540px;
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+  }
+  #divergence-banner {
+    display: none;
+    background: var(--caution-bg);
+    border: 1px solid var(--warn-border);
+    color: var(--caution);
+    padding: 10px 14px;
+    border-radius: var(--r-lg);
+    font-size: 13.5px;
+    margin-bottom: 16px;
+    /* 1.3（E2）：第二行列三对两两配对的分歧，textContent 里用 \n 分行 */
+    white-space: pre-line;
+  }
+  #divergence-banner.show { display: block; }
+  #input-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    padding: 16px;
+    margin-bottom: 20px;
+  }
+  #complaint {
+    width: 100%;
+    min-height: 84px;
+    resize: vertical;
+    font-size: 14px;
+    font-family: inherit;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    outline: none;
+    color: var(--text);
+  }
+  #complaint:focus { border-color: var(--accent); }
+  .input-row {
+    display: flex;
+    /* 窄屏上两个下拉 + 辨证/取消两个按钮放不下一行，原来没有 wrap 会直接
+       溢出卡片右缘。 */
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+  }
+  #status-text {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  #submit-btn {
+    background: var(--accent);
+    color: var(--surface);
+    border: none;
+    padding: 9px 22px;
+    font-size: 14px;
+    border-radius: var(--r-lg);
+    cursor: pointer;
+  }
+  #submit-btn:disabled {
+    background: var(--rule);
+    cursor: not-allowed;
+  }
+  #retriever-mode-label { font-size: 12.5px; color: var(--muted); }
+  #retriever-mode {
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    font-family: inherit;
+    font-size: 12.5px;
+    background: var(--panel);
+    color: var(--text);
+  }
+  /* M7：role 选择器，跟 retriever-mode 同一套视觉，不新起一套样式规则的理由
+     只是"这两个下拉框长得应该一样"，没有更深的耦合。 */
+  #role-select-label { font-size: 12.5px; color: var(--muted); }
+  #role-select {
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    font-family: inherit;
+    font-size: 12.5px;
+    background: var(--panel);
+    color: var(--text);
+  }
+  #progress-log {
+    display: none;
+    margin-top: 10px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    white-space: pre-wrap;
+    max-height: 130px;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+  }
+  #progress-log.show { display: block; }
+  #need-input-box {
+    display: none;
+    margin-top: 10px;
+    padding: 10px 12px;
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: var(--r-lg);
+  }
+  #need-input-box.show { display: block; }
+  #need-input-question {
+    font-size: 13.5px;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+  #need-input-answer {
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    font-family: inherit;
+    font-size: 13.5px;
+    outline: none;
+  }
+  #need-input-answer:focus { border-color: var(--accent); }
+  #need-input-submit {
+    background: var(--warn-border);
+    color: var(--surface);
+    border: none;
+    padding: 8px 16px;
+    font-size: 13.5px;
+    border-radius: var(--r-md);
+    cursor: pointer;
+  }
+  #error-box {
+    display: none;
+    background: var(--danger-bg);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    padding: 10px 14px;
+    border-radius: var(--r-lg);
+    font-size: 13.5px;
+    margin-bottom: 16px;
+    white-space: pre-wrap;
+  }
+  #error-box.show { display: block; white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px; }
+  /* EVAL_MODE 旁路了安全否决时的横幅：不能只在 JSON 里带个 safety_flag 字段、页面上看不出来 */
+  #safety-flag-note { display: none; margin: 8px 0; padding: 10px 12px; border: 2px solid var(--danger); background: var(--danger-bg); color: var(--danger); font-size: 13px; border-radius: var(--r-md); }
+  #safety-flag-note.show { display: block; }
+  /* 列数跟着医家数走，不写死。auto-fit 在 1180px 容器里给两位医家两列、
+     三位医家三列，加第四位也不用再改这里。原来是写死的 1fr 1fr，注册
+     张锡纯那一轮没跟着改，第三张卡片掉到第二行落单——而"三家并排对照"
+     正是这个项目的主张，并排本身是断的比数字错更严重。 */
+  #results {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+  }
+  @media (max-width: 780px) {
+    #results { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    padding: 16px;
+  }
+  .card h2 {
+    margin: 0 0 10px;
+    font-size: 17px;
+  }
+  .card .field {
+    font-size: 13.5px;
+    margin-bottom: 6px;
+    line-height: 1.5;
+  }
+  .card .field b {
+    color: var(--muted);
+    font-weight: 500;
+    margin-right: 4px;
+  }
+  /* M7：君臣佐使分组里"君药加粗"——不能复用 .field b（那是行首标签的样式，
+     颜色是灰的 var(--muted)），君药要的是正文本身加粗、颜色跟其余药材一致，
+     两种加粗的意图不同（一个是"这是个标签"，一个是"这味药更重要"），
+     所以另起一个类，不共用 .field b。 */
+  .herb-jun { font-weight: 700; }
+  .hallucination-warning {
+    background: var(--danger-bg);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: var(--r-md);
+    margin: 8px 0;
+    font-weight: 600;
+  }
+  /* X2 输出侧安全校验：配伍禁忌红、寒热警告黄、已修正小字 */
+  .safety-incompatible {
+    background: var(--danger-bg);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: var(--r-md);
+    margin: 8px 0;
+    font-weight: 600;
+  }
+  /* 「参西用药」是医家特征展示，不是警告——刻意用青蓝，跟 .hallucination-warning
+     的红、.safety-thermal 的橙分开，避免读成"这里有问题"。 */
+  .western-drugs {
+    background: var(--surface-2);
+    border: 1px solid var(--verified);
+    color: var(--verified);
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: var(--r-md);
+    margin: 8px 0;
+  }
+  .safety-thermal {
+    background: var(--caution-bg);
+    border: 1px solid var(--caution);
+    color: var(--caution);
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: var(--r-md);
+    margin: 8px 0;
+  }
+  .safety-revised {
+    font-size: 12px;
+    color: var(--muted, var(--muted));
+    margin: 4px 0 0;
+  }
+
+  /* ---------- M8：医生模式可编辑处方表 ---------- */
+  .doctor-disclaimer {
+    background: var(--purple-bg);
+    border: 1px solid var(--purple-border);
+    color: var(--purple-text);
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: var(--r-md);
+    margin: 8px 0;
+    line-height: 1.6;
+  }
+  .rx-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 12.5px;
+  }
+  .rx-table th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--muted);
+    font-size: 11.5px;
+    padding: 3px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .rx-table td {
+    padding: 2px 3px;
+    vertical-align: middle;
+  }
+  .rx-table input[type="text"], .rx-table input[type="number"], .rx-table select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 4px 5px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--panel);
+    color: var(--text);
+  }
+  .rx-table input[type="number"] { width: 62px; }
+  .rx-del-btn {
+    background: none;
+    border: none;
+    color: var(--danger);
+    cursor: pointer;
+    font-size: 15px;
+    padding: 2px 6px;
+  }
+  .rx-add-btn {
+    margin-top: 4px;
+    background: none;
+    border: 1px dashed var(--border);
+    border-radius: var(--r-md);
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 12.5px;
+    padding: 5px 10px;
+  }
+  .rx-formula-fields {
+    display: flex;
+    gap: 14px;
+    margin: 6px 0;
+    font-size: 12.5px;
+    color: var(--muted);
+    align-items: center;
+  }
+  .rx-formula-fields input {
+    padding: 4px 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    font-family: inherit;
+    font-size: 12.5px;
+  }
+  .rx-export-btn {
+    background: var(--accent);
+    color: var(--surface);
+    border: none;
+    padding: 7px 16px;
+    font-size: 13px;
+    border-radius: var(--r-md);
+    cursor: pointer;
+    margin-top: 6px;
+  }
+  .rx-override-box {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: var(--r-md);
+  }
+  .rx-override-box textarea {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 50px;
+    font-family: inherit;
+    font-size: 12.5px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    margin: 4px 0;
+  }
+  .rx-pharmacy-text {
+    white-space: pre;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    padding: 10px 12px;
+    margin-top: 8px;
+    overflow-x: auto;
+  }
+  /* 七列的处方表在窄屏上会撑破卡片。套一层可横向滚动的容器，不改表格结构
+     也不砍列——砍列会损失医生模式的信息完整性。 */
+  .rx-table-wrap { overflow-x: auto; }
+  .rx-table-wrap .rx-table { min-width: 560px; }
+  /* 追问记录框。renderFollowup() 原来给它挂的类名是 residual-note，而全文件
+     只有 #residual-note 这个 **id** 选择器，同名的类选择器从来不存在——这个
+     框一直是完全没样式的裸文本。 */
+  .followup-note {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    color: var(--caution);
+    padding: 10px 14px;
+    border-radius: var(--r-lg);
+    font-size: 12.5px;
+    line-height: 1.7;
+    margin-bottom: 16px;
+  }
+  /* 患者模式导诊面板。三档紧急度用边框色区分，high 必须一眼看出来。 */
+  #triage-box { display: none; margin-bottom: 16px; }
+  #triage-box.show { display: block; }
+  .triage-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: var(--r-lg);
+    padding: 12px 14px;
+    font-size: 13.5px;
+    line-height: 1.7;
+  }
+  .triage-card.urgency-high { border-left-color: var(--danger); background: var(--danger-bg); }
+  .triage-card.urgency-medium { border-left-color: var(--warn-border); background: var(--warn-bg); }
+  .triage-card .t-label { color: var(--muted); font-size: 12px; margin-right: 6px; }
+  .triage-card .t-flags { color: var(--danger); font-weight: 600; }
+  .triage-card .t-none { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  /* D1：额度条。平时是一行浅色小字，接近上限或降级时变色。 */
+  #usage-bar {
+    display: none; align-items: center; flex-wrap: wrap; gap: 10px;
+    margin: 10px 0 0; padding: 8px 12px; border-radius: var(--r-lg);
+    border: 1px solid var(--border); background: var(--surface-2);
+    font-size: 12.5px; color: var(--muted);
+  }
+  #usage-bar.show { display: flex; }
+  #usage-bar.warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--caution); }
+  #usage-bar.degraded { background: var(--danger-bg); border-color: var(--danger); color: var(--danger); }
+  #usage-bar .grow { flex: 1 1 auto; min-width: 220px; }
+  #byok-key {
+    width: 240px; padding: 5px 8px; font-size: 12px;
+    border: 1px solid var(--border); border-radius: var(--r-md);
+    font-family: var(--font-mono);
+  }
+  #byok-save, #byok-clear {
+    background: none; border: 1px solid var(--border); color: var(--text);
+    padding: 5px 10px; font-size: 12px; border-radius: var(--r-md); cursor: pointer;
+  }
+  #cancel-btn {
+    background: none;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    padding: 8px 16px;
+    font-size: 13.5px;
+    border-radius: var(--r-lg);
+    cursor: pointer;
+  }
+
+  details {
+    margin-top: 10px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+  }
+  summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--accent);
+  }
+  .detail-block {
+    font-size: 13px;
+    color: var(--text);
+    margin-top: 8px;
+    line-height: 1.6;
+  }
+  .detail-block .label {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 6px;
+  }
+  .ref-item {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .ref-excerpt {
+    margin-top: 4px; padding: 6px 8px; background: var(--surface-2);
+    border-left: 2px solid var(--rule); font-size: 12px; line-height: 1.6; color: var(--ink-2);
+  }
+  .ref-sym { margin-top: 2px; font-size: 12px; color: var(--muted); }
+  #graph-panel { position: relative; }
+  #graph-toolbar {
+    position: absolute; top: 10px; right: 12px; z-index: 5; display: flex; gap: 6px;
+  }
+  .ghost-btn {
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+    background: rgba(255,255,255,0.92); color: var(--ink-2);
+    border: 1px solid var(--rule); border-radius: var(--r-md); font-family: inherit;
+  }
+  .ghost-btn:hover { background: var(--surface); border-color: var(--noise); }
+  #evidence-panel {
+    position: fixed; top: 0; right: 0; width: 380px; max-width: 92vw; height: 100vh;
+    box-sizing: border-box;
+    background: var(--surface); border-left: 1px solid var(--rule); box-shadow: var(--shadow-float);
+    transform: translateX(100%); transition: transform .22s ease-out;
+    z-index: 50; display: flex; flex-direction: column;
+  }
+  /* 收起时 visibility:hidden，否则面板只是被 transform 推出视口、键盘
+     tab 仍然能走进去（焦点跑到看不见的地方）。transition 里带上
+     visibility 才不会让它在滑出动画开始前就消失。 */
+  #evidence-panel { visibility: hidden; transition: transform .22s ease-out, visibility .22s; }
+  #evidence-panel.open { transform: translateX(0); visibility: visible; }
+  #evidence-head {
+    display: flex; min-width: 0; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--rule-soft); flex: 0 0 auto;
+  }
+  #evidence-title {
+    font-weight: 600; font-size: 14px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  #evidence-close {
+    border: none; background: transparent; font-size: 22px; line-height: 1;
+    cursor: pointer; color: var(--muted); padding: 0 4px;
+  }
+  #evidence-close:hover { color: var(--ink); }
+  #evidence-body {
+    padding: 14px 16px; overflow-y: auto; overflow-x: hidden;
+    flex: 1 1 auto; font-size: 13px;
+    /* 医案原文是连续中文、case_id 是长串，不强制断行会把 fixed 面板撑宽，
+       表现为面板左缘跑到页面中间、右缘溢出屏幕 */
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  #evidence-body * { max-width: 100%; box-sizing: border-box; }
+  .ev-sec { margin-bottom: 16px; }
+  /* 这三处原来写死 var(--muted)（白底约 3.3:1）、页脚写死 var(--muted)（约 2.7:1），
+     都低于 WCAG AA 的 4.5:1，而且都是 11px；投影仪上更糟。有意思的是
+     --muted（var(--muted)，约 5.0:1）本身是合格的——不合格的正好是这几处绕开
+     变量写死的颜色。 */
+  .ev-sec > .label { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+  .ev-case {
+    border: 1px solid var(--rule-soft); border-radius: var(--r-md); padding: 9px 10px; margin-bottom: 9px;
+  }
+  .ev-case .cid { font-weight: 600; font-size: 12px; }
+  .ev-case .meta { font-size: 11px; color: var(--muted); margin: 3px 0 5px; }
+  .ev-raw {
+    background: var(--surface-2); border-left: 2px solid var(--rule); padding: 7px 9px;
+    font-size: 12px; line-height: 1.7; color: var(--ink-2);
+    max-height: 90px; overflow: hidden; position: relative;
+  }
+  .ev-raw.expanded { max-height: none; }
+  .ev-more {
+    font-size: 11px; color: var(--verified); cursor: pointer; margin-top: 4px; display: inline-block;
+  }
+  #cy .cy-clickable { cursor: pointer; }
+  /* .gt-tooltip：模块6的 hover tooltip 视觉样式，改成类而不是 #graph-tooltip 这个
+     具体 id——图谱浏览器（模块7）的画布是另一个 cytoscape 实例、另一个容器，
+     要用同一套视觉但挂在不同的 DOM 节点上，用类选择器两边共用，不重复抄一份。 */
+  .gt-tooltip {
+    display: none;
+    position: absolute;
+    z-index: 20;
+    max-width: 260px;
+    padding: 8px 10px;
+    background: var(--ink);
+    color: var(--surface-2);
+    border-radius: var(--r-md);
+    font-size: 12px;
+    line-height: 1.6;
+    pointer-events: none;
+  }
+  .gt-tooltip.show { display: block; }
+  .gt-tooltip b { color: var(--surface); }
+  .gt-tooltip .tt-meta { color: var(--noise); margin-top: 2px; }
+
+  /* ---------- 模块7：图谱浏览器页签 ---------- */
+  #tab-bar {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 10px 24px 0;
+    display: flex;
+    gap: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+    font-size: 14px;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .tab-panel[hidden] { display: none; }
+
+  #gb-lambda1-note {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    color: var(--caution);
+    padding: 10px 14px;
+    border-radius: var(--r-lg);
+    font-size: 12.5px;
+    line-height: 1.7;
+    margin-bottom: 12px;
+  }
+  #gb-error-box {
+    display: none;
+    background: var(--danger-bg);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    padding: 10px 14px;
+    border-radius: var(--r-lg);
+    font-size: 13.5px;
+    margin-bottom: 16px;
+  }
+  #gb-error-box.show { display: block; }
+  #gb-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  #gb-search {
+    flex: 1;
+    min-width: 160px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+  }
+  #gb-search:focus { border-color: var(--accent); }
+  #gb-search-status { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  #gb-physician-select {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    font-family: inherit;
+    font-size: 13px;
+    background: var(--panel);
+  }
+  #gb-panel {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    padding: 8px;
+  }
+  #gb-cy {
+    width: 100%;
+    height: 520px;
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+  }
+  #gb-empty-hint {
+    position: absolute;
+    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: var(--muted);
+    font-size: 13px;
+    pointer-events: none;
+  }
+  #gb-empty-hint[hidden] { display: none; }
+  #gb-stats {
+    margin-top: 10px;
+    font-size: 11.5px;
+    color: var(--muted);
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  #gb-cy .gb-search-hit { border-width: 3px !important; }
+  /* R3 演示模式提示。放在 header 下面、所有角色都看得见的位置：这行字是诚实性
+     要求，不是可选的装饰——挂在只有 researcher 拿得到的 manifest 上等于对真正
+     的观众隐身。颜色用醒目但不刺眼的琥珀色，字号小，不抢演示的主角。 */
+  #demo-mode-banner {
+    display: none;
+    margin: 0 auto 10px;
+    max-width: 1040px;
+    padding: 6px 12px;
+    background: var(--caution-bg);
+    border: 1px solid var(--caution);
+    border-radius: var(--r-md);
+    color: var(--caution);
+    font-size: 12px;
+    text-align: center;
+  }
+  #demo-mode-banner.show { display: block; }
+  /* 原来全文件只有一个 780px 断点、只改了 #results 的列数。画布固定
+     540/520px 高、header/main 固定 24px 内边距，手机上图几乎看不清。 */
+  @media (max-width: 640px) {
+    header { padding: 14px 14px 10px; }
+    header h1 { font-size: 19px; }
+    main { padding: 14px 14px 48px; }
+    #tab-bar { padding: 8px 14px 0; }
+    #cy { height: 380px; }
+    #gb-cy { height: 360px; }
+    .input-row { justify-content: stretch; }
+    .input-row > select, .input-row > button { flex: 1 1 auto; }
+  }
+
+  /* ============================================================================
+     §2.2 的字体分工落地：**宋体说中医的话，黑体说系统的话。**
+     这一块单独放在文件末尾而不是散进各个规则里，为的是"哪些内容算医学内容"
+     这件事能一眼看全——散开之后，新加一个展示医案原文的元素必然会漏掉。
+     ============================================================================ */
+  .card,                 /* 三家集注的正文：证型、治法、方名、药名 */
+  .ref-excerpt,          /* 医案引文 */
+  .ev-raw, .ev-case,     /* 证据侧栏里的原文块 */
+  .triage-card,          /* 患者模式的病名与就诊科室 */
+  #complaint,            /* 主诉输入：它是"正文"（§3.1） */
+  .herb-jun {
+    font-family: var(--font-classic);
+  }
+  /* 医学内容里**嵌着的界面元素**（按钮、标签、表头）要回到黑体——
+     它们是系统在说话，不是医家在说话。 */
+  .card button, .card select, .card input,
+  .card .tab-btn, .card .ev-more, .triage-card button {
+    font-family: var(--font-ui);
+  }
+  /* 数字与拉丁：指标、剂量、分数 */
+  .rx-table input[type="number"], .gt-tooltip code {
+    font-family: var(--font-num);
+  }

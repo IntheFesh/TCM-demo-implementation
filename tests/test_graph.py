@@ -3,8 +3,8 @@ M5 起还验证 compound 节点的 parent 引用有效（同样归 assert_graph_
 import json
 import subprocess
 
-from tests.node_script import js_tmp
 from pathlib import Path
+from tests.web_harness import js_tmp, load_app_js
 
 from api.main import assert_graph_edges_valid, to_graph
 from core.schemas import (
@@ -240,8 +240,7 @@ def _build_evidence_index(data: dict) -> dict:
     buildEvidenceIndex(data) 后取 EVIDENCE。测的是真实上线的代码，不是
     在测试里另抄一份反查逻辑——跟 test_western_drugs.py 里 _run_western_drugs_html
     是同一个模式。"""
-    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-    script = html.split("<script>")[-1].split("</script>")[0]
+    script = load_app_js()
     dom_stub = """
     const anyNode = new Proxy(function(){}, {
       get: () => anyNode, set: () => true, apply: () => anyNode, construct: () => anyNode,

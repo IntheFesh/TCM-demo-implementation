@@ -10,24 +10,15 @@ Playwright 验证的是"真实渲染出来看起来对不对"（模块报告里�
 import json
 import subprocess
 
-from tests.node_script import js_tmp
 from pathlib import Path
+from tests.web_harness import DOM_STUB, js_tmp, load_app_js
 
 ROOT = Path(__file__).resolve().parent.parent
 
-DOM_STUB = """
-const anyNode = new Proxy(function(){}, {
-  get: () => anyNode, set: () => true, apply: () => anyNode, construct: () => anyNode,
-});
-globalThis.document = anyNode;
-globalThis.window = anyNode;
-globalThis.cytoscape = anyNode;
-"""
 
 
 def _run_node(js_tail: str) -> str:
-    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-    script = html.split("<script>")[-1].split("</script>")[0]
+    script = load_app_js()
     proc = subprocess.run(
         ["node", js_tmp(DOM_STUB + script + "\n" + js_tail)],
         capture_output=True, text=True, timeout=30,

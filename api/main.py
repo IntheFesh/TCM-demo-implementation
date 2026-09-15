@@ -166,7 +166,21 @@ async def health() -> dict:
     # 这个端点不做 IO 的性质没变——replay_info() 读的是已经装载好的 fixture
     # 元信息（fixtures 惰性加载，健康探针不会触发扫目录：探针在服务起来后
     # 第一次被调时若还没装载，装载的是几百个小 JSON，一次性的）。
-    return {"status": "ok", "demo_mode": demo_mode_info()}
+    # physicians：**身份色的唯一来源是 core/physicians.py**（docs/DESIGN.md §2.1 的
+    # 订正 + CLAUDE.md 第 31 条前端小节）。前端一加载就从这里取，注入成 CSS 变量，
+    # CSS 里不写死——写死的话注册表加第四位医家时那份副本不会跟着长出来，新医家在
+    # 界面上就没有颜色（这个坑已经踩过一次）。
+    # 放 /health 而不是等第一次问诊：三列的顶边和姓名行在**还没有结果时**就要着色。
+    return {
+        "status": "ok",
+        "demo_mode": demo_mode_info(),
+        "physicians": [
+            {"id": pid, "name": info["name"], "years": info["years"],
+             "school": info["school"], "color": info["color"],
+             "color_bg": info["color_bg"]}
+            for pid, info in PHYSICIANS.items()
+        ],
+    }
 
 
 @app.get("/")

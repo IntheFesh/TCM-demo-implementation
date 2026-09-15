@@ -470,7 +470,10 @@ def test_export_cli_has_the_flag_and_defaults_to_excluding():
 
 
 def _make_docx(path: Path, paragraphs: list[str], table_rows: list[list[str]] | None = None):
-    import docx
+    # importorskip：python-docx 是可选依赖（只有处理 .docx 语料时才要）。
+    # 裸 import 会让干净机器上一批跟它无关的断言一起红——这个形状已经撞过四次，
+    # 判据写在 tests/test_conftest_embedding_marker.py 里。
+    docx = pytest.importorskip("docx")
 
     d = docx.Document()
     for p in paragraphs:

@@ -134,24 +134,44 @@ def test_s3_wall_drops_to_the_slowest_physician_while_sum_stays(tmp_path):
     """**R12 三医家并发的验收判据。** sum 是总共干了多少活、wall 是这一段占了多少
     墙钟、slowest 是最慢的那一位。
 
-    **这是有意的契约变更**：R11 写的这条断言是 `wall ≈ sum`（那时串行，docstring 里
-    就写明了"R12 之后会变"）。并发之后判据翻过来：
-      · `wall ≈ slowest`——三位医家真的在同时跑；
-      · `sum ≈ 3 × latency` 不变——**sum 不变正是"没有偷偷少干活"的证据**，
-        只看 wall 变小的话，"某位医家被跳过了"跟"三位并发"长得一模一样。
+    契约变过两次，都写在这里：
+    · R11 写的是 `wall ≈ sum`（那时串行，docstring 里就写明"R12 之后会变"）；
+    · R12 翻成 `wall ≈ slowest` 且 `sum` 不变——**sum 不变正是"没有偷偷少干活"的
+      证据**，只看 wall 变小的话，"某位医家被跳过了"跟"三位并发"长得一模一样。
 
-    latency 取 0.3 秒：够大到线程启动开销（毫秒级）不会淹掉信号，够小到测试仍是秒级。
+    **R13 起判据一律用比值，不要再用绝对秒数。** R12 那版写的是
+    `s3_sum == 0.3*N ± 0.15`，单跑三次全绿、跟全量一起跑时红：实测 `s3_sum 1.1162`
+    vs 期望 `0.9 ± 0.15`——每位医家 0.3 秒被线程启动和 GIL 竞争抬到 0.372 秒，
+    吃掉 17% 的容差。而 AutoDL 是 2GB 满载机器，这条早晚会红。
+    **绝对秒数度量的是"这台机器有多快"，而这条测试要测的是"并发了没有"**，
+    后者是一个比值，跟机器速度无关：
+
+      sum   >= N × latency × 0.9      只设下界（慢机器只会更大，不会更小）
+      wall / sum      ≈ 1/N ± 0.25    并发；串行时这个比值是 1.0
+      wall / slowest  <= 1.5          墙钟没有明显超过最慢的那一位
     """
-    report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2",
-                          "--fake-latency", "0.3")
     from core.physicians import PHYSICIANS
 
-    step = report["runs"][0]["by_step"]
+    latency, n = 0.3, len(PHYSICIANS)
+    report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2",
+                          "--fake-latency", str(latency))
+    run = report["runs"][0]
+    step = run["by_step"]
     assert {"s3_sum", "s3_wall", "s3_slowest"} <= set(step)
-    assert step["s3_sum"] == pytest.approx(0.3 * len(PHYSICIANS), abs=0.15)
-    assert step["s3_wall"] == pytest.approx(step["s3_slowest"], abs=0.15)
-    assert step["s3_wall"] < step["s3_sum"] * 0.6, (
-        f"并发之后 S3 的墙钟应该远小于总工作量：wall={step['s3_wall']} sum={step['s3_sum']}")
+    assert run["llm_calls"] == 2 + n
+    # 下界：每位医家至少睡满 latency。慢机器只会更慢，所以只卡下界不卡上界。
+    assert step["s3_sum"] >= latency * n * 0.9, step
+    # 这两个比值才是"并发了没有"的判据，跟机器速度无关
+    assert step["s3_wall"] / step["s3_sum"] == pytest.approx(1 / n, abs=0.25), step
+    assert step["s3_wall"] / step["s3_slowest"] <= 1.5, step
+
+
+def test_the_concurrency_ratio_would_catch_a_serial_implementation():
+    """对照：串行时 `wall/sum` 是 1.0，落在 `1/N ± 0.25` 之外（N=3 时上界 0.583）。
+    没有这条的话，"比值判据"有可能宽到连串行都放过去——那它就什么都没测。"""
+    n = 3
+    serial_ratio = 1.0
+    assert abs(serial_ratio - 1 / n) > 0.25, "比值判据宽到连串行都判成并发了"
 
 
 def test_summary_counts_and_averages_the_runs(tmp_path):
@@ -161,6 +181,28 @@ def test_summary_counts_and_averages_the_runs(tmp_path):
     assert s["elapsed_s"]["min"] <= s["elapsed_s"]["mean"] <= s["elapsed_s"]["max"]
     assert s["llm_calls"]["mean"] == report["runs"][0]["llm_calls"]
     assert "s1" in s["by_step_mean"] and "s2" in s["by_step_mean"]
+
+
+def test_usage_is_rolled_up_per_schema_when_it_is_available(tmp_path):
+    """R13：开思考那一步的默认上限从 16384 提到 32768，"S3 还会不会截断"要靠
+    completion_tokens + reasoning_tokens 贴着上限没有来判断，不是靠"这次没报错"。
+    所以 summary 里要有按 schema 的用量汇总（**看 max 不只看 mean**——截断是被最长
+    的那一次触发的，均值会把它抹平）。假后端没有 usage，汇总是空字典，字段仍在。"""
+    report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2")
+    assert report["summary"]["usage_by_schema"] == {}
+
+    rolled = bench_consult._usage_by_schema([{"calls": [
+        {"schema": "S3Syndrome", "usage": {"completion_tokens": 900,
+                                           "reasoning_tokens": 4000, "total_tokens": 6000}},
+        {"schema": "S3Syndrome", "usage": {"completion_tokens": 1500,
+                                           "reasoning_tokens": 9000, "total_tokens": 12000}},
+        {"schema": "S1Normalize", "usage": {"completion_tokens": 80}},
+        {"schema": None, "usage": {"completion_tokens": 1}},
+    ]}])
+    assert rolled["S3Syndrome"]["reasoning_tokens"] == {"mean": 6500.0, "max": 9000.0, "n": 2}
+    assert rolled["S3Syndrome"]["completion_tokens"]["max"] == 1500.0
+    assert rolled["S1Normalize"]["completion_tokens"]["n"] == 1
+    assert None not in rolled, "没有 schema 的调用不该占一个桶"
 
 
 def test_usage_is_reported_as_unavailable_instead_of_being_invented(tmp_path):

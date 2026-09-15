@@ -415,6 +415,33 @@ def summarize(runs: list[dict]) -> dict:
         "by_step_mean": {k: round(statistics.fmean(
             [r["by_step"][k] for r in ok if k in r["by_step"]]), 4) for k in sorted(step_keys)},
         "usage_available": any(r["usage_available"] for r in ok),
+        # **按 schema 汇总 token 用量**：R13 把开思考那一步的默认上限从 16384 提到
+        # 32768，"S3 还会不会截断"要靠 completion_tokens + reasoning_tokens 贴着
+        # 上限没有来判断，而不是靠"这次没报错"。没有 usage 的后端这里是空字典。
+        "usage_by_schema": _usage_by_schema(ok),
+    }
+
+
+def _usage_by_schema(runs: list[dict]) -> dict:
+    """每种 schema 的 token 用量均值与最大值。看最大值而不是只看均值——
+    截断是被最长的那一次触发的，均值会把它抹平。"""
+    buckets: dict[str, dict[str, list[float]]] = {}
+    for run in runs:
+        for call in run["calls"]:
+            usage = call.get("usage")
+            if not usage or not call.get("schema"):
+                continue
+            bucket = buckets.setdefault(call["schema"], {})
+            for field in ("prompt_tokens", "completion_tokens",
+                          "reasoning_tokens", "total_tokens"):
+                value = usage.get(field)
+                if value is not None:
+                    bucket.setdefault(field, []).append(float(value))
+    return {
+        schema: {field: {"mean": round(statistics.fmean(values), 1),
+                         "max": max(values), "n": len(values)}
+                 for field, values in fields.items()}
+        for schema, fields in buckets.items()
     }
 
 

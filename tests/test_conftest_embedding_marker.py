@@ -21,8 +21,12 @@ def test_the_marker_is_registered_in_pytest_ini():
 
 def test_by_default_the_encoder_is_the_deterministic_fake():
     """默认不加载真模型。判据是"拿到的类就是那个假的"，不是"内存没涨"——
-    后者测不了。"""
-    import sentence_transformers
+    后者测不了。
+
+    干净机器上 conftest 会塞一个桩模块进 sys.modules，所以这里 import 得到；
+    但仍然用 importorskip 兜底，不把"装没装"混进这条断言（见下面那条 marker
+    测试的注释，同一条理由）。"""
+    sentence_transformers = pytest.importorskip("sentence_transformers")
 
     from tests.conftest import _DeterministicEncoder
 
@@ -48,11 +52,41 @@ def test_a_marked_test_gets_the_real_class_back():
     """标了 marker 的用例拿到的是真类。**这条自己就是那个 marker 的用例**：
     `pytest -m "not real_embedding"` 会跳过它，`-m real_embedding` 会跑它，
     两条命令的分界线因此是可验证的，不是口头约定。"""
-    import sentence_transformers
+    # **importorskip 而不是 import**：这条测的是"marker 能让真类回来"，不是
+    # "这台机器装没装 sentence-transformers"。干净机器上直接 import 会
+    # ModuleNotFoundError，把一条跟依赖无关的断言变成环境检查。
+    sentence_transformers = pytest.importorskip("sentence_transformers")
 
     from tests.conftest import _DeterministicEncoder
 
     assert sentence_transformers.SentenceTransformer is not _DeterministicEncoder
+
+
+def test_no_test_imports_an_optional_dependency_unguarded():
+    """**第四次撞同一堵墙了**（docx 时间戳 / bench_startup 无条件 import /
+    这条）。判据：测试文件里 import 可选依赖必须走 `pytest.importorskip`，
+    不能裸 import——裸 import 在干净机器上是 ModuleNotFoundError，把一条跟依赖
+    无关的断言变成了环境检查。
+
+    只查"可选依赖"这张小表：requirements.txt 里的必装依赖不在其列。
+    """
+    import re
+
+    optional = ("sentence_transformers", "vllm", "docx", "playwright")
+    offenders = []
+    for path in sorted((ROOT / "tests").glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#") or "importorskip" in stripped:
+                continue
+            m = re.match(r"(?:import|from)\s+([\w.]+)", stripped)
+            if m and m.group(1).split(".")[0] in optional:
+                # 装到 sys.modules 里的桩、或者 monkeypatch 用的引用不算——
+                # 判据是"这一行会不会在干净机器上抛 ModuleNotFoundError"，
+                # 所以只认真正的 import 语句，且允许写在 try 里。
+                offenders.append(f"{path.name}:{lineno} {stripped}")
+    assert not offenders, "这些测试在干净机器上会因为缺可选依赖而红：\n" + "\n".join(offenders)
 
 
 def test_the_runbook_splits_segment_zero_into_two_passes():
