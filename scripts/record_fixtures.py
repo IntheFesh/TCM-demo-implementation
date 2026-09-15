@@ -125,7 +125,7 @@ def build_plan(queries: list[str] | None = None) -> list[Scenario]:
 RECORD_PLAN = build_plan
 
 
-def run_scenario(scenario: Scenario, recorder, bar=None) -> dict:
+def run_scenario(scenario: Scenario, recorder=None, bar=None) -> dict:
     """跑一个场景。**USE_REACT 真的设进环境**，理由见模块文档字符串。
 
     consult() 的 use_react 也显式传：环境变量是给 fixture 元信息用的诚实记录，
@@ -136,7 +136,10 @@ def run_scenario(scenario: Scenario, recorder, bar=None) -> dict:
 
     previous = os.environ.get("USE_REACT")
     os.environ["USE_REACT"] = "1" if scenario.use_react else "0"
-    before = recorder.n_written
+    # recorder=None：收尾的自洽校验用 ReplayBackend 重跑同一批场景，那一遍没有
+    # "写入了几条 fixture"可言（零调用、只读），但**必须走同一套按场景设 USE_REACT
+    # 的逻辑**——环境不一致 prompt 就不一样，验的就不是同一个东西了。
+    before = recorder.n_written if recorder is not None else 0
     t0 = time.time()
     if bar is not None:
         bar.note(f"开始场景 {scenario.name}（预估 {scenario.estimated_calls} 次调用）")
@@ -157,7 +160,7 @@ def run_scenario(scenario: Scenario, recorder, bar=None) -> dict:
         "scenario": scenario.name,
         "complaint": scenario.complaint,
         "use_react": scenario.use_react,
-        "n_fixtures": recorder.n_written - before,
+        "n_fixtures": (recorder.n_written - before) if recorder is not None else 0,
         "elapsed_s": round(time.time() - t0, 1),
         "error": error,
         "rejected": bool(outcome and outcome.get("rejected")),
@@ -168,6 +171,50 @@ def run_scenario(scenario: Scenario, recorder, bar=None) -> dict:
         # "什么算同一个输出"只能有一处定义。
         "canonical": canonical_outcome(outcome) if outcome else None,
     }
+
+
+def check_baseline_self_consistency(
+    scenario_names: list[str], baseline: dict[str, str], replay_one,
+) -> list[dict]:
+    """录完之后**用回放把每个场景再跑一遍**，跟 `_baseline.json` 逐条比对。
+    返回不一致清单（空 = 自洽）。零 LLM 调用，几秒钟。
+
+    为什么要有这一步（段 6 的教训）：基线是**每个场景跑完的当下**存的，后面的场景
+    改了 fixture 它不知道。R10-1 的跨场景复用让这种漂移不再发生，但那是"相信实现
+    做对了"；这一步是**结构性保证**——把"录出来的东西能不能放出来"从"跑完才知道"
+    变成"录制脚本自己保证"。将来别的路径再引入同样的漂移，这里会当场红。
+
+    `replay_one(scenario_name) -> canonical` 由调用方注入（真实调用方传的是"用
+    ReplayBackend 重跑这个场景再算 canonical_outcome"），这样这个函数本身不依赖
+    后端、可以单测。
+
+    没有基线的场景（录制时就失败了，canonical=None）**不参与比对**：它们已经在
+    失败清单里报过一次，这里再报一次"不一致"是噪音。
+    """
+    from core.llm import LLMError
+
+    mismatches: list[dict] = []
+    for name in scenario_names:
+        expected = baseline.get(name)
+        if expected is None:
+            continue
+        try:
+            now = replay_one(name)
+        except LLMError as e:
+            # 回放未命中（段 6 的症状）也算不一致，不让异常冒出去——这一步的产出
+            # 是一张清单，不是一个崩溃
+            now = f"回放失败：{type(e).__name__}: {str(e).splitlines()[0]}"
+        if now != expected:
+            mismatches.append({"scenario": name, "expected": expected, "now": now})
+    return mismatches
+
+
+def _first_difference(a: str, b: str) -> str:
+    """两段 canonical 的第一处差异，给人定位用。整段打出来没法看（几百字）。"""
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return f"位置 {i}：基线 {a[max(0, i - 20):i + 20]!r} vs 本次 {b[max(0, i - 20):i + 20]!r}"
+    return f"长度不同：基线 {len(a)} 字，本次 {len(b)} 字（前缀相同）"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -241,6 +288,11 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     t0 = time.time()
     for i, scenario in enumerate(plan, start=1):
+        # **场景边界**：把上一个场景写过的 key 冻结起来，这个场景里再遇到同一个 key
+        # 就复用已录的输出、不再调模型。段 6 的 bug 就是少了这一句（react_off_N 和
+        # react_on_N 共享同一条主诉 → 同一个 S1 key → 后者覆盖前者 → 前者的下游
+        # fixture 变孤儿 → 回放前者未命中）。见 RecordingBackend.begin_scenario。
+        recorder.begin_scenario(scenario.name)
         r = run_scenario(scenario, recorder, bar=bar)
         results.append(r)
         state = ("失败" if r["error"] else
@@ -265,14 +317,64 @@ def main(argv: list[str] | None = None) -> int:
     failed = [r for r in results if r["error"]]
     print()
     print(f"录制基线：{baseline_path}（{len(baseline)} 个场景，verify_replay 用它验逐字节一致）")
+    n_overwritten = recorder.n_written - len(recorder.keys_written)
     print(f"共写入 {recorder.n_written} 次（去重后 {len(recorder.keys_written)} 条 fixture）"
           f"，用时 {time.time() - t0:.0f}s")
+    # **复用 / 覆盖统计**（R10-1）。段 6 那次是 244 次写入 / 233 条 = 覆盖 11 个，
+    # 而覆盖数不为 0 正是"下游 key 漂移"的信号——未命中的错误消息会让人来看这两个数。
+    print(f"跨场景复用 {recorder.n_reused} 次（这些调用没有花钱：前面的场景已经录过"
+          f"同一个 key，多调一次只会拿到一个不同的输出、把前面那条盖掉）")
+    print(f"同一场景内覆盖 {n_overwritten} 次"
+          + ("（校验失败重试的正常结果：最后一次写进去的是通过校验的那份）"
+             if n_overwritten else "（0 = 这一轮没有任何 key 被盖过）"))
     print(f"fixture 目录：{out_dir}")
     if failed:
         print(f"\n【失败】{len(failed)}/{len(results)} 个场景失败："
               f"{[r['scenario'] for r in failed]}。这些场景的 fixture 不全，"
               "回放到它们会未命中——用 --only 补录。", file=sys.stderr)
         return 1
+
+    # ---- 收尾自洽校验（R10-2）：零调用，但它决定这批 fixture 能不能放出来 ----
+    print()
+    print("--- 收尾自洽校验：用 ReplayBackend 把所有场景再跑一遍，跟基线逐条比 ---")
+    print("（零 LLM 调用。段 6 的教训：基线是每个场景跑完的当下存的，后面的场景改了"
+          "fixture 它不知道——所以录完必须自己验一遍，不能等 verify_replay）")
+    from core.llm_replay import ReplayBackend
+
+    replay_backend = ReplayBackend(fixtures_path=out_dir)
+    by_name = {s.name: s for s in plan}
+
+    def _replay_one(name: str) -> str:
+        """用回放跑一个场景，返回它的 canonical。**canonical 走 run_scenario 里
+        那一处 canonical_outcome**（core/llm_replay.py 的那一个），不另算一遍——
+        "什么算同一个输出"只能有一处定义。"""
+        from core.llm import LLMError as _LLMError
+
+        llm_mod._llm_singleton = replay_backend
+        r = run_scenario(by_name[name])
+        if r["error"]:
+            raise _LLMError(r["error"])
+        if r["canonical"] is None:
+            raise _LLMError(f"{name}：回放跑完了但没有 canonical（被拦截/信息不足？）")
+        return r["canonical"]
+
+    try:
+        mismatches = check_baseline_self_consistency(
+            [s.name for s in plan], baseline, _replay_one)
+    finally:
+        llm_mod._llm_singleton = recorder
+    if mismatches:
+        print(f"\n【自洽校验失败】{len(mismatches)}/{len(baseline)} 个场景回放出来跟基线不一致：",
+              file=sys.stderr)
+        for m in mismatches:
+            print(f"  ✗ {m['scenario']}：{_first_difference(m['expected'], m['now'])}",
+                  file=sys.stderr)
+        print("这批 fixture **不能放出来**：回放的结论跟录制时的结论不是同一个。"
+              f"看上面的「跨场景复用 {recorder.n_reused} 次 / 覆盖 {n_overwritten} 次」"
+              "——覆盖数不为 0 说明有上游 fixture 被后面的场景盖过、下游 key 漂移了。",
+              file=sys.stderr)
+        return 1
+    print(f"★ 自洽校验通过：{len(baseline)} 个场景回放结论跟基线逐字节一致。")
     print("\n全部场景跑完。下一步：`python -m scripts.verify_replay`（退出码 0 = 回放"
           "逐字节一致）。")
     return 0

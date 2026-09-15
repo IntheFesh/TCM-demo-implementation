@@ -252,10 +252,10 @@ cp .env.example .env
 | `LLM_MODE` | `api`（默认，走 OpenAI 兼容接口）/ `local`（本地 vLLM 的 OpenAI 兼容 server）/ `local_inproc`（进程内 vLLM，批量评测用）/ `claude_cli`。后两种见下面「本地模型部署」一节 |
 | `LLM_API_KEY` | DeepSeek（或其他 OpenAI 兼容服务）的 API key |
 | `LLM_BASE_URL` | 默认 `https://api.deepseek.com` |
-| `LLM_MODEL` | 默认 `deepseek-chat` |
+| `LLM_MODEL` | 默认 `deepseek-v4-pro`。**原来的默认值 `deepseek-chat` 已于 2026-09 下线**——拿它发请求得到的是 HTTP 200 + **空响应体**（不是 404），症状是每次调用返回空串、校验失败、重试三次后 `LLMError`，看不出根因在模型名上。段 0 现在会查 `$LLM_BASE_URL/models`把这种情况在花第一分钱之前挡掉。⚠ 换模型 = 本仓库所有既有数字（ε/E3/E4/E8/E9/SDT）都不可直接比较，见 `eval/RESULTS.md` |
 | `LLM_MODE` 取 `claude_cli` | 走本机 `claude` CLI，**仅用于没有 API 网络时的冒烟**：模型不是 deepseek-chat、单次约 $0.06（DeepSeek 约 $0.0007），跑出来的分数不可与他人比较。`manifest.comparability_warning` 会把这一点一路带进报告 |
 | `LLM_TIMEOUT_SECONDS` | 单次调用的读超时秒数（旧名 `LLM_TIMEOUT` 仍然认）。不设时按后端取默认值：云端 API 读 120 秒 / 墙钟 180 秒，本地 vLLM server 600/900，进程内 vLLM 1800（首次调用要加载权重）。四个 HTTP 相位（connect/read/write/pool）**分别设**，另有一层墙钟兜底——理由见下面「超时」一节。SDK 自带重试已关，重试统一由 `generate()` 负责 |
-| `LLM_MAX_TOKENS` | 单次输出上限，默认 8192（DeepSeek 默认 4096，S0 抽多病人粗段会被截断） |
+| `LLM_MAX_TOKENS` | 单次输出上限。不设时按模型分两档：非推理模型 **8192**（DeepSeek 默认 4096，S0 抽多病人粗段会被截断）、推理模型 **16384**。推理模型要更大是因为 **max_tokens 同时盖住不可见的 reasoning tokens**：deepseek-v4-pro 实测「你好」一句就花 45 个 token、其中 36 个是 reasoning，8192 下 S3 的可见输出在 2081 字符处被砍断。判据在 `core/llm.py` 的 `_default_max_tokens()`（`REASONING_MODELS` 列出已知的推理模型），不靠人记着在 `.env` 里设对 |
 | `CLAUDE_CLI_MODEL` / `CLAUDE_CLI_TIMEOUT` | `claude_cli` 模式下的模型名与超时，默认 `claude-sonnet-5` / 180 |
 | `USE_REACT` | `1` 打开 ReAct 取证（默认关，见「ReAct 取证模式」一节） |
 | `FAST_MODE` | `1` 同时降级三处：追问 0 轮、ReAct 步数上限降到 2、残差辨证整体关闭（默认关，见「追问」一节）。实测一次完整问诊 14 次调用 → 8 次 |

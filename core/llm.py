@@ -282,6 +282,22 @@ INPROC_TIMEOUTS = CallTimeouts(connect=1800.0, read=1800.0, write=1800.0, pool=1
                                deadline=1800.0)
 
 
+# 单次输出上限的默认值。**两档，按模型是不是推理模型分**。
+#
+# DeepSeek 默认 4096 token：S0 抽多病人粗段的 JSON 会被截断，截断的 JSON 回灌重试
+# 也只会以同样方式再截断三次。所以非推理模型给到 8192。
+DEFAULT_MAX_TOKENS = 8192
+# 推理模型（deepseek-v4-pro）要另算：**max_tokens 同时盖住不可见的 reasoning
+# tokens**，不是只盖可见输出。2026-09-15 实测「你好」这一句就花了 45 个 token、
+# 其中 36 个是 reasoning；8192 下 S3 的可见输出在 2081 字符处被砍断——而 8192 这个
+# 数字看起来完全够用，所以症状是"输出莫名截断"，看不出跟推理有关。
+REASONING_MAX_TOKENS = 16384
+# 已知的推理模型。**按名字判**：服务端不给"这是不是推理模型"这个字段，而这件事
+# 只影响一个默认值、猜错的代价是上限偏大或偏小（`LLM_MAX_TOKENS` 能覆盖），
+# 不值得为它加一次探测调用。新模型上线时往这里加一行。
+REASONING_MODELS = frozenset({"deepseek-v4-pro"})
+
+
 class LLMBackend(ABC):
     """后端基类。**重试/校验/错误回灌只在这里实现一份**，子类只实现 `_complete`
     这个"单次原始调用"。
@@ -321,6 +337,25 @@ class LLMBackend(ABC):
                   file=sys.stderr)
             return self.TIMEOUTS
         return self.TIMEOUTS.with_seconds(seconds)
+
+    def _default_max_tokens(self) -> int:
+        """这次调用没有显式传 max_tokens 时用多少。`LLM_MAX_TOKENS` 优先。
+        **放在基类**：每个后端都要回答这个问题，各写一份的话"推理模型要更大"
+        这条会只在其中一个后端上生效。
+
+        **推理模型要更大**：它的 max_tokens 同时盖住不可见的 reasoning tokens，
+        所以 8192 留给可见输出的远不止少一点点——2026-09-15 实测 deepseek-v4-pro
+        在 8192 下 S3 的输出在 2081 字符处被砍断。这一档是把推理模型的**可见**
+        输出上限拉回到跟非推理模型同一个量级，不是"推理模型更强所以给更多"。
+
+        判据放在代码里而不是让人去 .env 里记一个数：一个"必须手动设对、否则
+        静默截断"的环境变量迟早有一次会忘，而忘了的代价是一整段的钱。
+        """
+        env = os.environ.get("LLM_MAX_TOKENS")
+        if env:
+            return int(env)
+        return (REASONING_MAX_TOKENS if self.model_name() in REASONING_MODELS
+                else DEFAULT_MAX_TOKENS)
 
     def abort_in_flight(self) -> None:
         """墙钟超时之后清理这个后端里挂着的东西。默认什么都不做；
@@ -473,11 +508,17 @@ class LLMBackend(ABC):
         校验错误一起回灌，要求模型修正。实测这一步是必要的——换模型时字段名
         猜错（比如把 element 写成 name）靠这一轮就能纠正。
 
-        max_tokens 不传就用各后端自己的默认值（OpenAICompatBackend 读
-        LLM_MAX_TOKENS 环境变量，默认 8192）。**不要全局调高默认值**：
-        S1/S2/S3 用不到那么多 token，调高只会让真正失控的输出更晚才被
-        发现；某个 prompt 确实需要更大上限（比如 S5 一张方子的「含」关系
-        会重复带出 source_span，实测容易顶到 8192），在那一处调用点单独传。
+        max_tokens 不传就用各后端自己的默认值（OpenAICompatBackend 见
+        `_default_max_tokens()`：非推理模型 8192、推理模型 16384，
+        `LLM_MAX_TOKENS` 覆盖两者）。**不要全局调高默认值**：S1/S2/S3 用不到
+        那么多 token，调高只会让真正失控的输出更晚才被发现；某个 prompt 确实
+        需要更大上限（比如 S5 一张方子的「含」关系会重复带出 source_span，
+        实测容易顶到 8192），在那一处调用点单独传。
+
+        R10 给推理模型单独一档，**不是违反上面那句**：对推理模型来说
+        max_tokens 盖的是 reasoning + 可见输出两部分，8192 里能给可见输出的
+        并不是 8192（实测 S3 在 2081 字符处被砍），所以这一档不是"调高上限"，
+        是把上限还原到跟非推理模型同一个量级的可见输出。
         """
         # 字段名那一句是实测来的：裸 prompt（不注入 schema）下模型 3/3 把
         # ElementHit.element 写成 name。注入 schema 后 3/3 一次过，所以这句是
@@ -526,10 +567,11 @@ class LLMBackend(ABC):
                 if _looks_like_truncated_json(e, stripped, schema):
                     # max_tokens=None 不是"没配置成功"，是"这次调用没有显式传，
                     # 会走各后端自己的默认值"（比如 OpenAICompatBackend 走
-                    # LLM_MAX_TOKENS 或 8192）——原来直接打 "max_tokens=None"
-                    # 容易让人以为配置丢了，去查环境变量，其实哪儿都没错。
+                    # LLM_MAX_TOKENS，或 _default_max_tokens()）——原来直接打
+                    # "max_tokens=None" 容易让人以为配置丢了，去查环境变量，其实哪儿都没错。
                     max_tokens_desc = (
-                        "未设置（走后端默认值）" if max_tokens is None else str(max_tokens)
+                        f"未设置（走后端默认值 {self._default_max_tokens()}）"
+                        if max_tokens is None else str(max_tokens)
                     )
                     raise LLMTruncatedError(
                         f"疑似输出在 max_tokens 上限处被截断（JSON 在文本末尾附近"
@@ -617,7 +659,16 @@ class OpenAICompatBackend(LLMBackend):
                 pass
 
     def model_name(self) -> str:
-        return os.environ.get("LLM_MODEL", "deepseek-chat")
+        """默认值 R10 从 `deepseek-chat` 改成 `deepseek-v4-pro`：**deepseek-chat
+        已经下线**（2026-09-15 实测 `/models` 只剩 deepseek-flash 和 deepseek-v4-pro；
+        拿 deepseek-chat 发请求得到的是 HTTP 200 + **空响应体**，不是 404）。
+        留着一个已经不存在的默认值，症状是"一次调用返回空串 → 校验失败 → 重试三次 →
+        LLMError"，而错误信息里看不出"模型名不存在"这件事。
+
+        ⚠ **换模型 = 所有既有数字不可比**：ε / E3 / E4 / E8 / E9 / SDT 全是
+        deepseek-chat 跑的，那个模型现在不存在了，任何重跑都换了模型。
+        manifest 的 comparability_warning 会如实记录这次的 model。"""
+        return os.environ.get("LLM_MODEL", "deepseek-v4-pro")
 
     def _request_model_name(self) -> str:
         """HTTP 请求里 `model` 字段的值。默认跟 model_name() 同一个——对 DeepSeek
@@ -648,18 +699,27 @@ class OpenAICompatBackend(LLMBackend):
             messages=messages,
             temperature=temperature,
             response_format={"type": "json_object"},
-            # DeepSeek 默认输出上限 4096 token：S0 抽多病人粗段的 JSON 会被截断，
-            # 截断的 JSON 回灌重试也只会以同样方式再截断三次。默认给到 8192；
-            # 调用方（generate() 的 max_tokens 参数）能覆盖这个默认值——
-            # 不是全局调高，是某个 prompt 明确知道自己需要更大上限时单独传
-            # （比如 S5 一张方子的多条「含」关系）。
-            max_tokens=(
-                max_tokens if max_tokens is not None
-                else int(os.environ.get("LLM_MAX_TOKENS", "8192"))
-            ),
+            # 默认值见 _default_max_tokens()（推理模型要更大，理由在那儿）。
+            # 调用方（generate() 的 max_tokens 参数）能覆盖它——不是全局调高，
+            # 是某个 prompt 明确知道自己需要更大上限时单独传（比如 S5 一张方子的
+            # 多条「含」关系）。
+            max_tokens=max_tokens if max_tokens is not None else self._default_max_tokens(),
             **kwargs,
         )
-        return resp.choices[0].message.content or ""
+        content = resp.choices[0].message.content or ""
+        if not content.strip():
+            # HTTP 200 + 空响应体 = **模型名很可能不存在/已下线**（2026-09-15 实测：
+            # 用已下线的 deepseek-chat 请求就是这个表现，不是 404）。不专门报出来的话
+            # 症状是"空串过不了 schema 校验 → 重试三次 → LLMError"，错误信息里全是
+            # 校验失败，看不出根因在模型名上。**照旧抛异常走重试**（网络抖动也可能
+            # 返回空），但把这条线索写进错误里。
+            raise LLMError(
+                f"后端返回了 HTTP 200 但响应体是空的（model={self._request_model_name()!r}）。"
+                "最常见的原因是**模型名不存在或已下线**——2026-09-15 实测 deepseek-chat "
+                "已下线，拿它发请求就是这个表现（不是 404）。"
+                "用 `curl $LLM_BASE_URL/models` 看当前可用的模型名，再设 LLM_MODEL。"
+            )
+        return content
 
 
 class ClaudeCLIBackend(LLMBackend):
@@ -1034,10 +1094,7 @@ class VLLMInProcessBackend(LLMBackend):
             guided = GuidedDecodingParams(json=schema.model_json_schema())
         return SamplingParams(
             temperature=temperature,
-            max_tokens=(
-                max_tokens if max_tokens is not None
-                else int(os.environ.get("LLM_MAX_TOKENS", "8192"))
-            ),
+            max_tokens=max_tokens if max_tokens is not None else self._default_max_tokens(),
             guided_decoding=guided,
         )
 

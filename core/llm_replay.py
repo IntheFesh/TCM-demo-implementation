@@ -222,6 +222,40 @@ class RecordingBackend(LLMBackend):
         self.out_dir = Path(out_dir) if out_dir else fixtures_dir()
         self.n_written = 0
         self.keys_written: list[str] = []
+        # ---- 跨场景复用（R10-1，段 6 那个 bug 的根治）----
+        # `_outputs` 只记**本次运行**写过的 key -> output：复用必须限定在一次运行内，
+        # 不能去读磁盘上已有的 fixture——两次录制之间模型可能换了（这次就是
+        # deepseek-chat 下线、换成 deepseek-v4-pro），跨运行复用会把两个模型的输出
+        # 缝在一条链上。
+        self._outputs: dict[str, str] = {}
+        self._frozen_keys: set[str] = set()    # 前面场景写过的：命中就复用，不再调模型
+        self._current_keys: set[str] = set()   # 当前场景写过的：照旧覆盖
+        self.scenario: str | None = None
+        self.n_reused = 0
+        self.reused_keys: list[str] = []
+
+    def begin_scenario(self, name: str | None = None) -> None:
+        """场景边界：把当前场景写过的 key **冻结**成"前面场景的产物"。
+
+        **复用的判据必须是「上一个场景写过」，不是「本次调用写过」。** 无条件
+        首写为准会把非法输出定死在 fixture 里：`generate()` 校验失败会带着回灌
+        消息重试，messages[0] 不变所以 key 不变，**最后一次**写进去的才是通过
+        校验的那份（见 `write()` 的文档字符串）。所以：
+
+          key 在冻结集合里   → 直接返回已录的输出，不调模型（跨场景复用）
+          key 只在当前场景里 → 照旧覆盖（校验重试的修复语义不变）
+
+        为什么需要它（段 6 实测）：录制清单里 `react_off_N` 和 `react_on_N` 用的是
+        **同一条主诉**，而 S1 的 system 只依赖主诉（`core/chain.py`），两者 S1 的
+        key 完全相同。v4-pro 是推理模型、同样输入给出不同输出，于是后一个场景
+        覆盖了前一个的 S1 → 前一个场景的 S2/S3 fixture 变成孤儿 → 回放前一个
+        场景时下游 key 算不出来 → 未命中。10 个 react_off 全挂、10 个 react_on
+        全过（后者录在后面、跟最终 fixture 状态自洽）就是这个形状。
+        **重跑救不回来**：顺序换一下只是轮到另一半变孤儿，是个跷跷板。
+        """
+        self._frozen_keys |= self._current_keys
+        self._current_keys = set()
+        self.scenario = name
 
     def model_name(self) -> str:
         return self.inner.model_name()
@@ -240,14 +274,23 @@ class RecordingBackend(LLMBackend):
 
     def _complete(self, messages, temperature, max_tokens=None, schema=None,
                   physician=None, **kwargs) -> str:
-        raw = self.inner._complete(messages, temperature, max_tokens=max_tokens,
-                                   schema=schema, physician=physician, **kwargs)
         if schema is None:
             # generate() 一定会传 schema；没有 schema 的调用（如果将来有）
-            # 索引不成立，如实跳过不录，不编一个键。
-            return raw
+            # 索引不成立，如实跳过不录，不编一个键——也就没法复用。
+            return self.inner._complete(messages, temperature, max_tokens=max_tokens,
+                                        schema=schema, physician=physician, **kwargs)
         _require_empty_user(messages)
-        self.write(schema.__name__, _system_of(messages), raw)
+        system = _system_of(messages)
+        key = fixture_key(schema.__name__, system)
+        # **先看 key 在不在冻结集合里，再决定要不要调模型**：前面场景已经录过这一条，
+        # 再调一次只会拿到一个不同的输出并把前面那条盖掉（见 begin_scenario 的文档）。
+        if key in self._frozen_keys:
+            self.n_reused += 1
+            self.reused_keys.append(key)
+            return self._outputs[key]
+        raw = self.inner._complete(messages, temperature, max_tokens=max_tokens,
+                                   schema=schema, physician=physician, **kwargs)
+        self.write(schema.__name__, system, raw)
         return raw
 
     def write(self, schema_name: str, system: str, output: str) -> Path:
@@ -279,6 +322,10 @@ class RecordingBackend(LLMBackend):
         if key not in self.keys_written:
             self.keys_written.append(key)
         self.n_written += 1
+        # 记进本次运行的输出表和当前场景的 key 集合：前者供跨场景复用取值，
+        # 后者在下一次 begin_scenario 时被冻结。
+        self._outputs[key] = output
+        self._current_keys.add(key)
         return path
 
 
@@ -418,6 +465,13 @@ class ReplayBackend(LLMBackend):
                      "「这是录制的结果」这个声称变成假的，而且录漏了必须暴露出来。"
                      "补录这一条：把触发它的那条主诉加进 scripts/record_fixtures.py "
                      "的清单，用录制时同样的环境变量重跑。")
+        # 段 6 的教训：那次未命中的主诉**本来就在清单里**，按上面那句去"补录"
+        # 会白跑两小时。所以先给出区分这两种情况的判据。
+        lines.append("  **先分清是哪一种**：如果这条主诉已经在录制清单里（`--dry-run` "
+                     "能看到它），那不是漏录，是**上游 fixture（S1/S2）被后面的场景"
+                     "覆盖、下游 key 跟着漂移**——去看 record_fixtures 收尾打的"
+                     "「复用 N 次 / 覆盖 N 次」统计：覆盖数不为 0 就是这种情况，"
+                     "重录一遍（R10 起录制会跨场景复用已录的 key，并在收尾自校验）。")
         return "\n".join(lines)
 
     def _env_diff(self) -> list[tuple[str, list[str | None], str | None]]:

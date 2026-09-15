@@ -428,13 +428,29 @@ def test_warning_counts_full_and_partial_runs_separately(tmp_path):
 
 
 def test_committed_runlog_backfills_the_runs_that_already_happened():
-    """**台账不能从 0 开始。** Test 已经跑过 3 次完整 + 1 次局部（见
-    eval/RESULTS.md 第 5 行），台账建立那天如果从 0 开始，提醒就会说"已跑过
+    """**台账不能从 0 开始。** 台账建立之前 Test 已经跑过几次（见 eval/RESULTS.md
+    第 5 行），那几次是回填进来的；台账建立那天如果从 0 开始，提醒就会说"已跑过
     0 次"——一句假话，而这个护栏的全部作用就是让人相信那个数。
 
     这一条读的是**真实提交进版本控制的那份台账**（不是 tmp_path），所以它同时
     钉住"这个文件真的在版本控制里"——`.gitignore` 里 `*.jsonl` 是整体忽略，
     少了那条例外它就会静默消失。
+
+    **R10 起判据改了，是有意的契约变更**：原来这条写死 `full == 3 and partial == 1`
+    和四个具体分数 `{21.702, 22.068, 22.833, 27.729}`。台账的语义就是"每跑一次
+    Test 追加一行"，所以真机上跑一次 Test（AutoDL 实测 chain 23.173）它必然红，
+    而它要测的性质（回填过、不是从 0 开始）一点没变——这是"数字过期"，不是契约
+    被破坏。改法是**从文件现读**：回填条数由文件里 `backfilled` 标记数出来，
+    逐条校验它的形状，新跑一次只会让总数变大。
+
+    逐条说明现在钉的是什么：
+    1. 至少有一条回填记录——"台账不是从 0 开始"这句话的全部内容；
+    2. 每条回填记录都带 `回填` 出处和一个数值分数（回填的意义就是把已经发生过
+       的那几次的分补进来，没有分的回填等于没回填）；
+    3. 回填记录必须排在所有真实记录之前——回填是补历史，出现在新记录后面说明
+       有人手改过这个文件；
+    4. 提醒里的次数是从这份文件现算的，且不是 0（原来的 `full == 3` 想钉的就是
+       这件事，只是钉在了一个会过期的数上）。
     """
     from pathlib import Path
 
@@ -444,11 +460,22 @@ def test_committed_runlog_backfills_the_runs_that_already_happened():
     assert committed.exists(), "台账文件不见了——先查 .gitignore 的 *.jsonl 例外"
     entries = runlog.read_log(committed)
     counts = runlog.count_test_runs(entries)
-    assert counts["full"] == 3 and counts["partial"] == 1
-    scores = {e["score"] for e in counts["entries"]}
-    assert {21.702, 22.068, 22.833, 27.729} == scores
-    assert all(e.get("backfilled") for e in counts["entries"])
-    assert all("回填" in e.get("source", "") for e in counts["entries"])
+    runs = counts["entries"]
+    backfilled = [e for e in runs if e.get("backfilled")]
+    assert backfilled, "台账里一条回填记录都没有——那它就是从 0 开始的"
+    for e in backfilled:
+        assert "回填" in e.get("source", ""), f"回填记录没说从哪儿回填的：{e}"
+        assert isinstance(e.get("score"), (int, float)), f"回填记录没有分数：{e}"
+    live = [i for i, e in enumerate(runs) if not e.get("backfilled")]
+    first_live = live[0] if live else len(runs)
+    assert all(i < first_live for i, e in enumerate(runs) if e.get("backfilled")), \
+        "有回填记录排在真实记录后面——这个文件被手改过"
+    assert counts["total"] == len(runs) >= len(backfilled)
+    assert counts["full"] + counts["partial"] == counts["total"]
+    warning = runlog.test_split_warning(entries)
+    assert f"已跑过 {counts['total']} 次" in warning and "已跑过 0 次" not in warning
+    for e in backfilled:
+        assert str(e["score"]) in warning, f"回填的分数没出现在提醒里：{e['score']}"
 
 
 def test_log_run_only_records_the_test_split(tmp_path):

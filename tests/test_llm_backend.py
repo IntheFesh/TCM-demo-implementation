@@ -2,6 +2,7 @@
 的参数拼装与错误路径。全部不真调 CLI、不联网——subprocess 用 monkeypatch 挡掉。
 """
 import json
+import os
 import subprocess
 from typing import Literal
 
@@ -9,6 +10,9 @@ import pytest
 from pydantic import BaseModel, Field, ValidationError
 
 from core.llm import (
+    DEFAULT_MAX_TOKENS,
+    REASONING_MAX_TOKENS,
+    REASONING_MODELS,
     ClaudeCLIBackend,
     LLMBackend,
     LLMError,
@@ -706,6 +710,96 @@ def test_openai_backend_max_tokens_falls_back_to_env_var_when_not_passed(monkeyp
     b._client = FakeClient()
     b._complete([{"role": "user", "content": "x"}], 0.0)
     assert captured["max_tokens"] == 12000
+
+
+# ---------- _default_max_tokens：推理模型要更大 ----------
+
+
+def test_default_max_tokens_is_bigger_for_a_reasoning_model(monkeypatch):
+    """**推理模型的 max_tokens 同时盖住不可见的 reasoning tokens。** 2026-09-15
+    实测 deepseek-v4-pro 在 8192 下 S3 的可见输出在 2081 字符处被砍断——而 8192
+    看起来完全够，所以症状是"输出莫名截断"，看不出跟推理有关。对照：非推理模型
+    同一条路径仍然是 8192，这一档不是全局调高。"""
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    assert OpenAICompatBackend()._default_max_tokens() == REASONING_MAX_TOKENS == 16384
+    monkeypatch.setenv("LLM_MODEL", "some-non-reasoning-model")
+    assert OpenAICompatBackend()._default_max_tokens() == DEFAULT_MAX_TOKENS == 8192
+
+
+def test_the_default_model_is_one_of_the_reasoning_models():
+    """默认模型换成 deepseek-v4-pro 之后，"不设任何环境变量就能跑"必须仍然成立
+    ——默认模型是推理模型而默认上限按非推理模型给，等于把那个坑设成默认。"""
+    import os
+
+    env_model = os.environ.pop("LLM_MODEL", None)
+    try:
+        assert OpenAICompatBackend().model_name() in REASONING_MODELS
+    finally:
+        if env_model is not None:
+            os.environ["LLM_MODEL"] = env_model
+
+
+def test_llm_max_tokens_env_var_still_wins_over_both_defaults(monkeypatch):
+    """环境变量优先：不然"某台机器上上限不对"就没有不改代码的补救办法。"""
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("LLM_MAX_TOKENS", "4096")
+    assert OpenAICompatBackend()._default_max_tokens() == 4096
+
+
+def test_default_max_tokens_lives_on_the_base_class_so_every_backend_gets_it():
+    """这个判断只能有一处实现（CLAUDE.md）：各后端各写一份的话，"推理模型要更大"
+    会只在其中一个后端上生效。判据是它定义在基类上、子类不覆盖。"""
+    assert "_default_max_tokens" in vars(LLMBackend)
+    for cls in (OpenAICompatBackend, VLLMBackend, ClaudeCLIBackend):
+        assert "_default_max_tokens" not in vars(cls), cls.__name__
+
+
+def test_openai_backend_uses_the_reasoning_default_when_nothing_is_passed(monkeypatch):
+    """上面三条测的是那个方法本身，这条测它真的被接到 SDK 调用上了
+    （R10 之前这一处是自己读环境变量的，改错了这里不会有人发现）。"""
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kw):
+            captured.update(kw)
+
+            class R:
+                choices = [type("C", (), {"message": type("M", (), {"content": '{"ok":true,"note":"n"}'})()})]
+            return R()
+
+    class FakeClient:
+        class chat:
+            completions = FakeCompletions()
+
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    b = OpenAICompatBackend()
+    b._client = FakeClient()
+    b._complete([{"role": "user", "content": "x"}], 0.0)
+    assert captured["max_tokens"] == REASONING_MAX_TOKENS
+
+
+def test_truncation_error_names_the_default_it_actually_used(monkeypatch):
+    """截断报错里原来只说"未设置（走后端默认值）"——现在把那个值打出来：
+    "8192 还是 16384"正是判断"是不是推理 token 把预算吃掉了"要看的东西。"""
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+
+    class Truncating(LLMBackend):
+        def model_name(self):
+            return os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+
+        def backend_id(self):
+            return "fake"
+
+        def _complete(self, messages, temperature, max_tokens=None, schema=None,
+                      physician=None, **kw):
+            return '{"ok":true,"note":"' + "医" * 400
+
+    with pytest.raises(LLMTruncatedError) as e:
+        Truncating().generate(system="s", user="u", schema=Tiny)
+    assert f"未设置（走后端默认值 {REASONING_MAX_TOKENS}）" in str(e.value)
 
 
 def test_claude_cli_complete_accepts_and_ignores_max_tokens(monkeypatch):
