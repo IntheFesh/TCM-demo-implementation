@@ -58,6 +58,14 @@
 
 - 缓存命中的输入 token 比未命中便宜 **30 倍**（$0.044/M vs $1.32/M，官方价）
 - 一次问诊 = `2 + 医家数 × 采样次数` = **11** 次调用（默认配置），其中 **9** 次是 S3
+- **两套单价差 29 倍**，报成本必须说清是哪一套：
+  | 口径 | 每次调用 | 什么时候是这一套 |
+  |---|---|---|
+  | top3 系 | ¥0.0055 | R21 之前的四种检索（一次只带三条医案）；上机段 3/4/6/7/8 钉的就是它 |
+  | full_context | ¥0.16 | R21 之后的默认（每次带 ~18 万 token 知识前缀）；上机段 9 |
+  两个数都在 `scripts/onsite_plan.py` 一处定义（full_context 那个由 `core/usage.py`
+  的价目表现算）。**上机剧本的清单按每段自己的模式分开算**，不给一个把两套加在
+  一起的总数——那个数谁都对不上
 - 一次问诊的钱：⏳ **还没实测**。算式是 9 × ¥0.16 ≈ **¥1.44**（高峰价，谷段五折）
   ——`reasoning_effort=max` 下思考 token 按输出价计，输出那部分比输入还大
 - `FAST_MODE=1` 时 S3 降到 3 次，≈ **¥0.48**（这个数单独给，不跟上面那个混着讲）
@@ -78,8 +86,9 @@
 
 | 项 | 数 | 凭据 |
 |---|---|---|
-| 全量测试 | **2971** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=2971` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
+| 全量测试 | **3022** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=3022` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
 | 前端状态验收 | **20** 种 | `bench/sandbox.json:bench.playwright_states_passed=20` |
+| 凭据核对 | **12** 份文档，退出码 **0** | `bench/sandbox.json:bench.n_checked_docs=12` `bench/sandbox.json:bench.check_exit_code=0` |
 | 知识图谱节点 | **1315** | `../data/graph.json:graph.n_nodes=1315` |
 | 知识图谱边 | **3771** | `../data/graph.json:graph.n_edges=3771` |
 | 证候 | **178** | `../data/graph.json:graph.n_syndromes=178` |

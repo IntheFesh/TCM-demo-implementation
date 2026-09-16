@@ -853,7 +853,8 @@ STATES = {
           // R24 补丁①：一次展开最多 20 个，**多出来的要说出来**。
           const status = (document.getElementById('gb-search-status') || {}).textContent || '';
           const outerCount = gbCy.nodes().length - window.__hubIds.length;
-          if (outerCount > 20) return '一次展开超过 20 个（' + outerCount + '）';
+          if (outerCount > GB_EXPAND_CAP) return '一次展开超过上限（' + outerCount
+            + ' > ' + GB_EXPAND_CAP + '）';
           if (!status.includes('还有') || !status.includes('搜索直达'))
             return '状态栏没说还剩多少个：' + status;
           // R24 补丁②：**标签要能读**。这两条是这一轮新加的，也是上一版

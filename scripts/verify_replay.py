@@ -106,8 +106,19 @@ def main(argv: list[str] | None = None) -> int:
                          "只验「回放能跑通且不未命中」，并在结尾如实说明。")
     args = ap.parse_args(argv)
 
-    from core.llm_replay import ReplayBackend, fixtures_dir
+    from core.llm import LLMError
+    from core.llm_replay import ReplayBackend, fixtures_dir, require_matching_mode
     from scripts.record_fixtures import _queries, build_plan
+
+    # R28：**先比对检索模式，再干别的**。fixture 的键含 system 全文，
+    # 模式不一致时每一条都不会命中——那时"验证失败"的原因不是漏录，
+    # 而是这批录音根本不属于当前配置。退出码 3 跟"还没录"（2）分开：
+    # 前者要切模式或重录，后者要去录。
+    try:
+        require_matching_mode(fixtures_dir())
+    except LLMError as e:
+        print(str(e), file=sys.stderr)
+        return 3
 
     queries = _queries(args.queries_path) if args.queries_path else None
     plan = build_plan(queries)

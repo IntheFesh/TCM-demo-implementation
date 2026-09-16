@@ -222,6 +222,18 @@ def _first_difference(a: str, b: str) -> str:
     return f"长度不同：基线 {len(a)} 字，本次 {len(b)} 字（前缀相同）"
 
 
+def write_run_manifest(out_dir, n_fixtures: int | None = None):
+    """把这一批的检索模式等元信息写进 fixture 目录。
+
+    **薄薄一层转发**：真正的写法在 `core/llm_replay.write_manifest`（跟回放端
+    读它的地方同一个模块）。脚本这边留一个名字，是为了让"录完要写 manifest"
+    这件事在录制脚本里看得见——一个只在别的模块里存在的约定没人会想起来。
+    """
+    from core.llm_replay import write_manifest
+
+    return write_manifest(out_dir, n_fixtures=n_fixtures)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="R3-2：录制回放 fixture")
     ap.add_argument("--queries-path", type=Path, default=DEFAULT_QUERIES_PATH)
@@ -231,7 +243,24 @@ def main(argv: list[str] | None = None) -> int:
                     help="只跑这些场景名（逗号分隔），逐条补录时用")
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印清单和预估调用数，不发任何请求")
+    ap.add_argument("--write-manifest", action="store_true",
+                    help="只给现有 fixture 目录补一份 _manifest.json（不录制、不花钱）。"
+                         "给 R28 之前录的那批用——它们没有 manifest，回放时无从判断"
+                         "是在哪个检索模式下录的")
     args = ap.parse_args(argv)
+
+    if args.write_manifest:
+        from core.llm_replay import fixtures_dir
+
+        out_dir = args.out_dir or fixtures_dir()
+        n = len(list(out_dir.glob("*.json"))) if out_dir.exists() else 0
+        # 数的是目录里现有的条数；下划线开头那两个元文件也会被数进去，
+        # 所以扣掉——**宁可报一个略小的数，也不要报一个把元文件算成 fixture 的数**。
+        n -= len([x for x in out_dir.glob("_*.json")]) if out_dir.exists() else 0
+        path = write_run_manifest(out_dir, n_fixtures=max(0, n))
+        print(f"已写 {path}（当前检索模式；这批 fixture 如果不是在这个模式下录的，"
+              f"现在写等于把错的模式钉上去——**只在你确定的时候用**）")
+        return 0
 
     plan = build_plan(_queries(args.queries_path))
     if args.only:
@@ -310,6 +339,10 @@ def main(argv: list[str] | None = None) -> int:
             bar.note(f"场景 {scenario.name} 失败：{r['error']}")
     bar.close(f"{recorder.n_written} 次写入")
 
+    # R28：写目录级 manifest——**这批是在哪个检索模式下录的**。
+    # 不写的话，模式一变整批 fixture 全不命中，而症状是演示到一半开始报未命中。
+    manifest_path = write_run_manifest(out_dir, n_fixtures=len(recorder.keys_written))
+
     # 写基线：没有它，verify_replay 只能验"没未命中"，验不了"逐字节一致"。
     from core.llm_replay import BASELINE_FILENAME
 
@@ -322,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
     failed = [r for r in results if r["error"]]
     print()
     print(f"录制基线：{baseline_path}（{len(baseline)} 个场景，verify_replay 用它验逐字节一致）")
+    print(f"录制清单：{manifest_path}（记了检索模式——回放时模式对不上会当场报错，"
+          f"不会让你在演示里一条条撞未命中）")
     n_overwritten = recorder.n_written - len(recorder.keys_written)
     print(f"共写入 {recorder.n_written} 次（去重后 {len(recorder.keys_written)} 条 fixture）"
           f"，用时 {time.time() - t0:.0f}s")

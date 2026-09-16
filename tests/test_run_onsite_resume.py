@@ -77,12 +77,24 @@ def test_resume_starts_at_the_first_segment_that_never_succeeded(tmp_path):
     `--resume --dry-run` 要能回答"它会从哪一段开始"——那正是开跑前最想知道的
     一件事，所以起点算在 --dry-run 退出**之前**。
     """
+    # **R28 起"第一个没成功的段"按执行序找**（0,1,2,9,3,4,…）。
+    # 这一份状态里段 9 从没跑过，所以 --resume 落在段 9 而不是段 5——
+    # 这正是想要的：段 9 决定后面每一段按哪套单价花钱，续跑也要先过它。
     st = _state(tmp_path, {"0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 1})
     r = _run(["--resume", "--dry-run"], state=st)
     assert r.returncode == 0, r.stderr
-    assert "--resume：从段 5 开始" in r.stdout
-    assert "段 0..4 上次都是退出码 0，不重跑" in r.stdout
+    assert "--resume：从段 9 开始" in r.stdout
+    # 措辞跟着变：段号连续区间（"段 0..4"）在执行序重排之后不成立了。
+    assert "执行序在它之前的段上次都是退出码 0，不重跑" in r.stdout
     assert "--dry-run：什么都没跑" in r.stdout
+
+
+def test_resume_lands_on_the_first_unfinished_in_execution_order(tmp_path):
+    """段 9 也成功过时，--resume 才轮到段 5——**顺序按执行序，寻址按段号**。"""
+    st = _state(tmp_path, {"0": 0, "1": 0, "2": 0, "9": 0, "3": 0, "4": 0, "5": 1})
+    r = _run(["--resume", "--dry-run"], state=st)
+    assert r.returncode == 0, r.stderr
+    assert "--resume：从段 5 开始" in r.stdout
 
 
 def test_resume_counts_a_never_run_segment_as_unfinished(tmp_path):

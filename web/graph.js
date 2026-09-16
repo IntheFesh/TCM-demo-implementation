@@ -491,6 +491,11 @@ function describeNodeTooltip(data) {
       }
       case "syndrome": {
         const lines = [`<b>证型</b>　${escapeHtml(data.label)}${data.is_category ? "　（类目）" : ""}`];
+        // 病名单独一行。**178 个证候里 66 个重名**（「肝郁气滞证」分属腹痛/胁痛/
+        // 积聚/癃闭，病机各不同），label 里的括号是给图上一眼区分用的，
+        // 这一行是给"到底属于哪个病"一个明确的位置。
+        // 17 条国标条目没有 disease——那时**不出这一行**，不留一个空的「病名：」。
+        if (data.disease) lines.push(`<div class="tt-meta">病名：${escapeHtml(data.disease)}</div>`);
         if (data.definition) lines.push(`<div class="tt-meta">${escapeHtml(data.definition)}</div>`);
         if (data.tongue_pulse) lines.push(`<div class="tt-meta">${escapeHtml(data.tongue_pulse)}</div>`);
         return lines.join("");
@@ -978,15 +983,19 @@ const GB_TYPE_LABEL = { element: "证素", syndrome: "证型", symptom: "症状"
 // R24 补丁：**一次展开最多画 20 个**。
 //
 // 上限不是"服务端给多少就画多少"（那是 GB_MAX_NEW_NODES=150 的止血阀，
-// 量级完全不同）。20 这个数是画布定的：1280×800 下，20 个带标签的节点摆成
-// 一个扇面之后标签还认得出来，再多就开始压字——而一张认不出字的图等于没画。
-// 实测见 screenshot_states 的 rings 判据（两两比包围盒，不许重叠）。
+// 量级完全不同）。**这个数是画布定的，标签一变大它就得跟着变小**：
+//   R24 补丁：20（当时证型标签约 100×50px）
+//   R28：**14**——加了病名限定之后标签变成两行、最宽 124px，
+//        20 个再也摆不下：实测压字 2~4 对、而且 fit 会把字缩到 11.9px（判据要 ≥12）。
+// 少画几个不丢信息：状态栏照旧报"还有 N 个，搜索直达"。
+// **宁可少画也不压字**——一张认不出字的图等于没画。
+// 实测见 screenshot_states 的 rings 判据（两两比包围盒 + 字号下限）。
 //
 // 取哪 20 个：**按该证型自己的症状数从多到少**（服务端算好的 `n_symptoms`，
 // 见 api/main.py 的 _symptom_counts_by_syndrome_code）。同分按 id 排，
 // 保证"同一次点击两次结果一样"——按加载顺序取前 20 看起来也有理由，
 // 其实取决于 networkx 的遍历顺序，那不是理由。
-const GB_EXPAND_CAP = 20;
+const GB_EXPAND_CAP = 14;
 
 function gbSymptomCount(node) {
   const n = node && node.data ? Number(node.data.n_symptoms) : 0;
@@ -1138,8 +1147,8 @@ function gbHubAngles(hubIds, focusHubId) {
     而 20 个标签要 10 万。硬守 40° 的结果只有一个：字压字。所以扇面按需张开，
     上限 ±75°（150° < 360°，环上仍然留着一大片空白，"这些是从这个证素点开的"
     这件事照样读得出来）。节点少的时候（≤7 个）它就老老实实是 ±40°。 */
-const GB_SLOT_V = 62;              // 一个位置要留多高（实测标签约 50px，留 12px 余量）
-const GB_SLOT_H = 112;             // 要留多宽（实测约 100px，同样留余量）
+const GB_SLOT_V = 62;              // 一个位置要留多高（R28 实测标签最高 51px：病名另起一行之后是两行）
+const GB_SLOT_H = 124;             // 要留多宽（R28 实测最宽 124px：带病名限定的证型）
 const GB_FAN_HALF_DEG_MAX = 90;    // 张开的上限：±90° = 半圈，再宽就退化成整圈
 
 /** 一排在给定半径和张角下能放几个。**内排比外排短，就该少放几个**——

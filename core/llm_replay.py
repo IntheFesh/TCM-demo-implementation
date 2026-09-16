@@ -170,6 +170,99 @@ def current_env() -> dict[str, str | None]:
 BASELINE_FILENAME = "_baseline.json"
 
 
+# ---------------------------------------------------------------------------
+# R28：fixture 与检索模式绑定
+# ---------------------------------------------------------------------------
+#
+# fixture 的键是 `sha256(送进模型的 system)`，而 full_context 下 S3 的 system 由
+# `core/context_prefix.assemble()` 拼出、含 18 万 token 的知识前缀。
+# **所以同一条主诉在两个检索模式下算出的键完全不同**：在 full_context 下录完，
+# 一旦退回 hybrid，整批 fixture 一条都命中不了。
+#
+# 症状是"演示到一半开始报未命中"——而未命中消息里那句"录制时 RETRIEVER_MODE=…"
+# （REPLAY_RELEVANT_ENV）只有在**撞上某一条**时才看得到，且那时钱和时间都花完了。
+# 这里把"这批是在什么模式下录的"写进目录级的 manifest，回放**启动时**就比对。
+MANIFEST_FILENAME = "_manifest.json"
+
+
+class FixtureSetManifest(BaseModel):
+    """一批 fixture 的目录级元信息。跟 `FixtureMeta`（单条）不是一回事：
+    单条那份回答"这一条是怎么来的"，这份回答"这一批能不能在当前配置下放"。"""
+
+    retriever_mode: str
+    prompt_version: str = "v1"
+    cases_sha256: str | None = None
+    recorded_at: str
+    n_fixtures: int | None = None
+
+
+def write_manifest(out_dir: Path, *, retriever_mode: str | None = None,
+                   n_fixtures: int | None = None) -> Path:
+    """写 `_manifest.json`。模式默认取**当前**模式——录制就是在当前模式下发生的。"""
+    from core.chain import cases_sha256
+    from core.retrieval_hybrid import effective_mode
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = FixtureSetManifest(
+        retriever_mode=retriever_mode or effective_mode(),
+        prompt_version="v1",
+        cases_sha256=cases_sha256(),
+        recorded_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        n_fixtures=n_fixtures,
+    )
+    path = out_dir / MANIFEST_FILENAME
+    path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+    return path
+
+
+def read_manifest(fixtures_path: Path) -> FixtureSetManifest | None:
+    """读目录级 manifest。没有或读不出来返回 None——**读不出来不等于不一致**，
+    两者的处置不同（前者提示，后者拒绝）。"""
+    path = Path(fixtures_path) / MANIFEST_FILENAME
+    if not path.exists():
+        return None
+    try:
+        return FixtureSetManifest.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 —— 坏 manifest 当没有，但下面会提示
+        return None
+
+
+def require_matching_mode(fixtures_path: Path, current_mode: str | None = None) -> None:
+    """当前检索模式与这批 fixture 录制时的模式不一致 → **立刻抛 LLMError**。
+
+    没有 manifest（R28 之前录的那些）**不拒绝**：那会让一批本来能用的录音在演示前
+    一刻变成不可用。只往 stderr 提一句怎么补。
+
+    当前模式问 `core.retrieval_hybrid.effective_mode()`，不自己读环境变量——
+    默认值只有那一处解析（R21 把默认换成 full_context 改的就是那一行）。
+    """
+    import sys
+
+    from core.retrieval_hybrid import effective_mode
+
+    path = Path(fixtures_path)
+    manifest = read_manifest(path)
+    now = current_mode or effective_mode()
+    if manifest is None:
+        print(f"⚠ {path}/{MANIFEST_FILENAME} 不在：这批 fixture 是在哪个检索模式下录的"
+              f"无从判断（当前是 {now}）。模式不一致时 key 会全部不命中。"
+              f"补一份：python -m scripts.record_fixtures --write-manifest",
+              file=sys.stderr)
+        return None
+    if manifest.retriever_mode == now:
+        return None
+    raise LLMError(
+        f"这批 fixture 是在 RETRIEVER_MODE={manifest.retriever_mode} 下录的"
+        f"（{manifest.recorded_at}，{manifest.n_fixtures or '?'} 条），当前是 {now}。"
+        "fixture 的 key 是 sha256(送进模型的 system)，而检索模式决定 system 里装的是"
+        "三条医案还是 18 万 token 的全量前缀——**key 必然全不命中**，不是"
+        "少录了几条。两条出路：要么切回去"
+        f"（export RETRIEVER_MODE={manifest.retriever_mode}），要么按当前模式重录"
+        "（python -m scripts.record_fixtures）。"
+    )
+
+
 def canonical_outcome(outcome: dict) -> str:
     """把一次 `consult()` 的结论压成一段可逐字节比对的文本。
 
@@ -358,6 +451,8 @@ class ReplayBackend(LLMBackend):
         out: dict[str, Fixture] = {}
         if not self._dir.exists():
             return out
+        # **启动时就比对模式**，不是等某一条未命中才发现（那时半场演示已经跑过去了）。
+        require_matching_mode(self._dir)
         for path in sorted(self._dir.glob("*.json")):
             if path.name.startswith("_"):
                 # 下划线开头的是录制附带的元文件（BASELINE_FILENAME），不是

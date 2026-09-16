@@ -266,17 +266,69 @@ def _persistent_graph_to_cytoscape(store) -> dict:
     直接 **data 展开会把 cytoscape 期待的边端点字段 source 覆盖掉。这里改名
     成 data_source，把 source/target 这两个字段名让给端点。
     """
-    nodes = [_node_payload(nid, d) for nid, d in store.g.nodes(data=True)]
+    ambiguous = ambiguous_syndrome_keys(store)
+    nodes = [_node_payload(nid, d, ambiguous) for nid, d in store.g.nodes(data=True)]
     edges = [_edge_payload(u, v, k, d) for u, v, k, d in store.g.edges(keys=True, data=True)]
     return {"nodes": nodes, "edges": edges}
 
 
-def _node_payload(node_id: str, data: dict) -> dict:
-    node_data = {"id": node_id, "label": data.get("name", node_id)}
+def _node_payload(node_id: str, data: dict,
+                  ambiguous: set[tuple[str, str]] | None = None) -> dict:
+    node_data = {"id": node_id, "label": _display_label(node_id, data, ambiguous)}
     for k, v in data.items():
         if k != "name":
             node_data[k] = v
     return {"data": node_data}
+
+
+def ambiguous_syndrome_keys(store) -> set[tuple[str, str]]:
+    """哪些 (证型名, 病名) 组合在图里**不止一条**。
+
+    加病名限定之后仍有 15 组撞在一起（「热证（胃痛）」有三条、「肝火犯肺证（咳嗽）」
+    有两条），而它们的 definition 各不相同且**对不上自己的名字**
+    （TB-114「热证」的定义是「肝郁化火，横逆犯胃」，TB-115 的是「脾胃虚寒，胃失和降」
+    ——脾胃虚寒挂在"热证"名下）。那是教材解析时名字列跟定义列错位，是数据缺陷，
+    不是显示层能修的（见 docs/reports/R28_report.md 第七节）。
+    显示层能做的是**不装作它们一样**：这几组再补一个 code。
+    """
+    seen: dict[tuple[str, str], int] = {}
+    for _nid, d in store.g.nodes(data=True):
+        if d.get("node_type") != "syndrome":
+            continue
+        key = (d.get("name") or "", (d.get("disease") or "").strip())
+        seen[key] = seen.get(key, 0) + 1
+    return {k for k, n in seen.items() if n > 1}
+
+
+def _display_label(node_id: str, data: dict,
+                   ambiguous: set[tuple[str, str]] | None = None) -> str:
+    """节点在图上显示什么。证型带病名限定，其余原样。
+
+    **为什么必须带**：178 个证候节点里 66 个重名（25 个名字重复 2–4 次）。
+    「肝郁气滞证」分属腹痛/胁痛/积聚/癃闭四个病名，**病机各不同**——
+    数据是对的（`data/standard/syndromes.jsonl` 有 disease 字段，build_graph 也
+    把它写进了节点），丢信息的是显示层：图上并排四个一模一样的方块，
+    点开才知道不是同一个证。
+
+    **只改 label，不动 `name`**：`/api/graph/search` 匹配的是 `name`
+    （见 api_graph_search），跟着改会让搜「肝郁气滞证」因为多出括号而漏掉全部条目。
+    17 条国标条目没有 disease，那时不加括号——一个空括号比没有更糟。
+
+    **病名另起一行**（`\n`，cytoscape 的 `text-wrap: wrap` 认它）。写成一行的
+    代价是量出来的：加了病名之后节点最宽到 **169px**（原来约 100px），
+    图谱浏览器那 20 个证型当场压字 8 对——`docs/screenshots/r24_rings.png` 的判据
+    立刻红了。换行之后宽度回到"名字和病名里较长的那个"，高度多一行。
+    """
+    name = data.get("name", node_id)
+    if data.get("node_type") != "syndrome":
+        return name
+    disease = (data.get("disease") or "").strip()
+    # 病名 + 编码都齐时才补编码，而且只在这一组确实还撞着的时候补——
+    # 给每条都挂编码会让图上全是 TB-xxx 的噪音。
+    if ambiguous and (name, disease) in ambiguous and data.get("code"):
+        inner = f"{disease} {data['code']}" if disease else str(data["code"])
+        return f"{name}\n（{inner}）"
+    return f"{name}\n（{disease}）" if disease else name
 
 
 def _symptom_counts_by_syndrome_code(store) -> dict[str, int]:
@@ -311,8 +363,9 @@ def _symptom_count(store, node_id: str, data: dict, by_code: dict[str, int]) -> 
                 if g.nodes[nb].get("node_type") == "symptom"})
 
 
-def _node_with_symptom_count(store, node_id: str, data: dict, by_code: dict[str, int]) -> dict:
-    payload = _node_payload(node_id, data)
+def _node_with_symptom_count(store, node_id: str, data: dict, by_code: dict[str, int],
+                             ambiguous: set[tuple[str, str]] | None = None) -> dict:
+    payload = _node_payload(node_id, data, ambiguous)
     payload["data"]["n_symptoms"] = _symptom_count(store, node_id, data, by_code)
     return payload
 
@@ -379,7 +432,8 @@ def api_graph(
         page_ids = ids[offset:offset + limit]
         keep = set(page_ids)
         graph = {
-            "nodes": [_node_payload(nid, store.g.nodes[nid]) for nid in page_ids],
+            "nodes": [_node_payload(nid, store.g.nodes[nid], ambiguous_syndrome_keys(store))
+                      for nid in page_ids],
             # 只发两端都在本页里的边——跟前端 gbAddNodes 的规则同一条，
             # 不在这里另写一套"半条边"的语义。
             "edges": [
@@ -459,7 +513,8 @@ def api_graph_neighbors(node: str, limit: int = 200, node_types: str | None = No
             # `n_symptoms` 是**给前端排序用的派生字段**：图谱浏览器一次只画得下
             # 20 个（GB_EXPAND_CAP），"是哪 20 个"得有依据，按症状数取前 20 是
             # 那个依据。前端算不了——它手里只有这一页，证型→症状那一层还没加载。
-            "nodes": [_node_with_symptom_count(store, nid, d, symptom_counts)
+            "nodes": [_node_with_symptom_count(store, nid, d, symptom_counts,
+                                               ambiguous_syndrome_keys(store))
                       for nid, d in picked],
             "edges": [e for e in edges
                       if e["data"]["source"] in keep and e["data"]["target"] in keep],
@@ -497,7 +552,8 @@ def api_graph_search(q: str, limit: int = 100, node_types: str | None = None) ->
     keep = {nid for nid, _ in picked}
     return {
         "graph": {
-            "nodes": [_node_payload(nid, d) for nid, d in picked],
+            "nodes": [_node_payload(nid, d, ambiguous_syndrome_keys(store))
+                      for nid, d in picked],
             "edges": [_edge_payload(u, v, k, d)
                       for u, v, k, d in store.g.edges(keys=True, data=True)
                       if u in keep and v in keep],

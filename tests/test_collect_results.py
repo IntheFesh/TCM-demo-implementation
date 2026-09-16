@@ -736,12 +736,23 @@ def test_every_round_snapshot_registers_its_own_evidence_keys():
     就把记号删掉，那一轮的数于是变成没人核的数。"""
     names = cr._round_snapshot_names()
     assert names, "eval/bench/rounds/ 下一份快照都没有"
+    checked = 0
     for name in names:
+        snapshot = json.loads(
+            (cr.EVAL_DIR / cr.BENCH_ROUNDS_DIR / f"{name}.json").read_text(encoding="utf-8"))
         for metric in cr.ROUND_METRIC_KEYS:
             key = f"round.{name}.{metric}"
+            # **只要求这一轮真量过的键**。R28 加了 `n_checked_docs`，
+            # R21~R27 的快照里没有它——那不是"注册漏了"，是**那一轮没量过这件事**，
+            # 往回补一个值就是编数据。
+            if metric not in snapshot:
+                assert key not in cr.EVIDENCE, f"{key}：这一轮没量过，不该被注册"
+                continue
             assert key in cr.EVIDENCE, key
             value, path = cr.evidence_value(key)
             assert path.exists() and value is not None, key
+            checked += 1
+    assert checked > 0, "一个键都没核到，判据形同虚设"
 
 
 def test_the_round_snapshot_is_not_the_same_file_as_the_current_measurement():

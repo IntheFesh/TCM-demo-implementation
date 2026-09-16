@@ -32,7 +32,7 @@ R26 的快照 `rounds/R26.json` 原样不动，R26 报告引的还是它。）
 | 全量测试 | **2971** passed / **10** skipped / **0** failed | `python -m scripts.bench_sandbox --all --round R27` |
 | ruff | 干净（`All checks passed!`） | `ruff check .` |
 | 防幻觉字段数 | **44**（口径：`grep -c "= Field(min_length=1" core/schemas.py`） | 当场跑 |
-| 凭据核对 | 退出码 **0**（11 份文档） | `python -m scripts.collect_results --check` |
+| 凭据核对 | 退出码 **0**（这里原写"11 份文档"是**错的**，当时实际 12 份——R28 把这个数改成量出来的、带凭据记号，见 `docs/reports/R28_report.md`） | `python -m scripts.collect_results --check` |
 | Playwright | **20** 种全过（rings 在 **1280×800** 下重验） | `python -m scripts.screenshot_states` |
 
 - 测试 passed **2971** —— `bench/rounds/R27.json:round.R27.pytest_passed=2971`

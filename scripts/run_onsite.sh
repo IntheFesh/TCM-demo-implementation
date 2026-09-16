@@ -33,11 +33,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# 每次调用的均价。**来源是本仓库唯一有过的一次成本记录**：README 里
-# record_fixtures 那条「约 272 次，¥1.5」。⚠ 这是一个量级估算、不是账单，
-# 换模型或改 prompt 长度都会变——它的用途是让人在开跑前决定「跑到哪一段」，
-# 不是用来报销的。
-YUAN_PER_CALL=0.0055
+# R28：单价**不在这里**了。两套单价（top3 的均价、full_context 的带前缀价）
+# 都在 scripts/onsite_plan.py，bash 这边只负责问它。
+# 原来这里写着 `YUAN_PER_CALL=0.0055`，而 R21 换掉默认检索模式之后它对
+# 段 9/10 已经错了一个量级——一个抄在两处的数，改了一处就会这样。
 
 # 每段的退出码落在这里，一行 `段号<TAB>退出码<TAB>结束时间`。
 # 放 out/ 下（gitignore）而不是仓库里：它是这台机器这一次跑的状态，不是项目内容。
@@ -60,6 +59,34 @@ record_segment() {
   rm -f "$tmp"
 }
 
+# R28：段 9 的闸门做出的决定（退回 hybrid / 维持 full_context）落进状态文件。
+#
+# **不落盘的话，下一次 `--resume` 起来的段又按 full_context 跑**，而人早就决定
+# 退回去了——那正是"按错的配置花十倍钱"的最后一个入口。
+#
+# 存成一行 `#retriever_mode_decided\t<模式>\t<时间>`：`#` 开头，不会被
+# `segment_state` 的 `^<段号>\t` 匹配到，**旧状态文件（只有三列段行）照常能读**。
+MODE_DECISION_KEY="#retriever_mode_decided"
+
+record_mode_decision() {
+  local mode="$1"
+  mkdir -p "$(dirname "$ONSITE_STATE")"
+  local tmp="${ONSITE_STATE}.tmp"
+  if [ -f "$ONSITE_STATE" ]; then
+    grep -v -F "${MODE_DECISION_KEY}	" "$ONSITE_STATE" > "$tmp" 2>/dev/null || true
+  else
+    : > "$tmp"
+  fi
+  printf '%s\t%s\t%s\n' "$MODE_DECISION_KEY" "$mode" "$(date -Is)" >> "$tmp"
+  mv "$tmp" "$ONSITE_STATE"
+  echo ">>> 这个决定已写进 $ONSITE_STATE：后面各段按 $mode 的口径算钱。"
+}
+
+mode_decision() {
+  [ -f "$ONSITE_STATE" ] || return 0
+  grep -F "${MODE_DECISION_KEY}	" "$ONSITE_STATE" 2>/dev/null | tail -1 | cut -f2
+}
+
 # 某段上次的退出码；没记录过回 `none`。
 segment_state() {
   [ -f "$ONSITE_STATE" ] || { echo none; return; }
@@ -73,18 +100,16 @@ segment_state() {
 # 全都是 0 时回一个比最大段号还大的数——那时 --resume 什么都不跑，
 # 并且下面会**说出来**，不是静默跑完 0 段。
 first_unfinished_segment() {
-  for row in "${SEGMENTS[@]}"; do
-    IFS='|' read -r n _ _ _ _ <<< "$row"
+  while IFS='|' read -r n _ _ _ _ _ _; do
     [ "$(segment_state "$n")" = "0" ] || { echo "$n"; return; }
-  done
+  done < <(segments_in_execution_order)
   echo 99
 }
 
 print_status() {
   echo "段  名称                     上次退出码  结束时间"
   echo "--------------------------------------------------------------------------"
-  for row in "${SEGMENTS[@]}"; do
-    IFS='|' read -r n name _ _ _ <<< "$row"
+  while IFS='|' read -r n _ _ name _ _ _; do
     local st line when
     st=$(segment_state "$n")
     when="—"
@@ -99,35 +124,76 @@ print_status() {
       *) st="$st（失败）" ;;
     esac
     printf "%-3s %-24s %-11s %s\n" "$n" "$name" "$st" "$when"
-  done
+  done < <(segments_in_execution_order)
   echo "--------------------------------------------------------------------------"
   echo "状态文件：$ONSITE_STATE"
+  local decided
+  decided=$(mode_decision)
+  [ -n "$decided" ] && echo "段 9 的闸门决定：默认检索模式 = $decided（后面各段按它的口径算钱）"
   local nxt
   nxt=$(first_unfinished_segment)
   if [ "$nxt" = "99" ]; then
-    echo "九段都是退出码 0。--resume 不会跑任何段。"
+    echo "每一段都是退出码 0。--resume 不会跑任何段。"
   else
     echo "--resume 会从段 $nxt 开始。"
   fi
 }
 
-# 段号|名称|预估调用数|人工卡点|一句话
+# 段号|执行序|检索模式|名称|预估调用数|人工卡点|一句话
+#
+# **段号和执行序是两件事**（R28）：段号是身份（`--only` / `--from` / `--resume`
+# 和状态文件都按它寻址，动它等于让所有在跑的机器上的状态文件作废），执行序是这一次
+# 实际按什么顺序跑。段 9 的段号留在 9，执行序提到段 3 之前——它决定"默认配置成不成立"
+# （full_context 的 E3/E4 闸门），而闸门不过要退回 hybrid，后面每一段的成本口径
+# 跟着变。放在最后跑意味着前面几千次调用是按一个还没验证的默认配置花的。
+#
+# **检索模式必须每段钉死，不许继承**（R28）：R21 把 `effective_mode()` 的默认值
+# 换成 full_context 之后，不钉模式的段会跟着新默认走，而两套单价差 29 倍
+# （top3 ¥0.0055/次 vs full_context ¥0.16/次）——段 7 的 1200 次因此从 ¥6.6
+# 变成约 ¥192，而且没有任何地方会报错。映射和单价都在 scripts/onsite_plan.py。
+#
 # 「预估调用数」那一格可以写 `auto:<文件>`：跑的时候由 scripts/onsite_plan.py 从那份
 # 文件现读（段 4 = eval/epsilon.json 三段 llm_calls 之和）。段 4 原来写死 215，ε 重跑
 # 成 212 之后剧本、说明文字、测试断言三处同时过期——现读就不会再有这种过期。
 SEGMENTS=(
-  "0|环境自检|0|no|零成本：pytest / ruff / 环境变量残留 / 数据文件齐不齐"
-  "1|零调用的验证|0|no|凭据核对 / 本地语料规范化 / 切块验证（要人看原文）/ SDT 失分分析"
-  "2|本地模型|2|no|起 vLLM + verify_local_backend（要先装 vllm、下基座）"
-  "3|R1 前提：role 填充率|60|YES|**不过就停**——填充率不够，分层 ε 三个数没有意义"
-  "4|R1 验收：噪声地板 ε|auto:eval/epsilon.json|no|预估调用数**现读** eval/epsilon.json（三段 llm_calls 之和）——ε 一重跑这个数就变，不写死"
-  "5|药理层抽取|2181|YES|六源预过滤后 2151 块（R8 实测，verify_pharmacology_chunks 合计行）+ 6×5 试抽；先 --limit-blocks 5 人工核质量，再全量 --crosscheck"
-  "6|录制回放|278|no|record_fixtures（--dry-run 实测 278）+ verify_replay"
-  "7|全套评测重跑|1200|no|最贵的一段：run_eval 四项 + SDT Test（会写台账）"
-  "8|性能基准|38|no|bench_startup 冷/热各一次（0 调用）+ bench_consult 不开 ReAct ×3、开 ReAct ×1"
-  "9|R21~R24 的上机项|320|no|前缀规模 0 + 缓存命中率 2 次问诊 ×11 = 22 + full_context 下 E3/E4（9 条主诉 × own/swapped/none 三种 × 11 次/问诊 ≈ 297）+ 字体子集化 0。**这个 11 是 R22 之后的 calls_per_consult()**（2 + 3 医家 × 采样 3 次）"
-  "10|R26 蒸馏（可选）|350|YES|**不做也能交付**：蒸馏是研究证据、不进演示路径。预估 350 次 = 70 条 × calls_per_consult(3 位医家, best_of_n=1)=5。70 这个数是 ¥40 预算按高峰价现算出来的（offline/distill_from_v4 --estimate），**不是配方要的 8000 条**——那要 ¥3956，见 docs/reports/R26_report.md 第三节"
+  "0|0|n/a|环境自检|0|no|零成本：pytest / ruff / 环境变量残留 / 数据文件齐不齐"
+  "1|1|n/a|零调用的验证|0|no|凭据核对 / 本地语料规范化 / 切块验证（要人看原文）/ SDT 失分分析"
+  "2|2|n/a|本地模型|2|no|起 vLLM + verify_local_backend（直接 generate() 验后端，不走检索层）"
+  "3|4|top3|R1 前提：role 填充率|60|YES|**不过就停**——填充率不够，分层 ε 三个数没有意义"
+  "4|5|top3|R1 验收：噪声地板 ε|auto:eval/epsilon.json|no|预估调用数**现读** eval/epsilon.json（三段 llm_calls 之和）——ε 一重跑这个数就变，不写死。钉 top3：epsilon.json 里的历史值是这一系跑的"
+  "5|6|n/a|药理层抽取|2181|YES|六源预过滤后 2151 块（R8 实测，verify_pharmacology_chunks 合计行）+ 6×5 试抽；先 --limit-blocks 5 人工核质量，再全量 --crosscheck。离线抽取，不走检索层"
+  "6|7|top3|录制回放|278|no|record_fixtures（--dry-run 实测 278）+ verify_replay。**本段产物与检索模式绑定**（fixture 的键是 sha256(system)，full_context 下 system 含 18 万 token 前缀）——必须在**段 9** 闸门通过、模式定下来之后再跑，否则退回 hybrid 时 278 条全部白录"
+  "7|8|top3|全套评测重跑|1200|no|最贵的一段：run_eval 四项 + SDT Test（会写台账）。钉 top3：E8 只遍历 TOP3_MODES，SDT 台账和 RESULTS.md 的历史值也全是这一系的"
+  "8|9|top3|性能基准|38|no|bench_startup 冷/热各一次（0 调用）+ bench_consult 不开 ReAct ×3、开 ReAct ×1。钉 top3：要跟 R11 起的历史性能数可比"
+  "9|3|full_context|R21~R24 的上机项|320|no|**闸门：不过则默认配置退回 hybrid，后面各段的成本口径随之改变**。前缀规模 0 + 缓存命中率 2 次问诊 ×11 = 22 + full_context 下 E3/E4（9 条主诉 × own/swapped/none 三种 × 11 次/问诊 ≈ 297）+ 字体子集化 0"
+  "10|10|n/a|R26 蒸馏（可选）|350|YES|**不做也能交付**：蒸馏是研究证据、不进演示路径。预估 350 次 = 70 条 × calls_per_consult(3 位医家, best_of_n=1)=5。70 这个数是 ¥40 预算按高峰价现算出来的（offline/distill_from_v4 --estimate），**不是配方要的 8000 条**——那要 ¥3956，见 docs/reports/R26_report.md 第三节"
 )
+
+# 按**执行序**排好的段表（一行一段，格式同上）。段号不参与排序——那正是这一轮
+# 要解耦的东西。`sort -t'|' -k2 -n` 按第二格（执行序）排。
+segments_in_execution_order() {
+  printf '%s\n' "${SEGMENTS[@]}" | sort -t'|' -k2 -n
+}
+
+# 这一段要用哪个 RETRIEVER_MODE，以及把它**真的 export 出去**。
+#
+# `n/a` 是 unset 不是"不管"：留着上一段的值等于让一段不该受模式影响的活儿
+# 悄悄依赖上一段的设置，而那正是这一轮要修的那条链子的形状。
+# 映射问 scripts/onsite_plan.py（全项目一处），bash 这边不自己写 top3→hybrid。
+apply_retriever_mode() {
+  local seg_mode="$1" want
+  want=$(python3 -m scripts.onsite_plan --retriever-mode "$seg_mode") || {
+    echo "段模式 $seg_mode 解析失败——不继续跑这一段（按错的模式跑比不跑更贵）" >&2
+    return 1
+  }
+  if [ -n "$want" ]; then
+    export RETRIEVER_MODE="$want"
+    echo ">>> 检索模式钉成 RETRIEVER_MODE=$want（段声明 $seg_mode）"
+  else
+    unset RETRIEVER_MODE
+    echo ">>> 这一段不走检索层（$seg_mode），已清掉 RETRIEVER_MODE，不继承上一段"
+  fi
+}
 
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -189,34 +255,49 @@ warn_if_peak() {
 }
 
 print_plan() {
-  local total=0
-  echo "段  名称                     预估调用  人工卡点  说明"
+  local total=0 total_yuan=0
+  local -A calls_by_mode=() yuan_by_mode=()
+  echo "段号 执行序 模式          名称                     预估调用  人工卡点  说明"
   echo "--------------------------------------------------------------------------"
-  for row in "${SEGMENTS[@]}"; do
-    IFS='|' read -r n name calls gate note <<< "$row"
+  while IFS='|' read -r n order mode name calls gate note; do
     calls=$(resolve_calls "$calls")
+    local yuan
+    yuan=$(python3 -m scripts.onsite_plan --cost "$mode" "$calls")
     total=$((total + calls))
-    printf "%-3s %-24s %8s  %-8s  %s\n" "$n" "$name" "$calls" "$gate" "$note"
-  done
+    total_yuan=$(python3 -c "print(f'{$total_yuan + $yuan:.1f}')")
+    calls_by_mode[$mode]=$(( ${calls_by_mode[$mode]:-0} + calls ))
+    yuan_by_mode[$mode]=$(python3 -c "print(f'{${yuan_by_mode[$mode]:-0} + $yuan:.1f}')")
+    printf "%-4s %-6s %-13s %-24s %8s  %-8s  %s\n" \
+      "$n" "$order" "$mode" "$name" "$calls" "$gate" "$note"
+  done < <(segments_in_execution_order)
   echo "--------------------------------------------------------------------------"
-  local yuan
-  yuan=$(python3 -c "print(f'{$total * $YUAN_PER_CALL:.1f}')")
-  echo "全部跑完预估 ${total} 次调用 ≈ ¥${yuan}（均价 ¥${YUAN_PER_CALL}/次，"
-  echo "来源是 README 里 record_fixtures 那条「约 272 次 ¥1.5」——量级估算，不是账单）"
+  echo "**按模式分开算**（两套单价差 29 倍，加在一起的总数谁都对不上）："
+  for mode in top3 full_context n/a; do
+    local c="${calls_by_mode[$mode]:-0}" y="${yuan_by_mode[$mode]:-0}" unit
+    unit=$(python3 -m scripts.onsite_plan --unit-price "$mode")
+    printf "  %-13s %6s 次 × ¥%-8s ≈ ¥%s\n" "$mode" "$c" "$unit" "$y"
+  done
+  echo "  合计 ${total} 次 ≈ ¥${total_yuan}（高峰价；谷段五折）"
   echo
-  echo "⚠ **这个总数是下限，不是上限。** 那个均价是 top3 时代量出来的：一次调用只带"
-  echo "  三条医案。R21 之后 full_context 每次调用要带 ~18 万 token 的知识前缀，"
-  echo "  R22 之后 S3 在 effort=max 下思考 token 按输出计费——段 9/10 的每次调用"
-  echo "  贵一个量级。段 10 自己的估算器（offline/distill_from_v4 --estimate）报的是"
-  echo "  ¥40 买 70 条，也就是 ¥0.11/次，是均价的 20 倍。**按段问它自己的估算器，"
-  echo "  不要拿这个均价去算那两段。**"
+  echo "单价来源（scripts/onsite_plan.py，全项目一处）：top3 是 README 里"
+  echo "record_fixtures 那条「约 272 次 ¥1.5」的均价；full_context 是 18 万 token"
+  echo "命中输入 + 一次输出按 core/usage.py 的价目表算出来的。两个都是量级估算、不是账单。"
   echo
-  echo "段 0/1 零调用，先跑它们：免费的问题先发现掉。段 5 最贵，但段 6/7 要用它落盘的"
-  echo "药理层数据（core/tools.py 读 data/materia_medica.jsonl），所以它在两者之前。"
-  echo "段 7 是（top3 系里）最贵的一段；段 8 性能基准要量的是跑完前面所有段之后的这套系统。"
-  echo "段 9（R21~R24 的上机项）要的东西前面几段都得先有——前缀规模要 cases.json、"
-  echo "命中率要真实 API、full_context 下的 E3/E4 要评测框架跑通、字体子集化要联网取原始字体。"
-  echo "段 10（R26 蒸馏）排最末，而且**整段可以不做**：它是研究证据，不进演示路径。"
+  echo "执行序（不是段号）：$(segments_in_execution_order | cut -d'|' -f1 | tr '\n' ' ')"
+  echo "段 0/1/2 零调用或近零调用，先跑：免费的问题先发现掉。"
+  echo "**段 9 提到了段 3 之前**：它验的是「full_context 还能不能当默认」——闸门不过"
+  echo "就要退回 hybrid，而那之后每一段的成本口径、段 6 录的 fixture 全都跟着变。"
+  echo "段 5 药理层抽取必须在段 6 录制、段 7 评测之前（core/tools.py 读它落盘的数据）。"
+  echo "段 8 性能基准量的是跑完前面所有段之后的系统；段 10（蒸馏）整段可以不做。"
+  local decided
+  decided=$(mode_decision)
+  if [ -n "$decided" ]; then
+    echo
+    echo "已有段 9 的闸门决定：默认检索模式 = $decided。"
+  else
+    printf '\033[33m⚠ 段 9 的闸门还没跑过：现在去跑段 6（录制）有白录的风险——\033[0m\n'
+    printf '\033[33m  fixture 的键含 system 全文，模式一变 278 条全部不命中。先跑段 9。\033[0m\n'
+  fi
 }
 
 gate() {   # $1 = 段号, $2 = 这一步要人确认什么
@@ -473,14 +554,24 @@ seg_10() {
 }
 
 run_segment() {
-  local n="$1" name="$2" gate_flag="$3"
+  local n="$1" name="$2" gate_flag="$3" seg_mode="${4:-n/a}"
   echo
   echo "=========================================================================="
   echo "[段 $n] $name    开始 $(date -Is)"
   echo "=========================================================================="
   warn_if_peak "$n"
-  local rc=0
-  case "$n" in
+  # **每一段自己钉模式**，不看上一段留下什么（R28）。
+  # 钉不上（段表里写了个不存在的模式）就**不跑这一段**，但退出码照样落盘——
+  # 早退会让状态文件缺这一行，`--resume` 下次跳过它，而它其实从没跑过。
+  local mode_rc=0
+  apply_retriever_mode "$seg_mode" || mode_rc=$?
+  local decided
+  decided=$(mode_decision)
+  if [ -n "$decided" ]; then
+    echo ">>> 段 9 的闸门已决定：默认检索模式 = $decided（本段按 $seg_mode 的口径算钱）"
+  fi
+  local rc=$mode_rc
+  [ "$mode_rc" = "0" ] && case "$n" in
     0) seg_0 || rc=$? ;;
     1) seg_1 || rc=$? ;;
     2) seg_2 || rc=$? ;;
@@ -501,7 +592,20 @@ run_segment() {
     6) seg_6 || rc=$? ;;
     7) seg_7 || rc=$? ;;
     8) seg_8 || rc=$? ;;
-    9) seg_9 || rc=$? ;;
+    9) seg_9 || rc=$?
+       # 闸门的结论要落盘：过了就维持 full_context，没过就退回 hybrid。
+       # **这一步以前不存在**——脚本只在 stderr 打一句"export RETRIEVER_MODE=hybrid"，
+       # 而下一次 --resume 起来的段照旧按 full_context 跑（R28 修的就是这个）。
+       if [ "$rc" = "0" ]; then
+         record_mode_decision full_context
+       else
+         record_mode_decision hybrid
+         echo ">>> 段 9 闸门未通过：**后面各段按 top3/hybrid 的口径**，"
+         echo ">>>   而且段 6 若已在 full_context 下录过 fixture，要重录（键含 system 全文）。"
+       fi ;;
+    # 段 10 这一支原来**不存在**：case 只到 9，于是段 10 什么都不跑、退出码 0，
+    # 一个"跑完了"的假绿。读代码时发现的，补上并加了判据。
+    10) seg_10 || rc=$? ;;
   esac
   echo "--------------------------------------------------------------------------"
   echo "[段 $n] $name    结束 $(date -Is)    退出码 $rc"
@@ -535,7 +639,7 @@ if [ "$RESUME" = "1" ]; then
     exit 0
   fi
   echo
-  echo "--resume：从段 $FROM 开始（段 0..$((FROM - 1)) 上次都是退出码 0，不重跑）。"
+  echo "--resume：从段 $FROM 开始（执行序在它之前的段上次都是退出码 0，不重跑）。"
 fi
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -544,16 +648,27 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# `--from N` 的语义：**从段 N 的执行序开始**（不是"段号大于等于 N"）。
+# 段号和执行序解耦之后这两者不再是同一件事——段 9 的执行序是 3，
+# `--from 3` 要跑的是段 3 及其之后的执行序，不该把已经跑过的段 9 再跑一遍。
+FROM_ORDER=0
+if [ "$FROM" != "0" ]; then
+  FROM_ORDER=$(segments_in_execution_order | awk -F'|' -v n="$FROM" '$1==n {print $2}')
+  if [ -z "$FROM_ORDER" ]; then
+    echo "--from $FROM：段表里没有这个段号。" >&2
+    exit 2
+  fi
+fi
+
 RESULTS=()
-for row in "${SEGMENTS[@]}"; do
-  IFS='|' read -r n name calls gate_flag note <<< "$row"
+while IFS='|' read -r n order seg_mode name calls gate_flag note; do
   if [ -n "$ONLY" ]; then
     [ "$n" = "$ONLY" ] || continue
-  elif [ "$n" -lt "$FROM" ]; then
+  elif [ "$order" -lt "$FROM_ORDER" ]; then
     continue
   fi
-  run_segment "$n" "$name" "$gate_flag"
-done
+  run_segment "$n" "$name" "$gate_flag" "$seg_mode"
+done < <(segments_in_execution_order)
 
 echo
 echo "=========================================================================="

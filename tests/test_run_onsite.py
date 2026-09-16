@@ -19,20 +19,26 @@ DOC = ROOT / "docs" / "onsite_troubleshooting.md"
 
 
 def _segment_rows() -> list[tuple[str, str, str, str, str]]:
-    """从脚本的 SEGMENTS 数组解析出段表**原文**（「预估调用数」那一格不解析，
-    可能是 `auto:<文件>`）。**测试读的就是脚本里那一份**，不在测试里另抄一份
-    ——抄一份就会漂。"""
-    text = SCRIPT.read_text(encoding="utf-8")
-    block = re.search(r"SEGMENTS=\(\n(.*?)\n\)", text, re.S)
-    assert block, "脚本里找不到 SEGMENTS 数组"
-    rows = []
-    for line in block.group(1).splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        n, name, calls, gate, note = line.strip('"').split("|")
-        rows.append((n, name, calls, gate, note))
-    return rows
+    """段表**原文**里这几条测试关心的那几格：`(段号, 名称, 预估调用数, 人工卡点, 说明)`。
+
+    **R28 起解析走 `scripts.onsite_plan.parse_segments`**，不在这里写正则：
+    段表这一轮从五格变成七格（多了执行序和检索模式），而原来每个测试文件各写一个
+    正则去抠它——加一格就要同时改好几处，漏改的那处不会报错、只会少断言一件事。
+    这里只是把七格里这几条判据用得到的那几格拆出来，执行序和模式有它们自己的
+    判据文件（tests/test_onsite_order_and_mode.py）。
+    """
+    from scripts.onsite_plan import parse_segments
+
+    rows = parse_segments(SCRIPT.read_text(encoding="utf-8"))
+    return [(r["num"], r["name"], r["calls"], r["gate"], r["note"]) for r in rows]
+
+
+def _segment_rows_in_execution_order() -> list[tuple[str, str, str, str, str]]:
+    """同上，但按**执行序**排。段号顺序和执行顺序 R28 之后是两回事。"""
+    from scripts.onsite_plan import segments_in_execution_order
+
+    rows = segments_in_execution_order(SCRIPT.read_text(encoding="utf-8"))
+    return [(r["num"], r["name"], r["calls"], r["gate"], r["note"]) for r in rows]
 
 
 def _segments() -> list[tuple[str, str, int, str, str]]:
@@ -42,6 +48,13 @@ def _segments() -> list[tuple[str, str, int, str, str]]:
 
     return [(n, name, resolve_calls(calls), gate, note)
             for n, name, calls, gate, note in _segment_rows()]
+
+
+def _segments_in_execution_order() -> list[tuple[str, str, int, str, str]]:
+    from scripts.onsite_plan import resolve_calls
+
+    return [(n, name, resolve_calls(calls), gate, note)
+            for n, name, calls, gate, note in _segment_rows_in_execution_order()]
 
 
 def test_script_is_valid_bash():
@@ -62,7 +75,8 @@ def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents(
     「数据文件不存在」的工具输出。所以这条改成：前两段零调用；药理层抽取在录制和
     评测之前；最后一段是全套评测（没有任何段依赖它、且是不被依赖的段里最贵的）。
     这是一次有意的契约变更，不是把断言改绿。"""
-    rows = _segments()
+    # **R28 起按执行序判**，不按段号顺序：段号是身份，执行序才是"先跑谁"。
+    rows = _segments_in_execution_order()
     assert rows[0][2] == 0 and rows[1][2] == 0, "前两段必须是零调用"
     names = [r[1] for r in rows]
     i_pharm = next(i for i, n in enumerate(names) if "药理层" in n)
@@ -88,15 +102,24 @@ def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents(
     # ——它要的东西前面几段都得先有（前缀规模要 cases.json、命中率要真实 API、
     # full_context 下的 E3/E4 要评测框架跑通、字体子集化要联网取原始字体）。
     i_r21 = next(i for i, n in enumerate(names) if "R21~R24" in n)
-    assert i_bench < i_r21, "性能基准在它之前（那一段要量的是跑完前面所有段之后的系统）"
     assert calls[i_eval] > calls[i_r21], "评测仍是最贵的一段（按调用数）"
+    # **R28 把这一条翻了过来**：R25 那版写的是「性能基准在段 9 之前」，理由是
+    # "段 9 要的东西前面几段都得先有"。R28 发现那个理由只对段 9 的**四个子步骤中的
+    # 两个**成立（前缀规模要 cases.json、字体要联网），而另外两个（缓存命中率、
+    # full_context 的 E3/E4）只要 cases.json + 真实 key——它们决定的是
+    # **后面每一段按哪套单价花钱**，晚跑一小时的代价是前面几千次调用按错的默认
+    # 配置花掉。所以段 9 提到了所有花钱的段之前，性能基准反而在它后面。
     # **R26 起最后一段是蒸馏**（第三次同一形状的契约变更）：原断言是「R21~R24
     # 那一段必须是最后一段」。段 10 排在它后面有两条硬依据：它要 cases.json、
     # 要真实 API（跟段 9 同样的前提），而且**整段可以不做**——可选的段排在必做的
     # 段后面，中途停下来不会漏掉任何必做项。
     i_last = next(i for i, n in enumerate(names) if "蒸馏" in n)
     assert i_last == len(rows) - 1, "蒸馏必须是最后一段"
-    assert i_r21 < i_last
+    # **R28：段 9 从最后挪到了最前面（执行序 3）**，理由不是成本是依赖——
+    # 它验的是「full_context 还能不能当默认」，闸门不过后面每一段的成本口径都变。
+    # 所以这条断言翻了个方向：以前是 i_r21 < i_last（它在蒸馏之前），
+    # 现在是它在**所有花钱的段**之前。
+    assert i_r21 < i_bench and i_r21 < i_eval and i_r21 < i_pharm
 
 
 def test_exactly_two_human_gates_and_they_are_segments_3_and_5():
@@ -161,6 +184,7 @@ def test_dry_run_prints_the_plan_and_runs_nothing():
                          capture_output=True, text=True, cwd=ROOT)
     assert out.returncode == 0, out.stderr
     assert "预估调用" in out.stdout
+    assert "执行序" in out.stdout, "R28 起清单要同时打段号和执行序"
     assert "什么都没跑" in out.stdout
     for n, name, *_ in _segments():
         assert name in out.stdout
@@ -170,7 +194,9 @@ def test_dry_run_total_matches_the_segment_table():
     out = subprocess.run(["bash", str(SCRIPT), "--dry-run"],
                          capture_output=True, text=True, cwd=ROOT)
     total = sum(r[2] for r in _segments())
-    assert f"预估 {total} 次调用" in out.stdout
+    # R28 起总计那行按模式分开算，措辞跟着变：`合计 N 次 ≈ ¥X`。
+    # **仍然是"清单上每段之和"这件事**，只是不再把两套单价加成一个数。
+    assert f"合计 {total} 次" in out.stdout
 
 
 def test_unknown_argument_fails_loudly():
@@ -301,7 +327,9 @@ def test_only_flag_runs_a_single_segment(tmp_path):
     text = SCRIPT.read_text(encoding="utf-8")
     assert 'if [ -n "$ONLY" ]; then' in text
     assert '[ "$n" = "$ONLY" ] || continue' in text
-    assert '[ "$n" -lt "$FROM" ]' in text
+    # R28：跳过判据从"段号小于 FROM"变成"**执行序**小于 FROM 的执行序"——
+    # 段号和执行序解耦之后，按段号跳会把已经跑过的段 9 再跑一遍。
+    assert '[ "$order" -lt "$FROM_ORDER" ]' in text
 
 
 def test_python_in_tests_can_import_the_record_plan():

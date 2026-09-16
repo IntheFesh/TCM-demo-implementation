@@ -127,10 +127,18 @@ def _nodes(n, counts=None):
     return "[" + ",".join(rows) + "]"
 
 
-def test_the_expansion_cap_is_twenty():
-    """20 不是随手定的：1280×800 下 20 个带标签的节点摆成扇面之后标签还认得出来，
-    再多就开始压字。真判据在 screenshot_states 的 rings（两两比包围盒）。"""
-    assert _json("return {cap: GB_EXPAND_CAP};")["cap"] == 20
+def test_the_expansion_cap_matches_what_the_canvas_can_hold():
+    """**有意的契约变更（R28）：20 → 14。**
+
+    这个上限是画布定的，不是随手定的——而 R28 给证型加了病名限定
+    （178 个证候里 66 个重名），标签从一行约 100px 变成两行、最宽 124px。
+    同一块 1280×800 的画布再也摆不下 20 个：实测压字 2~4 对，
+    而且 `fit` 会把字缩到 11.9px（判据要 ≥12）。
+
+    **少画几个不丢信息**：状态栏照旧报"还有 N 个，搜索直达"。
+    改期望值而不是放宽判据：放宽之后这条就再也说不出"画布放得下多少"这件事了。
+    """
+    assert _json("return {cap: GB_EXPAND_CAP};")["cap"] == 14
 
 
 def test_cap_keeps_the_syndromes_with_the_most_symptoms():
@@ -171,7 +179,7 @@ def test_cap_drops_the_edges_of_the_nodes_it_drops():
 def test_cap_is_a_noop_when_there_is_nothing_to_drop():
     out = _json(f"""
       const graph = {{nodes: {_nodes(3)}, edges: []}};
-      const capped = gbCapExpansion(graph, 20);
+      const capped = gbCapExpansion(graph, GB_EXPAND_CAP);
       return {{n: capped.graph.nodes.length, dropped: capped.dropped}};
     """)
     assert out == {"n": 3, "dropped": 0}
@@ -182,13 +190,13 @@ def test_the_status_line_says_how_many_are_left_and_how_to_reach_them():
     而那是一个静默的谎——比报错更难发现。"""
     out = _json("""
       return {
-        capped: gbExpandStatusText({total: 61, returned: 61, truncated: false}, 41, "证型"),
+        capped: gbExpandStatusText({total: 61, returned: 61, truncated: false}, 47, "证型"),
         plain: gbExpandStatusText({total: 5, returned: 5, truncated: false}, 0, "证型"),
         empty: gbExpandStatusText({total: 0, returned: 0, truncated: false}, 0, "证型"),
       };
     """)
-    assert "还有 41 个" in out["capped"] and "搜索直达" in out["capped"]
-    assert "20" in out["capped"], "要说清是按什么取的前 20 个"
+    assert "还有 47 个" in out["capped"] and "搜索直达" in out["capped"]
+    assert "14" in out["capped"], "要说清是按什么取的前 N 个"
     assert out["plain"] == "展开了 5 个证型——再点一次收起"
     assert out["empty"] == "这个节点下没有证型"
 
@@ -218,11 +226,11 @@ def test_the_fan_stays_on_one_side_and_starts_at_forty_degrees():
         const angs = slots.map(s => s.angle);
         return {n: slots.length, span: (Math.max(...angs) - Math.min(...angs)) * 180 / Math.PI};
       };
-      return {small: spanOf(5), big: spanOf(20)};
+      return {small: spanOf(5), big: spanOf(GB_EXPAND_CAP)};
     """)
     assert out["small"]["n"] == 5
     assert out["small"]["span"] <= 80.5, "五个节点不该把扇面张开"
-    assert out["big"]["n"] == 20
+    assert out["big"]["n"] == 14
     assert out["big"]["span"] <= 180.5, "再挤也不许摊成整圈"
 
 
@@ -230,7 +238,7 @@ def test_every_fan_slot_stays_outside_the_inner_ring():
     """扇面最里面那一排必须让开内环，否则展开出来的证型会插进证素堆里。"""
     out = _json("""
       const outer = {rx: 500, ry: 230}, inner = {rx: 200, ry: 95};
-      const slots = gbFanSlots(0, 20, outer, inner);
+      const slots = gbFanSlots(0, GB_EXPAND_CAP, outer, inner);
       return {minR: Math.min(...slots.map(s => s.scale * outer.ry)), innerRy: inner.ry};
     """)
     assert out["minR"] > out["innerRy"], out

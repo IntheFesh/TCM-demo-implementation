@@ -110,7 +110,10 @@ BENCH_ROUNDS_DIR = "bench/rounds"
 # 快照里进凭据注册表的那几个键 = 报告"五个数"里落文件的那几个。
 ROUND_METRIC_KEYS = ("pytest_passed", "pytest_skipped", "pytest_failed",
                      "pytest_wall_s", "playwright_states_passed", "playwright_wall_s",
-                     "import_api_main_s", "health_p50_ms_five", "health_p50_ms_three")
+                     "import_api_main_s", "health_p50_ms_five", "health_p50_ms_three",
+                     # R28：核对器自己核了几份文档。各轮报告里这个数一直是手写的
+                     # （9 / 10 / 11），而实际早就变了——手写的数必漂。
+                     "n_checked_docs", "check_exit_code")
 EPSILON_S3_DISABLED_JSON = "epsilon_s3_disabled.json"
 MATERIA_MEDICA_JSONL = "../data/standard/materia_medica.jsonl"
 FORMULARY_JSONL = "../data/standard/formulary.jsonl"
@@ -317,6 +320,8 @@ EVIDENCE: dict[str, tuple[str, object]] = {
     "bench.import_api_main_s": (BENCH_SANDBOX_JSON, lambda d: d["import_api_main_s"]),
     "bench.health_p50_ms_five": (BENCH_SANDBOX_JSON, lambda d: d["health_p50_ms_five"]),
     "bench.health_p50_ms_three": (BENCH_SANDBOX_JSON, lambda d: d["health_p50_ms_three"]),
+    "bench.n_checked_docs": (BENCH_SANDBOX_JSON, lambda d: d["n_checked_docs"]),
+    "bench.check_exit_code": (BENCH_SANDBOX_JSON, lambda d: d["check_exit_code"]),
     "bench.pytest_passed": (BENCH_SANDBOX_JSON, lambda d: d["pytest_passed"]),
     "bench.pytest_skipped": (BENCH_SANDBOX_JSON, lambda d: d["pytest_skipped"]),
     "bench.pytest_failed": (BENCH_SANDBOX_JSON, lambda d: d["pytest_failed"]),
@@ -366,7 +371,14 @@ def _register_round_evidence(eval_dir: Path = EVAL_DIR) -> None:
     """
     for name in _round_snapshot_names(eval_dir):
         rel = f"{BENCH_ROUNDS_DIR}/{name}.json"
+        # **只注册这一轮快照里真有的键。** R28 加了 `n_checked_docs`，而 R21~R27
+        # 的快照里没有这个字段——那不是"取不到值"，是**那一轮根本没量过这件事**。
+        # 无条件注册会让每一轮都多出几个永远查不到的键，而"查不到"这个信号
+        # 本来是用来抓"忘了跑 --round"的，被这种噪音一淹就没用了。
+        snapshot = _load_json(eval_dir / rel) or {}
         for metric in ROUND_METRIC_KEYS:
+            if metric not in snapshot:
+                continue
             EVIDENCE.setdefault(f"round.{name}.{metric}",
                                 (rel, lambda d, m=metric: d[m]))
 

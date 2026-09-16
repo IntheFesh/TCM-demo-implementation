@@ -374,8 +374,13 @@ def test_onsite_segment_5_uses_the_batch_entry_and_states_where_its_number_comes
     assert "offline.extract_materia_medica --limit 5\n" not in text
     import re
 
-    row = next(line for line in text.splitlines() if line.strip().startswith('"5|'))
-    _n, _name, calls, _gate, note = row.strip().strip('"').split("|")
+    # R28：段表从五格变成七格（多了执行序和检索模式）。**解析走
+    # scripts.onsite_plan.parse_segments**，不在这里再抠一次正则——
+    # 各写一份的后果这一轮已经吃到了：格子一变，四个测试文件同时炸。
+    from scripts.onsite_plan import parse_segments
+
+    seg5 = next(r for r in parse_segments(text) if r["num"] == "5")
+    calls, note = seg5["calls"], seg5["note"]
     kept = int(re.search(r"预过滤后 (\d+) 块", note).group(1))
     assert int(calls) == kept + 6 * 5, "段 5 = 六源预过滤后的块数 + 每源 5 块试抽"
     assert "verify_pharmacology_chunks" in note
@@ -478,8 +483,13 @@ def test_onsite_segment_5_number_tracks_the_measured_kept_blocks():
     import re
 
     text = (ROOT / "scripts" / "run_onsite.sh").read_text(encoding="utf-8")
-    row = next(line for line in text.splitlines() if line.strip().startswith('"5|'))
-    _n, _name, calls, _gate, note = row.strip().strip('"').split("|")
+    # R28：段表从五格变成七格（多了执行序和检索模式）。**解析走
+    # scripts.onsite_plan.parse_segments**，不在这里再抠一次正则——
+    # 各写一份的后果这一轮已经吃到了：格子一变，四个测试文件同时炸。
+    from scripts.onsite_plan import parse_segments
+
+    seg5 = next(r for r in parse_segments(text) if r["num"] == "5")
+    calls, note = seg5["calls"], seg5["note"]
     kept = int(re.search(r"预过滤后 (\d+) 块", note).group(1))
     assert int(calls) == kept + 6 * 5
 

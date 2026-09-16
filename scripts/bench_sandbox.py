@@ -153,6 +153,23 @@ def bench_playwright() -> dict:
     }
 
 
+def bench_credential_check() -> dict:
+    """凭据核对：退出码，以及**核了几份文档**。
+
+    R28：这个"几份"以前是各轮报告里手写的（R25 写 9、R26 写 10、R24 补丁写 11，
+    而实际已经是 12）——一个每轮都会变、又没有任何东西盯着的数，手写必然漂。
+    现在它跟测试条数、Playwright 种数一样：量出来落文件，报告引凭据记号。
+    """
+    from scripts.collect_results import DEFAULT_CHECK_PATHS
+
+    r = subprocess.run([sys.executable, "-m", "scripts.collect_results", "--check"],
+                       cwd=ROOT, capture_output=True, text=True)
+    return {
+        "check_exit_code": r.returncode,
+        "n_checked_docs": len(DEFAULT_CHECK_PATHS),
+    }
+
+
 def collect(run_all: bool) -> dict:
     out: dict = {}
     print("--- 冷进程 import api.main ---")
@@ -172,6 +189,9 @@ def collect(run_all: bool) -> dict:
         out.update(bench_playwright())
         print(f"  {out['playwright_states_passed']} 种通过，退出码 "
               f"{out['playwright_exit_code']}，墙钟 {out['playwright_wall_s']}s")
+        print("--- 凭据核对 ---")
+        out.update(bench_credential_check())
+        print(f"  {out['n_checked_docs']} 份文档，退出码 {out['check_exit_code']}")
     else:
         print("（没传 --all：全量测试和 Playwright 这两项没量。"
               "eval/bench/sandbox.json 里就不会有它们的键——"
