@@ -90,6 +90,18 @@ GRAPH_JSON = "../data/graph.json"
 # 它们进注册表的理由跟 graph.json 那几个一样：来源是数据文件本身、
 # 不在任何 report 里，手抄就一定会漂。
 BENCH_SANDBOX_JSON = "bench/sandbox.json"
+# R23：**每轮一份不可变快照**。`bench/sandbox.json` 是"当前这一轮的测量"，
+# 会被下一轮整份覆盖——R21 就是因为这个让 R19 的五个数当场 `--check` 报错
+# （SOURCES.md 第 64 条第十一点）。当时的改法是"历史值指到 git"，但那意味着
+# 每轮都要手改上一轮的报告，而手改的那一步一定有人会忘。
+# 现在 `bench_sandbox --round R23` 同时写两份：sandbox.json（当前）和
+# bench/rounds/R23.json（这一轮的，以后不再动）。每轮报告引自己那份快照，
+# 所有历史轮次因此永远可核。
+BENCH_ROUNDS_DIR = "bench/rounds"
+# 快照里进凭据注册表的那几个键 = 报告"五个数"里落文件的那几个。
+ROUND_METRIC_KEYS = ("pytest_passed", "pytest_skipped", "pytest_failed",
+                     "pytest_wall_s", "playwright_states_passed", "playwright_wall_s",
+                     "import_api_main_s", "health_p50_ms_five", "health_p50_ms_three")
 EPSILON_S3_DISABLED_JSON = "epsilon_s3_disabled.json"
 MATERIA_MEDICA_JSONL = "../data/standard/materia_medica.jsonl"
 FORMULARY_JSONL = "../data/standard/formulary.jsonl"
@@ -304,6 +316,36 @@ EVIDENCE: dict[str, tuple[str, object]] = {
         BENCH_SANDBOX_JSON, lambda d: d["playwright_states_passed"]),
     "bench.playwright_wall_s": (BENCH_SANDBOX_JSON, lambda d: d["playwright_wall_s"]),
 }
+
+
+def _round_snapshot_names(eval_dir: Path = EVAL_DIR) -> list[str]:
+    """`bench/rounds/` 下的轮次名（R21、R23…），按轮次号排序。"""
+    d = eval_dir / BENCH_ROUNDS_DIR
+    if not d.is_dir():
+        return []
+    found = []
+    for path in d.glob("R*.json"):
+        m = re.match(r"(R(\d+))\.json$", path.name)
+        if m:
+            found.append((int(m.group(2)), m.group(1)))
+    return [name for _, name in sorted(found)]
+
+
+def _register_round_evidence(eval_dir: Path = EVAL_DIR) -> None:
+    """把每轮快照的键注册进 EVIDENCE：`round.R23.pytest_passed` 这种形状。
+
+    **glob 注册而不是一轮一轮往 EVIDENCE 里加九行**：忘了加的那一轮，
+    它报告里的凭据记号会被当成"查不到的键"而报错——那还算好的；更糟的是
+    有人为了让它过而把记号删掉，于是那一轮的数变成没人核的数。
+    """
+    for name in _round_snapshot_names(eval_dir):
+        rel = f"{BENCH_ROUNDS_DIR}/{name}.json"
+        for metric in ROUND_METRIC_KEYS:
+            EVIDENCE.setdefault(f"round.{name}.{metric}",
+                                (rel, lambda d, m=metric: d[m]))
+
+
+_register_round_evidence()
 
 
 def _count_node_type(graph: dict, node_type: str) -> int:

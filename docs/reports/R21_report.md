@@ -73,13 +73,15 @@ top-3 条检索结果，而是该医家的**全部**医案 + 本草/方剂表，
 | 凭据核对 | 退出码 **0** | `python -m scripts.collect_results --check` |
 | Playwright | **16** 种全过 | `python -m scripts.screenshot_states` |
 
-带凭据记号的那几个（一行一个，核对器要求凭据说的数在同一行正文里也出现）：
+带凭据记号的那几个（一行一个，核对器要求凭据说的数在同一行正文里也出现）。
+引的是**这一轮的不可变快照** `eval/bench/rounds/R21.json`，不是会被下一轮覆盖的
+`sandbox.json`——这一条是 R23 补的机制，理由见 R23 报告第五节和 SOURCES 第 65 条：
 
-- 测试 passed **2783** —— `bench/sandbox.json:bench.pytest_passed=2783`
-- 测试 skipped **10** —— `bench/sandbox.json:bench.pytest_skipped=10`
-- 测试 failed **0** —— `bench/sandbox.json:bench.pytest_failed=0`
-- 全量测试墙钟 **66.2** 秒 —— `bench/sandbox.json:bench.pytest_wall_s=66.2`
-- Playwright 通过 **16** 种 —— `bench/sandbox.json:bench.playwright_states_passed=16`
+- 测试 passed **2783** —— `bench/rounds/R21.json:round.R21.pytest_passed=2783`
+- 测试 skipped **10** —— `bench/rounds/R21.json:round.R21.pytest_skipped=10`
+- 测试 failed **0** —— `bench/rounds/R21.json:round.R21.pytest_failed=0`
+- 全量测试墙钟 **66.2** 秒 —— `bench/rounds/R21.json:round.R21.pytest_wall_s=66.2`
+- Playwright 通过 **16** 种 —— `bench/rounds/R21.json:round.R21.playwright_states_passed=16`
 
 `ruff`、`min_length=1` 计数、`--check` 退出码这三个**没有凭据记号也不该有**：
 它们是命令的当场输出，不落任何文件。

@@ -31,6 +31,7 @@ R19 要一张「性能前后对照表」，而这个项目的铁律是**任何�
 from __future__ import annotations
 
 import argparse
+import re
 import json
 import statistics
 import subprocess
@@ -182,7 +183,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="连全量测试和 Playwright 一起量（慢，但那两个数才是每轮都在变的）")
     ap.add_argument("--out", type=Path, default=OUT_PATH)
     ap.add_argument("--show", action="store_true", help="只打印上次量的结果，不重量")
+    ap.add_argument("--round", dest="round_name", metavar="R23",
+                    help="同时写一份这一轮的**不可变快照** eval/bench/rounds/<R>.json。"
+                         "sandbox.json 会被下一轮整份覆盖，而每轮报告里的凭据记号"
+                         "要永远可核——R21 就是因为缺这一份，让 R19 的五个数当场 "
+                         "--check 报错（SOURCES.md 第 64 条第十一点）")
     args = ap.parse_args(argv)
+    if args.round_name is not None and not re.fullmatch(r"R\d+", args.round_name):
+        # 轮次名的形状被凭据注册表 glob 依赖（round.R23.pytest_passed），
+        # 写错一个字母的后果是那一轮的快照谁都不核，而它看起来跟被核过的一样。
+        ap.error(f"--round 只接受 R + 数字（比如 R23），给的是 {args.round_name!r}")
 
     if args.show:
         if not args.out.exists():
@@ -198,6 +208,12 @@ def main(argv: list[str] | None = None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n已写出 {args.out}")
+    if args.round_name:
+        snapshot = args.out.parent / "rounds" / f"{args.round_name}.json"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"已写出这一轮的不可变快照 {snapshot}"
+              f"（报告里引 bench/rounds/{args.round_name}.json:round.{args.round_name}.* ）")
     print("量不了的那几项（热启动 ≤20s 要真模型、一次问诊 ≤90s 要真 LLM）"
           "在 eval/RESULTS.md 里标 ⏳ 并附上机命令，不在这里编。")
     return 0

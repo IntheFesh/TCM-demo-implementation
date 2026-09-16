@@ -549,6 +549,43 @@ class FormulaSafety(BaseModel):
         return bool(self.incompatible) or bool(self.dose_violations)
 
 
+AdviceKind = Literal[
+    "incompatible",            # 十八反十九畏（复用安全层的表）
+    "over_dose",               # 超药典常用上限（复用安全层的 DOSE_LIMITS）
+    "thermal_mismatch",        # 证型寒热方向与主方药性相悖
+    "missing_channel_guide",   # 证型指向的病位上没有一味归该经的药
+    "duplicate_effect",        # 两味药性味功效重合过多
+]
+AdviceSeverity = Literal["blocking", "warning", "suggestion"]
+
+
+class Advice(BaseModel):
+    """R23：对一张方的一条**建议**。产出它的逻辑一律在 core/formula_check.py，
+    这里只定义字段（跟 FormulaSafety / DoseViolation 同一条边界，理由见那两处）。
+
+    **这不是 LLM 输出 schema**，是确定性规则算出来的结果——同样的方、同样的
+    数据文件，永远产出同样的 advice 列表。这一点决定了下面两个字段的松紧：
+
+    - `reason` 是 `Field(min_length=1)`：一条说不出理由的建议等于没有建议，
+      界面上会显示成一个空条目，人只会以为是 bug。
+    - `source_span` 是 `str | None`：**不是防幻觉字段**。药理层那四个 schema 里
+      `source_span` 必须非空，因为那些值是模型从原文里抽的、必须能回到原文核对；
+      这里的值是规则自己算的，十八反/剂量两条能给出表里的出处，寒热/缺引经/
+      重复三条**没有原文出处**——那时留 None 是如实，编一句"根据中医理论"才是
+      假的（CLAUDE.md「防幻觉约束不许放松」管的是模型填的可验证事实，
+      不是规则自己的判据）。
+
+    `herbs` 允许为空：`missing_channel_guide` 说的是"**没有**这样一味药"，
+    列不出涉及的药名是这条规则的本来形状，不是数据缺失。
+    """
+
+    kind: AdviceKind
+    herbs: list[str] = Field(default_factory=list)
+    reason: str = Field(min_length=1)
+    source_span: str | None = None
+    severity: AdviceSeverity
+
+
 class FormulaCandidate(BaseModel):
     """一个候选方。三种来源的可信度不同，前端必须视觉区分（M6/M7）：
       classic  —— 现有经典方，原方名照写

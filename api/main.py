@@ -31,6 +31,7 @@ from core.physicians import (
     PHYSICIANS, physicians_all, physicians_enabled, resolve_physician_id,
 )
 from core.prescription import compute_herb_diffs, format_pharmacy_text
+from core.formula_check import advice_dicts, check_formula
 from core.safety_output import (
     INCOMPATIBLE_TRAINING_NOTE,
     assess_formula_safety,
@@ -1117,6 +1118,14 @@ def _serialize_result(r: dict) -> dict:
         # G2 取证轨迹。不开 ReAct 时是 None；开了要如实带出来——ReAct 的卖点
         # 就是"能看见它查了什么"，只把结论传出去等于白跑。
         "react_trace": r["react_trace"].model_dump() if r.get("react_trace") else None,
+        # R23：建议层三个键。`.get` 带默认值而不是 `r["advice"]`——这个函数也
+        # 被「参考医家」引用区复用，那条路径的结果不是 run_physician 产出的，
+        # 没有这三个键；而缺键会让前端读到 undefined 悄悄进渲染。
+        # 患者角色的摘除在 _filter_response_by_role 里做，不在这儿：
+        # 这一层只负责"怎么序列化"，角色判据只有那一处。
+        "advice": r.get("advice", []),
+        "advice_skipped": r.get("advice_skipped", []),
+        "formula_score": r.get("formula_score"),
     }
 
 
@@ -1264,6 +1273,10 @@ def _filter_response_by_role(response: dict, role: Role, results: list[dict]) ->
             r["s3"] = _filter_s3_for_role(r["s3"], role)
             r["refs"] = []
             r["safety_output"] = _simplify_safety_output(r.get("safety_output"))
+        if not _role_gets_advice(role):
+            # 判据跟 /api/prescription/validate 是同一个函数，见 ADVICE_FIELDS。
+            for key in ADVICE_FIELDS:
+                r.pop(key, None)
         new_results.append(r)
     response["results"] = new_results
 
@@ -1468,6 +1481,12 @@ class PrescriptionValidateRequest(BaseModel):
     # 证型名里的关键词，不是病名。这里原样接住这个字段（跟请求契约保持一致，
     # 医生端可能想传），但目前确实没有消费它，如实留着不裁掉，也不假装用了它。
     disease: str | None = None
+    # R23：这条接口是医生端的可编辑处方表在用的，所以默认 doctor。
+    # 带 role 而不是"这条接口本来就只有医生在调、不用判"——**建议里带着具体
+    # 药名**，patient 拿到 advice 等于绕过 _filter_s3_for_role 摘掉 formula/herbs
+    # 的那道边界。裁剪在服务端做（跟 /api/consult 同一条原则：不是发了再让前端
+    # 藏起来，那样打开 devtools 照样能看到）。
+    role: Role = "doctor"
 
 
 def _safety_dict(safety: FormulaSafety) -> dict:
@@ -1482,13 +1501,44 @@ def _safety_dict(safety: FormulaSafety) -> dict:
     return {**safety.model_dump(), "blocking": safety.blocking}
 
 
+# R23：哪些角色能看到建议层。**全项目唯一的判据**——/api/prescription/validate
+# 和 results[i] 两处都问这一个函数，不是各写一遍 `if role == "patient"`。
+# patient 拿不到的理由：每条建议的 reason 里都带着具体药名（「甘草 与 甘遂 属
+# 配伍禁忌」），下发 advice 等于把处方内容从另一个字段漏出去，
+# _filter_s3_for_role 摘掉 formula/herbs 就白做了。formula_score 虽然只是个数，
+# 但它是"这张处方拟得好不好"的分，对患者没有意义，一起摘。
+ADVICE_FIELDS = ("advice", "advice_skipped", "formula_score")
+
+
+def _role_gets_advice(role: Role) -> bool:
+    return role != "patient"
+
+
+def _advice_fields_for_role(check, role: Role) -> dict:
+    """建议层那三个键。角色不该看到时返回 `{}`（不是三个空值）——
+    空列表读起来是"查过了，没有建议"，而真相是"这个角色不给这一层"。"""
+    if not _role_gets_advice(role):
+        return {}
+    return {
+        "advice": advice_dicts(check),
+        "advice_skipped": list(check.skipped),
+        "formula_score": check.score,
+    }
+
+
 @app.post("/api/prescription/validate")
 def api_prescription_validate(req: PrescriptionValidateRequest) -> dict:
     """纯规则校验，不调 LLM，毫秒级返回。独立于 /api/consult——医生可能在
     完全不同的场景下想校验一张手写/临时改动的方（不是从某次问诊来的），
-    这条接口不依赖任何问诊上下文。"""
+    这条接口不依赖任何问诊上下文。
+
+    R23 起除了 FormulaSafety 那几个键，还带 advice（建议）/ advice_skipped
+    （因为缺数据没跑的规则）/ formula_score（粗排序分）。安全层那几个键**一个
+    没动**：调用方已经在消费它们，建议层是新增的三个键，不是改写原有的。
+    """
     safety = assess_formula_safety(req.syndrome, req.herb_items)
-    return _safety_dict(safety)
+    check = check_formula(req.syndrome, req.herb_items)
+    return {**_safety_dict(safety), **_advice_fields_for_role(check, req.role)}
 
 
 class PrescriptionExportRequest(BaseModel):

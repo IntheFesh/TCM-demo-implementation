@@ -1444,12 +1444,56 @@ python -m scripts.train_lora --out-dir /root/autodl-tmp/lora
 
 ```
 POST /api/prescription/validate
-body: {herb_items: HerbItem[], syndrome: string, disease?: string}
+body: {herb_items: HerbItem[], syndrome: string, disease?: string, role?: Role}
 → FormulaSafety 的字段 + 一个额外的 blocking 布尔（FormulaSafety.blocking
   是 pydantic 的 @property，model_dump() 不带计算属性，接口这里手动补上，
   避免调用方各自重新判断一遍"incompatible 或 dose_violations 非空就是
-  blocking"）
+  blocking"）+ R23 的建议层三个键 advice / advice_skipped / formula_score
 ```
+
+## 方剂建议层（R23）：跟安全层分开的第二层
+
+`core/formula_check.py::check_formula(syndrome, herb_items)`。**跟上面的安全层
+不是同一件事**，所以是两个模块、两套输出：
+
+| | 安全层 `assess_formula_safety` | 建议层 `check_formula` |
+|---|---|---|
+| 回答的问题 | 这方**能不能发出去** | 这方**拟得好不好** |
+| 命中后果 | 拦截级会让 `run_physician` 重开一次方 | 不打回，只展示；给 R22 的 best-of-N 排序 |
+| 输出 | `FormulaSafety` | `Advice[]` + `skipped[]` + `score` |
+
+两层不合并的理由就是 CLAUDE.md「同一概念只能有一处实现」的**例外条款**：
+两处回答的不是同一个问题。合成一张表，以后调打分权重（排序需求）会连带改动
+拦截判据（病人安全）。作为代价，建议层**不重新实现任何判据**——五条规则里
+三条直接调安全层的函数：
+
+| 规则 | 判据来源 | 权重 | 分级 |
+|---|---|---|---|
+| 十八反十九畏 | **复用** `check_incompatible` | 1.0 | blocking |
+| 超药典常用上限 | **复用** `check_dose_limits`（`DOSE_LIMITS`） | 0.5 | blocking |
+| 证型寒热方向相悖 | **复用** `check_thermal_consistency` | 0.3 | warning |
+| 缺引经药 | 药理层「归经」+ `core.elements.LOCATIONS` | 0.15 | suggestion |
+| 性味功效重复 ≥ 60% | 药理层「性味」「功效」 | 0.1 | suggestion |
+
+`score_formula` = `1.0 − Σ权重`，下限 0.0，权重表只在 `ADVICE_WEIGHTS` 一处。
+**这是一把粗排序尺，不是疗效评分**：它唯一的用途是在**同一次问诊**采样出的
+N 张方之间挑一张（R22）。跨问诊比这个分没有意义——不同证型能触发的规则条数
+本来就不同，分高只说明"这张方踩到的规则少"。
+
+后两条规则要 `data/standard/materia_medica.jsonl`（药理层本草表，AutoDL 上跑
+抽取才有）。**缺它的时候不是静默少两条建议**，而是在 `advice_skipped` 里如实
+列出「哪条规则没跑、为什么、怎么才能跑」。三种情况分得开：
+
+| 情况 | `advice_skipped` 里的样子 |
+|---|---|
+| 表还没建出来 | `available: false` + 产物路径 + 上机命令 |
+| 表在、这味药不在表里 | `available: true` + `n_checked: 1, n_herbs: 2` |
+| 表在、查过了、确实没问题 | 不出现（advice 里也没有这一类） |
+
+**患者角色拿不到这一层**：每条建议的 reason 里都带着具体药名
+（「甘草 与 甘遂 属配伍禁忌」），下发 advice 等于把处方内容从另一个字段漏出去。
+判据是 `api/main.py::_role_gets_advice` 一个函数，`/api/prescription/validate`
+和 `results[i]` 两处都问它。
 
 ## 审计
 

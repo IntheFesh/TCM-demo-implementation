@@ -85,7 +85,12 @@ R21 之后**默认走 full_context**：一位医家的全部医案 + 本草/方�
   （`core/react.py::react_enabled`，即使 `USE_REACT=1` 也关，并打印一行说明）。
   E9 因此是**只在 top3 系有意义的指标**，0.463 那个数继续挂在上表 #6。
 
-## 性能：沙盒能量的四项 + 上机才能量的三项（R19）
+## 性能：沙盒能量的四项 + 上机才能量的三项（R19 建表，每轮重量）
+
+⚠ 这张表里的数是**当前这一轮**的测量（凭据指 `bench/sandbox.json`，它每轮被覆盖）。
+**每一轮自己的那份数在 `eval/bench/rounds/R<N>.json`**，由
+`python -m scripts.bench_sandbox --all --round R<N>` 一次写两份；每轮报告引自己那份，
+所以历史轮次的数永远可核（这个机制是 R23 补的，起因见 SOURCES.md 第 65 条）。
 
 **这一节的每个数都必须能被 `--check` 核对，或者标 ⏳。** 之前沙盒里量出来的数
 （启动 import 耗时、全量测试墙钟）只能手抄进文档——而这个项目手抄数字漂过三次。
@@ -94,16 +99,16 @@ R21 之后**默认走 full_context**：一位医家的全部医案 + 本草/方�
 
 | # | 指标 | 当前值 | 对照基准 | 量法 | 凭据 |
 |---|---|---|---|---|---|
-| P1 | 冷进程 `import api.main` | **0.431** s（3 次取中位数，R21 重量；R19 那次 0.517） | 它是 `bench_startup` 四段里的第一段。另外三段（construct / model_load / encode）要 cases.json 和真模型，沙盒量不了——所以这一段是沙盒里唯一跟真机可比的 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.import_api_main_s=0.431` |
-| P2 | `/health` p50（**五位**医家，R18 后） | **8.481** ms（200 次请求，R21 重量） | 见 P3 那一行——单看这个数说明不了任何事 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_five=8.481` |
-| P3 | `/health` p50（**三位**医家，R17 对照） | **8.603** ms（同一个进程、同一份代码，只把注册表砍回三位） | P2。⚠ **四次量下来方向来回翻**：R21 这次五位 8.481 / 三位 8.603（三位更慢），R19 那次五位 12.237 / 三位 12.554（三位更慢），再往前两次是五位 13.806 / 三位 12.666（三位更快）和五位 12.762 / 三位 13.676（三位更慢）。四次里两次一个方向、两次另一个方向，且 R21 整体比 R19 快 3~4ms（同一份代码、只隔了几轮，所以这个「变快」是机器负载而不是代码）——**注册表从三位扩到五位的代价落在测量噪声里**，不能说"多两位医家慢了 1ms"，也不能说"更快了" | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_three=8.603` |
-| P4 | 全量测试：条数 / 墙钟 | **2783** passed / **10** skipped / **0** failed，墙钟 **66.2** s | R17 结束时 2495 passed / 6 skipped；R18 结束时 2643 / 10；R19 结束时 2693 / 10。条数只增不减是硬约束（R21 新增 90 条）。墙钟 89.9 → 66.2 s **不是变快了**：条数多了 90 条而墙钟少了 23.7 s，说明这两个数之间夹着机器负载，不能相减当成优化 | `python -m scripts.bench_sandbox --all` | ✅ `bench/sandbox.json:bench.pytest_passed=2783` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` `bench/sandbox.json:bench.pytest_wall_s=66.2` |
-| P5 | Playwright 前端状态：通过数 / 墙钟 | **16** 种全过，墙钟 **37.1** s | R14 起 6 种 → R15 10 种 → R16 13 种 → R17 15 种 → R18 16 种 → R21 仍 16 种（R21 没动前端，所以这一轮它测的是「没有回归」）。墙钟的对照是「值不值得每轮都跑」——38 秒的答案是值得（它这一轮抓到了一个所有 Python 测试都绿的回归） | `python -m scripts.screenshot_states` | ✅ `bench/sandbox.json:bench.playwright_states_passed=16` `bench/sandbox.json:bench.playwright_wall_s=37.1` |
+| P1 | 冷进程 `import api.main` | **0.542** s（3 次取中位数，R23 重量；R21 那次 0.431、R19 那次 0.517） | 它是 `bench_startup` 四段里的第一段。另外三段（construct / model_load / encode）要 cases.json 和真模型，沙盒量不了——所以这一段是沙盒里唯一跟真机可比的 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.import_api_main_s=0.542` |
+| P2 | `/health` p50（**五位**医家，R18 后） | **13.14** ms（200 次请求，R23 重量） | 见 P3 那一行——单看这个数说明不了任何事 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_five=13.14` |
+| P3 | `/health` p50（**三位**医家，R17 对照） | **12.49** ms（同一个进程、同一份代码，只把注册表砍回三位） | P2。⚠ **五次量下来方向来回翻**：R23 这次五位 13.14 / 三位 12.49（三位更快），R21 那次五位 8.481 / 三位 8.603（三位更慢），R19 那次 12.237 / 12.554（三位更慢），再往前两次是 13.806 / 12.666（三位更快）和 12.762 / 13.676（三位更慢）。**而且 R21 那次整组比 R19 快 3~4ms、R23 这次又涨回 R19 的量级**——同一份注册表代码，三轮之间来回摆 4ms，说明这个开销落在机器负载里，量不出来——**注册表从三位扩到五位的代价落在测量噪声里**，不能说"多两位医家慢了 1ms"，也不能说"更快了" | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_three=12.49` |
+| P4 | 全量测试：条数 / 墙钟 | **2829** passed / **10** skipped / **0** failed，墙钟 **89.8** s | R17 结束时 2495 passed / 6 skipped；R18 结束时 2643 / 10；R19 结束时 2693 / 10；R21 结束时 2783 / 10。条数只增不减是硬约束（R21 +90、R23 +46）。墙钟 R19 89.9 → R21 66.2 → R23 89.8 s：**三轮之间墙钟先降 24s 又涨回去，而条数一路只增**——这一对数最该被读到的就是这件事，它把 R21 报告里「不能把 66.2 当成变快了」那句话直接证实了 | `python -m scripts.bench_sandbox --all` | ✅ `bench/sandbox.json:bench.pytest_passed=2829` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` `bench/sandbox.json:bench.pytest_wall_s=89.8` |
+| P5 | Playwright 前端状态：通过数 / 墙钟 | **16** 种全过，墙钟 **37.7** s | R14 起 6 种 → R15 10 种 → R16 13 种 → R17 15 种 → R18 16 种 → R21/R23 仍 16 种（这两轮都没动前端，所以它测的是「没有回归」；R24 会把这个数推上去）。墙钟的对照是「值不值得每轮都跑」——38 秒的答案是值得（它这一轮抓到了一个所有 Python 测试都绿的回归） | `python -m scripts.screenshot_states` | ✅ `bench/sandbox.json:bench.playwright_states_passed=16` `bench/sandbox.json:bench.playwright_wall_s=37.7` |
 | P6 | 热启动（第二次起进程） | ⏳ 还没跑过 | 闸门 ≤ 20 s（docs/DESIGN.md §9 第 1 行）。对照是冷启动同一个数 | `python -m scripts.bench_startup` 跑**两次进程**，看第二次 | ⏳ 还没跑过——要真模型和 cases.json，沙盒里 `--self-test` 出来的是合成语料 + 假编码器，那个数不是热启动 |
 | P7 | 一次问诊（不开 ReAct ×3 / 开 ReAct ×1） | ⏳ 还没跑过 | 闸门 ≤ 90 s（不开）/ ≤ 240 s（开）。对照是两者之差 = ReAct 那几次工具调用的代价 | `python -m scripts.bench_consult --backend real --repeat 3 --no-react`，再 `--repeat 1 --react` | ⏳ 还没跑过——要真 LLM |
 | P8 | ε 两套设置（思考开 / 关）的耗时与调用数 | ⏳ 还没跑过 | 两套数**不可比**（README「S3_THINKING」那一行），并列报、不相减。这一对数回答「思考模式值不值那几十倍的时间」 | 段 4 会跑两次：默认那次落 `eval/epsilon.json`，`S3_THINKING=disabled` 那次落 `eval/epsilon_s3_disabled.json` | ⏳ 还没跑过——凭据键已经就位（`epsilon_s3_disabled.*`），文件一落盘自动生效 |
 
-**P2/P3 这一对是这一节最该被读到的地方**：四次测量方向相反（两次一头、两次另一头），所以正确的结论是
+**P2/P3 这一对是这一节最该被读到的地方**：五次测量方向相反（三次一头、两次另一头），所以正确的结论是
 「这个开销量不出来」，不是「涨了 1ms」或「降了 0.9ms」。挑一次合意的方向写进文档
 就是这个项目在 E2 那条（师承内 vs 跨学派两轮结论相反）上已经学过的教训。
 

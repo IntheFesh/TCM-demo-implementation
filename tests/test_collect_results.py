@@ -717,3 +717,50 @@ def test_check_still_passes_with_the_new_marks():
         assert not result["mismatches"], result["mismatches"]
         assert not result["unresolved"], result["unresolved"]
         assert not result["missing_in_line"], result["missing_in_line"]
+
+
+# ---------- R23：每轮一份不可变快照 ----------
+
+
+def test_round_snapshots_are_sorted_by_round_number_not_by_string():
+    """字符串排序下 R9 排在 R21 后面。轮次号是数字，就按数字排。"""
+    names = cr._round_snapshot_names()
+    nums = [int(n[1:]) for n in names]
+    assert nums == sorted(nums)
+
+
+def test_every_round_snapshot_registers_its_own_evidence_keys():
+    """`bench/rounds/R23.json` 一落盘，`round.R23.pytest_passed` 就该可用——
+    **glob 注册，不是一轮一轮往 EVIDENCE 里加九行**。忘了加的那一轮，
+    报告里的凭据记号会被当成查不到的键；而更糟的做法是有人为了让 --check 过
+    就把记号删掉，那一轮的数于是变成没人核的数。"""
+    names = cr._round_snapshot_names()
+    assert names, "eval/bench/rounds/ 下一份快照都没有"
+    for name in names:
+        for metric in cr.ROUND_METRIC_KEYS:
+            key = f"round.{name}.{metric}"
+            assert key in cr.EVIDENCE, key
+            value, path = cr.evidence_value(key)
+            assert path.exists() and value is not None, key
+
+
+def test_the_round_snapshot_is_not_the_same_file_as_the_current_measurement():
+    """这两份文件的分工是整个机制的要点：sandbox.json 会被下一轮覆盖
+    （RESULTS.md 的性能表引它），rounds/R<N>.json 此后不再动（每轮报告引它）。
+    判据写成"路径不同"而不是比内容——同一轮里两份内容本来就一样。"""
+    _, current = cr.evidence_value("bench.pytest_passed")
+    latest = cr._round_snapshot_names()[-1]
+    _, snapshot = cr.evidence_value(f"round.{latest}.pytest_passed")
+    assert current != snapshot
+    assert snapshot.parent.name == "rounds"
+
+
+def test_bench_sandbox_rejects_a_malformed_round_name():
+    """轮次名的形状被凭据注册表的 glob 依赖（`round.R23.*`）。
+    写成 `r23` 或 `R23-fix` 的后果是那份快照谁都不核，而它看起来跟被核过的一样
+    ——所以在入口就拒绝，不是"能跑就行"。"""
+    import scripts.bench_sandbox as bs
+
+    for bad in ("r23", "R23-fix", "23", "round23"):
+        with pytest.raises(SystemExit):
+            bs.main(["--show", "--round", bad])

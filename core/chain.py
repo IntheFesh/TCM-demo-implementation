@@ -55,6 +55,7 @@ from core.retrieval_hybrid import (
     effective_mode,
 )
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
+from core.formula_check import advice_dicts, check_formula
 from core.safety_output import assess_formula_safety, format_blocking_issues
 from core.schemas import (
     CaseRecord, FollowupResult, S1Normalize, S2Elements, S3Syndrome, S3SyndromeUnreferenced,
@@ -733,6 +734,13 @@ def run_physician(
         warn = f"病名「{s3.disease}」不在病名参考表（含别名）里，未做规则校验。"
         s3.note = f"{s3.note}；{warn}" if s3.note else warn
 
+    # R23：方剂建议层。跟 safety_output 那三个键**不是同一件事**：那三个回答
+    # "这方能不能发出去"，这里回答"这方拟得好不好"——同一张方可以既没有拦截级
+    # 问题、又拿到一条"缺引经药"的建议。只算 selected 那一张：其余候选方的
+    # 建议没有消费方（R22 的 best-of-N 是在采样出的多张 s3 之间选，
+    # 那时每张都是各自的 selected），算了也只是往响应里塞没人读的数据。
+    formula_check = check_formula(s3.syndrome, s3.formula_candidates[s3.selected].herb_items)
+
     return {
         "physician": physician,
         "physician_name": physician_name,
@@ -771,6 +779,11 @@ def run_physician(
             "revised": revised,
         },
         "react_trace": trace,
+        # R23：建议、没跑的规则、粗排序分。三个键一起给——只给 advice 的话，
+        # "这条规则没给出建议"和"这条规则因为缺数据没跑"在界面上长得一样。
+        "advice": advice_dicts(formula_check),
+        "advice_skipped": list(formula_check.skipped),
+        "formula_score": formula_check.score,
     }
 
 

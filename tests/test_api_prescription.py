@@ -91,15 +91,24 @@ def test_validate_reports_thermal_warning(client):
 
 
 def test_validate_clean_formula_has_no_problems(client):
+    """**有意的契约变更（R23）**：原断言是整个响应体逐键相等（六个安全键）。
+    R23 在安全层之外新增了建议层三个键（advice / advice_skipped /
+    formula_score），所以"整体相等"这个写法必须换成"安全那六个键一个没变
+    + 建议层存在"——直接把三个新键塞进期望字典会让这条测试变成一个
+    "有什么就断言什么"的复印件，而它本来的作用是钉住安全层的形状。
+    """
     resp = client.post("/api/prescription/validate", json={
         "herb_items": [_herb("党参"), _herb("白术")],
         "syndrome": "脾胃气虚",
     })
     body = resp.json()
-    assert body == {
+    safety_keys = ("incompatible", "thermal_warning", "dose_violations",
+                   "decoction_missing", "toxic_herbs", "blocking")
+    assert {k: body[k] for k in safety_keys} == {
         "incompatible": [], "thermal_warning": None, "dose_violations": [],
         "decoction_missing": [], "toxic_herbs": [], "blocking": False,
     }
+    assert set(body) == set(safety_keys) | {"advice", "advice_skipped", "formula_score"}
 
 
 def test_validate_accepts_empty_herb_items():

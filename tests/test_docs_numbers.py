@@ -82,15 +82,23 @@ def test_the_report_pins_this_rounds_five_numbers():
     """**当前轮**报告里的五个数要能被核。历史几轮的数是 git 可核的、不是文件可核的，
     所以只给当前轮上记号——给历史行编造凭据比不给更糟。
 
+    **R23 再改了一次凭据的对象**：引 `bench/rounds/R<N>.json`（这一轮的不可变
+    快照）而不是 `bench/sandbox.json`（会被下一轮覆盖）。R21 那次只把历史值指到
+    git，而那意味着每轮都要手改上一轮的报告——手改的那一步一定有人会忘，
+    于是同一个错误会以"R21 报告的五个数报错"的形式再来一次。
+
     **有意的判据变更（R21）**：原来查的是 `docs/R11-R19_report.md`。R21 重跑
     `bench_sandbox --all` 把 `eval/bench/sandbox.json` 整份覆盖成了 R21 的数，
     于是挂在它上面的 R19 凭据当场报了 6 处不一致——**一个会被下一轮覆盖的文件，
     不能给一个历史轮次的数当凭据**。历史值改指 git 的那个 commit，
     「当前轮」这个角色转给 `docs/reports/R<N>_report.md`。"""
-    text = _current_round_report().read_text(encoding="utf-8")
-    for key in ("bench.pytest_passed", "bench.pytest_skipped", "bench.pytest_failed",
-                "bench.pytest_wall_s", "bench.playwright_states_passed"):
-        assert f"bench/sandbox.json:{key}=" in text, key
+    report = _current_round_report()
+    text = report.read_text(encoding="utf-8")
+    name = report.name.split("_")[0]        # R23_report.md → R23
+    for key in ("pytest_passed", "pytest_skipped", "pytest_failed",
+                "pytest_wall_s", "playwright_states_passed"):
+        token = f"bench/rounds/{name}.json:round.{name}.{key}="
+        assert token in text, token
 
 
 def test_the_report_says_which_numbers_deliberately_have_no_evidence():
@@ -177,14 +185,28 @@ def test_the_report_records_the_nine_round_test_counts_monotonically():
             "——条数只增不减，历史表的末行不该比当前实测还大")
 
 
-def test_the_current_round_report_states_the_measured_test_count():
-    """当前轮报告里写的条数必须等于 bench 文件里**这一轮实测**的条数。
-    这一条是上面那条移交过来的责任：写死在文档里的条数一旦跟文件不同步，
-    它就变成一个没人核的数——这个项目漂过三次的正是这种。"""
+def test_the_latest_round_snapshot_matches_the_current_measurement():
+    """最新那份轮次快照的条数必须等于 `sandbox.json` 里的——两份由
+    `bench_sandbox --all --round R<N>` 同一次运行写出，理应逐值相同。
+
+    这一条抓两件事：**重量了但忘了带 `--round`**（快照停在上一轮，
+    而报告引的是快照），以及**手改了其中一份**。
+
+    判据是文件对文件，不比报告正文——报告正文里那几个数由 `--check` 对着
+    快照逐个核（上面 `test_each_checked_doc_passes` 那条），两处各管一段，
+    合起来才是"报告里的数 = 这一轮真实量出来的数"。写成"报告正文对 sandbox.json"
+    会绕成一个死循环：报告要先写出来才能被量，而量出来的条数又取决于报告
+    存不存在（它自己也是被测的文件之一）。
+    """
     latest, bench_path = evidence_value("bench.pytest_passed")
     if not bench_path.exists() or latest is None:
         pytest.skip("eval/bench/sandbox.json 还没有 pytest_passed")
-    report = _current_round_report()
-    text = report.read_text(encoding="utf-8")
-    token = f"bench/sandbox.json:bench.pytest_passed={latest}"
-    assert token in text, f"{report.name} 里没有 `{token}`"
+    names = round_report_paths()
+    assert names, "docs/reports/ 下没有任何一轮的报告"
+    snapshots = [p.name.split("_")[0] for p in names]
+    newest = snapshots[-1]
+    snap_value, snap_path = evidence_value(f"round.{newest}.pytest_passed")
+    assert snap_path.exists(), f"{newest} 的报告在，但 {snap_path.name} 不在——忘了 --round"
+    assert snap_value == latest, (
+        f"{snap_path.name} 是 {snap_value}，sandbox.json 是 {latest}"
+        "——要么重量时忘了 --round，要么有一份被手改过")
