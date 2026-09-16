@@ -36,9 +36,12 @@ disease_hint 收窄候选池要用的锚点。也不跟原有 17 条做名字去
 from __future__ import annotations
 
 import argparse
+import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from core.elements import LOCATIONS, NATURES
 from core.schemas import SyndromeDefinition
@@ -59,14 +62,43 @@ _ELEMENT_VOCAB = LOCATIONS + NATURES  # 匹配顺序：先长的病位/病性词
 
 OCR_FIXES_PATH = ROOT / "data" / "standard" / "ocr_fixes.tsv"
 
+# 一条修正规则作用在哪一列。**R29 新增的第四列。**
+#   name / disease  证型名、病名（R29 之前这两列一条规则都没指向过）
+#   symptom         cardinal_symptoms + tongue_pulse（表原本瞄的就是这两项）
+#   all             不限列——在切分之前对整份原文生效，这是旧行的默认值
+# 为什么需要这一列：「疽→疸」是单字规则。病名列是 51 个值的闭集合，里面没有一个
+# 合法含「疽」；而正文里「痈疽》」的疽是对的（实测 1 处）。同一条规则在一列安全、
+# 在另一列会把对的原文改错——所以规则必须能说清自己管哪一列。
+OCR_SCOPES = ("name", "disease", "symptom", "all")
 
-def load_ocr_fixes(path: Path | None = None) -> list[tuple[str, str]]:
-    """读 data/standard/ocr_fixes.tsv。返回 [(错, 对)]，**按左列长度降序**。
+
+class OcrFix(NamedTuple):
+    """修正表的一行。字段顺序跟文件里的列顺序一致。
+
+    用命名元组而不是 `(错, 对)` 二元组：从两列扩到四列之后，位置解包
+    （`for w, r in fixes`）会静默错位成「把说明当右列」，而命名元组当场报错。
+    """
+
+    wrong: str
+    right: str
+    why: str
+    scope: str
+
+
+def load_ocr_fixes(path: Path | None = None) -> list[OcrFix]:
+    """读 data/standard/ocr_fixes.tsv。返回 [OcrFix]，**按左列长度降序**。
 
     降序是必须的：表里同时有「大便唐薄→大便溏薄」和「便唐→便溏」，先替换短的
     会把长的那条永远匹配不到。
     恒等项（错 == 对）和空行直接报错而不是忽略——一条恒等项在表里只可能是
     手误，静默忽略会让人以为它生效了。
+
+    三条加载期校验，都是"这张表本身写错了"而不是"原文有错字"：
+      - scope 不在 OCR_SCOPES 里 → 报错并列出四个合法值。静默当成 `all`
+        会让一条本该限定在病名列的单字规则全局生效，把对的原文改坏。
+      - 某条的右列里含着另一条（或自己）的左列 → 报错。`str.replace` 之下
+        这种表是不幂等的：「面唇发→面唇发绀」跑两遍会变成「面唇发绀绀」。
+      - 说明列为空 → 报错。这张表的每一条都要能回答"为什么这条安全"。
     """
     p = path or OCR_FIXES_PATH
     if not p.exists():
@@ -74,7 +106,7 @@ def load_ocr_fixes(path: Path | None = None) -> list[tuple[str, str]]:
             f"未找到 OCR 修正表 {p}。它在版本控制里（data/standard/*.tsv），"
             "缺失说明工作树不完整，不是可以跳过的一步。"
         )
-    pairs: list[tuple[str, str]] = []
+    fixes: list[OcrFix] = []
     for lineno, raw in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.rstrip("\n")
         if not line.strip() or line.lstrip().startswith("#"):
@@ -85,20 +117,137 @@ def load_ocr_fixes(path: Path | None = None) -> list[tuple[str, str]]:
         if len(cols) < 2:
             raise ValueError(f"{p}:{lineno} 至少要有「错\\t对」两列，实际：{line!r}")
         wrong, right = cols[0].strip(), cols[1].strip()
+        why = cols[2].strip() if len(cols) > 2 else ""
+        # 旧行只有三列（错/对/说明），默认 all——这是为了**行为逐字节不变**：
+        # 默认成别的值会让已经落盘的教材条目重跑出不一样的结果。
+        scope = cols[3].strip() if len(cols) > 3 and cols[3].strip() else "all"
         if not wrong or not right:
             raise ValueError(f"{p}:{lineno} 两列都不许空：{line!r}")
         if wrong == right:
             raise ValueError(f"{p}:{lineno} 恒等项（{wrong}）在表里只可能是手误")
-        pairs.append((wrong, right))
-    pairs.sort(key=lambda kv: -len(kv[0]))
-    return pairs
+        if not why:
+            raise ValueError(
+                f"{p}:{lineno}（{wrong}→{right}）第三列要写清为什么会错 / 为什么这条安全"
+            )
+        if scope not in OCR_SCOPES:
+            raise ValueError(
+                f"{p}:{lineno}（{wrong}→{right}）scope 是 {scope!r}，"
+                f"合法值只有：{' / '.join(OCR_SCOPES)}"
+            )
+        fixes.append(OcrFix(wrong=wrong, right=right, why=why, scope=scope))
+    fixes.sort(key=lambda f: -len(f.wrong))
+    _reject_non_idempotent(fixes, p)
+    return fixes
 
 
-def apply_ocr_fixes(text: str, fixes: list[tuple[str, str]] | None = None) -> str:
-    """整词替换。**不逐字替换**——只写「唐→溏」会把「唐代」一起改掉。"""
-    for wrong, right in (fixes if fixes is not None else load_ocr_fixes()):
-        text = text.replace(wrong, right)
+def _reject_non_idempotent(fixes: list[OcrFix], path: Path) -> None:
+    """右列里含着某条左列 → 多次替换会累加。**在加载时拒绝，不在使用时补救。**
+
+    只在同一作用域（或跟 `all`）之间比：symptom 的规则跟 name 的规则不会落在
+    同一段文本上，它们之间的包含关系不构成问题。
+    """
+    for f in fixes:
+        for g in fixes:
+            if "all" not in (f.scope, g.scope) and f.scope != g.scope:
+                continue
+            if g.wrong in f.right:
+                raise ValueError(
+                    f"{path}：「{f.wrong}→{f.right}」的右列里含着「{g.wrong}」，"
+                    f"这张表跑两遍结果会变（不幂等）。把右列带上下文改写成"
+                    "不含任何左列的形式，或者把这两条合成一条。"
+                )
+
+
+def apply_ocr_fixes(
+    text: str,
+    fixes: list[OcrFix] | None = None,
+    *,
+    scope: str = "all",
+) -> str:
+    """整词替换。**不逐字替换**——只写「唐→溏」会把「唐代」一起改掉。
+
+    `scope` 是**正在修的那一列**，不是"筛哪些规则"。一条规则参与进来的判据是
+    「这条规则管不管这一列」：`fix.scope == "all"` 或 `fix.scope == scope`。
+    所以默认 `scope="all"` 就是旧行为——只施加不限列的那些规则。
+    """
+    if scope not in OCR_SCOPES:
+        raise ValueError(f"scope 只能是 {' / '.join(OCR_SCOPES)}，收到 {scope!r}")
+    for f in (fixes if fixes is not None else load_ocr_fixes()):
+        if f.scope == "all" or f.scope == scope:
+            text = text.replace(f.wrong, f.right)
     return text
+
+
+# ---------- R29：可疑条目（报出来，不自动改） ----------
+
+# 去掉「证」只剩一个字、但教材里确实这么叫的证型名。
+# 中风分闭证/脱证，厥证分实证/虚证——它们不是掉字。
+# **这不是第二张匹配表**：它回答的是"这个短名字是不是教材里的正式叫法"，
+# 跟 ocr_fixes.tsv 回答的"这个写法是不是 OCR 错字"不是同一个问题
+# （CLAUDE.md 第 31 条的例外要写清两个问题的区别，这就是那一句）。
+SHORT_NAME_WHITELIST = frozenset({"闭证", "脱证", "实证", "虚证"})
+
+# 四条可疑判据的理由文本。**做成常量**是因为报告和测试都要引它，
+# 写死在两处以后改一边就对不上了。
+SUSPICIOUS_ONE_CHAR_DISEASE = "病名疑似掉字：只剩一个字"
+SUSPICIOUS_NAME_NOT_ZHENG = "证型名不以「证」结尾且不在白名单里"
+SUSPICIOUS_SHORT_NAME = "证型名疑似掉字：去掉「证」只剩一个字"
+SUSPICIOUS_REUSED_NAME = "证型名疑似被上一条复用：同名同病出现多次"
+
+
+@dataclass(frozen=True)
+class SuspiciousEntry:
+    """一条"看起来不对但不能自动改"的记录。
+
+    **为什么只报不改**：`disease=逆` 少的是「呃」、`name=阻心脉证` 少的是「瘀」，
+    而教材 markdown 原文本身就没有那个字（`# 第五节 逆` 在原文第 5968 行、
+    `# 6.阻心脉` 在第 2981 行）。补字要靠语义猜，猜错了就是把一个错的名字
+    换成另一个错的名字，而且以后没人知道它被动过——**改错比不改坏**。
+    """
+
+    code: str
+    name: str
+    disease: str | None
+    reason: str
+    # 教材原文行号。从已落盘的 jsonl 复查时取不到（教材 markdown 不在版本控制里），
+    # 那时是 None，报告里要照实说"行号取不到"而不是编一个。
+    lineno: int | None = None
+
+
+def find_suspicious_entries(
+    entries: list[SyndromeDefinition],
+    linenos: dict[str, dict[str, int]] | None = None,
+) -> list[SuspiciousEntry]:
+    """扫一遍抽出来的条目，报出四类可疑形状。**不改任何字段。**
+
+    判据是"这个数被报出来"，不是"它归零"——归零要么是真的修好了解析器，
+    要么是有人把判据放宽了，而后者从这个函数的返回值上看不出来。
+
+    `linenos`：code → {"name": 证型名标题行号, "disease": 病名标题行号}。
+    没有就都报 None。
+    """
+    groups = Counter((e.name, e.disease) for e in entries)
+    out: list[SuspiciousEntry] = []
+    for e in entries:
+        where = (linenos or {}).get(e.code, {})
+        reasons: list[tuple[str, str]] = []   # (reason, 取哪个行号)
+        if e.disease is not None and len(e.disease.strip()) == 1:
+            reasons.append((SUSPICIOUS_ONE_CHAR_DISEASE, "disease"))
+        # 这一条**当前 0 条命中**：parse_textbook 会给没带「证」的名字补上。
+        # 留着它是为了将来有人去掉那个补字动作时不至于没人看着——
+        # 一条永远不触发的判据不算覆盖，报告里照实写 0。
+        if not e.name.endswith("证") and e.name not in SHORT_NAME_WHITELIST:
+            reasons.append((SUSPICIOUS_NAME_NOT_ZHENG, "name"))
+        if len(e.name.removesuffix("证")) <= 1 and e.name not in SHORT_NAME_WHITELIST:
+            reasons.append((SUSPICIOUS_SHORT_NAME, "name"))
+        if groups[(e.name, e.disease)] > 1:
+            reasons.append((SUSPICIOUS_REUSED_NAME, "name"))
+        for reason, which in reasons:
+            out.append(SuspiciousEntry(
+                code=e.code, name=e.name, disease=e.disease,
+                reason=reason, lineno=where.get(which),
+            ))
+    return out
 
 
 @dataclass(frozen=True)
@@ -234,7 +383,7 @@ def parse_textbook(
     md_path: Path,
     layout: TextbookLayout | None = None,
     *,
-    ocr_fixes: list[tuple[str, str]] | None = None,
+    ocr_fixes: list[OcrFix] | None = None,
 ) -> tuple[list[SyndromeDefinition], dict]:
     """返回 (抽出的证候定义, 统计)。统计里如实报跳过的块和跳过原因——
     "临床表现：" 在原文里出现的次数是抽取质量的上界，跳过多少、为什么跳，
@@ -243,11 +392,16 @@ def parse_textbook(
     clinical_re = _label_re(lay.clinical_labels)
     pathogenesis_re = _label_re(lay.pathogenesis_labels)
     end_re = _label_re(lay.end_labels)
-    # OCR 修正在**切分之前**做：错字落在标签上（「证候分忻：」）会让整块解析不到，
-    # 落在症状里会让症状节点 id 跟图谱对不上。切完再修就晚了。
-    raw_text = apply_ocr_fixes(md_path.read_text(encoding="utf-8"), ocr_fixes)
+    fixes = ocr_fixes if ocr_fixes is not None else load_ocr_fixes()
+    # 不限列（scope=all）的 OCR 修正在**切分之前**做：错字落在标签上
+    # （「证候分忻：」）会让整块解析不到，落在症状里会让症状节点 id 跟图谱对不上。
+    # 切完再修就晚了。**R29 之后这一遍只施加 all 那些规则**——限定到某一列的
+    # 规则（「疽→疸」只管病名）在下面各列抽出来的那一刻单独施加，
+    # 顺序仍然是"修正在切分之前"：病名/证型名不再切分，症状那一列是在
+    # `_extract_symptoms_and_tongue` 之前修的。
+    raw_text = apply_ocr_fixes(md_path.read_text(encoding="utf-8"), fixes)
     lines = raw_text.splitlines()
-    stats = {
+    stats: dict = {
         "layout": lay.key, "book": lay.book,
         "clinical_blocks_seen": 0, "extracted": 0,
         "skipped_no_disease": 0, "skipped_no_syndrome_name": 0,
@@ -255,6 +409,9 @@ def parse_textbook(
     }
     current_disease: str | None = None
     current_syndrome_name: str | None = None
+    disease_lineno: int | None = None
+    name_lineno: int | None = None
+    linenos: dict[str, dict[str, int]] = {}
     entries: list[SyndromeDefinition] = []
     seq = 0
 
@@ -265,19 +422,25 @@ def parse_textbook(
 
         m = _DISEASE_RE.match(line)
         if m:
-            current_disease = _clean_disease_name(m.group(1))
+            # 病名列单独过一遍 scope=disease 的规则（「疽→疸」：病名列是闭集合，
+            # 里面没有一个合法含「疽」，而正文里「痈疽》」是对的）
+            current_disease = apply_ocr_fixes(
+                _clean_disease_name(m.group(1)), fixes, scope="disease")
+            disease_lineno = i + 1
             i += 1
             continue
 
         m = _SYN_HEADING_RE.match(line)
         if m:
-            current_syndrome_name = m.group(1).strip()
+            current_syndrome_name = apply_ocr_fixes(m.group(1).strip(), fixes, scope="name")
+            name_lineno = i + 1
             i += 1
             continue
 
         m = _SYN_SUBITEM_RE.match(line)
         if m:
-            current_syndrome_name = m.group(1).strip()
+            current_syndrome_name = apply_ocr_fixes(m.group(1).strip(), fixes, scope="name")
+            name_lineno = i + 1
             i += 1
             continue
 
@@ -315,7 +478,9 @@ def parse_textbook(
             if not location and not nature:
                 stats["skipped_no_elements_matched"] += 1
                 continue
-            symptoms, tongue_pulse = _extract_symptoms_and_tongue(clinical_text)
+            # 症状/舌脉那一列：scope=symptom 的规则在**切分之前**施加
+            symptoms, tongue_pulse = _extract_symptoms_and_tongue(
+                apply_ocr_fixes(clinical_text, fixes, scope="symptom"))
             if not symptoms:
                 stats["skipped_no_elements_matched"] += 1
                 continue
@@ -324,8 +489,12 @@ def parse_textbook(
             if not name.endswith("证"):
                 name += "证"
             seq += 1
+            code = f"{lay.code_prefix}-{seq:03d}"
+            linenos[code] = {k: v for k, v in
+                             (("disease", disease_lineno), ("name", name_lineno))
+                             if v is not None}
             entries.append(SyndromeDefinition(
-                code=f"{lay.code_prefix}-{seq:03d}",
+                code=code,
                 name=name,
                 is_category=False,
                 parent=None,
@@ -343,12 +512,65 @@ def parse_textbook(
 
         i += 1
 
+    stats["linenos"] = linenos
+    stats["suspicious"] = find_suspicious_entries(entries, linenos)
+    stats["n_suspicious"] = len(stats["suspicious"])
     return entries, stats
+
+
+def load_committed_textbook_entries(path: Path | None = None) -> list[SyndromeDefinition]:
+    """从已落盘的 syndromes.jsonl 里读回教材条目（`source == "textbook"`）。
+
+    为什么需要这条路：教材 markdown 不在版本控制里（`books/` 是 gitignore 的，
+    十四五教材要另外 clone），所以 clone 这个仓库的人**手上只有 jsonl**。
+    可疑条目清单要能在那种情况下也复查得出来，只是拿不到原文行号。
+    """
+    p = path or DEFAULT_OUT_PATH
+    if not p.exists():
+        raise FileNotFoundError(f"未找到 {p}。它在版本控制里，缺失说明工作树不完整。")
+    out: list[SyndromeDefinition] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        data = json.loads(line)
+        if data.get("source") == "textbook":
+            out.append(SyndromeDefinition(**data))
+    return out
+
+
+def print_suspicious(suspicious: list[SuspiciousEntry], *, with_linenos: bool) -> None:
+    """打印可疑条目清单。**按理由分组**，每组先报条数再逐条列。
+
+    条数在前是因为这份清单的用途是"这一轮比上一轮多了还是少了"——
+    逐条往下翻到底才知道有多少条，那个数就没人看了。
+    """
+    print(f"\n可疑条目 {len(suspicious)} 条"
+          + ("" if with_linenos else "（**原文行号取不到**：教材 markdown 不在版本控制里，"
+                                     "这份清单是从 data/standard/syndromes.jsonl 复查的）"))
+    if not suspicious:
+        print("  —— 一条都没有。这不一定是好消息：先确认判据还在（"
+              "find_suspicious_entries 的四条），再确认解析器真的修好了。")
+        return
+    by_reason: dict[str, list[SuspiciousEntry]] = {}
+    for s in suspicious:
+        by_reason.setdefault(s.reason, []).append(s)
+    for reason, group in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+        print(f"\n  【{reason}】{len(group)} 条")
+        for s in group:
+            where = f"  原文第 {s.lineno} 行" if s.lineno is not None else ""
+            print(f"    {s.code}  {s.name}（{s.disease or '—'}）{where}")
+    print("\n  这些**不自动改**：掉的那个字在教材原文里就没有（`# 第五节 逆` 在原文"
+          "第 5968 行、`# 6.阻心脉` 在第 2981 行），补字要靠语义猜——"
+          "改错比不改坏。判据是这个数被报出来，不是它归零。")
 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="从十四五教材抽取证候定义（规则脚本，零 LLM 调用）")
-    ap.add_argument("--md-path", type=Path, required=True)
+    ap.add_argument(
+        "--md-path", type=Path, default=None,
+        help="教材 markdown。抽取和 --detect 必须传；--report 不传就从 --out 复查"
+             "（那时报不出原文行号）",
+    )
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT_PATH)
     ap.add_argument(
         "--layout", choices=sorted(LAYOUTS), default="neike",
@@ -360,13 +582,34 @@ def main(argv: list[str] | None = None) -> None:
              "抽出 0 条时先跑这个——它区分「标签都不匹配」和「--layout 传错了」",
     )
     ap.add_argument(
+        "--report", action="store_true",
+        help="只打印可疑条目清单（病名/证型名看起来掉了字、或名字被上一条复用的），"
+             "**一个字节都不写**。不传 --md-path 就从 --out 已落盘的条目复查",
+    )
+    ap.add_argument(
         "--append", action="store_true",
         help="追加到 --out 已有内容后面，不传就是覆盖写（先读一遍旧内容确认不是误覆盖）",
     )
     args = ap.parse_args(argv)
 
-    if not args.md_path.exists():
+    if args.md_path is None and not args.report:
+        ap.error("抽取需要 --md-path（只看可疑条目清单的话传 --report）")
+    if args.md_path is not None and not args.md_path.exists():
         raise FileNotFoundError(f"未找到 {args.md_path}。先 clone TCM_Datasets 仓库。")
+
+    if args.report:
+        # **只报不写。** 这条路径一个字节都不落盘——它是给"上机之前先看一眼
+        # 还有多少条名字不对"用的，不是抽取流程的一环。
+        if args.md_path is None:
+            entries = load_committed_textbook_entries(args.out)
+            print(f"从 {args.out} 复查 {len(entries)} 条教材条目")
+            print_suspicious(find_suspicious_entries(entries), with_linenos=False)
+        else:
+            entries, stats = parse_textbook(args.md_path, LAYOUTS[args.layout])
+            print(f"教材：{stats['book']}（--layout {stats['layout']}），"
+                  f"抽出 {stats['extracted']} 条")
+            print_suspicious(stats["suspicious"], with_linenos=True)
+        return
 
     if args.detect:
         counts = detect_layout(args.md_path.read_text(encoding="utf-8"))

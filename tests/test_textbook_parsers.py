@@ -148,17 +148,28 @@ def test_ocr_fixes_file_is_in_version_control():
 
 
 def test_ocr_fixes_load_sorted_longest_first():
-    """表里同时有「大便唐薄」和「便唐」，先替换短的会让长的永远匹配不到。"""
-    pairs = load_ocr_fixes()
-    lengths = [len(w) for w, _ in pairs]
+    """表里同时有「大便唐薄」和「便唐」，先替换短的会让长的永远匹配不到。
+
+    **有意的契约变更（R29）**：`load_ocr_fixes` 从 `[(错, 对)]` 变成
+    `[OcrFix(wrong, right, why, scope)]`——表加了第四列 `scope`。
+    位置解包（`for w, r in pairs`）在四列之下会静默把说明当成右列，所以改成
+    命名元组，按字段名取。这一条原来写的是 `for w, _ in pairs`。
+    """
+    fixes = load_ocr_fixes()
+    lengths = [len(f.wrong) for f in fixes]
     assert lengths == sorted(lengths, reverse=True)
+    pairs = [(f.wrong, f.right) for f in fixes]
     assert ("大便唐薄", "大便溏薄") in pairs
     assert ("便唐", "便溏") in pairs
 
 
 def test_ocr_fixes_cover_the_four_known_error_shapes():
-    """四类实测错法：溏→唐、蒌→萎、白→自、掉字（香薷饮）。"""
-    got = dict(load_ocr_fixes())
+    """四类实测错法：溏→唐、蒌→萎、白→自、掉字（香薷饮）。
+
+    同上，`dict(load_ocr_fixes())` 在四列之下会抛
+    「dictionary update sequence element #0 has length 4」，改成按字段名建表。
+    """
+    got = {f.wrong: f.right for f in load_ocr_fixes()}
     assert got["便唐"] == "便溏"
     assert got["瓜萎"] == "瓜蒌"
     assert got["自术"] == "白术"

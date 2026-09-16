@@ -553,10 +553,14 @@ R16 起**首屏铺的是证素**（20 个 `../data/graph.json:graph.n_elements=2
 枢纽在内圈。之前首屏铺 80 个证型方块——证型之间本来就没有边，力导向对一堆
 孤立节点只能摊平，那张图不传达任何东西。
 
-这张图当前的规模：节点 1315 `../data/graph.json:graph.n_nodes=1315`、
-边 3771 `../data/graph.json:graph.n_edges=3771`、
-证候 178 `../data/graph.json:graph.n_syndromes=178`、
-症状 1117 `../data/graph.json:graph.n_symptoms=1117`。
+这张图当前的规模：节点 1312 `../data/graph.json:graph.n_nodes=1312`、
+边 3765 `../data/graph.json:graph.n_edges=3765`、
+证候 177 `../data/graph.json:graph.n_syndromes=177`、
+症状 1115 `../data/graph.json:graph.n_symptoms=1115`。
+**R29 这四个数各降了一点**（1315/3771/178/1117 → 1312/3765/177/1115）：
+OCR 修正表覆盖到 name/disease 两列之后，「温疤证」并回「温疟证」、
+「唇甲发」并回「唇甲发绀」、「神昏语」并回「神昏谵语」——
+降的是**同一个东西被拼错成两个节点**的那部分，不是丢了内容。
 **这四个数以前没有凭据记号**（它们不在 eval/ 下的任何 report 里），于是
 "重建图谱之后忘了回写"没有任何机制拦得住——而它已经发生过一次（839 → 941）。
 R17 把它们纳入了 `python -m scripts.collect_results --check`。
