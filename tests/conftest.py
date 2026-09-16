@@ -135,7 +135,11 @@ def _disable_embedding_cache():
 def _isolate_runtime_env(monkeypatch):
     # EVAL_MODE 会让安全否决不中止、RETRIEVER_MODE 会改检索默认路——都是
     # consult() 的行为开关，跟 USE_REACT/FAST_MODE 一样要跟外面的 shell 隔开。
-    for var in ("USE_REACT", "FAST_MODE", "EVAL_MODE", "RETRIEVER_MODE"):
+    # R22 加了后三个：它们决定 S3 采几次、想多久、开不开思考，
+    # 开发者 shell 里留一个 `S3_BEST_OF_N=5` 会让一堆数调用数的测试变红，
+    # 而红的地方跟改动毫无关系（这条夹具当初就是为 USE_REACT=1 这种情况加的）。
+    for var in ("USE_REACT", "FAST_MODE", "EVAL_MODE", "RETRIEVER_MODE",
+                "S3_BEST_OF_N", "S3_REASONING_EFFORT", "S3_THINKING"):
         monkeypatch.delenv(var, raising=False)
 
 

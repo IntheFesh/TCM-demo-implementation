@@ -67,7 +67,7 @@ def test_usage_endpoint_reports_the_ledger_without_spending_anything(client, see
     body = r.json()
     assert body["mode"] == "shared"
     assert body["remaining_calls"] == body["ip_limit_calls"]
-    assert body["calls_per_consult"] == usage_mod.CALLS_PER_CONSULT
+    assert body["calls_per_consult"] == usage_mod.calls_per_consult()
     assert body["remaining_consults_estimate"] >= 1
     assert seen == [], "看板不该触发任何一次问诊"
 

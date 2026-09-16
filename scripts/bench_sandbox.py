@@ -212,8 +212,13 @@ def main(argv: list[str] | None = None) -> int:
         snapshot = args.out.parent / "rounds" / f"{args.round_name}.json"
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         snapshot.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 指针文件：**"最近量的是哪一轮"不能靠轮次号大小推**。这个项目的轮次
+        # 顺序是人定的（R21 → R23 → R22 → R24…，R23 的打分器被 R22 依赖），
+        # 按数字排会把 R23 当成最新。指针由写快照的同一次运行落盘，所以不会漂。
+        (snapshot.parent / "LATEST").write_text(args.round_name + "\n", encoding="utf-8")
         print(f"已写出这一轮的不可变快照 {snapshot}"
               f"（报告里引 bench/rounds/{args.round_name}.json:round.{args.round_name}.* ）")
+        print(f"已更新 {snapshot.parent / 'LATEST'} → {args.round_name}")
     print("量不了的那几项（热启动 ≤20s 要真模型、一次问诊 ≤90s 要真 LLM）"
           "在 eval/RESULTS.md 里标 ⏳ 并附上机命令，不在这里编。")
     return 0

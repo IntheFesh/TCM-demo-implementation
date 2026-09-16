@@ -161,6 +161,9 @@ def test_demo_mode_still_blocks_dangerous_followup_answer(monkeypatch):
 def test_eval_mode_continues_past_dangerous_followup_answer(monkeypatch):
     """旁路必须覆盖追问这条路——只覆盖初始主诉的话，带患者模拟器的评测
     照样会被拦在半路，"安全否决花了多少分"仍然算不出来。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条测的是 EVAL_MODE 下安全否决不中止。采几次跟它无关，钉成 1 让调用数可数。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = _setup(monkeypatch, llm_cls=ReActFakeLLM)
     monkeypatch.delenv("FAST_MODE", raising=False)
     monkeypatch.setenv("EVAL_MODE", "1")
@@ -194,6 +197,9 @@ def test_demo_mode_still_blocks_dangerous_asserted_symptom(monkeypatch):
 
 
 def test_eval_mode_continues_past_dangerous_asserted_symptom(monkeypatch):
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 同上：这条测的是旁路，不是采样。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = _setup(monkeypatch)
     _force_dangerous_asserted(monkeypatch)
     monkeypatch.setenv("EVAL_MODE", "1")

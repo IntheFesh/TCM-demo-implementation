@@ -29,8 +29,15 @@ def test_estimate_counts_react_as_several_times_the_baseline():
     """按请求数计费会让开 ReAct 的人用别人三倍的钱记同一笔账。"""
     plain = usage.estimate_calls(use_react=False, n_physicians=3)
     react = usage.estimate_calls(use_react=True, n_physicians=3)
-    assert plain == 5  # S1 + S2 + 三位医家各一次 S3
-    assert react >= plain * 3
+    # **有意的契约变更（R22）**：原来写死 `plain == 5`（S1 + S2 + 三位医家各一次 S3）。
+    # best-of-N 之后 plain 是 `2 + 3 × N`，期望值问 calls_per_consult() 这一处——
+    # estimate_calls 内部也问它，两边对上才说明预占和折算用的是同一个公式
+    # （不一致的后果是账本持续少扣，而少扣不会报错）。
+    assert plain == usage.calls_per_consult(3)
+    assert plain == usage.estimate_calls(use_react=False, n_physicians=3, best_of_n=None)
+    # N=1 时退回历史上的 5，这条钉住"公式没换，只是多了一个因子"
+    assert usage.calls_per_consult(3, 1) == 5
+    assert react >= plain * 1.5, "ReAct 仍然明显更贵（N 变大时倍数会被摊薄，所以不是 3 倍）"
 
 
 def test_a_fresh_ip_gets_the_shared_pool():
@@ -115,8 +122,10 @@ def test_snapshot_converts_calls_into_something_a_visitor_can_read():
     """llm_calls 对访问者没有意义，折算系数只有 core/usage.py 一处定义。"""
     led = usage.UsageLedger(per_ip_limit=25, global_limit=1000)
     snap = led.snapshot("1.2.3.4")
-    assert snap["remaining_consults_estimate"] == 25 // usage.CALLS_PER_CONSULT
-    assert snap["calls_per_consult"] == usage.CALLS_PER_CONSULT
+    # R22：CALLS_PER_CONSULT 从常量变成 calls_per_consult() 函数（它现在依赖
+    # 医家数和 S3_BEST_OF_N，一个常量表达不了）。
+    assert snap["remaining_consults_estimate"] == 25 // usage.calls_per_consult()
+    assert snap["calls_per_consult"] == usage.calls_per_consult()
     assert snap["warn"] is False
 
 

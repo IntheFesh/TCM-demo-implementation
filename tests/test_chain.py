@@ -253,6 +253,10 @@ def test_run_physician_embeds_raw_excerpt_in_the_real_prompt_after_the_example(m
     （P0-3 的顺序要求）。E3 在 AutoDL 上重跑不过时，靠这条测试排除"格式化对了
     但没送到模型那里"这种可能——如果这条测试绿了还是不过，问题在别处
     （比如模型没理会 prompt），不在这个环节。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条测的是 prompt 里有没有 raw_excerpt。采 N 次会拿到 N 份一样的 system prompt，
+    # 断言 len(s3_systems) == 1 就不再成立，而那跟这条要验的事没关系。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     excerpt = "此患者形瘦神疲，纳谷不香，脘腹痞满，特征串POCKMARK7f3a用于定位"
     case = _case(raw_excerpt=excerpt, symptoms=["纳差"], tongue="淡红", pulse="细弱")
     s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
@@ -440,6 +444,10 @@ def test_shared_stages_run_once_per_physician_stages_run_twice(monkeypatch):
 
     这三个数字任何一个变了都要先想清楚为什么，不要直接改期望值。
     """
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条测的是「共享阶段只跑一次、按医家阶段每位一次」。best-of-N 让每位医家的 S3
+    # 变成 N 次，会把这条判据的分子改掉——而它要钉的是「S1 有没有被跑两次」。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     s3_ye = S3Syndrome(
         syndrome="脾胃气虚",
         reasoning="纳差乏力，脉细弱",
@@ -665,6 +673,9 @@ def test_lora_fields_are_none_on_backends_without_adapters(monkeypatch):
 
 def test_incompatible_formula_triggers_one_regeneration(monkeypatch):
     """S3 开出甘草+海藻（十八反）→ 把冲突写进 prompt 重开一次 → 重开后干净。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条数的是「重开了几次」，采样次数会把总调用数抬上去。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     dirty = {
         "叶天士": _s3("脾胃气虚", ["甘草", "海藻", "白术"], "ye_tianshi-001"),
         "吴鞠通": _s3("脾胃气虚", ["党参", "白术", "茯苓"], "wu_jutong-001"),
@@ -700,6 +711,9 @@ def test_incompatible_formula_triggers_one_regeneration(monkeypatch):
 def test_still_incompatible_after_retry_is_reported_not_hidden(monkeypatch):
     """重开之后仍然违规：保留结果但如实标出来，不再重开第二次。
     这条比"修好了"更重要——它是系统承认自己没修好的地方。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 同上：数的是重开，不是采样。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     dirty = {
         "叶天士": _s3("脾胃气虚", ["甘草", "海藻", "白术"], "ye_tianshi-001"),
         "吴鞠通": _s3("脾胃气虚", ["党参", "白术", "茯苓"], "wu_jutong-001"),
@@ -719,6 +733,9 @@ def test_still_incompatible_after_retry_is_reported_not_hidden(monkeypatch):
 
 
 def test_clean_formula_does_not_regenerate(monkeypatch):
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 同上：数的是「没重开」。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     clean = {
         "叶天士": _s3("脾胃气虚", ["党参", "白术", "茯苓"], "ye_tianshi-001"),
         "吴鞠通": _s3("脾胃气虚", ["党参", "白术", "甘草"], "wu_jutong-001"),
@@ -836,6 +853,9 @@ def test_react_receives_physician_id_not_only_chinese_name(monkeypatch):
 def test_react_off_by_default_leaves_s3_prompt_untouched(monkeypatch):
     """不开 ReAct 时 S3 的提示词里不能多出任何东西——多一个字，
     use_react 的 A/B 就混进了 prompt 变化这个额外变量。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条数的是 ReAct 的调用，采样次数跟它无关。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = _react_setup(monkeypatch)
     outcome = chain.consult("纳差乏力", use_react=False)
 
@@ -847,6 +867,9 @@ def test_react_off_by_default_leaves_s3_prompt_untouched(monkeypatch):
 
 
 def test_react_on_appends_evidence_and_counts_its_calls(monkeypatch):
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 同上：数的是 ReAct 那几步。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = _react_setup(monkeypatch)
     outcome = chain.consult("纳差乏力", use_react=True)
 
@@ -911,6 +934,9 @@ def _followup_setup(monkeypatch, s3=None):
 
 def test_consult_without_ask_channel_is_unchanged(monkeypatch):
     """没有提问渠道就不追问，调用数跟改造前一样。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条数的是「没有提问渠道时调用数不变」。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = _followup_setup(monkeypatch)
     outcome = chain.consult("纳差乏力")
     assert outcome["followup"].stopped_by == "no_answer"
@@ -943,6 +969,9 @@ def test_followup_costs_one_extra_s2_no_matter_how_many_rounds(monkeypatch):
     （残差是既有行为，跟追问无关——它被触发是因为追问加进来的症状本身
     没被 FakeLLM 的证素解释）。轮数变多时这个数不许跟着涨。
     """
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条数的是追问额外花的那一次 S2。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = _followup_setup(monkeypatch)
     outcome = chain.consult("纳差乏力", ask_fn=_affirm_unless_dangerous)
     assert outcome["followup"].rounds >= 2
@@ -962,6 +991,9 @@ def test_asserted_symptoms_are_merged_into_the_symptom_list(monkeypatch):
 
 def test_all_denials_do_not_rerun_s2(monkeypatch):
     """全是否定回答时没有新症状可并，不该白花一次 S2。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 同上：数的是 S2 有没有被重跑。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = _followup_setup(monkeypatch)
     outcome = chain.consult("纳差乏力", ask_fn=lambda q: "没有")
     assert outcome["followup"].denied
@@ -1021,6 +1053,9 @@ class UnreferencedFakeLLM(ReActFakeLLM):
 def test_empty_retrieval_uses_schema_without_cited_case_ids(monkeypatch):
     """一条相关医案都没有时，S3Syndrome 的 min_length=1 会逼模型编一个 id。
     CLAUDE.md 的规定是新建一个不含该字段的 schema，不是放松原来的约束。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条测的是「检索为空时换哪个 schema」，采几次跟它无关。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     fake_llm = UnreferencedFakeLLM({"叶天士": None, "吴鞠通": None})
     monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
     monkeypatch.setattr(chain, "get_retriever", lambda: EmptyRetriever())

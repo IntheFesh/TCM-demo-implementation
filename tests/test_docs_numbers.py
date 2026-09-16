@@ -21,6 +21,7 @@ from scripts.collect_results import (
     _is_metric_table_header,
     check,
     evidence_value,
+    latest_round_name,
     metric_rows,
     round_report_paths,
 )
@@ -41,10 +42,19 @@ def test_the_four_fixed_docs_and_every_round_report_are_in_the_checker():
 
 
 def _current_round_report():
-    """最新那一轮的报告。R11–R19 那份是**合起来的历史总账**，从 R21 起它不再
-    承担"当前轮"这个角色——当前轮的五个数挂在 `docs/reports/R<N>_report.md`。"""
+    """最近量过的那一轮的报告。R11–R19 那份是**合起来的历史总账**，从 R21 起它
+    不再承担"当前轮"这个角色——当前轮的五个数挂在 `docs/reports/R<N>_report.md`。
+
+    **"最新"按 `bench/rounds/LATEST` 指针，不按轮次号大小**：这个项目的轮次顺序
+    是人定的（R21 → R23 → R22 → R24…，R22 的打分器依赖 R23），按数字排会把 R23
+    当成最新，而 R23 的快照早就封版了。
+    """
     paths = round_report_paths()
     assert paths, "docs/reports/ 下没有任何一轮的报告"
+    name = latest_round_name()
+    by_name = {p.name.split("_")[0]: p for p in paths}
+    if name in by_name:
+        return by_name[name]
     return paths[-1]
 
 
@@ -201,10 +211,8 @@ def test_the_latest_round_snapshot_matches_the_current_measurement():
     latest, bench_path = evidence_value("bench.pytest_passed")
     if not bench_path.exists() or latest is None:
         pytest.skip("eval/bench/sandbox.json 还没有 pytest_passed")
-    names = round_report_paths()
-    assert names, "docs/reports/ 下没有任何一轮的报告"
-    snapshots = [p.name.split("_")[0] for p in names]
-    newest = snapshots[-1]
+    newest = latest_round_name()
+    assert newest, "eval/bench/rounds/ 下没有任何一轮的快照"
     snap_value, snap_path = evidence_value(f"round.{newest}.pytest_passed")
     assert snap_path.exists(), f"{newest} 的报告在，但 {snap_path.name} 不在——忘了 --round"
     assert snap_value == latest, (

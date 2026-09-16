@@ -98,7 +98,11 @@ def test_every_call_records_the_arguments_it_actually_received(tmp_path):
     s3_calls = [c for c in calls if c["schema"].startswith("S3")]
     assert s3_calls, "没有 S3 调用"
     for call in s3_calls:
-        assert call["thinking"] == "enabled" and call["reasoning_effort"] == "high"
+        # **不写死 "high"**：R22 起 effort 的默认值跟检索方式绑（full_context → max，
+        # top3 → high）。这条测的是"观测层记下了这次真实用的参数"，
+        # 所以期望值问 thinking_for("s3") 这一处，不抄一个字面量。
+        assert call["thinking"] == "enabled"
+        assert call["reasoning_effort"] == thinking_for("s3")["reasoning_effort"]
 
 
 def test_repeat_does_not_let_one_run_record_another_runs_calls(tmp_path):
@@ -132,7 +136,7 @@ def test_fake_cases_make_s3_actually_run_for_every_physician(tmp_path):
     assert report["config"]["fake_cases"] == 2 * len(PHYSICIANS)
 
 
-def test_s3_wall_drops_to_the_slowest_physician_while_sum_stays(tmp_path):
+def test_s3_wall_drops_to_the_slowest_physician_while_sum_stays(tmp_path, monkeypatch):
     """**R12 三医家并发的验收判据。** sum 是总共干了多少活、wall 是这一段占了多少
     墙钟、slowest 是最慢的那一位。
 
@@ -156,6 +160,12 @@ def test_s3_wall_drops_to_the_slowest_physician_while_sum_stays(tmp_path):
 
     PHYSICIANS = physicians_enabled()
 
+    # **R22：这条把 best-of-N 钉成 1。** 它测的是"医家之间并发了没有"，
+    # 而 best-of-N 在同一位医家内部又开了一层并发——两层叠在一起时
+    # wall/sum 这个比值测的就不再是医家级并发了（分母变成 N 倍，
+    # 而分子受 LLM_MAX_INFLIGHT 的波次影响）。best-of-N 自己的并发
+    # 在 tests/test_best_of_n.py 里单独测。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     latency, n = 0.3, len(PHYSICIANS)
     report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "2",
                           "--fake-latency", str(latency))
@@ -318,17 +328,25 @@ def test_a_run_with_no_physician_results_is_not_reported_as_ok(tmp_path, monkeyp
     assert code == 1, "有跑失败时退出码必须非 0"
 
 
-def test_a_valid_fake_run_makes_exactly_five_calls(tmp_path):
-    """**llm_calls == 5 才算一次有效的基准**：S1 + S2 + 三位医家各一次 S3。
-    少于 5 就说明有医家没跑到，这份数据不能用来比并发前后的耗时。"""
+def test_a_valid_fake_run_makes_the_expected_number_of_calls(tmp_path):
+    """**有意的契约变更（R22）**：原来写死 `llm_calls == 2 + 3 == 5`。
+    R22 把 S3 改成采 N 次（默认 3），一次问诊变成 `2 + 医家数 × N` 次调用。
+
+    期望值问 `core.usage.calls_per_consult()`——**那是这个折算系数唯一的一处
+    实现**，额度账本、前端"约剩几次"、这条测试问的是同一个函数。在这里重新写一遍
+    `2 + len(PHYSICIANS) * s3_best_of_n()` 就是把同一个公式抄到第二处。
+
+    判据的意思没变：少于这个数就说明有医家或某次采样没跑到，这份数据不能用来
+    比耗时。"""
     from core.physicians import physicians_enabled
+    from core.usage import calls_per_consult
 
     PHYSICIANS = physicians_enabled()
 
     report = _run_consult(tmp_path, "--repeat", "1", "--fake-cases", "3")
     run = report["runs"][0]
     assert run["ok"] is True, run["error"]
-    assert run["llm_calls"] == 2 + len(PHYSICIANS) == 5
+    assert run["llm_calls"] == calls_per_consult(len(PHYSICIANS))
     assert len(run["by_step"]["s3_by_physician"]) == len(PHYSICIANS)
 
 
@@ -364,7 +382,10 @@ def test_fake_backend_installs_synthetic_cases_when_the_repo_has_none(tmp_path, 
     monkeypatch.setattr(retrieval.DenseRetriever.__init__, "__defaults__", (missing,))
     monkeypatch.setattr(HybridRetriever.__init__, "__defaults__", (missing,))
 
+    from core.usage import calls_per_consult
+
     report = _run_consult(tmp_path, "--repeat", "1")
     assert report["config"]["fake_cases_auto"] is True
     assert report["config"]["fake_cases"] == 3 * len(PHYSICIANS)
-    assert report["runs"][0]["llm_calls"] == 5
+    # R22：不再是写死的 5，理由同 test_a_valid_fake_run_makes_the_expected_number_of_calls
+    assert report["runs"][0]["llm_calls"] == calls_per_consult(len(PHYSICIANS))

@@ -149,11 +149,18 @@ def test_fast_mode_integration_cuts_llm_calls(monkeypatch):
     """一次完整 consult（开 ReAct + 有提问渠道）两种模式的调用数对比。
 
     实测（manifest.llm_calls 与真实 generate 次数完全一致，没有漏算）：
-      正常模式 16 次 = S1 1 + S2 1 + 追问后重跑 S2 1 + 残差 S2 1
-                       + 两位医家各 (ReAct 5 步 + S3 1) = 4 + 12
+      正常模式 20 次 = S1 1 + S2 1 + 追问后重跑 S2 1 + 残差 S2 1
+                       + 两位医家各 (ReAct 5 步 + S3 **3 次采样**) = 4 + 16
       FAST_MODE 8 次 = S1 1 + S2 1 + 两位医家各 (ReAct 2 步 + S3 1) = 2 + 6
-                       （追问 0 轮所以不重跑 S2，残差整体关闭）
-    降幅一半。这两个数字任何一个变了都要先想清楚为什么，不要直接改期望值。
+                       （追问 0 轮所以不重跑 S2、残差整体关闭、**采样降到 1 次**）
+    降幅从"一半"变成"六成"。
+
+    **有意的期望值变更（R22），这正是这条 docstring 原来要求的"先想清楚为什么"**：
+    原来是 16 / 8。R22 给 S3 加了 best-of-N（默认采 3 次），正常模式因此
+    16 → 20（两位医家各多 2 次采样）；FAST_MODE 那一侧**一个数都没变**，
+    因为 best-of-N 在 FAST_MODE 下降到 1——这是 FAST_MODE 的第四处降级，
+    不降的话 FAST_MODE 会变成 2 + 2×(2+3) = 12，"省预算"这个承诺就打了对折。
+    所以这两个数的变化方向本身就是判据：**正常模式涨、FAST_MODE 不动**。
     """
     normal, fake_n = _consult_calls(monkeypatch, FAST_MODE=None)
     normal_calls = normal["manifest"]["llm_calls"]
@@ -161,12 +168,15 @@ def test_fast_mode_integration_cuts_llm_calls(monkeypatch):
     fast, fake_f = _consult_calls(monkeypatch, FAST_MODE="1")
     fast_calls = fast["manifest"]["llm_calls"]
 
-    assert normal_calls == 16, f"正常模式实际 {normal_calls} 次：{fake_n.calls}"
+    assert normal_calls == 20, f"正常模式实际 {normal_calls} 次：{fake_n.calls}"
     assert fast_calls == 8, f"FAST_MODE 实际 {fast_calls} 次：{fake_f.calls}"
     assert fast_calls < normal_calls
     # 三处降级都体现在调用数里
     assert fake_f.calls.count("ReActStep") == 4, "两位医家各 2 步"
     assert fake_f.calls.count("S2Elements") == 1, "追问不重跑 S2、残差不跑"
+    # R22 第四处降级的直接判据：FAST_MODE 下每位医家只采一次
+    assert fake_f.calls.count("S3Syndrome") == 2, "两位医家各一次 S3（采样没被降到 1 就会是 6）"
+    assert fake_n.calls.count("S3Syndrome") == 6, "正常模式两位医家各采 3 次"
     assert fast["followup"].stopped_by == "fast_mode"
     assert fast["residual"] is None
     # 关键：省了调用不等于不出结果，两位医家照样出方

@@ -268,6 +268,8 @@ cp .env.example .env
 | `MAX_CONCURRENT_CONSULTS` | 同时进行的问诊数上限（`/api/consult` 与 `/api/consult/stream` 合计），默认 4。满了立刻 503 + `Retry-After: 10`，不排队。这是部署侧的进程级设置，跟逐请求的 `retriever_mode` 不是一回事 |
 | `LLM_MAX_INFLIGHT` | 进程内**同时在途**的 LLM 请求数上限，默认 6。**跟 `MAX_CONCURRENT_CONSULTS` 是两件事**：那个限"同时几次问诊"，这个限"同时几个请求打到模型"。R12 三位医家改成并发之后两者相乘——4 个问诊槽 × 3 位医家 = 12 路同时打 API，会撞 DeepSeek 的速率限制（429）。只留一个闸拦不住 |
 | `S3_THINKING` | S3（按医家开方）开不开思考模式，`enabled`（默认，配 `reasoning_effort=high`）/ `disabled`。S1/S2/追问/ReAct **一律关思考**（结构化抽取，思考无增益却慢几十倍），这张表在 `core/llm.py::STEP_THINKING`。⚠ **关掉 S3 思考跑出来的数字跟默认配置下的不可比**，`manifest.comparability_warning` 会带上这句话；另外**思考模式下 temperature 不生效**，所以 `manifest.temperature_effective` 按步分别记 |
+| `S3_REASONING_EFFORT` | S3 想多久，`low`/`medium`/`high`/`max`。**不设时按检索方式取默认**：`full_context`（默认）→ `max`、top3 系 → `high`。理由在 `core/llm.py::s3_reasoning_effort`——full_context 下输入已经十几万 token 且靠缓存便宜 30 倍，这时限推理深度是省小钱费大钱；top3 保持 `high` 是为了跟 R1~R21 的数字可比。`max` 那一档的 `max_tokens` 默认升到 65536（推理 token 也算在里面） |
+| `S3_BEST_OF_N` | S3 采几次、按分最高的那次出结果，默认 **3**。`1` = 关掉（逐字节走回 R21 及之前那条路径）。打分用 R23 的 `score_formula`，见下面「best-of-N」一节。**这个数直接决定钱**：一次问诊的调用数是 `2 + 医家数 × N`，默认配置下 11 次。`FAST_MODE=1` 时它降到 1 |
 | `EMBEDDING_CACHE` / `EMBEDDING_CACHE_DIR` | 语料向量的磁盘缓存：`0` 关掉，或指定目录（默认 `data/cache/`，已 gitignore）。命中判据是模型名 + 语料条数 + **被编码文本的 sha256** 三者全等；缓存省的是"给全部语料编码"那一段，模型本身不管命不命中都要加载（查询要用它） |
 | `LOW_DISCRIMINATION_CUTOFF` | `0` 关闭（默认开）：检索到的候选之间没有真实区分度（top-1 与 top-k 原始相似度差 < 0.03）时只保留 top-1，避免塞几条弱相关候选进 prompt 稀释信号。这条不确定是不是净收益，做成开关是为了能跑两遍对比（`consult()` 返回的每位医家结果带 `low_discrimination` 标记） |
 
@@ -462,8 +464,8 @@ curl -N -X POST http://127.0.0.1:8000/api/consult/stream \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `QUOTA_PER_IP_DAILY_CALLS` | `25`（= 5 次问诊 × 每次 5 调用） | 每个 IP 每天的**模型调用**上限 |
-| `QUOTA_GLOBAL_DAILY_CALLS` | `1000`（= 200 次问诊） | 全站每天的模型调用上限，防一个人换 IP 刷爆 |
+| `QUOTA_PER_IP_DAILY_CALLS` | `55`（= 5 次问诊 × 每次 11 调用） | 每个 IP 每天的**模型调用**上限。**R22 起这个默认值是算出来的**：`calls_per_consult() * 5`，而 `calls_per_consult()` = `2 + 医家数 × S3_BEST_OF_N` = 2 + 3×3 = 11。把 `S3_BEST_OF_N` 调回 1 时它自动变回 25 |
+| `QUOTA_GLOBAL_DAILY_CALLS` | `2200`（= 200 次问诊 × 每次 11 调用） | 全站每天的模型调用上限，防一个人换 IP 刷爆。同上，`calls_per_consult() * 200` |
 | `QUOTA_MAX_TRACKED_IPS` | `5000` | 额度表里最多记多少个 IP。**这是内存保护**：不设上限的话，用海量伪造 IP 发请求能把进程内存撑爆 |
 | `TRUSTED_PROXY_HOPS` | `0` | **默认 0 = 完全不读 `X-Forwarded-For`。** 直接信任 XFF 等于把限额送人——任何人加一个头就换一个"IP"。只有部署在**自己的**反代后面时才设成反代跳数（nginx 一层就是 1），此时从右往左数第 N 跳才是真实客户端；**绝不取最左跳**，最左跳是客户端自己写的 |
 | `FORCE_REPLAY` | 未设 | `1` 强制全站走回放（演示日用）。零成本、断网可用、每次一致 |
@@ -496,7 +498,7 @@ server {
 对应的服务端设置：
 
 ```bash
-TRUSTED_PROXY_HOPS=1 QUOTA_PER_IP_DAILY_CALLS=25 QUOTA_GLOBAL_DAILY_CALLS=1000 \
+TRUSTED_PROXY_HOPS=1 QUOTA_PER_IP_DAILY_CALLS=55 QUOTA_GLOBAL_DAILY_CALLS=2200 \
   python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -1494,6 +1496,38 @@ N 张方之间挑一张（R22）。跨问诊比这个分没有意义——不同
 （「甘草 与 甘遂 属配伍禁忌」），下发 advice 等于把处方内容从另一个字段漏出去。
 判据是 `api/main.py::_role_gets_advice` 一个函数，`/api/prescription/validate`
 和 `results[i]` 两处都问它。
+
+## best-of-N：同一位医家采 N 次，按分挑一张（R22，默认 N=3）
+
+S3 不再只采一次：每位医家**并发**采 `S3_BEST_OF_N` 次（默认 3），用上面那把
+`score_formula` 给每次打分，挑分最高的一次出结果。
+
+```
+一次问诊的调用数 = 2 + 医家数 × N        ← core/usage.py::calls_per_consult()
+默认配置（3 位医家、N=3）= 2 + 9 = 11 次   （R21 及之前是 5 次）
+```
+
+这个折算系数**只有一处实现**：额度默认值、看板上的"约剩几次问诊"、
+基准脚本的期望调用数、README 里那两个数，问的都是 `calls_per_consult()`。
+
+| 事实 | 为什么这么定 |
+|---|---|
+| 打分用 `score_formula`，不另写一把尺 | 同一把尺同时给医生看建议、给这里排序。另写一把就有两把，改权重只改一处这条就破了 |
+| 平手取**下标最小**的那次 | 不定的挑选让 fixture 回放和 ε 都不可复现——平手规则本身是契约的一部分 |
+| N 次里失败几次仍然出结果 | 429/超时是常态。失败那次在 `candidates_scored` 里留一行 `score: null` + `error`，**不从列表里消失**（消失的话 N 对不上，而"为什么只有两条"没人能回答）。全灭才抛 |
+| 并发上限沿用 `LLM_MAX_INFLIGHT` | 不设第二个上限。两个闸门管同一件事时，实际生效的是哪个取决于数值大小，那是看不出来的行为 |
+| 安全层重开在挑选**之后** | 反过来会让"被拦掉的恰好是分最高的那张"静默消失 |
+| `llm_calls` 按真实采样次数计 | 按医家数计会漏掉 N−1 次。manifest 的调用数是额度结算的依据，**少扣不会报错** |
+| `FAST_MODE=1` 时 N 降到 1 | best-of-N 是这条链上最大的成本倍数，不降它 FAST_MODE 就名不副实（这是 FAST_MODE 的第四处降级） |
+
+响应里每位医家多三个键：`candidates_scored`（每次采样的分、方名、建议类别、
+选中标记）、`best_of_n`、以及重开之后最终那张方的 `formula_score`。
+**`candidates_scored` 里的分是"挑选时"的分，`formula_score` 是最终留下那张方的分**
+——安全层重开过的话两者会不同，这正是要分两个字段的理由。
+
+⚠ **换 N 或换 effort = 换实验条件**，跟换模型同级：`manifest.best_of_n` /
+`manifest.reasoning_effort` 都是一等字段，`eval/RESULTS.md` 里引用任何数字时
+要一起说明。
 
 ## 审计
 

@@ -451,6 +451,11 @@ def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
         "cache_hit_ratio": manifest.get("cache_hit_ratio"),
         "retriever_mode": manifest.get("retriever_mode"),
         "prefix_tokens_by_section": manifest.get("prefix_tokens_by_section"),
+        # R22：这两项跟 retriever_mode 一样是"这次跑在什么配置下"，
+        # 不带上的话两份报告放在一起比时看不出差异是配置引起的还是代码引起的。
+        # best_of_n 同时解释 llm_calls 为什么比 R21 高三倍。
+        "best_of_n": manifest.get("best_of_n"),
+        "reasoning_effort": manifest.get("reasoning_effort"),
     }
 
 
@@ -480,6 +485,8 @@ def summarize(runs: list[dict]) -> dict:
         "cache_hit_ratio_by_run": [r.get("cache_hit_ratio") for r in ok],
         "cache_hit_ratio_last": (ok[-1].get("cache_hit_ratio") if ok else None),
         "retriever_mode": (ok[-1].get("retriever_mode") if ok else None),
+        "best_of_n": (ok[-1].get("best_of_n") if ok else None),
+        "reasoning_effort": (ok[-1].get("reasoning_effort") if ok else None),
     }
 
 

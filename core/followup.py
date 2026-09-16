@@ -50,11 +50,13 @@ AskFn = Callable[[str], str | None]
 def fast_mode_enabled() -> bool:
     """演示现场网络慢或临时预算紧张时的兜底开关。默认关。
 
-    **全项目唯一的 FAST_MODE 判定实现**，三处代码路径都调它、不各写一套：
+    **全项目唯一的 FAST_MODE 判定实现**，四处代码路径都调它、不各写一套：
       1. 本模块的追问循环：max_rounds 降到 0（一个问题都不问）
       2. core/react.py 的 run_react：步数上限降到 FAST_MODE_MAX_STEPS
       3. core/chain.py 的 run_residual：残差辨证整体关闭
-    三处必须同时生效——只关一半的开关是陷阱：用户以为省了预算，实际还在花。
+      4. core/llm.py 的 s3_best_of_n：采样次数降到 1（R22 加的第四处——
+         best-of-N 是这条链上最大的成本倍数，不降它 FAST_MODE 就名不副实）
+    四处必须同时生效——只关一半的开关是陷阱：用户以为省了预算，实际还在花。
 
     判定实现留在这个模块是历史原因（FAST_MODE 最早只管追问）。没有挪到中立
     模块：本项目三个开关的约定就是"住在它主要治理的模块里"

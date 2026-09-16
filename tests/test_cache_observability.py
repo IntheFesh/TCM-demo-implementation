@@ -163,7 +163,9 @@ def test_openai_compat_backend_records_usage_from_the_response(monkeypatch):
     monkeypatch.setattr(OpenAICompatBackend, "client",
                         property(lambda self: fake_client), raising=False)
     monkeypatch.setattr(backend, "_request_model_name", lambda: "deepseek-v4-pro")
-    monkeypatch.setattr(backend, "_default_max_tokens", lambda thinking: 1024)
+    # R22 起这个方法多收一个 reasoning_effort（max 档要更大的 max_tokens），
+    # 替身用 *args 接住：这条测的是 usage 有没有被记下来，不是 max_tokens 算得对不对。
+    monkeypatch.setattr(backend, "_default_max_tokens", lambda *args: 1024)
     out = backend._complete([{"role": "system", "content": "x"}], 0.0)
     assert out == '{"ok": 1}'
     stats = current_usage_stats()

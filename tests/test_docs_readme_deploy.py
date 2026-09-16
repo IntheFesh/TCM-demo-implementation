@@ -64,10 +64,12 @@ def test_the_quota_defaults_in_the_doc_match_the_code():
     但环境变量的单位是**调用数**，两者差 CALLS_PER_CONSULT 倍。这一条就是
     防那个换算被写反。"""
     import api.main as api_main
-    from core.usage import CALLS_PER_CONSULT
+    from core.usage import calls_per_consult
     section = README[README.index("## 公开部署"):README.index("## 前端页面")]
-    assert f"`{CALLS_PER_CONSULT * 5}`" in section, "每 IP 默认调用数写错了"
-    assert f"`{CALLS_PER_CONSULT * 200}`" in section, "全局默认调用数写错了"
+    # R22：折算系数从常量变成函数（`2 + 医家数 × S3_BEST_OF_N`）。
+    # 这条判据的作用没变——文档里那两个数必须跟代码算出来的一致。
+    assert f"`{calls_per_consult() * 5}`" in section, "每 IP 默认调用数写错了"
+    assert f"`{calls_per_consult() * 200}`" in section, "全局默认调用数写错了"
     assert f"`{api_main.MAX_TRACKED_IPS}`" in section
 
 

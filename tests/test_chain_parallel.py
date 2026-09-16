@@ -79,6 +79,10 @@ def test_the_three_physicians_really_run_at_the_same_time(monkeypatch):
     ② 总耗时接近**一次** delay 而不是三次。
     只看 ② 的话，"某位医家被跳过了"也会让总耗时变短。
     """
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条测的是**医家之间**并发。best-of-N 在医家内部又开一层并发，
+    # 「同一时刻在飞的 S3 调用数」这个判据会同时被两层影响。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     llm = SlowLLM({info["name"]: _s3(pid) for pid, info in chain.PHYSICIANS.items()},
                   delay=0.3)
     _setup(monkeypatch, llm)
@@ -93,6 +97,10 @@ def test_the_three_physicians_really_run_at_the_same_time(monkeypatch):
 
 def test_max_workers_follows_the_registry_size(monkeypatch):
     """注册表加到四位医家时并发度要跟着变——写死 3 的话第四位会排队等前三位。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条测的是医家线程池的 max_workers 跟注册表一样大。
+    # best-of-N 会再建一个线程池（max_workers=N），捕获到的就不止一个了。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     captured = {}
     real_pool = chain.ThreadPoolExecutor
 
@@ -117,6 +125,9 @@ def test_max_workers_follows_the_registry_size(monkeypatch):
 def test_llm_calls_are_summed_across_workers(monkeypatch):
     """每位医家的调用数在自己的线程里数，主线程求和。少算一次，manifest 里的
     成本和"这次跑了几次"就都是错的。"""
+    # R22：**把 best-of-N 钉成 1**，让这条测试只测它自己那件事。
+    # 这条数的是「跨 worker 的调用数有没有被汇总」，钉成 1 让期望值可写死。
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
     _setup(monkeypatch)
     outcome = chain.consult("纳差乏力")
     # S1 + S2 + 每位医家一次 S3

@@ -38,6 +38,8 @@ from core.llm import (
     new_retry_stats,
     new_usage_stats,
     render,
+    s3_best_of_n,
+    s3_reasoning_effort,
     s3_thinking,
     thinking_by_step,
     thinking_for,
@@ -534,6 +536,92 @@ def pairwise_divergence(results: list[dict]) -> dict:
     }
 
 
+# R22：best-of-N 打分挑选。**评分尺是 R23 的 score_formula，不是这里另算一个**
+# ——同一把尺同时给医生看建议、给这里排序，改权重只改一处。
+def _score_candidate(s3) -> tuple[float, dict]:
+    """一次采样的分 + 写进 manifest/响应的那一行。
+
+    分数只看 `selected` 那张方：模型自己挑了一张，我们评的就是它挑的那张。
+    评所有候选方再取最高会让"模型挑得对不对"这件事从判据里消失。
+    """
+    selected = s3.formula_candidates[s3.selected]
+    check = check_formula(s3.syndrome, selected.herb_items)
+    return check.score, {
+        "score": check.score,
+        "syndrome": s3.syndrome,
+        "formula": selected.name,
+        # 逐类计数而不是整条 advice：这一行是给"为什么选了它"用的，
+        # 完整建议在 results[i].advice 里（那是**选中那张**的建议，不重复三份）。
+        "advice_kinds": sorted({a.kind for a in check.advice}),
+        "n_advice": len(check.advice),
+    }
+
+
+def _best_of_n_s3(s3_system: str, s3_schema, physician: str):
+    """采 N 次 S3，按 `score_formula` 挑分最高的一次。返回 (s3, candidates_scored)。
+
+    **N=1 时逐字节走回 R21 及之前的那条路径**（一次 generate、不建线程池、
+    candidates_scored 只有一条）——把"关掉 best-of-N"做成一条独立代码路径会让
+    两条路径慢慢分叉，而这个旋钮正是要拿来做对照实验的。
+
+    并发：用线程池发 N 次，真正的并发上限由 `LLM_MAX_INFLIGHT` 的信号量管
+    （在 core/llm.py 里，跨所有医家共享）。这里**不再设第二个上限**——
+    两个闸门管同一件事时，实际生效的是哪个取决于数值大小，那是看不出来的行为。
+    每个 worker 跑在 `copy_context().run` 里：重试统计和 usage 统计都在
+    ContextVar 上，不拷贝 Context 的话工作线程写进的是一个没人读的地方
+    （R21 在 `_complete_within_deadline` 上踩过这个坑，SOURCES.md 第 64 条第九点）。
+
+    平手时取**下标最小**的那次：`max` 对相等的键返回先遇到的那个，而下面是按
+    下标顺序遍历的，所以这条是确定的——同一批采样结果永远选出同一张方。
+    """
+    n = s3_best_of_n()
+    thinking = thinking_for("s3")
+
+    def one():
+        return get_llm().generate(
+            system=s3_system, user="", schema=s3_schema, physician=physician,
+            **thinking,
+        )
+
+    if n == 1:
+        s3 = one()
+        score, row = _score_candidate(s3)
+        return s3, [{**row, "index": 0, "chosen": True}]
+
+    samples: list = [None] * n
+    with ThreadPoolExecutor(max_workers=n, thread_name_prefix="s3-sample") as pool:
+        futures = {pool.submit(contextvars.copy_context().run, one): i for i in range(n)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            # 一次采样失败不该让整位医家失败：N 次里有一次撞 429/超时是常态，
+            # 剩下的仍然能挑出一张。**全部失败才抛**——那时抛的是最后一个异常，
+            # 而不是一个"没有候选方"的假结果（后者会在下游变成 IndexError，
+            # 离根因十几帧远）。
+            try:
+                samples[i] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                samples[i] = exc
+
+    scored: list[dict] = []
+    best_i, best_score, best_s3 = None, -1.0, None
+    last_exc: BaseException | None = None
+    for i, sample in enumerate(samples):
+        if isinstance(sample, BaseException):
+            last_exc = sample
+            scored.append({"index": i, "score": None, "chosen": False,
+                           "error": type(sample).__name__})
+            continue
+        score, row = _score_candidate(sample)
+        scored.append({**row, "index": i, "chosen": False})
+        if score > best_score:
+            best_i, best_score, best_s3 = i, score, sample
+    if best_s3 is None:
+        assert last_exc is not None
+        raise last_exc
+    scored[best_i]["chosen"] = True
+    return best_s3, scored
+
+
 def run_physician(
     s1: S1Normalize,
     s2: S2Elements,
@@ -679,10 +767,7 @@ def run_physician(
     # （DeepSeek）如实忽略它，见 core/llm.py::LLMBackend._complete 的文档。
     # S3 是这条链上唯一真正需要推理的一步，默认开思考（S3_THINKING 可整体关掉，
     # 关掉之后跑出来的数字跟默认配置不可比——manifest 会带上这句话）。
-    s3 = get_llm().generate(
-        system=s3_system, user="", schema=s3_schema, physician=physician,
-        **thinking_for("s3"),
-    )
+    s3, candidates_scored = _best_of_n_s3(s3_system, s3_schema, physician)
 
     # X2 输出侧安全（M2 起覆盖五条规则，见 core/safety_output.assess_formula_safety
     # 的文档字符串）：给每个候选方都算一份 FormulaSafety，不是只算 selected 那个——
@@ -784,6 +869,12 @@ def run_physician(
         "advice": advice_dicts(formula_check),
         "advice_skipped": list(formula_check.skipped),
         "formula_score": formula_check.score,
+        # R22：这一位医家这次采了几张方、每张多少分、选了哪张。
+        # **安全层的重开发生在挑选之后**，所以这一行记的是"挑选时"的分，
+        # 而 formula_score 是最终留下那张方的分——重开过的话两者会不同，
+        # 这正是要分两个字段的理由。
+        "candidates_scored": candidates_scored,
+        "best_of_n": len(candidates_scored),
     }
 
 
@@ -879,9 +970,16 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
         # 每位医家的稳定前缀各段多少 token。full_context 之外恒 None——
         # 不是 0：0 会被读成"算过、是零"，而那几段在 top3 下根本不存在。
         "prefix_tokens_by_section": _prefix_tokens_or_none(retriever_mode),
-        # 缓存命中读数，从响应 usage 取（core/llm.py::last_usage）。
+        # 缓存命中读数，从响应 usage 取（core/llm.py::record_usage）。
         # 非 DeepSeek 后端如实为 None。
         **_cache_usage_fields(),
+        # R22：S3 这一步想多久、采几次。两项都直接决定钱和耗时，也都让数字
+        # 不可比（effort 从 high 换到 max、N 从 1 换到 3 都是换实验条件），
+        # 所以跟 thinking_by_step 一样是 manifest 的一等字段。
+        # effort 只在 S3 开着思考时有值——关了思考它不生效，记一个不生效的
+        # 实验条件比不记更糟。
+        "reasoning_effort": (s3_reasoning_effort() if s3_thinking() == "enabled" else None),
+        "best_of_n": s3_best_of_n(),
     }
 
 
@@ -1329,7 +1427,13 @@ def consult(
         calls = (
             2 + extra_calls + (1 if residual else 0) + veto.llm_calls
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
-            + len(results)
+            # R22：**不是 len(results)**。每位医家的 S3 采了 N 次（best-of-N），
+            # 按医家数计等于漏掉 N−1 次真实调用——manifest 的调用数是额度结算的
+            # 依据，漏算的表现是账本持续少扣，而少扣不会报错。
+            # 用每位医家自己报的 N（`_best_of_n_s3` 返回几条就是采了几次），
+            # 不是全局 s3_best_of_n()：中途改环境变量、或某位医家采样部分失败时，
+            # 全局那个数跟实际发生的次数会不一致。
+            + sum(len(r["candidates_scored"]) for r in results)
             + sum(1 for r in results if r["safety_output"]["revised"])
         )
         return {
@@ -1523,7 +1627,8 @@ def consult(
             int((time.time() - _t0) * 1000),
             2
             + extra_calls
-            + len(results)
+            # R22：每位医家采了 N 次 S3，见上面 SafetyVeto 分支里那段注释。
+            + sum(len(r["candidates_scored"]) for r in results)
             + (1 if residual else 0)
             + sum(1 for r in results if r["safety_output"]["revised"])
             # ReAct 的每一步都是一次真实调用，必须计进来：漏算的话 manifest 报的

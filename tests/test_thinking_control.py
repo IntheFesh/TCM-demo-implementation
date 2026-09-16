@@ -11,8 +11,11 @@ from core import chain
 from core.llm import (
     LLMBackend,
     OpenAICompatBackend,
+    S3_REASONING_EFFORT_FULL_CONTEXT,
+    S3_REASONING_EFFORT_TOP3,
     S3_THINKING_DEFAULT,
     STEP_THINKING,
+    s3_reasoning_effort,
     s3_thinking,
     thinking_by_step,
     thinking_for,
@@ -42,9 +45,42 @@ def test_extraction_steps_have_thinking_disabled():
 
 
 def test_s3_keeps_thinking_on_by_default():
-    """S3 是这条链上唯一真正需要推理的一步——默认开，effort=high，保持现有输出质量。"""
+    """S3 是这条链上唯一真正需要推理的一步——默认开。
+
+    **有意的契约变更（R22）**：原来断言 `reasoning_effort == "high"` 是写死的。
+    R22 起 effort 的默认值**跟检索方式绑**：full_context（默认）下 `max`、
+    top3 系下 `high`。理由见 `core/llm.py::s3_reasoning_effort` 的文档字符串——
+    full_context 下输入已经是十几万 token 且靠缓存便宜 30 倍，这时限制推理深度
+    是省小钱费大钱；top3 保持 high 是为了跟 R1~R21 的数字可比。
+    """
     assert s3_thinking() == S3_THINKING_DEFAULT == "enabled"
-    assert thinking_for("s3") == {"thinking": "enabled", "reasoning_effort": "high"}
+    assert thinking_for("s3") == {"thinking": "enabled",
+                                  "reasoning_effort": S3_REASONING_EFFORT_FULL_CONTEXT}
+
+
+def test_s3_effort_default_follows_the_retriever_mode(monkeypatch):
+    """两系各自的默认档。写成两条断言而不是一条参数化：这两个值的**理由不同**
+    （一个是"输入已经很贵了"，一个是"要跟历史数字可比"），合成一条会把理由抹掉。"""
+    monkeypatch.delenv("S3_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("RETRIEVER_MODE", raising=False)
+    assert s3_reasoning_effort() == S3_REASONING_EFFORT_FULL_CONTEXT == "max"
+    monkeypatch.setenv("RETRIEVER_MODE", "hybrid")
+    assert s3_reasoning_effort() == S3_REASONING_EFFORT_TOP3 == "high"
+
+
+def test_s3_effort_env_var_wins_over_the_mode_default(monkeypatch):
+    monkeypatch.setenv("S3_REASONING_EFFORT", "low")
+    assert s3_reasoning_effort() == "low"
+    monkeypatch.setenv("RETRIEVER_MODE", "hybrid")
+    assert s3_reasoning_effort() == "low", "显式指定不该被检索方式覆盖"
+
+
+def test_an_unknown_effort_falls_back_loudly(monkeypatch, capsys):
+    """拼错一档的表现是"这次悄悄用了别的设置"——跟没设一样看不出来，
+    所以要吼一声（同 thinking_for 未知 step 那条）。"""
+    monkeypatch.setenv("S3_REASONING_EFFORT", "ultra")
+    assert s3_reasoning_effort() == S3_REASONING_EFFORT_FULL_CONTEXT
+    assert "只认" in capsys.readouterr().err
 
 
 def test_s3_thinking_env_var_turns_it_off(monkeypatch):

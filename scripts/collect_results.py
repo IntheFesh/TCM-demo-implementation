@@ -331,6 +331,23 @@ def _round_snapshot_names(eval_dir: Path = EVAL_DIR) -> list[str]:
     return [name for _, name in sorted(found)]
 
 
+def latest_round_name(eval_dir: Path = EVAL_DIR) -> str | None:
+    """最近一次 `bench_sandbox --round` 量的是哪一轮。读 `bench/rounds/LATEST`。
+
+    **不按轮次号大小推**：这个项目的轮次顺序是人定的（R21 → R23 → R22 → R24…，
+    因为 R22 的 best-of-N 打分器依赖 R23 的 score_formula），按数字排会把 R23
+    当成"最新"，于是"最新快照要等于当前测量"这条判据会拿一份已经封版的快照去比。
+    指针文件由写快照的同一次运行落盘，两者不会分叉。
+    """
+    pointer = eval_dir / BENCH_ROUNDS_DIR / "LATEST"
+    if pointer.exists():
+        name = pointer.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"R\d+", name):
+            return name
+    names = _round_snapshot_names(eval_dir)
+    return names[-1] if names else None
+
+
 def _register_round_evidence(eval_dir: Path = EVAL_DIR) -> None:
     """把每轮快照的键注册进 EVIDENCE：`round.R23.pytest_passed` 这种形状。
 

@@ -883,7 +883,11 @@ def test_truncation_error_names_the_default_it_actually_used(monkeypatch):
         Truncating().generate(system="s", user="u", schema=Tiny)
     # 报错里同时带上 thinking：同一个后端在两种情形下默认上限差四倍，
     # 只报一个数字看不出这次走的是哪一档。
-    assert f"未设置（走后端默认值 {THINKING_MAX_TOKENS}，thinking=None）" in str(e.value)
+    # **有意的文案变更（R22）**：现在还带 reasoning_effort——上限分了三档
+    # （关思考 8192 / 开思考 32768 / effort=max 65536），只报 thinking 已经
+    # 定位不到具体哪一档了。
+    assert (f"未设置（走后端默认值 {THINKING_MAX_TOKENS}，"
+            f"thinking=None, reasoning_effort=None）") in str(e.value)
 
 
 def test_claude_cli_complete_accepts_and_ignores_max_tokens(monkeypatch):

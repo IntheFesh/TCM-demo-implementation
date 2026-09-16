@@ -302,6 +302,9 @@ DEFAULT_MAX_TOKENS = 8192
 # 四倍，等于把截断风险集中到了唯一开思考的那一步上。取 64K 的一半：既远离截断，
 # 又保留"输出失控时还能被发现"这个上限本来的作用。
 THINKING_MAX_TOKENS = 32768
+# R22：`reasoning_effort=max` 那一档的上限。v4-pro 的输出上限是 384K，
+# 65536 远在其下——这不是"顶格给"，是给 max 档的推理过程留出它真正需要的量。
+MAX_EFFORT_MAX_TOKENS = 65536
 # 旧名保留一轮：R10–R12 的文档和 SOURCES 里引用的是这个名字。值跟着新名字走，
 # 不留一个"看起来还在、其实早就不是那个数"的常量。
 REASONING_MAX_TOKENS = THINKING_MAX_TOKENS
@@ -334,7 +337,16 @@ STEP_THINKING: dict[str, str] = {
     "s3": "enabled",
 }
 S3_THINKING_DEFAULT = "enabled"
-S3_REASONING_EFFORT = "high"
+# R22：`reasoning_effort` 从写死的 "high" 变成可配 + 按检索方式取默认。
+# 官方四档，顺序是"想得越多越贵越慢"。未知值不静默走默认——拼错一档的表现是
+# "这次悄悄用了别的设置"，跟没设一样看不出来（同 thinking_for 未知 step 那条）。
+REASONING_EFFORTS = ("low", "medium", "high", "max")
+S3_REASONING_EFFORT_ENV = "S3_REASONING_EFFORT"
+# top3 系沿用 high（R1~R21 所有数字都是在 high 下跑出来的，换档 = 不可比）。
+S3_REASONING_EFFORT_TOP3 = "high"
+# full_context 下默认 max：一次问诊的输入已经是几十万 token 的全量医案，
+# 这时候省推理 token 是本末倒置——贵的那部分（输入）已经靠缓存降到 1/30 了。
+S3_REASONING_EFFORT_FULL_CONTEXT = "max"
 
 
 def s3_thinking() -> str:
@@ -346,6 +358,68 @@ def s3_thinking() -> str:
               f"这次按默认 {S3_THINKING_DEFAULT} 处理", file=sys.stderr)
         return S3_THINKING_DEFAULT
     return value
+
+
+def s3_reasoning_effort() -> str:
+    """S3 这一步想多久。`S3_REASONING_EFFORT` 显式指定优先；不设时**按检索方式
+    取默认**——full_context 下 `max`，top3 系下 `high`。
+
+    为什么默认值跟检索方式绑：full_context 下一次问诊的输入是该医家的全量医案
+    （十几万 token），而缓存命中让输入便宜 30 倍，此时限制推理深度是省小钱费大钱；
+    top3 系保持 high 是为了**可比**——R1~R21 的数字全是在 high 下跑出来的。
+
+    检索方式用函数内 import 取：这个模块是全项目最底层的一层，
+    在模块顶层 import core.retrieval_hybrid 会把"检索"这条依赖倒灌进"调模型"。
+    """
+    raw = (os.environ.get(S3_REASONING_EFFORT_ENV) or "").strip().lower()
+    from core.retrieval_hybrid import DEFAULT_MODE, effective_mode
+
+    default = (S3_REASONING_EFFORT_FULL_CONTEXT if effective_mode() == DEFAULT_MODE
+               else S3_REASONING_EFFORT_TOP3)
+    if not raw:
+        return default
+    if raw not in REASONING_EFFORTS:
+        print(f"[llm] {S3_REASONING_EFFORT_ENV}={raw!r} 只认 {'/'.join(REASONING_EFFORTS)}，"
+              f"这次按默认 {default} 处理", file=sys.stderr)
+        return default
+    return raw
+
+
+# R22：S3 采样几次（best-of-N）。1 = 关掉（跟 R21 及之前逐字节同一条路径）。
+S3_BEST_OF_N_ENV = "S3_BEST_OF_N"
+S3_BEST_OF_N_DEFAULT = 3
+
+
+def s3_best_of_n() -> int:
+    """S3 采几次、挑分最高的那次。**默认 3。**
+
+    放在这个模块而不是 core/chain.py：它跟 `S3_THINKING` / `S3_REASONING_EFFORT`
+    是同一族旋钮（都决定"S3 这一步怎么调模型"），而 `core/usage.py` 算
+    「一次问诊几次调用」时也要读它——usage 依赖 llm 这条边本来就有（同族常量），
+    依赖 chain 会把"推理链"倒灌进"额度账本"。
+
+    非正整数不静默按默认处理就算了事——**它直接决定钱**：把 3 写成 30，
+    一次问诊的调用数从 11 变成 92，而表现只是"这次好慢"。
+    """
+    raw = (os.environ.get(S3_BEST_OF_N_ENV) or "").strip()
+    if not raw:
+        # FAST_MODE 下降到 1。**这是 FAST_MODE 的第四处降级**：R22 之后
+        # best-of-N 是这条链上最大的成本倍数（一次问诊的 S3 从 3 次变 9 次），
+        # 不跟着降的话 FAST_MODE 就名不副实——"用户以为省了预算、实际还在花"
+        # 正是 fast_mode_enabled() 的文档里点名要防的那件事。
+        # 显式设了 S3_BEST_OF_N 的话尊重它（显式 > 兜底，跟 EVAL_MODE 那条一致）。
+        from core.followup import fast_mode_enabled
+
+        return 1 if fast_mode_enabled() else S3_BEST_OF_N_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n < 1:
+        print(f"[llm] {S3_BEST_OF_N_ENV}={raw!r} 不是 ≥1 的整数，"
+              f"这次按默认 {S3_BEST_OF_N_DEFAULT} 处理", file=sys.stderr)
+        return S3_BEST_OF_N_DEFAULT
+    return n
 
 
 def thinking_for(step: str) -> dict[str, str | None]:
@@ -361,7 +435,9 @@ def thinking_for(step: str) -> dict[str, str | None]:
     mode = s3_thinking() if step == "s3" else STEP_THINKING[step]
     return {
         "thinking": mode,
-        "reasoning_effort": S3_REASONING_EFFORT if mode == "enabled" else None,
+        # effort 只在开着思考时有意义（关了思考传它 = 一个不生效却出现在 manifest
+        # 里的实验条件）。取值问 s3_reasoning_effort() 这一处。
+        "reasoning_effort": s3_reasoning_effort() if mode == "enabled" else None,
     }
 
 
@@ -606,7 +682,8 @@ class LLMBackend(ABC):
             return self.TIMEOUTS
         return self.TIMEOUTS.with_seconds(seconds)
 
-    def _default_max_tokens(self, thinking: str | None = None) -> int:
+    def _default_max_tokens(self, thinking: str | None = None,
+                            reasoning_effort: str | None = None) -> int:
         """这次调用没有显式传 max_tokens 时用多少。`LLM_MAX_TOKENS` 优先。
         **放在基类**：每个后端都要回答这个问题，各写一份的话这条会只在其中一个
         后端上生效。
@@ -628,7 +705,13 @@ class LLMBackend(ABC):
             return int(env)
         if thinking is None:
             thinking = "enabled" if self.model_name() in REASONING_MODELS else "disabled"
-        return THINKING_MAX_TOKENS if thinking == "enabled" else DEFAULT_MAX_TOKENS
+        if thinking != "enabled":
+            return DEFAULT_MAX_TOKENS
+        # R22：`effort=max` 单独再高一档。max_tokens 盖住的是 reasoning + 可见输出
+        # 两部分，而 max 档的推理过程本身就能吃掉几万 token——沿用 32768 的后果是
+        # **推理没写完就撞上限**，而那表现为一个在末尾处解析失败的 JSON
+        # （_looks_like_truncated_json 会把它认出来，但那已经是白烧一次调用之后了）。
+        return MAX_EFFORT_MAX_TOKENS if reasoning_effort == "max" else THINKING_MAX_TOKENS
 
     def abort_in_flight(self) -> None:
         """墙钟超时之后清理这个后端里挂着的东西。默认什么都不做；
@@ -818,8 +901,8 @@ class LLMBackend(ABC):
         猜错（比如把 element 写成 name）靠这一轮就能纠正。
 
         max_tokens 不传就用各后端自己的默认值（OpenAICompatBackend 见
-        `_default_max_tokens()`：非推理模型 8192、推理模型 16384，
-        `LLM_MAX_TOKENS` 覆盖两者）。**不要全局调高默认值**：S1/S2/S3 用不到
+        `_default_max_tokens()`：关思考 8192、开思考 32768、`effort=max` 65536，
+        `LLM_MAX_TOKENS` 覆盖三者）。**不要全局调高默认值**：S1/S2/S3 用不到
         那么多 token，调高只会让真正失控的输出更晚才被发现；某个 prompt 确实
         需要更大上限（比如 S5 一张方子的「含」关系会重复带出 source_span，
         实测容易顶到 8192），在那一处调用点单独传。
@@ -888,9 +971,11 @@ class LLMBackend(ABC):
                     # 带上 thinking：同一个后端在"开思考"和"关思考"两种情形下默认
                     # 上限差四倍，只报一个数字看不出这次走的是哪一档。
                     call_thinking = kwargs.get("thinking")
+                    call_effort = kwargs.get("reasoning_effort")
                     max_tokens_desc = (
-                        f"未设置（走后端默认值 {self._default_max_tokens(call_thinking)}，"
-                        f"thinking={call_thinking}）"
+                        f"未设置（走后端默认值 "
+                        f"{self._default_max_tokens(call_thinking, call_effort)}，"
+                        f"thinking={call_thinking}, reasoning_effort={call_effort}）"
                         if max_tokens is None else str(max_tokens)
                     )
                     raise LLMTruncatedError(
@@ -1037,7 +1122,7 @@ class OpenAICompatBackend(LLMBackend):
             # 是某个 prompt 明确知道自己需要更大上限时单独传（比如 S5 一张方子的
             # 多条「含」关系）。
             max_tokens=(max_tokens if max_tokens is not None
-                        else self._default_max_tokens(thinking)),
+                        else self._default_max_tokens(thinking, reasoning_effort)),
             **kwargs,
         )
         # R21：缓存命中读数就在这里取。**取完立刻记**，不等 generate() 层——
@@ -1422,10 +1507,14 @@ class VLLMInProcessBackend(LLMBackend):
     def _sampling_params(
         self, temperature: float, max_tokens: int | None,
         schema: type[BaseModel] | None, thinking: str | None = None,
+        reasoning_effort: str | None = None,
     ):
-        """thinking 只用来挑默认的 max_tokens：进程内 vLLM 跑的是本地基座，
-        没有"思考模式"这个开关，但**上限该给多少仍然取决于调用方这一步要不要
-        长输出**——所以参数照收，语义是"这一步的预算档位"。"""
+        """thinking / reasoning_effort 只用来挑默认的 max_tokens：进程内 vLLM 跑的是
+        本地基座，没有"思考模式"也没有 effort 这两个开关，但**上限该给多少仍然取决于
+        调用方这一步要不要长输出**——所以参数照收，语义是"这一步的预算档位"。
+        R22 加 effort 这个参数就是为了这一点：`effort=max` 那一档在云端后端上
+        默认上限更高，本地后端不跟着走的话，同一段代码在两个后端上会在不同的
+        长度处被截断，而那种差异极难归因。"""
         from vllm import SamplingParams  # 延迟 import
 
         guided = None
@@ -1436,7 +1525,7 @@ class VLLMInProcessBackend(LLMBackend):
         return SamplingParams(
             temperature=temperature,
             max_tokens=(max_tokens if max_tokens is not None
-                        else self._default_max_tokens(thinking)),
+                        else self._default_max_tokens(thinking, reasoning_effort)),
             guided_decoding=guided,
         )
 
@@ -1454,7 +1543,8 @@ class VLLMInProcessBackend(LLMBackend):
         # thinking 仍然影响默认的 max_tokens 档位（见 _sampling_params 的文档）。
         outputs = self._engine.chat(
             messages,
-            sampling_params=self._sampling_params(temperature, max_tokens, schema, thinking),
+            sampling_params=self._sampling_params(temperature, max_tokens, schema,
+                                                  thinking, reasoning_effort),
             lora_request=self._lora_request(physician),
             **kwargs,
         )

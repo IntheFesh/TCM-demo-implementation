@@ -5,7 +5,7 @@
 取证循环）。按请求数计，开着 ReAct 的访问者花的是别人的三倍钱却记同样一笔。
 
 **为什么还是对外说"几次问诊"**：`llm_calls` 对访问者没有意义。所以额度在内部
-以调用数为单位，前端按 `CALLS_PER_CONSULT` 折算成"约剩 N 次问诊"，并注明开
+以调用数为单位，前端按 `calls_per_consult()` 折算成"约剩 N 次问诊"，并注明开
 ReAct 消耗约三倍——折算系数只有这一处定义，前端不再自己算一份。
 
 **闸门放在调第一次 LLM 之前**（`decide()` 只看账本、不碰模型），所以被拦下来的
@@ -25,10 +25,36 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Literal
 
-# 不开 ReAct 的一次问诊大约花多少次调用：S1 + S2 + 三位医家各一次 S3。
-# 追问、安全否决、校验重试都会让真实值上下浮动，所以这是"折算系数"不是"定值"，
-# 只用来把调用数换算成对访问者有意义的"次数"。
-CALLS_PER_CONSULT = 5
+# 不开 ReAct 的一次问诊大约花多少次调用。
+# **R22 起这个数是算出来的，不是写死的 5**：S1 + S2 + 每位医家 N 次 S3
+# （best-of-N 采样），也就是 `2 + n_physicians × N`。写死 5 的话，把
+# `S3_BEST_OF_N` 从 1 调到 3 之后，"约剩 N 次问诊"会虚报三倍——
+# 访问者看到还剩 10 次、实际只够 3 次，这是折算系数存在的全部意义所在的地方。
+#
+# 追问、安全否决、校验重试都会让真实值上下浮动，所以它仍然是"折算系数"不是
+# "定值"（真实花费由 `manifest.llm_calls` 结算）。
+CALLS_PER_CONSULT_FIXED_STEPS = 2   # S1 + S2，跟医家数和 N 都无关
+
+
+def calls_per_consult(n_physicians: int | None = None, best_of_n: int | None = None) -> int:
+    """`2 + n_physicians × best_of_n`。**全项目这个折算系数只有这一处实现**——
+    前端不自己算（它读 `/api/usage` 给的 `calls_per_consult`），额度默认值、
+    看板、README 都问这里。
+
+    两个参数都默认从当前配置取：医家数问 `core.physicians.physicians_enabled()`
+    （注册表是唯一名单，R18 扩到五位时就是靠这一点没改到别处），N 问
+    `core.llm.s3_best_of_n()`。函数内 import 是为了不把"额度账本"绑死在
+    "推理链的注册表"上：这个模块在测试里常被单独拿来跑。
+    """
+    if n_physicians is None:
+        from core.physicians import physicians_enabled
+
+        n_physicians = len(physicians_enabled())
+    if best_of_n is None:
+        from core.llm import s3_best_of_n
+
+        best_of_n = s3_best_of_n()
+    return CALLS_PER_CONSULT_FIXED_STEPS + n_physicians * best_of_n
 # 开了 ReAct 之后每位医家额外的取证循环步数（估算用，结算时会被真实值覆盖）。
 REACT_STEPS_PER_PHYSICIAN = 5
 
@@ -52,9 +78,15 @@ def force_replay_enabled() -> bool:
     return os.environ.get("FORCE_REPLAY", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def estimate_calls(use_react: bool, n_physicians: int) -> int:
-    """一次问诊的调用数估算。只用于预占，跑完会按真实值结算。"""
-    base = 2 + max(n_physicians, 1)  # S1 + S2 + 每位医家一次 S3
+def estimate_calls(use_react: bool, n_physicians: int, best_of_n: int | None = None) -> int:
+    """一次问诊的调用数估算。只用于预占，跑完会按真实值结算。
+
+    **不自己算 `2 + n × N`**，问 `calls_per_consult()`：R22 把 S3 改成采 N 次之后，
+    这里和那里回答的是同一个问题（"不开 ReAct 一次问诊几次调用"）。两处各算一遍的
+    后果很具体——预占按 1 次 S3 估、实际花 3 次，账本会持续少算，
+    而"少算"这种偏差不会报错，只会让额度形同虚设。
+    """
+    base = calls_per_consult(max(n_physicians, 1), best_of_n)
     if use_react:
         base += max(n_physicians, 1) * REACT_STEPS_PER_PHYSICIAN
     return base
@@ -67,7 +99,7 @@ def estimate_calls(use_react: bool, n_physicians: int) -> int:
 # 前端用量面板都从这里取。写两处的话夏令时/时区换算会有一处算错，
 # 而算错的表现是"按五折估的预算，实际按原价扣"。
 #
-# **只记不改额度**：额度仍按调用数算（`CALLS_PER_CONSULT`），峰谷只影响钱。
+# **只记不改额度**：额度仍按调用数算（`calls_per_consult()`），峰谷只影响钱。
 # 让额度跟着时段变会让"今天还能问几次"这个数每隔几小时跳一次，没人看得懂。
 PEAK_UTC_HOUR_RANGES = ((1, 4), (6, 10))
 
@@ -125,11 +157,11 @@ class UsageLedger:
     ) -> None:
         self._per_ip = (
             per_ip_limit if per_ip_limit is not None
-            else _env_int("QUOTA_PER_IP_DAILY_CALLS", CALLS_PER_CONSULT * 5)
+            else _env_int("QUOTA_PER_IP_DAILY_CALLS", calls_per_consult() * 5)
         )
         self._global = (
             global_limit if global_limit is not None
-            else _env_int("QUOTA_GLOBAL_DAILY_CALLS", CALLS_PER_CONSULT * 200)
+            else _env_int("QUOTA_GLOBAL_DAILY_CALLS", calls_per_consult() * 200)
         )
         self._today_fn = today_fn or date.today
         self._lock = threading.Lock()
@@ -166,7 +198,7 @@ class UsageLedger:
         return {
             "per_ip_calls": self._per_ip,
             "global_calls": self._global,
-            "calls_per_consult": CALLS_PER_CONSULT,
+            "calls_per_consult": calls_per_consult(),
         }
 
     def snapshot(self, ip: str) -> dict:
@@ -185,8 +217,8 @@ class UsageLedger:
                 "global_limit_calls": self._global,
                 "remaining_calls": left,
                 # 折算只在这里做一次，前端不再自己算
-                "remaining_consults_estimate": left // CALLS_PER_CONSULT,
-                "calls_per_consult": CALLS_PER_CONSULT,
+                "remaining_consults_estimate": left // calls_per_consult(),
+                "calls_per_consult": calls_per_consult(),
                 "force_replay": force_replay_enabled(),
                 # 80% 预警：用掉的比例按"两条限额里更紧的那条"算
                 "warn": _warn_ratio(ip_used, self._per_ip, self._global_used, self._global) >= 0.8,
