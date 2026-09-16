@@ -30,6 +30,12 @@
 // 而这个状态是"这一次页面生命周期里已经包过了"，不该出现在 DOM 快照里。
 const ENHANCED_SELECTS = new WeakSet();
 
+// 原生元素 → 它那张皮的 refresh()。**必须有这张表**：选项是页面加载之后才由
+// fetch 回来的数据填进原生元素的（图谱浏览器那两个下拉就是），
+// 而自绘按钮上的字是 enhance 那一刻渲染的——中间没有人通知它，
+// 屏幕上就是两个空框（R24 的 r24_rings.png 拍到的正是这个）。
+const SELECT_REFRESHERS = new WeakMap();
+
 /** 这个 <select> 现在选中项的文字。空值（"默认"那种）也如实返回它自己的文字。 */
 function selectedOptionLabel(sel) {
   const opt = sel.options[sel.selectedIndex];
@@ -92,6 +98,20 @@ function selectKeyAction(key, isOpen) {
   }
 }
 
+/** 别处用代码改了这个下拉的**选项或 hidden** 之后，把自绘层重画一遍。
+
+    名字叫 `refreshSelect` 不叫 `refresh`：这几个脚本共用一个全局作用域
+    （见 tests/web_harness.py 的说明），一个叫 `refresh` 的全局函数早晚会撞上。
+
+    **没被增强过就返回 false，不报错**：调用方（graph.js 的两个 populate）
+    不该先判断"这个下拉被包过没有"——那种判断漏写一处，症状又是一个空按钮。 */
+function refreshSelect(sel) {
+  const refresh = sel && SELECT_REFRESHERS.get(sel);
+  if (!refresh) return false;
+  refresh();
+  return true;
+}
+
 function enhanceSelect(sel) {
   if (!sel || ENHANCED_SELECTS.has(sel)) return null;
   ENHANCED_SELECTS.add(sel);
@@ -114,6 +134,17 @@ function enhanceSelect(sel) {
 
   function renderButton() {
     button.textContent = selectedOptionLabel(sel);
+  }
+
+  /** 重画按钮文字；列表开着就连列表一起重画；**并且把 hidden 同步到壳子上**。
+
+      hidden 这一条不是顺手加的：`populateGbCategorySelect` 在"一个门类都没有"
+      时把原生元素 `hidden = true`，而原生元素本来就 `opacity: 0` 看不见——
+      真正要藏的是壳子。不同步的话页面上会留下一个点开也没内容的空下拉。 */
+  function refresh() {
+    renderButton();
+    if (!list.hidden) renderList();
+    wrap.hidden = !!sel.hidden;
   }
 
   function renderList() {
@@ -193,8 +224,9 @@ function enhanceSelect(sel) {
   // 原生元素留在 DOM 里（它是值的唯一来源，Playwright 的 select_option 也要它），
   // 只是视觉上藏起来。**不用 display:none**：那样 Playwright 会判定元素不可交互。
   sel.classList.add("cs-native");
-  renderButton();
-  return {wrap, button, list};
+  SELECT_REFRESHERS.set(sel, refresh);
+  refresh();
+  return {wrap, button, list, refresh};
 }
 
 /** 把页面上所有带 `data-custom-select` 的原生下拉包一层。

@@ -52,15 +52,21 @@ ROUND_REPORTS_DIR = ROOT / "docs" / "reports"
 
 def round_report_paths(reports_dir: Path = ROUND_REPORTS_DIR) -> tuple[Path, ...]:
     """按轮次号排序的每轮报告。排序用**数字**而不是文件名字符串——
-    字符串排序下 R9 会排在 R21 后面。"""
+    字符串排序下 R9 会排在 R21 后面。
+
+    也收 `R24_patch_report.md` 这种**补丁报告**（轮次号后面带一个小写后缀）：
+    补丁报告里同样有凭据记号，而一份不进核对器的报告正是这套机制要防的东西
+    ——它可以一直挂着一个早就对不上的数，没有人会发现。
+    同号时不带后缀的排在前面（`R24_report.md` → `R24_patch_report.md`）。
+    """
     if not reports_dir.is_dir():
         return ()
     found = []
     for path in reports_dir.glob("R*_report.md"):
-        m = re.match(r"R(\d+)_report\.md$", path.name)
+        m = re.match(r"R(\d+)(?:_([a-z]+))?_report\.md$", path.name)
         if m:
-            found.append((int(m.group(1)), path))
-    return tuple(path for _, path in sorted(found))
+            found.append((int(m.group(1)), m.group(2) or "", path))
+    return tuple(path for _, _, path in sorted(found))
 
 
 # R25：材料索引也进核对器。**竞赛材料里的每个数都要可核**——那份文件的全部

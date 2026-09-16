@@ -185,18 +185,24 @@ def test_collapse_only_removes_what_this_node_brought_in():
 
 
 def test_the_layout_is_concentric_with_hubs_inside():
-    """§3.2 规格 5：concentric，证素在内圈。
+    """§3.2 规格 5：环形布局，证素在内圈。
 
     为什么不是 cose：cose 是力导向，摆出来的位置取决于连边的拉扯，
-    "谁是枢纽"在图上看不出来——而这张图的整个心智模型就是"从证素往外长"。"""
+    "谁是枢纽"在图上看不出来——而这张图的整个心智模型就是"从证素往外长"。
+
+    **有意的契约变更（R24 补丁）**：布局引擎从 cytoscape 的 `concentric` 换成
+    `preset` + 自己算位置。规格没变（内圈枢纽、外圈展开），换的是实现——
+    concentric 不接受半径下限、扇形范围、椭圆，而这三样正是 r24_rings.png 上
+    "20 个枢纽挤成中心一个点、61 个证型摊成整圆"的直接原因。
+    位置对不对现在由**纯函数判据**管（tests/test_ui_r24_patch.py 那一组），
+    这里只钉住"不是力导向、也不是随机摆"这件事。
+    """
     src = _graph_js()
     body = src[src.index("function gbRelayout"):]
     body = body[:body.index("function gbRingLegendText")]
-    assert 'name: "concentric"' in body
-    # **有意的契约变更（R24）**：原来是三档（枢纽 3 / 枢纽展开的 2 / 更深的 1），
-    # 现在收成正好两环（是枢纽 2 / 不是枢纽 1）。理由在 gbRelayout 上方的注释里：
-    # 三四个半径相近的环读不出"离枢纽多远"，反而像一团同心圆噪声。
-    assert "gbHubIds.has(ele.id()) ? 2 : 1" in body
+    assert 'name: "preset"' in body
+    assert "gbLayoutPositions(" in body, "位置要由那个纯函数算，不是就地拍"
+    assert "gbHubIds.has(id)" in body, "内外圈仍然按是不是枢纽来分"
     # 节点太多时仍然退回 grid：力导向/环形对上千节点都会卡住浏览器。
     assert "GB_COSE_MAX_NODES" in body and '"grid"' in body
 

@@ -227,11 +227,20 @@ def test_the_controls_keep_their_radius():
 
 def test_the_browser_has_exactly_two_rings():
     """正好两环：是枢纽 / 不是枢纽。原来三档会在屏幕上出现三四个半径相近的环，
-    而"这个节点在第几环"本来是要一眼读出"离枢纽多远"的。"""
+    而"这个节点在第几环"本来是要一眼读出"离枢纽多远"的。
+
+    **有意的契约变更（R24 补丁）**：两环的语义没变，判据从"concentric 回调
+    返回 2 还是 1"换成"gbRelayout 仍然按枢纽/非枢纽分两组"。原断言钉的是
+    concentric 的参数写法，而那个布局引擎已经被换掉了（理由见
+    tests/test_graph_browser.py 同名判据）。**两环真的分得开**由
+    tests/test_ui_r24_patch.py 的 `test_layout_positions_put_every_expanded_node_outside_every_hub`
+    和 Playwright 的 rings 判据一起管——那两条比数一个字面量强。
+    """
     src = (WEB / "graph.js").read_text(encoding="utf-8")
     body = src[src.index("function gbRelayout"):]
     body = body[:body.index("function gbRingLegendText")]
-    assert "gbHubIds.has(ele.id()) ? 2 : 1" in body
+    assert "hubIds = visible.filter((id) => gbHubIds.has(id))" in body
+    assert "gbLayoutPositions(" in body
     assert "gbDepthOf" not in src, "三档的旧函数还在（死代码）"
 
 

@@ -39,6 +39,11 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "docs" / "screenshots"
 VIEWPORT = {"width": 1440, "height": 900}
 
+# 个别状态要在**更小的屏**上验。rings 那条"标签可读"的承诺是对最小的那块屏
+# 讲的（1280×800 的投影仪），在 1440×900 上验等于放过一批在投影仪上糊掉的布局。
+# 只覆盖需要的那几个，其余仍用统一视口——截图之间的可比性靠这一点。
+VIEWPORT_OVERRIDES = {"rings": {"width": 1280, "height": 800}}
+
 COMPLAINT = "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。"
 
 # 每种状态属于哪一轮。截图文件名带轮次前缀是为了"这张图是哪一轮的验收物"
@@ -845,28 +850,56 @@ STATES = {
           if (!legend || !legend.textContent.trim()) return '两环图例是空的';
           if (!legend.textContent.includes('内圈') || !legend.textContent.includes('外圈'))
             return '图例没说清哪个是内圈';
-          // 正好两环：所有节点到中心的距离聚成两簇
-          const box = gbCy.extent();
-          const cx = (box.x1 + box.x2) / 2, cy2 = (box.y1 + box.y2) / 2;
-          const d = (n) => Math.hypot(n.position('x') - cx, n.position('y') - cy2);
+          // R24 补丁①：一次展开最多 20 个，**多出来的要说出来**。
+          const status = (document.getElementById('gb-search-status') || {}).textContent || '';
+          const outerCount = gbCy.nodes().length - window.__hubIds.length;
+          if (outerCount > 20) return '一次展开超过 20 个（' + outerCount + '）';
+          if (!status.includes('还有') || !status.includes('搜索直达'))
+            return '状态栏没说还剩多少个：' + status;
+          // R24 补丁②：**标签要能读**。这两条是这一轮新加的，也是上一版
+          // 全绿却拍出一张糊图的原因——旧判据只看半径聚类，不看字。
+          const nodes = gbCy.nodes();
+          const fonts = nodes.map(n => parseFloat(n.renderedStyle('font-size')));
+          const minFont = Math.min.apply(null, fonts);
+          if (!(minFont >= 12)) return '字号被 fit 缩到 ' + minFont.toFixed(1) + 'px（要 ≥ 12）';
+          // 两两比包围盒（含标签）。留 2px 容差：renderedBoundingBox 把标签的
+          // 抗锯齿边也算进去，两个框贴着但没压字时会报出 1px 级的相交，
+          // 那不是"压字"，把它算成失败会让判据变成一个永远红的东西。
+          const boxes = nodes.map(n => ({label: n.data('label'),
+                                         bb: n.renderedBoundingBox({includeLabels: true})}));
+          for (let i = 0; i < boxes.length; i += 1) {
+            for (let j = i + 1; j < boxes.length; j += 1) {
+              const a = boxes[i].bb, c = boxes[j].bb;
+              const ox = Math.min(a.x2, c.x2) - Math.max(a.x1, c.x1);
+              const oy = Math.min(a.y2, c.y2) - Math.max(a.y1, c.y1);
+              if (ox > 2 && oy > 2) {
+                return '标签压字：「' + boxes[i].label + '」和「' + boxes[j].label
+                  + '」重叠 ' + Math.round(ox) + '×' + Math.round(oy) + 'px';
+              }
+            }
+          }
+          // R24 补丁③：内环不许塌成一点。**从枢纽自己的重心量**，不是从
+          // 画布 extent 的中心量——扇面只在一侧，extent 的中心被它拽偏了，
+          // 量出来的"半径"会小一半（实测 0.068 vs 0.21，同一张图）。
           const hubs = gbCy.nodes().filter(n => window.__hubIds.includes(n.id()));
           const others = gbCy.nodes().filter(n => !window.__hubIds.includes(n.id()));
           if (!others.length) return '展开之后外圈是空的';
-          const inner = hubs.map(d).reduce((a, b) => a + b, 0) / hubs.length;
-          const outer = others.map(d).reduce((a, b) => a + b, 0) / others.length;
-          if (!(inner < outer)) return '枢纽没在内圈（内 ' + Math.round(inner)
-            + ' / 外 ' + Math.round(outer) + '）';
-          // 0.25 而不是 R16 那条 0.15：**这一轮当场量过**，两环在模型坐标里是
-          // 内 649 / 外 1972（比值 0.329）。判据卡在实测值下面一点点，
-          // 既能抓住"内圈被压回中心"的回归，又不会因为节点数变化而假红。
-          if (!(inner > outer * 0.25)) return '内圈被压扁了（内 ' + Math.round(inner)
-            + ' / 外 ' + Math.round(outer) + '，比值 ' + (inner / outer).toFixed(3) + '）';
-          // 外圈是一簇而不是好几圈：半径的相对标准差要小
-          const rs = others.map(d);
-          const mean = rs.reduce((a, b) => a + b, 0) / rs.length;
-          const sd = Math.sqrt(rs.reduce((s, r) => s + (r - mean) ** 2, 0) / rs.length);
-          if (sd / mean > 0.35) return '外圈散成了好几环（相对标准差 '
-            + (sd / mean).toFixed(2) + '）';
+          const hx = hubs.map(n => n.position('x')).reduce((a, b) => a + b, 0) / hubs.length;
+          const hy = hubs.map(n => n.position('y')).reduce((a, b) => a + b, 0) / hubs.length;
+          const d = (n) => Math.hypot(n.position('x') - hx, n.position('y') - hy);
+          const short = Math.min(gbCy.width(), gbCy.height());
+          const innerMin = Math.min.apply(null, hubs.map(d));
+          if (!(innerMin >= short * 0.18))
+            return '内环塌了：最小半径 ' + Math.round(innerMin) + 'px = 短边的 '
+              + (innerMin / short).toFixed(3) + '（要 ≥ 0.18）';
+          // 两环：每个外圈节点都要比最里面那个枢纽远。
+          if (!others.every(n => d(n) > innerMin))
+            return '有外圈节点跑进内环里了';
+          // 扇形而不是整圈：外圈节点的角度跨度要明显小于 360°。
+          const angs = others.map(n => Math.atan2(n.position('y') - hy, n.position('x') - hx));
+          const span = Math.max.apply(null, angs) - Math.min.apply(null, angs);
+          if (!(span < Math.PI * 1.9))
+            return '外圈摊成了整圈（跨度 ' + Math.round((span * 180) / Math.PI) + '°）';
           return null;
         }""",
     ),
@@ -897,7 +930,7 @@ def run(only: str | None, wait_ms: int) -> int:
             browser = pw.chromium.launch(executable_path=_chromium_path())
             for name in names:
                 setup, check = STATES[name]
-                page = browser.new_page(viewport=VIEWPORT)
+                page = browser.new_page(viewport=VIEWPORT_OVERRIDES.get(name, VIEWPORT))
                 errors: list[str] = []
                 page.on("pageerror", lambda e: errors.append(str(e)))
                 page.goto(f"http://127.0.0.1:{port}/app/index.html", wait_until="networkidle")

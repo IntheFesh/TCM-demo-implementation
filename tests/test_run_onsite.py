@@ -4,6 +4,8 @@ bash 脚本也要有测试：上机剧本写错一个模块路径，代价是在
 而那时候前面几段的钱已经花了。所以这里**解析脚本本身**——段表连不连续、人工卡点
 在不在该在的位置、里面 `python -m` 的每个模块是不是真的存在。
 """
+import json
+import os
 import re
 import subprocess
 import sys
@@ -307,3 +309,71 @@ def test_python_in_tests_can_import_the_record_plan():
     真的 import 得进来（它模块顶层不加载任何模型/大文件）。"""
     assert sys.modules.get("scripts.record_fixtures") or True
     import scripts.record_fixtures  # noqa: F401
+
+
+# ---------- R24 补丁 0.4：E3/E4 闸门没过要有退路 ----------
+
+
+def _gate_snippet() -> str:
+    """把段 9 里那段 heredoc 的 python 抠出来，单独跑。
+
+    抠出来跑而不是"读一遍源码断言有这几个字"：一段没被执行过的兜底代码
+    跟没有兜底是一回事——R9 那轮的教训（静默不再正常）就是这个形状。
+    """
+    src = SCRIPT.read_text(encoding="utf-8")
+    body = src[src.index("python - <<'GATE_PY'"):src.index("GATE_PY", src.index("python - <<'GATE_PY'") + 20)]
+    return body.split("\n", 1)[1]
+
+
+def test_the_gate_snippet_does_not_hardcode_the_threshold():
+    """闸门阈值只有一处定义（eval/run_eval.py::GATE_OUTPUT_CHANGE_RATE）。
+    剧本里抄一个 0.4 的后果：将来闸门调了，剧本还按旧值放行。"""
+    snippet = _gate_snippet()
+    assert "GATE_OUTPUT_CHANGE_RATE" in snippet
+    assert "0.4" not in snippet
+
+
+def test_the_gate_snippet_passes_when_both_rates_clear_the_bar(tmp_path):
+    (tmp_path / "eval").mkdir()
+    (tmp_path / "eval" / "report_e3.json").write_text(
+        json.dumps({"e3": {"change_rate": 0.51}}), encoding="utf-8")
+    (tmp_path / "eval" / "report_e4.json").write_text(
+        json.dumps({"e4": {"change_rate": 0.62}}), encoding="utf-8")
+    out = subprocess.run([sys.executable, "-c", _gate_snippet()], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": str(ROOT)})
+    assert out.returncode == 0, out.stderr
+    assert "可以继续当默认" in out.stdout
+
+
+def test_a_failed_gate_exits_nonzero_and_names_the_way_back(tmp_path):
+    """**闸门没过就停，并且给退路。** 把默认检索模式换成 full_context 是拿这个
+    闸门担保的；闸门不过还继续演示，等于带着一个没过闸门的默认配置上台。"""
+    (tmp_path / "eval").mkdir()
+    (tmp_path / "eval" / "report_e3.json").write_text(
+        json.dumps({"e3": {"change_rate": 0.31}}), encoding="utf-8")
+    (tmp_path / "eval" / "report_e4.json").write_text(
+        json.dumps({"e4": {"change_rate": 0.55}}), encoding="utf-8")
+    out = subprocess.run([sys.executable, "-c", _gate_snippet()], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": str(ROOT)})
+    assert out.returncode == 1
+    assert "export RETRIEVER_MODE=hybrid" in out.stderr
+    assert "0.310" in out.stderr, "要说清是哪个数没过"
+
+
+def test_a_null_change_rate_is_treated_as_not_passing(tmp_path):
+    """change_rate 为 null 表示"闸门无法判定"（两侧检索全为空）。
+    **无法判定不等于通过**——按通过处理会让一次什么都没测到的跑变成绿灯。"""
+    import subprocess
+
+    (tmp_path / "eval").mkdir()
+    (tmp_path / "eval" / "report_e3.json").write_text(
+        json.dumps({"e3": {"change_rate": None}}), encoding="utf-8")
+    (tmp_path / "eval" / "report_e4.json").write_text(
+        json.dumps({"e4": {"change_rate": 0.55}}), encoding="utf-8")
+    out = subprocess.run([sys.executable, "-c", _gate_snippet()], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": str(ROOT)})
+    assert out.returncode == 1
+    assert "无法判定" in out.stderr

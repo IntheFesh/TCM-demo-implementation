@@ -764,3 +764,17 @@ def test_bench_sandbox_rejects_a_malformed_round_name():
     for bad in ("r23", "R23-fix", "23", "round23"):
         with pytest.raises(SystemExit):
             bs.main(["--show", "--round", bad])
+
+
+def test_patch_reports_are_checked_too(tmp_path):
+    """补丁报告（`R24_patch_report.md` 这种）也要进核对器。
+
+    一份不进核对器的报告可以一直挂着一个早就对不上的数，而它读起来跟被核过的
+    一样——这套凭据机制存在的全部理由就是这个。同号时不带后缀的排在前面。
+    """
+    from scripts.collect_results import round_report_paths
+
+    for name in ("R24_report.md", "R24_patch_report.md", "R9_report.md", "notes.md"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    names = [p.name for p in round_report_paths(tmp_path)]
+    assert names == ["R9_report.md", "R24_report.md", "R24_patch_report.md"]

@@ -909,14 +909,20 @@ function gbAddNodes(nodeIds) {
 // F1：展开改成问服务端。
 // 原来是在本地全量邻接表上展开——图一分页，本地就没有全量邻接表了，展开会
 // **静默只展开"恰好在本页里"的那部分**。那不是没找到，是没找过，比报错更误导。
-async function gbFetchInto(url, statusText) {
+async function gbFetchInto(url, statusText, pick) {
   const status = document.getElementById("gb-search-status");
   try {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
-    gbMergeGraph(data.graph);
-    if (status && statusText) status.textContent = statusText(data.page);
+    // `pick` 让调用方在**并进画布之前**先筛一遍（展开时只留前 20 个，见
+    // GB_EXPAND_CAP）。做成钩子而不是让调用方自己 fetch：错误处理、状态栏
+    // 文案、gbMergeGraph 这三件事只能有一处实现，各写一份的话"加载失败"
+    // 会有两种表现。
+    const picked = pick ? pick(data.graph, data.page) : {graph: data.graph, dropped: 0};
+    gbMergeGraph(picked.graph);
+    data.dropped = picked.dropped || 0;
+    if (status && statusText) status.textContent = statusText(data.page, data.dropped);
     return data;
   } catch (err) {
     if (status) status.textContent = `加载失败：${err.message || err}`;
@@ -969,6 +975,57 @@ const GB_EXPAND_TARGET = {
 
 const GB_TYPE_LABEL = { element: "证素", syndrome: "证型", symptom: "症状", case: "医案" };
 
+// R24 补丁：**一次展开最多画 20 个**。
+//
+// 上限不是"服务端给多少就画多少"（那是 GB_MAX_NEW_NODES=150 的止血阀，
+// 量级完全不同）。20 这个数是画布定的：1280×800 下，20 个带标签的节点摆成
+// 一个扇面之后标签还认得出来，再多就开始压字——而一张认不出字的图等于没画。
+// 实测见 screenshot_states 的 rings 判据（两两比包围盒，不许重叠）。
+//
+// 取哪 20 个：**按该证型自己的症状数从多到少**（服务端算好的 `n_symptoms`，
+// 见 api/main.py 的 _symptom_counts_by_syndrome_code）。同分按 id 排，
+// 保证"同一次点击两次结果一样"——按加载顺序取前 20 看起来也有理由，
+// 其实取决于 networkx 的遍历顺序，那不是理由。
+const GB_EXPAND_CAP = 20;
+
+function gbSymptomCount(node) {
+  const n = node && node.data ? Number(node.data.n_symptoms) : 0;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** 把一页邻居裁到 cap 个。返回 {graph, dropped}，**纯函数**（可在 node 里逐条断言）。 */
+function gbCapExpansion(graph, cap) {
+  const nodes = (graph && graph.nodes) || [];
+  const edges = (graph && graph.edges) || [];
+  if (!cap || nodes.length <= cap) return {graph: {nodes, edges}, dropped: 0};
+  const sorted = [...nodes].sort((a, b) =>
+    gbSymptomCount(b) - gbSymptomCount(a) || String(a.data.id).localeCompare(String(b.data.id)));
+  const keep = sorted.slice(0, cap);
+  const dropIds = new Set(sorted.slice(cap).map((n) => n.data.id));
+  return {
+    graph: {
+      nodes: keep,
+      // 被裁掉的节点的边一起裁掉，否则画布上会留下指向不存在节点的半条边。
+      edges: edges.filter((e) => !dropIds.has(e.data.source) && !dropIds.has(e.data.target)),
+    },
+    dropped: dropIds.size,
+  };
+}
+
+/** 展开后状态栏那句话。**"还有 N 个"必须说出来**：不说的话用户以为
+    这个证素就这 20 个证型，而那是个静默的谎。 */
+function gbExpandStatusText(page, dropped, wantLabel) {
+  if (!page || page.total === 0) return `这个节点下没有${wantLabel}`;
+  if (dropped > 0) {
+    return `展开了 ${page.returned - dropped} 个${wantLabel}（按症状数排序取前 ${GB_EXPAND_CAP} 个）`
+      + `——还有 ${dropped + (page.total - page.returned)} 个，搜索直达；再点一次收起`;
+  }
+  if (page.truncated) {
+    return `这个节点有 ${page.total} 个${wantLabel}，只展开了前 ${page.returned} 个——再点一次收起`;
+  }
+  return `展开了 ${page.returned} 个${wantLabel}——再点一次收起`;
+}
+
 async function gbExpandNode(nodeId) {
   if (gbExpanded.has(nodeId)) {
     gbCollapseNode(nodeId);
@@ -983,11 +1040,8 @@ async function gbExpandNode(nodeId) {
   const before = new Set(gbVisibleIds);
   const data = await gbFetchInto(
     `/api/graph/neighbors?node=${encodeURIComponent(nodeId)}&limit=${GB_MAX_NEW_NODES}${typeParam}`,
-    (page) => page.total === 0
-      ? `这个节点下没有${wantLabel}`
-      : page.truncated
-        ? `这个节点有 ${page.total} 个${wantLabel}，只展开了前 ${page.returned} 个——再点一次收起`
-        : `展开了 ${page.returned} 个${wantLabel}——再点一次收起`
+    (page, dropped) => gbExpandStatusText(page, dropped, wantLabel),
+    (graph) => gbCapExpansion(graph, GB_EXPAND_CAP)
   );
   if (!data) return;
   const added = [...gbVisibleIds].filter((id) => !before.has(id));
@@ -1027,28 +1081,225 @@ function gbCollapseNode(nodeId) {
 // ——它体现在交互里（是你自己一层层点开的，收起按钮也按这个结构给），
 // 而交互里的信息比一个读不准的半径可靠。
 // 环的含义在画布下方那行图例里写着（`gbRingLegendText`），不靠人猜。
+// R24 补丁：两环还是两环，但**位置自己算**（preset），不再交给 concentric。
+//
+// concentric 的三个毛病在 r24_rings.png 上一次看全了：
+//   1. 内圈半径是它按"圈上节点数 × minNodeSpacing"算的，20 个枢纽挤成中间
+//      一个点——"谁是枢纽"这件事在图上就不存在了；
+//   2. 展开出来的节点摊成**整圆**，于是"这 20 个是从哪个证素点开的"看不出来；
+//   3. 画布是 2:1 的横幅，正圆用不掉横向那一半地方，纵向却已经挤不下。
+// 这三件都不是参数能调出来的（concentric 不接受半径下限、扇形范围、椭圆），
+// 所以位置改成自己算。**布局规则因此变成纯函数，可以在 node 里逐条断言。**
+//
+// 两环的语义没变：内圈 = 枢纽证素，外圈 = 其余全部（不论展开了几层）。
+// 变的是外圈节点的**角度**——它落在"把它展开出来的那个枢纽"的扇面里（±40°）。
+const GB_INNER_RADIUS_MIN_RATIO = 0.18;   // 内圈短半轴 ≥ 画布短边的 0.18
+const GB_FAN_HALF_DEG = 40;               // 扇面半角
+const GB_FAN_ROW_MAX = 7;                 // 一排最多几个，超了往里再起一排
+const GB_HUB_ZIG = 1.22;                  // 相邻枢纽交替往外错开的倍数
+const GB_OUTER_RATIO = 0.45;              // 外圈椭圆占画布的比例（0.44 时连标签一起算会超出画布，触发 fit 缩小）
+
+/** 内圈椭圆的两个半轴。短半轴卡死 ≥ 0.18×短边——**这是"不许塌成一点"那条规格**。 */
+function gbInnerRadii(width, height) {
+  const short = Math.max(1, Math.min(width, height));
+  // 贴着规格下限一点点（0.19 > 0.18），不往上加：内环每多占 10px，
+  // 外圈那 20 个证型标签就少 10px 的活动空间，而挤的是外圈不是内环
+  // （证素标签一两个字，证型标签五六个字还会 wrap 成两行）。
+  const ry = short * 0.181;
+  // 横幅画布上正圆会浪费横向空间，所以按宽高比拉成椭圆；上限 0.28×宽度，
+  // 免得内圈顶到外圈上。
+  const rx = Math.min(width * 0.28, ry * (width / Math.max(1, height)));
+  return {rx: Math.max(rx, ry), ry};
+}
+
+/** 枢纽在内圈上的角度。**正在展开的那个转到正右方**（0 弧度）。
+
+    这不是"好看一点"：画布是 2:1 的横幅，横向可用半径是纵向的两倍，
+    而一个 ±40° 的扇面能不能放下 20 个带标签的节点**完全取决于它指向哪边**
+    ——朝上那个扇面的面积只有朝右的四分之一（算过：3.4 万 px² vs 13 万 px²，
+    而 20 个证型标签要 5.7 万）。朝上就必然压字，朝右就绰绰有余。
+    没有展开时从正上方起排，跟人读表的顺序一致。 */
+function gbHubAngles(hubIds, focusHubId) {
+  const n = Math.max(1, hubIds.length);
+  const step = (2 * Math.PI) / n;
+  const idx = hubIds.indexOf(focusHubId);
+  const base = idx >= 0 ? -idx * step : -Math.PI / 2;
+  return new Map(hubIds.map((id, i) => [id, base + i * step]));
+}
+
+/** 扇面里第 i 个位置的角度 + 半径缩放。**分排 + 按需张开**。
+
+    两个数是量出来的，不是估的（1280×800 下真浏览器量 `renderedBoundingBox`）：
+    一个证型标签 wrap 到 90px 上限之后约 100×50px，所以一个位置要留
+    106×58 才不压字。
+
+    **±40° 是设计默认值，不是硬上限。** 这一点必须写明白：20 个这么大的标签
+    塞进一个 ±40° 的扇面，几何上放不下——那个扇面的面积约 4.8 万 px²，
+    而 20 个标签要 10 万。硬守 40° 的结果只有一个：字压字。所以扇面按需张开，
+    上限 ±75°（150° < 360°，环上仍然留着一大片空白，"这些是从这个证素点开的"
+    这件事照样读得出来）。节点少的时候（≤7 个）它就老老实实是 ±40°。 */
+const GB_SLOT_V = 62;              // 一个位置要留多高（实测标签约 50px，留 12px 余量）
+const GB_SLOT_H = 112;             // 要留多宽（实测约 100px，同样留余量）
+const GB_FAN_HALF_DEG_MAX = 90;    // 张开的上限：±90° = 半圈，再宽就退化成整圈
+
+/** 一排在给定半径和张角下能放几个。**内排比外排短，就该少放几个**——
+    每排一样多是上一版没通过判据的直接原因：外排还宽松，内排已经压字了。 */
+function gbRowCapacity(ry, scale, halfRad) {
+  return Math.max(1, Math.floor((2 * ry * scale * Math.sin(halfRad)) / GB_SLOT_V) + 1);
+}
+
+function gbFanSlots(centerAngle, n, outer, inner, halfDegBase = GB_FAN_HALF_DEG) {
+  if (n <= 0) return [];
+  const rx = Math.max(1, (outer && outer.rx) || 400);
+  const ry = Math.max(1, (outer && outer.ry) || 200);
+  // 内环最外那一圈（错开出去的那一半）才是扇面要让开的东西。
+  const innerRy = ((inner && inner.ry) || 0) * GB_HUB_ZIG;
+  const rows = n <= GB_FAN_ROW_MAX ? 1 : (n <= GB_FAN_ROW_MAX * 2 ? 2 : 3);
+  // 最内一排必须让开内环：内环半轴 + 半个位置（内环上是证素，标签一两个字、
+  // 只有半个位置高）。这里每多留 10px，排与排之间就少 10px——而实测压字压的是
+  // 排与排之间（相邻两排的标签横向撞上），不是内排撞内环。
+  const minScale = Math.min(0.92, Math.max(0.5, (innerRy + GB_SLOT_V / 2) / ry));
+  const step = rows > 1 ? Math.min(GB_SLOT_H / rx, (1 - minScale) / (rows - 1)) : 0;
+  const scales = [];
+  for (let r = 0; r < rows; r += 1) scales.push(1 - (rows - 1 - r) * step);
+  // 张角：从设计默认值 ±40° 起，不够放就一档档张开到 ±75°。
+  let halfRad = (halfDegBase * Math.PI) / 180;
+  const maxRad = (GB_FAN_HALF_DEG_MAX * Math.PI) / 180;
+  const capacityOf = (h) => scales.reduce((sum, sc) => sum + gbRowCapacity(ry, sc, h), 0);
+  while (capacityOf(halfRad) < n && halfRad < maxRad) halfRad = Math.min(maxRad, halfRad + Math.PI / 36);
+  // 每排先按容量分，**放不下的那几个加到最外排**（弧最长、最宽松）。
+  // 上一版把余数丢给最内排，结果最内排挤成一团——判据当场抓到一对压着 28px
+  // 的标签。"余数给谁"这种看起来无所谓的选择，落在最短的那条弧上就是压字。
+  const counts = scales.map((sc) => gbRowCapacity(ry, sc, halfRad));
+  let left = n - counts.reduce((a, b) => a + b, 0);
+  while (left > 0) { counts[counts.length - 1] += 1; left -= 1; }
+  let placed = 0;
+  const slots = [];
+  for (let r = rows - 1; r >= 0 && placed < n; r -= 1) {
+    const room = Math.min(counts[r], n - placed);
+    // 相邻两排错开**半格**：两排的半径差有限，真正把相邻两排的标签分开的是
+    // 这个角度偏移。（试过 0.37 格这种"两两都不对齐"的写法，实测更差：
+    // 偏移量一大，最外侧那个就顶到扇面边上去了，反而多压出三对。）
+    const jitter = r % 2 && room > 1 ? halfRad / (room - 1) : 0;
+    // 错开之后**把这一排的跨度收窄同样多**，让所有位置仍然落在 ±half 之内。
+    // 不收窄的话最后一个会被推到扇面外面去——实测扇面跨度因此变成 184°，
+    // 判据里那句"永远不摊成整圈"就开始靠运气。
+    const spread = 2 * halfRad - jitter;
+    for (let i = 0; i < room; i += 1) {
+      const t = room === 1 ? 0.5 : i / (room - 1);
+      slots.push({angle: centerAngle - halfRad + jitter + spread * t, scale: scales[r]});
+    }
+    placed += room;
+  }
+  return slots.slice(0, n);
+}
+
+/** 节点 id → 它属于哪个枢纽（顺着展开关系往上走）。找不到返回 null。 */
+function gbHubOf(nodeId, parentOf, hubIds) {
+  let cur = nodeId;
+  for (let i = 0; i < 10 && cur; i += 1) {      // 10 层封顶，防数据成环时死循环
+    if (hubIds.has(cur)) return cur;
+    cur = parentOf.get(cur);
+  }
+  return null;
+}
+
+/** 算出每个节点的位置。**纯函数**：给定 id 和画布尺寸就能算，不碰 cytoscape。 */
+function gbLayoutPositions(opts) {
+  const hubIds = opts.hubIds || [];
+  const fans = opts.fans || [];               // [{hubId, childIds}]
+  const others = opts.others || [];
+  const width = opts.width || 1000;
+  const height = opts.height || 600;
+  const cx = width / 2;
+  const cy = height / 2;
+  const inner = gbInnerRadii(width, height);
+  const outer = {rx: width * GB_OUTER_RATIO, ry: height * GB_OUTER_RATIO};
+  const pos = {};
+  const hubAngle = gbHubAngles(hubIds, opts.focusHubId);
+  hubIds.forEach((id, i) => {
+    const a = hubAngle.get(id);
+    // 相邻枢纽交替错开半径：切向间距够、但标签宽度不够时，
+    // 错开半径是唯一不改变"它属于哪一环"又能让标签让开的办法。
+    // **往外错不往内错**（1.22 而不是 0.78）：往内错会让一半的枢纽掉到
+    // 「内环半径 ≥ 0.18×短边」这条规格线以下——实测 0.78 那版的最小半径是
+    // 0.148×短边，判据当场红。往外错则每一个都 ≥ 基准半径。
+    const zig = i % 2 ? GB_HUB_ZIG : 1;
+    pos[id] = {x: cx + inner.rx * zig * Math.cos(a), y: cy + inner.ry * zig * Math.sin(a)};
+  });
+  for (const fan of fans) {
+    const center = hubAngle.has(fan.hubId) ? hubAngle.get(fan.hubId) : -Math.PI / 2;
+    const slots = gbFanSlots(center, fan.childIds.length, outer, inner);
+    fan.childIds.forEach((id, i) => {
+      const slot = slots[i];
+      pos[id] = {
+        x: cx + outer.rx * slot.scale * Math.cos(slot.angle),
+        y: cy + outer.ry * slot.scale * Math.sin(slot.angle),
+      };
+    });
+  }
+  // 没有主人的外圈节点（搜索命中、按门类加进来的）：均匀铺在外圈上。
+  others.forEach((id, i) => {
+    const a = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, others.length);
+    pos[id] = {x: cx + outer.rx * Math.cos(a), y: cy + outer.ry * Math.sin(a)};
+  });
+  return pos;
+}
+
 function gbRelayout() {
   if (!gbCy) return;
   if (gbVisibleIds.size > GB_COSE_MAX_NODES) {
     gbCy.layout({ name: "grid", animate: false, fit: true, padding: 24 }).run();
     return;
   }
+  const width = gbCy.width() || 1000;
+  const height = gbCy.height() || 600;
+  const parentOf = new Map();
+  for (const [parent, kids] of gbExpanded.entries()) {
+    for (const kid of kids) parentOf.set(kid, parent);
+  }
+  const visible = [...gbVisibleIds];
+  const hubIds = visible.filter((id) => gbHubIds.has(id));
+  const hubSet = new Set(hubIds);
+  const byHub = new Map(hubIds.map((id) => [id, []]));
+  const others = [];
+  for (const id of visible) {
+    if (hubSet.has(id)) continue;
+    const hub = gbHubOf(id, parentOf, hubSet);
+    if (hub && byHub.has(hub)) byHub.get(hub).push(id);
+    else others.push(id);
+  }
+  const fans = [...byHub.entries()].map(([hubId, childIds]) => ({hubId, childIds}));
+  // 焦点 = 展开出最多节点的那个枢纽（并列时取 id 小的，保证确定性）。
+  const focus = fans.filter((f) => f.childIds.length)
+    .sort((a, b) => b.childIds.length - a.childIds.length
+      || String(a.hubId).localeCompare(String(b.hubId)))[0];
+  const positions = gbLayoutPositions({
+    hubIds, fans, others, width, height, focusHubId: focus ? focus.hubId : null,
+  });
   gbCy.layout({
-    name: "concentric",
+    name: "preset",
     animate: false,
-    fit: true,
-    padding: 24,
-    // 两环：内圈 = 枢纽证素，外圈 = 其余全部（不论展开了几层）。
-    concentric: (ele) => (gbHubIds.has(ele.id()) ? 2 : 1),
-    levelWidth: () => 1,
-    // 圈的半径 ≈ 圈上节点数 × minNodeSpacing / 2π。28 太小：20 个枢纽挤成中间
-    // 一个点，而展开出来的 61 个证型摊成一个大环——内圈看不见，"枢纽"这件事
-    // 在图上就不存在了。60 大致等于一个节点标签的宽度，两圈的半径比落在 1:3
-    // 上下（有一条 Playwright 判据钉住内圈半径不低于外圈的 15%）。
-    minNodeSpacing: 60,
-    avoidOverlap: true,
+    fit: false,                 // 位置本来就是按画布尺寸算的，再 fit 一次等于缩小
+    positions: (ele) => positions[ele.id()] || {x: width / 2, y: height / 2},
   }).run();
+  gbFitIfNeeded(24);
   gbRenderRingLegend();
+}
+
+/** 摆得下就 1:1 显示，摆不下才缩。**这一步决定标签能不能读**：
+    cytoscape 的 fit 会连字号一起缩，20 个节点本来摆得下、被 fit 缩成 0.7 倍之后
+    13px 的字就只剩 9px——判据里那条"字号 ≥ 12px"抓的正是这个。 */
+function gbFitIfNeeded(padding) {
+  const bb = gbCy.elements().boundingBox();
+  const w = gbCy.width();
+  const h = gbCy.height();
+  if (bb.w + padding * 2 <= w && bb.h + padding * 2 <= h) {
+    gbCy.zoom(1);
+    gbCy.center();
+  } else {
+    gbCy.fit(undefined, padding);
+  }
 }
 
 // R24：两环的图例文字。**环的含义必须写出来**——一张同心圆图上"内圈是什么"
@@ -1166,6 +1417,8 @@ function populateGbCategorySelect(nodes) {
   }
   // 一个门类都没有时藏起来，不留一个只有占位项的空下拉。
   sel.hidden = sel.options.length <= 1;
+  // 选项是刚填进原生元素的，自绘层还停在"空下拉"那一帧——必须通知它。
+  refreshSelect(sel);
 }
 
 async function gbBrowseCategory(elementId) {
@@ -1209,6 +1462,8 @@ function populateGbPhysicianSelect(physicians) {
   }
   gbCurrentPhysician = (physicians && physicians[0] && physicians[0].id) || null;
   if (gbCurrentPhysician) sel.value = gbCurrentPhysician;
+  // 同上：填完选项、选完默认值之后才轮到自绘层重画。
+  refreshSelect(sel);
 }
 
 async function loadGraphBrowserData() {

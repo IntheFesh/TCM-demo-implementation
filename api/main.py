@@ -279,6 +279,44 @@ def _node_payload(node_id: str, data: dict) -> dict:
     return {"data": node_data}
 
 
+def _symptom_counts_by_syndrome_code(store) -> dict[str, int]:
+    """证型编码 → 挂在它上面的症状数。
+
+    **症状不直接连证型**：这张图里症状连的是证素（`indicates` 边），
+    是哪个证型把它们串起来记在**边的 `via_syndrome` 属性**上（build_graph 的形状）。
+    所以"这个证型有多少症状"数不出来自节点的邻居，只能扫边。
+    第一版写成数 symptom 邻居，实测 61 个证型**全部返回 0**——一个恒为 0 的
+    排序键跟没有排序一样，而它不会报错。
+    """
+    by_code: dict[str, set] = {}
+    for u, _v, _k, d in store.g.edges(keys=True, data=True):
+        if d.get("edge_type") != "indicates":
+            continue
+        code = d.get("via_syndrome")
+        if not code:
+            continue
+        by_code.setdefault(code, set()).add(u)
+    return {code: len(srcs) for code, srcs in by_code.items()}
+
+
+def _symptom_count(store, node_id: str, data: dict, by_code: dict[str, int]) -> int:
+    """挂在这个节点上的症状数。**一个问题，两种编码**：证型走边上的
+    `via_syndrome`，其余节点（证素等）走直接邻居。合成一个函数是因为
+    调用方问的是同一句话，分两处会让"证型怎么数"散到调用点上去。
+    """
+    if data.get("node_type") == "syndrome":
+        return by_code.get(data.get("code"), 0)
+    g = store.g
+    return len({nb for nb in (list(g.successors(node_id)) + list(g.predecessors(node_id)))
+                if g.nodes[nb].get("node_type") == "symptom"})
+
+
+def _node_with_symptom_count(store, node_id: str, data: dict, by_code: dict[str, int]) -> dict:
+    payload = _node_payload(node_id, data)
+    payload["data"]["n_symptoms"] = _symptom_count(store, node_id, data, by_code)
+    return payload
+
+
 def _edge_payload(src: str, dst: str, key, data: dict) -> dict:
     edge_data = {"id": f"{src}::{dst}::{key}", "source": src, "target": dst}
     for k, v in data.items():
@@ -415,9 +453,14 @@ def api_graph_neighbors(node: str, limit: int = 200, node_types: str | None = No
     total = len(seen)
     picked = list(seen.items())[:max(limit, 0)] if limit and limit > 0 else list(seen.items())
     keep = {nid for nid, _ in picked} | {node}
+    symptom_counts = _symptom_counts_by_syndrome_code(store)
     return {
         "graph": {
-            "nodes": [_node_payload(nid, d) for nid, d in picked],
+            # `n_symptoms` 是**给前端排序用的派生字段**：图谱浏览器一次只画得下
+            # 20 个（GB_EXPAND_CAP），"是哪 20 个"得有依据，按症状数取前 20 是
+            # 那个依据。前端算不了——它手里只有这一页，证型→症状那一层还没加载。
+            "nodes": [_node_with_symptom_count(store, nid, d, symptom_counts)
+                      for nid, d in picked],
             "edges": [e for e in edges
                       if e["data"]["source"] in keep and e["data"]["target"] in keep],
         },

@@ -381,8 +381,15 @@ seg_8() {
 }
 
 seg_9() {
-  # R21~R24 攒下来的上机项，合成一段。**排在最后**：它要的东西前面几段都得先有
-  # （前缀规模要 cases.json、命中率要真实 API、E3/E4 要评测框架跑通）。
+  # R21~R24 攒下来的上机项，合成一段。段号排在最后（它要的东西前面几段都得先有：
+  # 前缀规模要 cases.json、命中率要真实 API、E3/E4 要评测框架跑通），
+  # **但顺序上建议提前单独跑**：
+  #
+  #     bash scripts/run_onsite.sh --only 9
+  #
+  # 理由是②③两步决定的是**默认配置成不成立**（full_context 能不能当默认），
+  # 而它们只要 cases.json + 真实 key，不依赖段 5~8 的产物。闸门没过要退回 hybrid
+  # ——那件事越早知道越好：等段 5/7 那几千次调用花完再发现，钱是按错的默认配置花的。
   #
   # ⚠ **这一段跑出来的数跟段 7 的历史数不可比**：R21 把检索默认换成
   # full_context、R22 把 S3 改成采 3 次 + effort=max。三个旋钮都换了实验条件，
@@ -397,6 +404,36 @@ seg_9() {
   echo "--- ③ full_context 下的 E3/E4。判据：两个 change_rate 各自 ≥ 0.4 ---"
   echo "--- **跟 top3 系那两个数（0.451 / 0.497）并列报，不相减**：换掉的量不同 ---"
   RETRIEVER_MODE=full_context python -m eval.run_eval --e3 --e4 || return 1
+  # **闸门没过要当场停，并且给出退路。** 这是 R21 那个决定的兜底：把默认检索
+  # 模式从 hybrid 换成 full_context 是拿 E3/E4 闸门担保的，闸门不过就说明
+  # "全量语料让模型更认得出这是谁的医案"这个前提在真机上不成立——那时该退回
+  # hybrid，而不是带着一个没过闸门的默认配置去演示。
+  # 闸门阈值不在这里写死：问 eval/run_eval.py 的 GATE_OUTPUT_CHANGE_RATE
+  # （全项目一处），bash 这边只负责读报告和给退路。
+  python - <<'GATE_PY' || return 1
+import json, sys
+from pathlib import Path
+from eval.run_eval import GATE_OUTPUT_CHANGE_RATE as GATE
+
+bad = []
+for name, key in (("report_e3.json", "e3"), ("report_e4.json", "e4")):
+    path = Path("eval") / name
+    if not path.exists():
+        bad.append(f"{name} 不在（这一段没跑完）")
+        continue
+    rate = (json.loads(path.read_text(encoding="utf-8")).get(key) or {}).get("change_rate")
+    if rate is None:
+        bad.append(f"{key}: change_rate 是 null（可用样本两侧检索全为空，闸门无法判定）")
+    elif rate < GATE:
+        bad.append(f"{key}: change_rate {rate:.3f} < {GATE}")
+if bad:
+    print("闸门未通过：" + "；".join(bad), file=sys.stderr)
+    print("**默认检索模式退回 hybrid：export RETRIEVER_MODE=hybrid**", file=sys.stderr)
+    print("（退回之后 top3 系那套数才是可引的；full_context 系的行留 ⏳ 并写明闸门没过）",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"E3/E4 两个 change_rate 都 ≥ {GATE}，full_context 可以继续当默认。")
+GATE_PY
 
   echo "--- ④ 字体子集化（0 调用，要网络取原始字体）。判据：每个面 < 原始的 10% ---"
   python -m scripts.subset_fonts --check-deps || {

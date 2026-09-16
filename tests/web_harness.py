@@ -57,6 +57,19 @@ def load_app_js() -> str:
     return "\n".join((WEB / name).read_text(encoding="utf-8") for name in SCRIPT_FILES)
 
 
+def load_ui_js() -> str:
+    """只要 `ui/select.js` + `graph.js`，**不含 app.js**。
+
+    给 DOM_FAKE 那一路用：app.js 末尾有一批加载即执行的初始化
+    （`getElementById("tab-btn-consult").addEventListener(...)` 这种），
+    它们要的是一个真实页面，在假 DOM 上会当场抛 TypeError。
+    把 app.js 排除掉不是"绕过问题"——这一路测的是自绘下拉这一层的渲染行为，
+    页面初始化那一层由 Playwright 兜。
+    """
+    return "\n".join((WEB / name).read_text(encoding="utf-8")
+                     for name in ("ui/select.js", "graph.js"))
+
+
 def load_css() -> str:
     return (WEB / "app.css").read_text(encoding="utf-8")
 
@@ -79,3 +92,140 @@ def js_tmp(source: str) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
         f.write(source)
         return f.name
+
+
+# **第二个 DOM 桩，回答的不是同一个问题**（CLAUDE.md 第 31 条的例外，走例外要写清区别）：
+#
+#   DOM_STUB（上面那个 Proxy）回答「被测代码在没有 DOM 的地方跑会不会炸」——
+#       它什么都接住、什么都不记录，所以纯函数能测，渲染结果测不了。
+#   DOM_FAKE（这个）回答「自绘层真的把东西渲染成了什么」——
+#       它记录父子关系、属性、文本和事件，所以 `enhanceSelect` 的行为可以被断言。
+#
+# 合成一个的话，Proxy 那种"什么都接住"的性质会让所有断言恒真，
+# 而恒真的断言正是这一轮要修的那个 bug 当初没被发现的原因。
+#
+# **它仍然刻意不是一个像样的 DOM**：只实现 select.js 真正用到的那些 API。
+# 真实渲染（字号、重叠、能不能点开）由 Playwright 兜，那是另一条路。
+DOM_FAKE = r"""
+class FakeEvent {
+  constructor(type, opts) {
+    this.type = type;
+    this.bubbles = !!(opts && opts.bubbles);
+    this.defaultPrevented = false;
+    this.target = null;
+  }
+  preventDefault() { this.defaultPrevented = true; }
+}
+globalThis.Event = FakeEvent;
+
+class FakeNode {
+  constructor(tag) {
+    this.tagName = String(tag || "").toUpperCase();
+    this.children = [];
+    this.parentNode = null;
+    this.attributes = {};
+    this.className = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.id = "";
+    this._text = "";
+    this._listeners = {};
+    const owned = new Set();
+    this.classList = {
+      add: (c) => owned.add(c),
+      remove: (c) => owned.delete(c),
+      contains: (c) => owned.has(c),
+    };
+  }
+  get textContent() {
+    return this.children.length ? this.children.map((c) => c.textContent).join("") : this._text;
+  }
+  set textContent(v) { this.children = []; this._text = String(v); }
+  setAttribute(k, v) { this.attributes[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null; }
+  _detach(n) {
+    if (n.parentNode) {
+      const i = n.parentNode.children.indexOf(n);
+      if (i >= 0) n.parentNode.children.splice(i, 1);
+    }
+  }
+  appendChild(n) { this._detach(n); n.parentNode = this; this.children.push(n); return n; }
+  insertBefore(n, ref) {
+    this._detach(n);
+    n.parentNode = this;
+    const i = ref ? this.children.indexOf(ref) : -1;
+    if (i < 0) this.children.push(n); else this.children.splice(i, 0, n);
+    return n;
+  }
+  contains(n) {
+    if (n === this) return true;
+    return this.children.some((c) => c.contains(n));
+  }
+  addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
+  dispatchEvent(e) {
+    e.target = e.target || this;
+    for (const fn of this._listeners[e.type] || []) fn(e);
+    return !e.defaultPrevented;
+  }
+  focus() { globalThis.document.activeElement = this; }
+  querySelectorAll() { return []; }
+}
+
+class FakeOption extends FakeNode {
+  constructor(value, label) { super("option"); this.value = value; this.textContent = label; }
+}
+
+class FakeSelect extends FakeNode {
+  constructor() { super("select"); this.options = []; this.selectedIndex = -1; }
+  appendChild(n) {
+    super.appendChild(n);
+    if (n.tagName === "OPTION") {
+      this.options.push(n);
+      if (this.selectedIndex < 0) this.selectedIndex = 0;
+    }
+    return n;
+  }
+  // graph.js 只用 `sel.innerHTML = '<option value="">…</option>'` 这一种写法
+  // （清空 + 放一个占位项），所以只支持这一种。别的写法要用到时再加，
+  // 不预先造一个"通用 HTML 解析器"——那会让这个桩自己变成要维护的东西。
+  set innerHTML(v) {
+    this.children = [];
+    this.options = [];
+    this.selectedIndex = -1;
+    const m = /<option value="([^"]*)">([^<]*)<\/option>/.exec(String(v));
+    if (m) this.appendChild(new FakeOption(m[1], m[2]));
+  }
+  get innerHTML() { return ""; }
+  get value() { const o = this.options[this.selectedIndex]; return o ? o.value : ""; }
+  set value(v) { const i = this.options.findIndex((o) => o.value === v); if (i >= 0) this.selectedIndex = i; }
+}
+
+const FAKE_BY_ID = {};
+globalThis.document = {
+  activeElement: null,
+  createElement: (tag) => (String(tag).toLowerCase() === "select" ? new FakeSelect() : new FakeNode(tag)),
+  createTextNode: (t) => { const n = new FakeNode("#text"); n.textContent = t; return n; },
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  getElementById: (id) => FAKE_BY_ID[id] || null,
+  addEventListener: () => {},
+  body: new FakeNode("body"),
+};
+globalThis.window = {addEventListener: () => {}, localStorage: {getItem: () => null, setItem: () => {}}};
+globalThis.cytoscape = new Proxy(function () {}, {
+  get: () => globalThis.cytoscape, set: () => true,
+  apply: () => globalThis.cytoscape, construct: () => globalThis.cytoscape,
+});
+
+/** 造一个挂在容器里的原生 select（带 id，可被 getElementById 找到）。 */
+function fakeSelect(id, pairs) {
+  const host = new FakeNode("div");
+  const sel = new FakeSelect();
+  sel.id = id;
+  sel.setAttribute("data-custom-select", "");
+  for (const [value, label] of pairs || []) sel.appendChild(new FakeOption(value, label));
+  host.appendChild(sel);
+  FAKE_BY_ID[id] = sel;
+  return sel;
+}
+"""
