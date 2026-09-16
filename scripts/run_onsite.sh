@@ -126,6 +126,7 @@ SEGMENTS=(
   "7|全套评测重跑|1200|no|最贵的一段：run_eval 四项 + SDT Test（会写台账）"
   "8|性能基准|38|no|bench_startup 冷/热各一次（0 调用）+ bench_consult 不开 ReAct ×3、开 ReAct ×1"
   "9|R21~R24 的上机项|320|no|前缀规模 0 + 缓存命中率 2 次问诊 ×11 = 22 + full_context 下 E3/E4（9 条主诉 × own/swapped/none 三种 × 11 次/问诊 ≈ 297）+ 字体子集化 0。**这个 11 是 R22 之后的 calls_per_consult()**（2 + 3 医家 × 采样 3 次）"
+  "10|R26 蒸馏（可选）|350|YES|**不做也能交付**：蒸馏是研究证据、不进演示路径。预估 350 次 = 70 条 × calls_per_consult(3 位医家, best_of_n=1)=5。70 这个数是 ¥40 预算按高峰价现算出来的（offline/distill_from_v4 --estimate），**不是配方要的 8000 条**——那要 ¥3956，见 docs/reports/R26_report.md 第三节"
 )
 
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -173,7 +174,7 @@ is_peak() { python3 -c "import sys; from core.usage import is_peak; sys.exit(0 i
 
 # 这几段是花钱的大头（段 5 药理层抽取、段 6 录制、段 7 全套评测、段 8 性能基准）。
 # 高峰时段启动它们只提醒、**不阻止**：有时就是得现在跑。
-COSTLY_SEGMENTS=" 5 6 7 8 9 "
+COSTLY_SEGMENTS=" 5 6 7 8 9 10 "
 
 warn_if_peak() {
   local n="$1"
@@ -203,11 +204,19 @@ print_plan() {
   echo "全部跑完预估 ${total} 次调用 ≈ ¥${yuan}（均价 ¥${YUAN_PER_CALL}/次，"
   echo "来源是 README 里 record_fixtures 那条「约 272 次 ¥1.5」——量级估算，不是账单）"
   echo
+  echo "⚠ **这个总数是下限，不是上限。** 那个均价是 top3 时代量出来的：一次调用只带"
+  echo "  三条医案。R21 之后 full_context 每次调用要带 ~18 万 token 的知识前缀，"
+  echo "  R22 之后 S3 在 effort=max 下思考 token 按输出计费——段 9/10 的每次调用"
+  echo "  贵一个量级。段 10 自己的估算器（offline/distill_from_v4 --estimate）报的是"
+  echo "  ¥40 买 70 条，也就是 ¥0.11/次，是均价的 20 倍。**按段问它自己的估算器，"
+  echo "  不要拿这个均价去算那两段。**"
+  echo
   echo "段 0/1 零调用，先跑它们：免费的问题先发现掉。段 5 最贵，但段 6/7 要用它落盘的"
   echo "药理层数据（core/tools.py 读 data/materia_medica.jsonl），所以它在两者之前。"
-  echo "段 7 是最贵的一段；段 8 性能基准要量的是跑完前面所有段之后的这套系统，所以排在它后面。"
-  echo "段 9（R21~R24 的上机项）排最末：它要的东西前面几段都得先有——前缀规模要 cases.json、"
+  echo "段 7 是（top3 系里）最贵的一段；段 8 性能基准要量的是跑完前面所有段之后的这套系统。"
+  echo "段 9（R21~R24 的上机项）要的东西前面几段都得先有——前缀规模要 cases.json、"
   echo "命中率要真实 API、full_context 下的 E3/E4 要评测框架跑通、字体子集化要联网取原始字体。"
+  echo "段 10（R26 蒸馏）排最末，而且**整段可以不做**：它是研究证据，不进演示路径。"
 }
 
 gate() {   # $1 = 段号, $2 = 这一步要人确认什么
@@ -398,6 +407,32 @@ seg_9() {
   python -m scripts.subset_fonts || return 1
   echo "--- 把上面打印的四段 @font-face 贴进 web/app.css，再跑一次演示自检 ---"
   python -m scripts.demo_preflight || true
+}
+
+seg_10() {
+  # R26：从 v4-pro 蒸六步链样本。**这一段可以整段不做**——蒸馏是研究证据，
+  # 不进演示、不阻塞交付（总纲 R26 原话）。
+  #
+  # ⚠ 它是全剧本唯一一段「预算决定规模」而不是「规模决定预算」的段：
+  # 配方要 8000 条，¥40 只买得起 70 条（高峰价）。脚本默认按预算现算条数，
+  # 所以**不传 --limit 就不会超预算**；真要 8000 条得先决定花 ¥3956。
+  echo "--- ① 先估钱（0 调用）。判据：打印出的条数 × 预算跟你打算花的钱一致 ---"
+  python -m offline.distill_from_v4 --estimate || return 1
+
+  echo "--- ② 真跑。超过 ¥30 要 --yes-spend（§0.5 第 2 条第三款），这是人工卡点那一步 ---"
+  python -m offline.distill_from_v4 --yes-spend || return 1
+
+  echo "--- ③ 训练计划（0 调用、不加载模型）。判据：train 条数不是 0 ---"
+  python -m scripts.train_lora --data distill_v4 --base qwen3.5-9b --dry-run || return 1
+
+  echo "--- ④ 真训要 GPU（32GB 单卡跑 9B 的 LoRA）。判据：heldout loss 不比 train 高出 20% ---"
+  python -m scripts.train_lora --data distill_v4 --base qwen3.5-9b --check-deps || {
+    echo "（缺训练依赖：pip install -r requirements-train.txt，然后重跑这一段）"
+    return 1
+  }
+  echo "--- ⑤ 蒸馏模型只跑一次 SDT Test 作为旁证，**跟 v4-pro 并列报、不覆盖** ---"
+  echo "    命令：LLM_MODE=local_inproc LORA_DIR=lora_out/qwen3.5-9b python -m eval.sdt.run --split Test"
+  echo "    判据：台账 eval/sdt/test_run_log.jsonl 多一行，且 RESULTS.md 那一行标明是蒸馏模型"
 }
 
 run_segment() {

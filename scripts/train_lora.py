@@ -49,7 +49,6 @@ from core.physicians import (
 from offline.export_sft import ITEMIZED_STEPS
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SAMPLES_PATH = ROOT / "sft_chain.jsonl"
 DEFAULT_OUT_DIR = ROOT / "lora_out"
 
 # 两个基座都要能跑，所以基座是**参数**不是写死的常量。RTX 5090 32GB 上 1.5B~1.8B
@@ -71,6 +70,29 @@ BASES: dict[str, dict] = {
         "note": "已在中医语料上继续预训练过的基座。对照的意义是回答「先验中医知识"
                 "有没有用」——它跟通用基座的差值就是那个答案",
     },
+    # R26：蒸馏那一路的基座。9B 比上面两个大一个量级，**32GB 单卡跑 LoRA 刚好**
+    # （全参微调塞不下），所以这一档只能 LoRA，不是"选择用 LoRA"。
+    # 它不参与"先验中医知识有没有用"那个对照（那对照要求两个基座同尺寸），
+    # 所以默认不训——`--base` 不传时只训上面那两个同量级的。
+    "qwen3.5-9b": {
+        "model": "Qwen/Qwen3.5-9B-Instruct",
+        "verified": False,
+        "note": "R26 蒸馏路径的基座（社区那套「8000 条把 V4 蒸进 9B」的配方）。"
+                "跟上面两个 1.5B/1.8B 不同量级，**不能跟它们并列比分**",
+    },
+}
+
+#: 默认要训的基座：同量级的那两个。R26 的 9B 要显式 `--base qwen3.5-9b` 才训——
+#: 不传就把三个都训会让"免费的对照"变成一次跨量级的误比。
+DEFAULT_BASE_KEYS = ("qwen2.5-1.5b", "zhongjing-2-1.8b")
+
+#: 数据集别名 → 样本文件。R26 的蒸馏产物走 `data/sft/distill_v4.jsonl`，
+#: 老的三源合并产物走仓库根的 `sft_chain.jsonl`。
+#: **只在这里映射一次**：`--samples` 照旧能传任意路径，`--data` 只是给这两个
+#: 常用的起个名字，免得命令行里到处抄路径（抄错一处的表现是"训练集是空的"）。
+DATASETS: dict[str, Path] = {
+    "chain": ROOT / "sft_chain.jsonl",
+    "distill_v4": ROOT / "data" / "sft" / "distill_v4.jsonl",
 }
 
 # LoRA 超参。这几个数是 peft 文档里 1B 级模型的常规起点，**不是在这个数据集上
@@ -447,8 +469,12 @@ def report_deps() -> bool:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="按医家训 LoRA（阶段五 M16）。两个基座都能跑，并列出对照。")
-    ap.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES_PATH,
-                    help="offline/export_sft.py --format chain 的产出")
+    ap.add_argument("--samples", type=Path, default=None,
+                    help="样本文件路径（默认由 --data 决定）")
+    ap.add_argument("--data", choices=sorted(DATASETS), default="chain",
+                    help="用哪份训练数据：chain=三源合并（offline/export_sft --format chain）、"
+                         "distill_v4=R26 从 v4-pro 蒸出来的（offline/distill_from_v4）。"
+                         "--samples 给了就以它为准。")
     ap.add_argument("--base", action="append", choices=sorted(BASES), default=None,
                     help="可重复。不传就是两个基座都训——同一份数据训两个基座，"
                          "对照是免费的，而「先验中医知识有没有用」只能靠这个对照回答。")
@@ -473,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_deps:
         return 0 if report_deps() else 1
 
-    base_keys = args.base or sorted(BASES)
+    base_keys = args.base or list(DEFAULT_BASE_KEYS)
     if args.base_model and len(base_keys) != 1:
         raise SystemExit("--base-model 是给某一个基座换仓库 id 的，要同时用 --base 指定是哪个")
     bases = [resolve_base(k, args.base_model) for k in base_keys]
@@ -490,7 +516,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"认不出医家 {args.physician!r}。{physician_choices_text()}")
         physician_ids = [pid]
 
-    samples = load_chain_samples(args.samples)
+    samples_path = args.samples or DATASETS[args.data]
+    samples = load_chain_samples(samples_path)
     plan = build_plan(samples, physician_ids, base_keys, args.out_dir)
     print(format_plan_text(plan, bases))
 

@@ -778,3 +778,42 @@ class S3SyndromeUnreferenced(_S3Base):
         """让下游（幻觉检查、前端）按同一个接口读；这里永远是空——没有可引用的医案。
         是 property 不是字段：model_dump 里不会出现，api 层负责补一个空列表。"""
         return []
+
+
+class DistillStep(BaseModel):
+    """蒸馏产物里的一步。形状跟 `offline/export_sft.py` 的 `_step()` 一致——
+    步骤名的合法集合由那边的 `CHAIN_STEPS` 管（一处实现），这里只保证非空。
+
+    `output` 是 `str | list`：大多数步是一句结论，方剂→药材那一步是逐味药一项
+    （`ITEMIZED_STEPS`）。两种形状共存不是省事，是数据本身的形状。
+    """
+
+    step: str = Field(min_length=1)
+    output: str | list
+    rationale: str | None = None
+    source: str = Field(min_length=1)
+    rationale_source: str | None = None
+
+
+class DistillRecord(BaseModel):
+    """R26：一条蒸馏样本（教师模型在 `full_context` 下对一条主诉、一位医家的输出）。
+
+    **新建 schema，没有动任何既有字段**——CLAUDE.md 那条铁律要求的正是这个形状：
+    新场景要的字段不一样时新建一个，不去放松 `S3Syndrome` 的约束。
+    这里的 `Field(min_length=1)` 是同一套防幻觉思路：样本 id、医家、主诉、
+    教师模型名、来源标签一个都不许是空串——空串会在训练集里变成"没有出处的样本"，
+    而那正是蒸馏最容易悄悄引入的一类脏数据。
+
+    `teacher_saw_source_case`：这条主诉的来源医案是不是就在教师自己的知识前缀里
+    （医案那一半恒为 True，SDT 那一半恒为 False）。**下游必须分开统计**：
+    教师抄自己语料抄得准，不等于它会推理。
+    """
+
+    sample_id: str = Field(min_length=1)
+    source: Literal["sdt", "case"]
+    physician: str = Field(min_length=1)
+    complaint: str = Field(min_length=1)
+    steps: list[DistillStep] = Field(min_length=1)
+    teacher_model: str = Field(min_length=1)
+    teacher_saw_source_case: bool
+    case_refs: list[str] = Field(default_factory=list)

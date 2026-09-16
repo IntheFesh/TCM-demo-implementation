@@ -127,6 +127,39 @@ def peak_note(now: datetime | None = None) -> str:
     return f"北京时间 {stamp}：谷段，**五折**计费。适合跑贵的段。"
 
 
+#: 每百万 token 的价格（美元，DeepSeek 2026-08-17 起的峰谷分时表，**高峰价**）。
+#: 谷段五折（`OFF_PEAK_MULTIPLIER`）。汇率按 7.2 折成人民币——**这是估算**，
+#: 不是账单，用途是让人在花钱之前知道量级。
+#:
+#: **R26 把这三个数从 `api/main.py` 搬到这里**，理由是第 31 条：蒸馏脚本
+#: （`offline/distill_from_v4.py`）要算"这一跑花多少钱"，验 key 的提示语要算
+#: "第一次问诊花多少钱"，两处回答的是同一个问题（token → 人民币）。
+#: 价格表写两份的后果很具体：官方调一次价，改了一处、另一处继续按旧价估，
+#: 而两处都不会报错——一个按旧价算出来的预算正好是 §0.5 那条 ¥30 闸门要看的数。
+PRICE_USD_PER_MTOK_MISS = 1.32
+PRICE_USD_PER_MTOK_HIT = 0.044
+PRICE_USD_PER_MTOK_OUT = 3.96
+USD_TO_CNY = 7.2
+OFF_PEAK_MULTIPLIER = 0.5
+
+
+def cost_cny(*, miss_tokens: int = 0, hit_tokens: int = 0, out_tokens: int = 0,
+             peak: bool | None = None) -> float:
+    """三类 token → 人民币（估算）。**全项目只有这一处把 token 折成钱。**
+
+    `peak=None` 表示"按现在的时段算"（问 `is_peak()`）；传 True/False 是为了
+    让调用方能算"如果放到谷段跑"。谷段五折只影响钱、不影响额度（额度按调用数）。
+    """
+    if peak is None:
+        peak = is_peak()
+    usd = (miss_tokens * PRICE_USD_PER_MTOK_MISS
+           + hit_tokens * PRICE_USD_PER_MTOK_HIT
+           + out_tokens * PRICE_USD_PER_MTOK_OUT) / 1_000_000
+    if not peak:
+        usd *= OFF_PEAK_MULTIPLIER
+    return usd * USD_TO_CNY
+
+
 @dataclass(frozen=True)
 class QuotaDecision:
     """这一次请求该用哪个后端，以及为什么。`reason` 是给访问者看的原话。"""

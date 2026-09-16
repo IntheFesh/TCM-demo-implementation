@@ -72,7 +72,7 @@ R21 之后**默认走 full_context**：一位医家的全部医案 + 本草/方�
 | 13 | E3 own vs swapped（full_context：换成另一位医家的全量语料） | deepseek-v4-pro | ⏳ 无真机数 | 同一指标的 top3 系值 **0.451**（上表 #3）。**两个数不相减**：换掉的量不同（3 条 vs 全量），只看各自过不过 0.4 | ≥ 0.4（**跟 top3 系同一个闸门**，没有因为换了检索方式就放宽） | ⏳ 待上机：`RETRIEVER_MODE=full_context python -m eval.run_eval --e3` | ⏳ 还没跑过——凭据键沿用 `report_e3.json:e3.change_rate`，跑完落盘即生效 |
 | 14 | E4 own vs none（full_context：整块语料不给） | deepseek-v4-pro | ⏳ 无真机数 | 同一指标的 top3 系值 **0.497**（上表 #4） | ≥ 0.4（同上，不放宽） | ⏳ 待上机：`RETRIEVER_MODE=full_context python -m eval.run_eval --e4` | ⏳ 还没跑过——同 #13 |
 | 15 | 前缀缓存命中率（第二次起） | deepseek-v4-pro | ⏳ 无真机数；沙盒**模拟**命中率末次 0.996（`--simulate-cache`，按 64-token 块对齐算最长公共前缀，manifest 里标 `simulated_cache: true`） | 第一次跑必然接近 0（全 miss），所以对照是「同一脚本第 1 次 vs 第 2 次」。闸门定 0.9 不定 1.0：§6 那段（本次主诉）永远不命中，占 prompt 约 1% | ≥ 0.9（第二次跑） | ⏳ 待上机：`python -m scripts.bench_consult --backend real --repeat 2` | ⏳ 还没跑过——沙盒里没有真实 `usage.prompt_cache_hit_tokens`，模拟值不是真机值 |
-| 16 | 一次问诊的钱 | deepseek-v4-pro | ⏳ 无真机数 | 对照是同一次问诊在 miss 价上的钱（首次）。按官方价算：单医家 ≈180K token 首次 $0.24、之后 $0.008；三医家一次问诊 ≈¥0.17 | ≤ ¥0.5（第二次起） | ⏳ 待上机：看 `/api/usage` 看板的 `tokens_today`，或 bench 产物里的 hit/miss token 数 | ⏳ 还没跑过——算式在 `api/main.py` 的 `_prefix_warmup_note`，它自己也会说明当前是估算 |
+| 16 | 一次问诊的钱 | deepseek-v4-pro | ⏳ 无真机数 | 对照是同一次问诊在 miss 价上的钱（首次）。按官方价算：单医家 ≈180K token 首次 $0.24、之后 $0.008；三医家一次问诊 ≈¥0.17。⚠ **R26 核出这个 ¥0.17 只算了命中的输入**（540K × $0.044/M × 7.2 = ¥0.171，对得上），没算输出——R22 之后 S3 在 `effort=max` 下思考 token 按输出价计费，按每次 3600 token 估，三次 S3 的输出是 ¥0.31，比输入那部分还大。所以这一格的对照要读成「输入 ¥0.17 + 输出 ≈¥0.31」，真机跑完按 `usage` 实测改 | ≤ ¥0.5（第二次起） | ⏳ 待上机：看 `/api/usage` 看板的 `tokens_today`，或 bench 产物里的 hit/miss token 数 | ⏳ 还没跑过——算式在 `api/main.py` 的 `_prefix_warmup_note`，它自己也会说明当前是估算 |
 | 17 | 每位医家的稳定前缀 token 数 | —（不调 LLM） | ⏳ 无真机数；沙盒**合成语料**（每位 20 条造的医案）下 5,868 ~ 6,008 | 预算 500,000 / 医家。对照是「裁了没裁」：合成规模下一段未裁；`--budget 6000` 能看到按固定顺序裁掉方剂速查表 | 不设闸门，超预算按固定顺序裁（医案永不裁） | ⏳ 待上机：`python -m core.context_prefix --report`（不带 `--synthetic`，读真 `cases.json`） | ⏳ 还没跑过——沙盒没有 `cases.json`，合成语料的绝对值不是真机数 |
 
 **E8 和 E9 两条留在 top3 系，不跟着换**：
@@ -84,6 +84,28 @@ R21 之后**默认走 full_context**：一位医家的全部医案 + 本草/方�
   而语料已经全在上下文里，所以 `full_context` 下 ReAct 一律关
   （`core/react.py::react_enabled`，即使 `USE_REACT=1` 也关，并打印一行说明）。
   E9 因此是**只在 top3 系有意义的指标**，0.463 那个数继续挂在上表 #6。
+
+## R26：蒸馏（研究证据，**不进产品路径**）
+
+最终推理后端是 `deepseek-v4-pro`（总纲 §1 已拍板）。蒸馏出来的小模型只作为
+「我们也训了」的旁证，跟 v4-pro **并列报、不覆盖**，也不进演示。
+
+**这一节最重要的不是某个分数，是一个成本事实**：R26 的脚本
+（`offline/distill_from_v4.py --estimate`）按 `core/usage.py` 的价格表现算出来——
+配方要的 8000 条样本，在 R21/R22 之后的架构下要 **¥3,956**（高峰价）/ **¥1,978**
+（谷段），而这一轮的预算是 ¥40。**¥40 买 70 条**（高峰价，脚本现算，不写死）。
+差 99 倍的原因不是哪里算错了，是两件事叠起来：R21 之后每次 S3 调用都带
+~18 万 token 的知识前缀（命中价也要钱），R22 之后 S3 的思考 token 按输出价计费。
+「一次问诊很便宜」和「八千次问诊很便宜」不是同一句话。
+
+| # | 指标 | 后端 | 当前值 | 对照 | 闸门 | 状态 | 凭据 |
+|---|---|---|---|---|---|---|---|
+| 18 | 蒸馏样本条数 / 花费 | deepseek-v4-pro | ⏳ 无真机数 | 配方 8000 条 ≈ ¥3,956（高峰）；¥40 预算 = 70 条。**两个数并列报**，不要只报后者——只报 70 条会让人以为配方就是 70 条 | 不设闸门；脚本自己卡 ¥30（要 `--yes-spend`）和 ¥40（一律不跑） | ⏳ 待上机：`python -m offline.distill_from_v4 --estimate` 看数，`--yes-spend` 真跑 | ⏳ 还没跑过——沙盒没有 `cases.json` 也没有 key，脚本会如实说"算不出前缀就算不出钱" |
+| 19 | 蒸馏模型 SDT Test | qwen3.5-9b + LoRA | ⏳ 无真机数 | 同一张卷子上的 v4-pro chain **23.173**（上表 #7）。**不相减**：不同模型、不同参数量，这一行只回答"训得起来吗"，不回答"谁更强" | 不设闸门（研究证据，不阻塞交付） | ⏳ 待上机（要 GPU）：段 10 第 ⑤ 步，`LLM_MODE=local_inproc` + `eval.sdt.run --split Test` | ⏳ 还没跑过——训练要 32GB 单卡，蒸馏数据要先落盘 |
+
+⚠ **第 19 行跑出来的分只准跟自己比，不准进「我们的系统得了多少分」那句话**：
+演示和材料里的分全部来自 v4-pro 管道（`docs/MATERIALS.md` 第二节第 4 条）。
+蒸馏模型是另一个系统，混着讲就是拿一个没进产品的东西去撑产品的结论。
 
 ## 性能：沙盒能量的四项 + 上机才能量的三项（R19 建表，每轮重量）
 
@@ -99,11 +121,11 @@ R21 之后**默认走 full_context**：一位医家的全部医案 + 本草/方�
 
 | # | 指标 | 当前值 | 对照基准 | 量法 | 凭据 |
 |---|---|---|---|---|---|
-| P1 | 冷进程 `import api.main` | **0.538** s（3 次取中位数，R25 重量；R24 0.611、R22 0.521、R23 0.542、R21 0.431、R19 0.517——**六轮在 0.43~0.61 之间来回摆**） | 它是 `bench_startup` 四段里的第一段。另外三段（construct / model_load / encode）要 cases.json 和真模型，沙盒量不了——所以这一段是沙盒里唯一跟真机可比的 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.import_api_main_s=0.538` |
-| P2 | `/health` p50（**五位**医家，R18 后） | **12.915** ms（200 次请求，R25 重量） | 见 P3 那一行——单看这个数说明不了任何事 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_five=12.915` |
-| P3 | `/health` p50（**三位**医家，R17 对照） | **13.536** ms（同一个进程、同一份代码，只把注册表砍回三位） | P2。⚠ **八次量下来方向来回翻**：R25 这次五位 12.915 / 三位 13.536（三位更慢 0.62ms）、R24 那次 12.749 / 12.791（**差 0.042ms，等于没差**）、R22 那次 12.782 / 13.025（三位更慢）、R23 那次 13.14 / 12.49（三位更快），R21 那次五位 8.481 / 三位 8.603（三位更慢），R19 那次 12.237 / 12.554（三位更慢），再往前两次是 13.806 / 12.666（三位更快）和 12.762 / 13.676（三位更慢）。**而且 R21 那次整组比 R19 快 3~4ms、R23 这次又涨回 R19 的量级**——同一份注册表代码，三轮之间来回摆 4ms，说明这个开销落在机器负载里，量不出来——**注册表从三位扩到五位的代价落在测量噪声里**，不能说"多两位医家慢了 1ms"，也不能说"更快了"——R25 这次三位比五位慢 0.62ms，比 R24 那次的 0.042ms 大了一个量级，方向却跟 R24 相反，八次里这是第五次翻向 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_three=13.536` |
-| P4 | 全量测试：条数 / 墙钟 | **2906** passed / **10** skipped / **0** failed，墙钟 **97.8** s | R17 结束时 2495 passed / 6 skipped；R18 结束时 2643 / 10；R19 结束时 2693 / 10；R21 结束时 2783；R23 结束时 2829；R22 结束时 2853；R24 结束时 2885。条数只增不减是硬约束（R21 +90、R23 +46、R22 +24、R24 +32、R25 +21）。墙钟 R19 89.9 → R21 66.2 → R23 89.8 → R22 90.8 → R24 97.0 → R25 97.8 s：**几轮之间墙钟先降 24s 又涨回去，而条数一路只增**——这一对数最该被读到的就是这件事，它把 R21 报告里「不能把 66.2 当成变快了」那句话直接证实了。R25 这 +21 条全部是不调 LLM 的脚本测试（`demo_preflight` 20 条），墙钟只涨 0.8s | `python -m scripts.bench_sandbox --all` | ✅ `bench/sandbox.json:bench.pytest_passed=2906` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` `bench/sandbox.json:bench.pytest_wall_s=97.8` |
-| P5 | Playwright 前端状态：通过数 / 墙钟 | **20** 种全过，墙钟 **47.8** s | R14 起 6 种 → R15 10 种 → R16 13 种 → R17 15 种 → R18 16 种 → R21/R23/R22 仍 16 种（那三轮没动前端，测的是「没有回归」）→ **R24 加到 20 种**（八项前端改造各自的验收）。墙钟的对照是「值不值得每轮都跑」——47 秒的答案是值得：R18 那轮它抓到一个所有 Python 测试都绿的回归，**R24 这轮又抓到两个**（对照带换 SVG 之后旧判据查的元素已经不存在；token 面板嵌在折叠区里时 innerText 读回空串）。R25 没动前端，这 20 种测的是「没有回归」 | `python -m scripts.screenshot_states` | ✅ `bench/sandbox.json:bench.playwright_states_passed=20` `bench/sandbox.json:bench.playwright_wall_s=47.8` |
+| P1 | 冷进程 `import api.main` | **0.575** s（3 次取中位数，R26 重量；R25 0.538、R24 0.611、R22 0.521、R23 0.542、R21 0.431、R19 0.517——**七轮在 0.43~0.61 之间来回摆**） | 它是 `bench_startup` 四段里的第一段。另外三段（construct / model_load / encode）要 cases.json 和真模型，沙盒量不了——所以这一段是沙盒里唯一跟真机可比的 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.import_api_main_s=0.575` |
+| P2 | `/health` p50（**五位**医家，R18 后） | **14.22** ms（200 次请求，R26 重量） | 见 P3 那一行——单看这个数说明不了任何事 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_five=14.22` |
+| P3 | `/health` p50（**三位**医家，R17 对照） | **13.401** ms（同一个进程、同一份代码，只把注册表砍回三位） | P2。⚠ **九次量下来方向来回翻**：R26 这次五位 14.22 / 三位 13.401（三位更快 0.82ms，又翻回去了）、R25 那次 12.915 / 13.536（三位更慢 0.62ms）、R24 那次 12.749 / 12.791（**差 0.042ms，等于没差**）、R22 那次 12.782 / 13.025（三位更慢）、R23 那次 13.14 / 12.49（三位更快），R21 那次五位 8.481 / 三位 8.603（三位更慢），R19 那次 12.237 / 12.554（三位更慢），再往前两次是 13.806 / 12.666（三位更快）和 12.762 / 13.676（三位更慢）。**而且 R21 那次整组比 R19 快 3~4ms、R23 这次又涨回 R19 的量级**——同一份注册表代码，三轮之间来回摆 4ms，说明这个开销落在机器负载里，量不出来——**注册表从三位扩到五位的代价落在测量噪声里**，不能说"多两位医家慢了 1ms"，也不能说"更快了"——R25 那次三位比五位慢 0.62ms、R26 这次又快 0.82ms，**相邻两轮同一份代码方向相反、幅度都在 1ms 内**，九次里这是第六次翻向 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_three=13.401` |
+| P4 | 全量测试：条数 / 墙钟 | **2950** passed / **10** skipped / **0** failed，墙钟 **102.1** s | R17 结束时 2495 passed / 6 skipped；R18 结束时 2643 / 10；R19 结束时 2693 / 10；R21 结束时 2783；R23 结束时 2829；R22 结束时 2853；R24 结束时 2885。条数只增不减是硬约束（R21 +90、R23 +46、R22 +24、R24 +32、R25 +21、R26 +44）。墙钟 R19 89.9 → R21 66.2 → R23 89.8 → R22 90.8 → R24 97.0 → R25 97.8 → R26 102.1 s：**几轮之间墙钟先降 24s 又涨回去，而条数一路只增**——这一对数最该被读到的就是这件事，它把 R21 报告里「不能把 66.2 当成变快了」那句话直接证实了。R25 这 +21 条全部是不调 LLM 的脚本测试（`demo_preflight` 20 条），墙钟只涨 0.8s；R26 这 +44 条同样一次 LLM 都不调（蒸馏脚本 42 条 + 两处参数化），墙钟涨 4.3s | `python -m scripts.bench_sandbox --all` | ✅ `bench/sandbox.json:bench.pytest_passed=2950` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` `bench/sandbox.json:bench.pytest_wall_s=102.1` |
+| P5 | Playwright 前端状态：通过数 / 墙钟 | **20** 种全过，墙钟 **48.4** s | R14 起 6 种 → R15 10 种 → R16 13 种 → R17 15 种 → R18 16 种 → R21/R23/R22 仍 16 种（那三轮没动前端，测的是「没有回归」）→ **R24 加到 20 种**（八项前端改造各自的验收）。墙钟的对照是「值不值得每轮都跑」——47 秒的答案是值得：R18 那轮它抓到一个所有 Python 测试都绿的回归，**R24 这轮又抓到两个**（对照带换 SVG 之后旧判据查的元素已经不存在；token 面板嵌在折叠区里时 innerText 读回空串）。R25/R26 都没动前端，这 20 种测的是「没有回归」 | `python -m scripts.screenshot_states` | ✅ `bench/sandbox.json:bench.playwright_states_passed=20` `bench/sandbox.json:bench.playwright_wall_s=48.4` |
 | P6 | 热启动（第二次起进程） | ⏳ 还没跑过 | 闸门 ≤ 20 s（docs/DESIGN.md §9 第 1 行）。对照是冷启动同一个数 | `python -m scripts.bench_startup` 跑**两次进程**，看第二次 | ⏳ 还没跑过——要真模型和 cases.json，沙盒里 `--self-test` 出来的是合成语料 + 假编码器，那个数不是热启动 |
 | P7 | 一次问诊（不开 ReAct ×3 / 开 ReAct ×1） | ⏳ 还没跑过 | 闸门 ≤ 90 s（不开）/ ≤ 240 s（开）。对照是两者之差 = ReAct 那几次工具调用的代价 | `python -m scripts.bench_consult --backend real --repeat 3 --no-react`，再 `--repeat 1 --react` | ⏳ 还没跑过——要真 LLM |
 | P8 | ε 两套设置（思考开 / 关）的耗时与调用数 | ⏳ 还没跑过 | 两套数**不可比**（README「S3_THINKING」那一行），并列报、不相减。这一对数回答「思考模式值不值那几十倍的时间」 | 段 4 会跑两次：默认那次落 `eval/epsilon.json`，`S3_THINKING=disabled` 那次落 `eval/epsilon_s3_disabled.json` | ⏳ 还没跑过——凭据键已经就位（`epsilon_s3_disabled.*`），文件一落盘自动生效 |

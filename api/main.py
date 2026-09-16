@@ -665,13 +665,12 @@ def api_validate_key(x_llm_key: str | None = Header(default=None)) -> dict:
     return out
 
 
-#: 每百万 token 的价格（美元，DeepSeek 2026-08-17 起的峰谷分时表，高峰价）。
-#: 谷段五折。汇率按 7.2 折成人民币——**这是估算**，不是账单，
-#: 用途是让人在填 key 之前知道量级。
-PRICE_USD_PER_MTOK_MISS = 1.32
-PRICE_USD_PER_MTOK_HIT = 0.044
-PRICE_USD_PER_MTOK_OUT = 3.96
-USD_TO_CNY = 7.2
+#: 价格表和 token→人民币的折算都在 `core/usage.py`（R26 搬过去的，第 31 条：
+#: 蒸馏脚本要算同一件事）。这里只是把名字引过来，方便本模块和既有调用方读。
+PRICE_USD_PER_MTOK_MISS = usage_mod.PRICE_USD_PER_MTOK_MISS
+PRICE_USD_PER_MTOK_HIT = usage_mod.PRICE_USD_PER_MTOK_HIT
+PRICE_USD_PER_MTOK_OUT = usage_mod.PRICE_USD_PER_MTOK_OUT
+USD_TO_CNY = usage_mod.USD_TO_CNY
 
 
 def _prefix_warmup_note() -> str:
@@ -689,8 +688,9 @@ def _prefix_warmup_note() -> str:
         return ("首次问诊会预热知识前缀（这台机器上算不出它有多大：缺 cases.json "
                 "或药理层文件），之后每次几乎全部命中缓存、便宜一个数量级。")
     total = sum(per_phys)
-    first = total / 1_000_000 * PRICE_USD_PER_MTOK_MISS * USD_TO_CNY
-    later = total / 1_000_000 * PRICE_USD_PER_MTOK_HIT * USD_TO_CNY
+    # 高峰价报，谷段五折在下面那句话里说——报低的那个数会让人以为随时都这么便宜。
+    first = usage_mod.cost_cny(miss_tokens=total, peak=True)
+    later = usage_mod.cost_cny(hit_tokens=total, peak=True)
     return (f"首次问诊会预热知识前缀（{total:,} token，{len(per_phys)} 位医家合计），"
             f"约 ¥{first:.1f}；之后每次约 ¥{later:.2f}（缓存命中价差 30 倍）。"
             "谷段（北京 12–14、18–09）再打五折。")

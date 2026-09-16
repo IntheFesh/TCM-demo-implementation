@@ -8,6 +8,7 @@ import pytest
 
 from scripts.train_lora import (
     BASES,
+    DEFAULT_BASE_KEYS,
     OVERFIT_RELATIVE_GAP,
     build_plan,
     count_truncated,
@@ -60,11 +61,21 @@ def _sdt_sample(split="train"):
 
 
 def test_both_bases_are_declared_and_one_is_marked_unverified():
-    """两个基座都要能跑。`verified` 为 False 的那个是如实标注——R4 那轮六条下载 URL
-    全靠猜、六条全错，所以这里不假装核对过。"""
-    assert set(BASES) == {"qwen2.5-1.5b", "zhongjing-2-1.8b"}
+    """两个同量级基座都要能跑。`verified` 为 False 的那个是如实标注——R4 那轮六条
+    下载 URL 全靠猜、六条全错，所以这里不假装核对过。
+
+    **有意的契约变更（R26）**：`BASES` 从两个变成三个（加了蒸馏路径的 9B）。
+    期望值跟着改，但**多了一条**：9B 不在 `DEFAULT_BASE_KEYS` 里。
+    这条不是可有可无的——「不传 --base 就两个基座都训」那个免费对照回答的是
+    「先验中医知识有没有用」，前提是两个基座同量级；把 9B 默默加进默认集合，
+    那个对照就变成了一次跨量级的误比，而误比不会报错。
+    """
+    assert set(BASES) == {"qwen2.5-1.5b", "zhongjing-2-1.8b", "qwen3.5-9b"}
     assert BASES["qwen2.5-1.5b"]["verified"] is True
     assert BASES["zhongjing-2-1.8b"]["verified"] is False
+    assert BASES["qwen3.5-9b"]["verified"] is False
+    assert set(DEFAULT_BASE_KEYS) == {"qwen2.5-1.5b", "zhongjing-2-1.8b"}
+    assert "不能跟它们并列比分" in BASES["qwen3.5-9b"]["note"]
 
 
 def test_resolve_base_returns_the_key_and_rejects_unknown():

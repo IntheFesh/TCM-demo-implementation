@@ -59,6 +59,8 @@
 - 缓存命中的输入 token 比未命中便宜 **30 倍**（$0.044/M vs $1.32/M，官方价）
 - 一次问诊 = `2 + 医家数 × 采样次数` = **11** 次调用（默认配置）
 - ⏳ 真机命中率、真机每次问诊的钱：见 `eval/RESULTS.md` 的 full_context 系五行
+- **产品路径就是 `deepseek-v4-pro`，没有本地模型**。R26 的蒸馏是研究证据、不进演示；
+  演示和这份材料里的每个分数都出自 v4-pro 管道，两者不混着讲
 
 ### 7. 前端不是一个模板（R24）
 
@@ -72,7 +74,7 @@
 
 | 项 | 数 | 凭据 |
 |---|---|---|
-| 全量测试 | **2906** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=2906` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
+| 全量测试 | **2950** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=2950` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
 | 前端状态验收 | **20** 种 | `bench/sandbox.json:bench.playwright_states_passed=20` |
 | 知识图谱节点 | **1315** | `../data/graph.json:graph.n_nodes=1315` |
 | 知识图谱边 | **3771** | `../data/graph.json:graph.n_edges=3771` |
@@ -91,6 +93,7 @@
 | "换了 full_context 之后效果更好" | full_context 系的 E3/E4 **还没跑过** | ⏳ `eval/RESULTS.md` 那一节五行全 ⏳ |
 | "best-of-N 提升了质量" | 没跟 ε 比过，分数差可能落在噪声里 | ⏳ 上机第 2 项（R22 报告第六节） |
 | "本地模型/LoRA 已经训好了" | 训练三个前提（role 填充率、药理层、MES 盲评）都没过 | 代码就绪、没训 |
+| "我们也蒸了一版小模型" | 蒸馏脚本就绪，但 ¥40 预算只买得起 **70** 条样本，配方要 8000 条（¥3,956） | ⏳ 上机段 10，见 `eval/RESULTS.md` R26 一节 |
 | "药理层有 1 万多条数据" | 那两个 `.jsonl` 要 AutoDL 上抽取才有 | ⏳ 上机段 5 |
 | "断网也能完整演示" | 回放模式可以，**但字体还在 CDN 上** | ⏳ R24 第六节 1/2 |
 | E2（师承内 vs 跨学派） | **两轮结论相反**，判据落在噪声里 | 只报出、绝不设闸门 |

@@ -13,6 +13,7 @@ import pytest
 from core.physicians import PHYSICIANS, physicians_all
 from scripts.train_lora import (
     BASES,
+    DEFAULT_BASE_KEYS,
     build_plan,
     format_plan_text,
     main,
@@ -101,8 +102,10 @@ def test_dry_run_on_cpu_needs_neither_peft_nor_a_gpu(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "样本总数 20" in out
-    # 十个 adapter 都在计划里
-    assert out.count("→ ") >= len(BASES) * len(physicians_all(PHYSICIANS))
+    # 默认两个基座 × 五位医家 = 十个 adapter 都在计划里。
+    # **有意的契约变更（R26）**：分母从 `len(BASES)` 改成 `len(DEFAULT_BASE_KEYS)`
+    # ——`BASES` 里多了个 9B，但它要显式 --base 才训，所以它不该出现在默认计划里。
+    assert out.count("→ ") >= len(DEFAULT_BASE_KEYS) * len(physicians_all(PHYSICIANS))
     assert "没有加载模型，没有训练" in out
 
 

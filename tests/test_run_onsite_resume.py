@@ -17,7 +17,10 @@ SCRIPT = ROOT / "scripts" / "run_onsite.sh"
 # R25 加了段 9（R21~R24 的上机项）。**这个元组是"脚本里有哪几段"的期望值**，
 # 不是段数的第二处定义——下面那条测试拿它跟脚本里现数出来的比，两者不一致就红。
 # 加段时改这一处是有意的：它是一道"你知道自己加了一段"的确认。
-SEGMENTS = ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+# **有意的契约变更（R26）**：十元组 → 十一元组（加了段 10「R26 蒸馏」）。
+# 这个元组钉的是"可续跑的段清单跟剧本里的段一一对应"，所以段一多就必须改，
+# 不能放宽成包含关系——后者再也发现不了误删一段。
+SEGMENTS = ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10")
 
 
 def _run(args, state: Path | None = None):
@@ -90,7 +93,7 @@ def test_resume_counts_a_never_run_segment_as_unfinished(tmp_path):
 
 
 def test_resume_says_so_when_there_is_nothing_left(tmp_path):
-    """九段都成功过时 --resume 不跑任何段。**要说出来**——静默退出会被当成
+    """每段都成功过时 --resume 不跑任何段。**要说出来**——静默退出会被当成
     "又跑了一遍，都过了"。"""
     st = _state(tmp_path, {n: 0 for n in SEGMENTS})
     r = _run(["--resume"], state=st)

@@ -85,16 +85,28 @@ def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents(
     # 依赖别人的放后面"。段 9 只有 33 次调用，不违反前半句；而它必须在最后有硬依据
     # ——它要的东西前面几段都得先有（前缀规模要 cases.json、命中率要真实 API、
     # full_context 下的 E3/E4 要评测框架跑通、字体子集化要联网取原始字体）。
-    i_last = next(i for i, n in enumerate(names) if "R21~R24" in n)
-    assert i_last == len(rows) - 1, "R21~R24 那一段必须是最后一段"
-    assert i_bench < i_last, "性能基准在它之前（那一段要量的是跑完前面所有段之后的系统）"
-    assert calls[i_eval] > calls[i_last], "评测仍是最贵的一段"
+    i_r21 = next(i for i, n in enumerate(names) if "R21~R24" in n)
+    assert i_bench < i_r21, "性能基准在它之前（那一段要量的是跑完前面所有段之后的系统）"
+    assert calls[i_eval] > calls[i_r21], "评测仍是最贵的一段（按调用数）"
+    # **R26 起最后一段是蒸馏**（第三次同一形状的契约变更）：原断言是「R21~R24
+    # 那一段必须是最后一段」。段 10 排在它后面有两条硬依据：它要 cases.json、
+    # 要真实 API（跟段 9 同样的前提），而且**整段可以不做**——可选的段排在必做的
+    # 段后面，中途停下来不会漏掉任何必做项。
+    i_last = next(i for i, n in enumerate(names) if "蒸馏" in n)
+    assert i_last == len(rows) - 1, "蒸馏必须是最后一段"
+    assert i_r21 < i_last
 
 
 def test_exactly_two_human_gates_and_they_are_segments_3_and_5():
-    """两处人工卡点存在的理由是：闸门没过就往下跑，后面几百次调用全部白花。"""
+    """人工卡点存在的理由是：闸门没过就往下跑，后面几百次调用全部白花。
+
+    **有意的契约变更（R26）**：卡点从 3/5 两处变成 3/5/10 三处。段 10 的卡点
+    不是因为"它可能失败"，而是因为它**花的钱超过 ¥30 那条线**（§0.5 第 2 条
+    第三款），而超过那条线的动作必须有人点头。判据保持"逐个列出是哪几段"
+    而不是放宽成"至少有两处"——后者再也发现不了"某段偷偷去掉了卡点"。
+    """
     gated = [r[0] for r in _segments() if r[3] == "YES"]
-    assert gated == ["3", "5"], gated
+    assert gated == ["3", "5", "10"], gated
 
 
 def test_every_python_module_the_runbook_invokes_actually_exists():
