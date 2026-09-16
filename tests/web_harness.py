@@ -17,8 +17,9 @@ R13 把前端拆成 `index.html` + `app.css` + `app.js` + `graph.js` 之后，
 互相可见，顶层的 `let`/`const` 也在同一个全局词法环境里。node 里把两份文本拼起来
 跑，语义跟浏览器一致；分成两个文件反而要自己造模块边界，那才是跟线上不一样。
 
-拼接顺序跟 `index.html` 里的 `<script src>` 顺序一致：**graph.js 在前、app.js 在后**
-（app.js 末尾有一批加载时就执行的初始化）。
+拼接顺序跟 `index.html` 里的 `<script src>` 顺序一致：**ui/select.js → graph.js →
+app.js**（app.js 末尾有一批加载时就执行的初始化，其中包括调用 select.js 的
+`enhanceAllSelects()`——顺序反了那个函数还不存在）。
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ DOM_STUB_OFFLINE = DOM_STUB + 'globalThis.fetch = () => Promise.reject(new Error
 
 # 拼接顺序 = index.html 里 <script src> 的顺序。两者不一致的话，node 里跑得通的
 # 代码在浏览器里可能因为初始化顺序而炸。
-SCRIPT_FILES = ("graph.js", "app.js")
+SCRIPT_FILES = ("ui/select.js", "graph.js", "app.js")
 
 
 def load_app_js() -> str:

@@ -51,6 +51,8 @@ PREFIX = {
     "consult_graph": "r16", "browser_home": "r16", "browser_expanded": "r16",
     "topbar_byok": "r17", "demo_mode": "r17",
     "reference_physicians": "r18",
+    "epigraph": "r24", "select_open": "r24",
+    "advice_panel": "r24", "rings": "r24",
 }
 
 
@@ -238,6 +240,52 @@ DONE_PAYLOAD = {
     "manifest": {"model": "deepseek-v4-pro", "prompt_version": "v1",
                  "cases_sha256": "abc1234", "llm_calls": 6, "elapsed_ms": 88000},
 }
+
+# R24：建议层 + token 面板的 fixture。三档 severity 各一条（三档画成一样就等于
+# 没渲染），另带一条"没跑的规则"（那一行的存在本身就是 R23 的判据）。
+R24_ADVICE = [
+    {"kind": "incompatible", "herbs": ["甘草", "甘遂"],
+     "reason": "甘草 与 甘遂 属配伍禁忌，同方相见须改方",
+     "source_span": "十八反", "severity": "blocking"},
+    {"kind": "thermal_mismatch", "herbs": [],
+     "reason": "证型「肝胃不和证」属热，但主方前 6 味中有 4 味温热药，寒热方向可能相悖",
+     "source_span": None, "severity": "warning"},
+    {"kind": "duplicate_effect", "herbs": ["白术", "苍术"],
+     "reason": "白术 与 苍术 性味功效重合 100%（健脾益气、燥湿利水），考虑去其一",
+     "source_span": None, "severity": "suggestion"},
+]
+R24_ADVICE_SKIPPED = [
+    {"rule": "missing_channel_guide", "available": False,
+     "reason": "药理层本草表还没建出来（AutoDL 上跑 run_pharmacology_extraction 才有）"},
+]
+R24_MANIFEST = {
+    "model": "deepseek-v4-pro", "prompt_version": "v1", "cases_sha256": "abc1234",
+    "llm_calls": 11, "elapsed_ms": 96000,
+    "retriever_mode": "full_context",
+    "prefix_tokens_by_section": {"§2 本草速查表": 77, "§3 方剂速查表": 65,
+                                 "§1 辨证指令与输出 schema": 2943, "§4 医案全量": 180412,
+                                 "§5 本医家用过的药材与方剂条目": 58},
+    "cache_hit_tokens": 179000, "cache_miss_tokens": 1200, "cache_hit_ratio": 0.993,
+    "reasoning_tokens": 4096, "best_of_n": 3, "reasoning_effort": "max",
+}
+# 三位医家的结果各带一份建议层（第一位带满三档，另两位各带一条，
+# 让"三列都有这一块"这件事在截图上看得见）。
+R24_DONE_PAYLOAD = json.loads(json.dumps(DONE_PAYLOAD))
+for _i, _r in enumerate(R24_DONE_PAYLOAD["results"]):
+    _r["advice"] = R24_ADVICE if _i == 0 else R24_ADVICE[_i:_i + 1]
+    _r["advice_skipped"] = R24_ADVICE_SKIPPED
+    _r["formula_score"] = [0.0, 0.7, 0.9][_i]
+    _r["candidates_scored"] = [
+        {"index": 0, "score": [0.0, 0.7, 0.9][_i], "chosen": True,
+         "formula": _r["s3"]["formula"], "syndrome": _r["s3"]["syndrome"],
+         "advice_kinds": ["incompatible"], "n_advice": 1},
+    ]
+R24_DONE_PAYLOAD["manifest"] = R24_MANIFEST
+R24_USAGE = {"mode": "shared", "remaining_calls": 44, "ip_limit_calls": 55,
+             "remaining_consults_estimate": 4, "calls_per_consult": 11,
+             "since": "2026-09-16T00:00:00", "warn": False, "degraded": False,
+             "tokens_today": {"cache_hit": 537000, "cache_miss": 3600, "output": 18400,
+                              "cache_hit_ratio": 0.993}}
 
 # 每种状态：截图文件名 + 把页面推进那个状态的 JS + 一条 DOM 断言（返回 null 表示通过）。
 # R18-I 的两个 fixture。医家列表带 enabled=false 两位——REFERENCE_PHYSICIANS
@@ -644,14 +692,181 @@ STATES = {
             return '三列不等高：' + heights.join('/');
           const dots = document.querySelectorAll('#rx-compare .dot').length;
           if (dots !== 1 + 6 + 4 + 4) return '对照带点数不对：' + dots;
-          const segs = document.querySelectorAll('#rx-compare .rx-seg');
-          if (segs.length !== 2) return 'ε 参考线不是两段';
-          const noise = segs[0].getBoundingClientRect().width;
-          const real = segs[1].getBoundingClientRect().width;
+          // R24：带子从两个 div 段换成一张 SVG（斜纹 = 噪声地板、实心 = 真实分歧）。
+          // **判据跟着结构改，但问的还是同一件事**：两段在不在、噪声段是不是更长。
+          // 另加两条 R24 特有的：带高（要能隔着几米看清）和斜纹 pattern 在不在
+          // ——斜纹是这次改动的全部意义（纹理不依赖亮度，投影压暗了也还在），
+          // 只查"有两个 rect"的话，把 fill 换回第二种灰也会绿。
+          const band = document.querySelector('#rx-compare svg.rx-band');
+          if (!band) return '对照带不是 SVG';
+          if (!band.querySelector('pattern#rx-hatch line')) return '噪声段没有斜纹 pattern';
+          const rects = band.querySelectorAll('rect.rx-band-noise, rect.rx-band-real');
+          if (rects.length !== 2) return 'ε 参考线不是两段';
+          if (band.getBoundingClientRect().height < 12) return '对照带太矮，隔远了看不见';
+          const noise = rects[0].getBoundingClientRect().width;
+          const real = rects[1].getBoundingClientRect().width;
           if (!(noise > real)) return 'ε=0.3954 差异=0.53，噪声段该比真实段长';
+          if (rects[0].getAttribute('fill') !== 'url(#rx-hatch)') return '噪声段不是斜纹填充';
           if (!document.body.innerText.includes('0.3954')) return '没显示这条主诉的 ε';
           const folds = document.querySelectorAll('.herb-fold').length;
           if (folds < 1) return '药材一处都没折叠';
+          return null;
+        }""",
+    ),
+    # ---------- R24：八项前端改造的真浏览器验收 ----------
+    #
+    # 为什么这四张是必须的（CLAUDE.md 那条硬约定的具体落点）：
+    #   · 题记/去卡片化是纯 CSS 效果，node 测试连 CSS 都不加载；
+    #   · 自绘下拉的弹出层是运行时建的 DOM，字符串断言看不到它；
+    #   · 建议层三档颜色要真的分得开（computedStyle 才知道）；
+    #   · 两环的半径关系只有真布局跑完才有坐标。
+    "epigraph": (
+        "renderComplaintBody(''); setConsultState('first');",
+        """() => {
+          const eg = document.getElementById('epigraph');
+          if (!eg) return '题记不在 DOM 里';
+          if (getComputedStyle(eg).display === 'none') return '首屏没显示题记';
+          const lines = eg.querySelectorAll('.eg-line');
+          if (lines.length !== 3) return '题记不是三行：' + lines.length;
+          // 三行三种字号/颜色：它们是三句不同性质的话，不是一段话的三行
+          const sizes = [...lines].map(l => parseFloat(getComputedStyle(l).fontSize));
+          if (new Set(sizes).size !== 3) return '三行字号没区分：' + sizes.join('/');
+          if (!(sizes[0] > sizes[1] && sizes[1] > sizes[2]))
+            return '三行字号不是递减：' + sizes.join('/');
+          // 宋体说中医的话：第一行必须是 classic 栈
+          if (!getComputedStyle(lines[0]).fontFamily.includes('Serif'))
+            return '题记第一行不是宋体栈';
+          // 去卡片化：输入区不再是圆角框
+          const panel = getComputedStyle(document.getElementById('input-panel'));
+          if (parseFloat(panel.borderTopLeftRadius) > 0) return '输入区还是圆角卡片';
+          // 自绘下拉：按钮吃到了页面字体（原生 select 的弹出层不吃）
+          const btn = document.querySelector('#role-select-label + .cs-wrap .cs-button')
+                   || document.querySelector('.cs-wrap .cs-button');
+          if (!btn) return '自绘下拉按钮没建出来';
+          if (!getComputedStyle(btn).fontFamily.includes('Noto'))
+            return '自绘按钮没用页面字体：' + getComputedStyle(btn).fontFamily;
+          return null;
+        }""",
+    ),
+    "select_open": (
+        # 用键盘打开：自绘之后键盘契约要自己实现，而键盘是最容易漏的那一半
+        "document.querySelector('.cs-wrap .cs-button').focus();"
+        " document.querySelector('.cs-wrap .cs-button')"
+        ".dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}));",
+        """() => {
+          const wrap = document.querySelector('.cs-wrap');
+          const btn = wrap.querySelector('.cs-button');
+          const list = wrap.querySelector('.cs-list');
+          if (list.hidden) return '↓ 没有打开列表';
+          if (btn.getAttribute('aria-expanded') !== 'true') return 'aria-expanded 没跟上';
+          const opts = list.querySelectorAll('.cs-option');
+          const native = wrap.querySelector('select');
+          if (!native) return '原生 select 被移除了（值就没有唯一来源了）';
+          if (opts.length !== native.options.length)
+            return '选项数跟原生不一致：' + opts.length + ' vs ' + native.options.length;
+          if (list.getBoundingClientRect().height < 20) return '列表没有实际高度';
+          // 选中项要看得出是选中的
+          const sel = list.querySelector('.cs-option[aria-selected="true"]');
+          if (!sel) return '没有标出当前选中项';
+          // 键盘移动 + 回车提交：值要真的写回原生元素
+          const before = native.value;
+          btn.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}));
+          btn.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+          if (native.value === before) return '回车没有把值写回原生 select';
+          if (!list.hidden) return '选完没有关闭列表';
+          // 截图要留打开的那一张
+          btn.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}));
+          return null;
+        }""",
+    ),
+    "advice_panel": (
+        "renderComplaintBody(COMPLAINT); renderUsage(R24_USAGE);"
+        " renderConsultResult(R24_DONE_PAYLOAD);",
+        """() => {
+          const rows = document.querySelectorAll('#columns .adv-row');
+          if (rows.length < 5) return '建议行太少：' + rows.length;
+          const byClass = (c) => document.querySelectorAll('#columns .adv-row.adv-' + c);
+          for (const c of ['blocking', 'warning', 'suggestion']) {
+            if (!byClass(c).length) return '缺 ' + c + ' 档的建议行';
+          }
+          // 三档颜色必须真的分得开（三档画成一样就等于没渲染）
+          const colors = ['blocking', 'warning', 'suggestion']
+            .map(c => getComputedStyle(byClass(c)[0]).color);
+          if (new Set(colors).size !== 3) return '三档颜色没分开：' + colors.join(' / ');
+          // 没跑的规则要看得见、且没被折叠
+          const skipped = document.querySelectorAll('#columns .adv-skipped-row');
+          if (!skipped.length) return '没显示"没跑的规则"';
+          if (skipped[0].closest('details')) return '没跑的规则被折叠了';
+          if (!document.body.innerText.includes('不是疗效评分')
+              && !document.querySelector('.adv-score[title*="不是疗效评分"]'))
+            return '评分没带口径说明';
+          // token 面板：本次 + 今日两段
+          const tp = document.getElementById('token-panel');
+          if (!tp || !tp.querySelector('.tp-block')) return 'token 面板是空的';
+          // **祖先的 <details> 也要打开**：token 面板挂在 manifest 旁边，而那块在
+          // 「图谱与细节」这个折叠区里。innerText 只返回**渲染出来的**文字，
+          // 外层折叠着的话读回来是空串——这一条本身就是"面板在 DOM 里"和
+          // "面板看得见"两件事的区别（这次就是被它绊了一下）。
+          for (let el = tp; el; el = el.parentElement) {
+            if (el.tagName === 'DETAILS') el.open = true;
+          }
+          tp.querySelector('details').open = true;
+          const text = tp.innerText;
+          if (!text.includes('本次前缀各段 token')) return 'token 面板缺"本次"那一段';
+          if (!text.includes('今日累计')) return 'token 面板缺"今日累计"那一段';
+          if (!text.includes('180,412')) return '前缀 token 没按千分位显示';
+          if (!text.includes('99.3%')) return '没显示本次命中率';
+          // 君臣佐使两列密排
+          const grid = document.querySelector('#columns .herb-grid');
+          if (!grid) return '君臣佐使不是两列网格';
+          if (getComputedStyle(grid).display !== 'grid') return 'herb-grid 没有真的 grid';
+          const roleCells = grid.querySelectorAll('.hg-role');
+          const herbCells = grid.querySelectorAll('.hg-herbs');
+          if (roleCells.length !== herbCells.length) return '两列数量不对齐';
+          // 四组药味的左边界要对齐（两列排版的全部意义）
+          const lefts = new Set([...herbCells].map(
+            c => Math.round(c.getBoundingClientRect().left)));
+          if (lefts.size !== 1) return '药味左边界没对齐：' + [...lefts].join('/');
+          // 去卡片化：对照带不再是圆角框
+          const rx = getComputedStyle(document.getElementById('rx-compare'));
+          if (parseFloat(rx.borderTopLeftRadius) > 0) return '对照带还是圆角卡片';
+          return null;
+        }""",
+    ),
+    "rings": (
+        "switchTab('graph-browser'); await loadGraphBrowserData();"
+        " await new Promise(r => setTimeout(r, 400));"
+        " window.__hubIds = gbCy.nodes().map(n => n.id());"
+        " window.__hub = gbCy.nodes().filter(n => n.data('category') === 'location')[0].id();"
+        " await gbExpandNode(window.__hub);",
+        """async () => {
+          await new Promise(r => setTimeout(r, 800));
+          const legend = document.getElementById('gb-ring-legend');
+          if (!legend || !legend.textContent.trim()) return '两环图例是空的';
+          if (!legend.textContent.includes('内圈') || !legend.textContent.includes('外圈'))
+            return '图例没说清哪个是内圈';
+          // 正好两环：所有节点到中心的距离聚成两簇
+          const box = gbCy.extent();
+          const cx = (box.x1 + box.x2) / 2, cy2 = (box.y1 + box.y2) / 2;
+          const d = (n) => Math.hypot(n.position('x') - cx, n.position('y') - cy2);
+          const hubs = gbCy.nodes().filter(n => window.__hubIds.includes(n.id()));
+          const others = gbCy.nodes().filter(n => !window.__hubIds.includes(n.id()));
+          if (!others.length) return '展开之后外圈是空的';
+          const inner = hubs.map(d).reduce((a, b) => a + b, 0) / hubs.length;
+          const outer = others.map(d).reduce((a, b) => a + b, 0) / others.length;
+          if (!(inner < outer)) return '枢纽没在内圈（内 ' + Math.round(inner)
+            + ' / 外 ' + Math.round(outer) + '）';
+          // 0.25 而不是 R16 那条 0.15：**这一轮当场量过**，两环在模型坐标里是
+          // 内 649 / 外 1972（比值 0.329）。判据卡在实测值下面一点点，
+          // 既能抓住"内圈被压回中心"的回归，又不会因为节点数变化而假红。
+          if (!(inner > outer * 0.25)) return '内圈被压扁了（内 ' + Math.round(inner)
+            + ' / 外 ' + Math.round(outer) + '，比值 ' + (inner / outer).toFixed(3) + '）';
+          // 外圈是一簇而不是好几圈：半径的相对标准差要小
+          const rs = others.map(d);
+          const mean = rs.reduce((a, b) => a + b, 0) / rs.length;
+          const sd = Math.sqrt(rs.reduce((s, r) => s + (r - mean) ** 2, 0) / rs.length);
+          if (sd / mean > 0.35) return '外圈散成了好几环（相对标准差 '
+            + (sd / mean).toFixed(2) + '）';
           return null;
         }""",
     ),
@@ -695,6 +910,9 @@ def run(only: str | None, wait_ms: int) -> int:
                                    ("SIX_LAYER_GRAPH", SIX_LAYER_GRAPH),
                                    ("REFERENCE_HEALTH", REFERENCE_HEALTH),
                                    ("REFERENCE_FIXTURE", REFERENCE_FIXTURE),
+                                   # R24：建议层 + token 面板 + 今日用量
+                                   ("R24_DONE_PAYLOAD", R24_DONE_PAYLOAD),
+                                   ("R24_USAGE", R24_USAGE),
                                    ("COMPLAINT", COMPLAINT)):
                     page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
                 # setup 里可能有 await（图谱浏览器要先把数据拉回来），

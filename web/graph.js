@@ -1019,6 +1019,14 @@ function gbCollapseNode(nodeId) {
 // 为什么不是 cose：cose 是力导向，它摆出来的位置取决于连边的拉扯，
 // "谁是枢纽"这件事在图上看不出来。而这张图的整个心智模型就是"从证素往外长"。
 // 节点多到 cose 会卡的时候仍然退回 grid（那条上限没变）。
+//
+// **R24：收成正好两环。** 原来是三档（枢纽 3 / 枢纽展开的 2 / 更深的 1），
+// 于是屏幕上可能出现三四个半径相近的环——而"这个节点在第几环"本来是要一眼
+// 读出"它离枢纽多远"的，环一多就读不出来了，反而像是一团同心圆噪声。
+// 现在只有两环：**是枢纽 / 不是枢纽**。代价是"深两层"这个信息不再体现在半径上
+// ——它体现在交互里（是你自己一层层点开的，收起按钮也按这个结构给），
+// 而交互里的信息比一个读不准的半径可靠。
+// 环的含义在画布下方那行图例里写着（`gbRingLegendText`），不靠人猜。
 function gbRelayout() {
   if (!gbCy) return;
   if (gbVisibleIds.size > GB_COSE_MAX_NODES) {
@@ -1030,8 +1038,8 @@ function gbRelayout() {
     animate: false,
     fit: true,
     padding: 24,
-    // 内圈 = 枢纽证素；第二圈 = 从枢纽展开出来的；再外面 = 更深的层。
-    concentric: (ele) => (gbHubIds.has(ele.id()) ? 3 : gbDepthOf(ele.id())),
+    // 两环：内圈 = 枢纽证素，外圈 = 其余全部（不论展开了几层）。
+    concentric: (ele) => (gbHubIds.has(ele.id()) ? 2 : 1),
     levelWidth: () => 1,
     // 圈的半径 ≈ 圈上节点数 × minNodeSpacing / 2π。28 太小：20 个枢纽挤成中间
     // 一个点，而展开出来的 61 个证型摊成一个大环——内圈看不见，"枢纽"这件事
@@ -1040,16 +1048,28 @@ function gbRelayout() {
     minNodeSpacing: 60,
     avoidOverlap: true,
   }).run();
+  gbRenderRingLegend();
 }
 
-// 一个节点离枢纽有多远：枢纽本身 3，枢纽展开出来的 2，再往外 1。
-// 数越大越靠内（concentric 的约定）。
-function gbDepthOf(nodeId) {
-  for (const [parent, ids] of gbExpanded.entries()) {
-    if (!ids.includes(nodeId)) continue;
-    return gbHubIds.has(parent) ? 2 : 1;
-  }
-  return 1;
+// R24：两环的图例文字。**环的含义必须写出来**——一张同心圆图上"内圈是什么"
+// 如果要靠人猜，那这个布局就只是好看而没有信息。
+// 数从画布现算，不另存一份计数（两处各存一份必然有一处忘了更新）。
+function gbRingLegendText(nHub, nOuter) {
+  if (!nHub && !nOuter) return "";
+  return `内圈 ${nHub} 个证素枢纽　外圈 ${nOuter} 个展开出来的节点`
+    + `（不论展开了几层都在外圈——深度在交互里，不在半径上）`;
+}
+
+function gbRenderRingLegend() {
+  const el = document.getElementById("gb-ring-legend");
+  if (!el || !gbCy) return;
+  let nHub = 0;
+  let nOuter = 0;
+  gbCy.nodes().forEach((ele) => {
+    if (gbHubIds.has(ele.id())) nHub += 1;
+    else nOuter += 1;
+  });
+  el.textContent = gbRingLegendText(nHub, nOuter);
 }
 
 async function gbSearch(query) {

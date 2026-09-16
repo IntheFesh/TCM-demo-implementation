@@ -20,7 +20,9 @@ R19 要一张「性能前后对照表」，而这个项目的铁律是**任何�
   只把注册表从五位改回三位。R18-A 把注册表扩到五位，这一对数回答的是
   「多两位医家让 /health 慢了多少」——单报五位那个数说明不了任何事。
 - `pytest_*`：对照是上一轮的条数（写在 RESULTS.md 那一行的正文里）。
-- `playwright_*`：16 种状态的墙钟。对照是「它值不值得每轮都跑」——
+- `playwright_*`：前端状态的墙钟（种数由 screenshot_states 的 STATES 决定，
+  R24 起是 20 种——**这里不写死数字**，写死的话加一种状态就有一处对不上）。
+  对照是「它值不值得每轮都跑」——
   47 秒的答案是值得。
 
 用法：
@@ -132,7 +134,8 @@ def bench_pytest() -> dict:
 
 
 def bench_playwright() -> dict:
-    """16 种前端状态的真浏览器判据 + 截图，墙钟。
+    """全部前端状态的真浏览器判据 + 截图，墙钟。种数问 screenshot_states.STATES，
+    不写死——R24 从 16 种加到 20 种时，写死的那个数会在两处各错一次。
 
     退出码也记下来：**墙钟本身不说明它过了没有**，一个 5 秒就挂掉的跑法
     看起来比 47 秒"更快"。
@@ -163,7 +166,9 @@ def collect(run_all: bool) -> dict:
         print("--- 全量测试（几十秒） ---")
         out.update(bench_pytest())
         print(f"  {out['pytest_summary_line']}  墙钟 {out['pytest_wall_s']}s")
-        print("--- Playwright 16 种状态（几十秒） ---")
+        from scripts.screenshot_states import STATES
+
+        print(f"--- Playwright {len(STATES)} 种状态（几十秒） ---")
         out.update(bench_playwright())
         print(f"  {out['playwright_states_passed']} 种通过，退出码 "
               f"{out['playwright_exit_code']}，墙钟 {out['playwright_wall_s']}s")

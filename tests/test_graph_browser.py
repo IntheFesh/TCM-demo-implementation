@@ -191,9 +191,12 @@ def test_the_layout_is_concentric_with_hubs_inside():
     "谁是枢纽"在图上看不出来——而这张图的整个心智模型就是"从证素往外长"。"""
     src = _graph_js()
     body = src[src.index("function gbRelayout"):]
-    body = body[:body.index("function gbDepthOf")]
+    body = body[:body.index("function gbRingLegendText")]
     assert 'name: "concentric"' in body
-    assert "gbHubIds.has(ele.id()) ? 3" in body
+    # **有意的契约变更（R24）**：原来是三档（枢纽 3 / 枢纽展开的 2 / 更深的 1），
+    # 现在收成正好两环（是枢纽 2 / 不是枢纽 1）。理由在 gbRelayout 上方的注释里：
+    # 三四个半径相近的环读不出"离枢纽多远"，反而像一团同心圆噪声。
+    assert "gbHubIds.has(ele.id()) ? 2 : 1" in body
     # 节点太多时仍然退回 grid：力导向/环形对上千节点都会卡住浏览器。
     assert "GB_COSE_MAX_NODES" in body and '"grid"' in body
 

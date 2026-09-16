@@ -64,6 +64,12 @@ function authHeaders(base) {
   return h;
 }
 
+// R24：token 面板要同时用到"这一次问诊的 manifest"和"今天的用量快照"，
+// 而这两份数据由两条不同的路径刷新（问诊回来 / `/api/usage` 轮询）。
+// 各存一份最近值，谁回来谁刷自己那段——不存的话另一段会在刷新时被清空。
+let lastManifest = null;
+let lastUsage = null;
+
 function usageText(u) {
   if (!u) return "";
   if (u.mode === "byok") return "正在使用你自己的 API key，不占用站点额度。";
@@ -100,6 +106,7 @@ function quotaChipLevel(u) {
 }
 
 function renderUsage(u) {
+  lastUsage = u || null;
   const chip = document.getElementById("quota-chip");
   const text = document.getElementById("usage-text");
   if (u && text) text.textContent = usageText(u);
@@ -112,12 +119,109 @@ function renderUsage(u) {
     }
   }
   renderDegradeBanner(u);
+  // 今日累计那一段只在 /api/usage 回来时才会变；本次那几段由
+  // renderConsultResult 传 manifest 进来。两个来源各刷自己那部分，
+  // 所以这里带上 lastManifest（没有问诊过就是 null，面板只有"今日累计"）。
+  renderTokenPanel(lastManifest, u);
 }
 
 // §5.1 第 3 条：**超限降级到回放而不是报错**——访问者仍能看到预录主诉的完整
 // 效果。所以这一行用 --surface-2 底、不是警告色：降级不是错误，是换了个后端
 // 继续跑。原话由服务端给（u.reason），前端不自己编一套——两处措辞不一致时
 // 用户不知道信哪个。
+// R24：token 面板（R21 的数据）。两段分开报，**因为它们的分母不同**：
+//   · 这一次问诊：前缀各段 token（prefix_tokens_by_section）+ 本次命中率
+//   · 今天累计：命中/未命中/输出三项 + 今日命中率（/api/usage 的 tokens_today）
+// 合成一段会让"这次命中了没有"和"今天整体命中率"混成一个数，而前者是要看的，
+// 后者是要报的。
+function tokenSectionRowsHtml(sections) {
+  if (!sections) return "";
+  const rows = Object.entries(sections)
+    .map(([name, n]) => `<tr><td>${escapeHtml(name)}</td>`
+      + `<td class="tp-num">${escapeHtml(formatTokenCount(n))}</td></tr>`).join("");
+  return `<table class="tp-table"><tbody>${rows}</tbody></table>`;
+}
+
+// 千分位。**不缩写成 k/M**：前缀 token 数是要跟 500,000 预算对着看的，
+// "180k" 和 "18万" 在同一页里混着出现过一次就会有人算错一个数量级。
+function formatTokenCount(n) {
+  if (n === null || n === undefined) return "—";
+  return Number(n).toLocaleString("en-US");
+}
+
+// 命中率显示成百分比；null 是"这个后端不报这个数"，**不是 0%**
+// （R21 那条：0 会被读成"跑了但一次没命中"）。
+function formatHitRatio(r) {
+  return (r === null || r === undefined) ? "未报" : `${Math.round(r * 1000) / 10}%`;
+}
+
+function tokenPanelHtml(manifest, usage) {
+  const m = manifest || {};
+  const parts = [];
+  if (m.prefix_tokens_by_section) {
+    parts.push(`<div class="tp-block"><div class="tp-title">本次前缀各段 token`
+      + `（${escapeHtml(m.retriever_mode || "?")}）</div>`
+      + tokenSectionRowsHtml(m.prefix_tokens_by_section) + `</div>`);
+  }
+  if (m.cache_hit_tokens !== undefined || m.cache_miss_tokens !== undefined) {
+    parts.push(`<div class="tp-block"><div class="tp-title">本次前缀缓存</div>`
+      + `<div class="tp-line">命中 ${escapeHtml(formatTokenCount(m.cache_hit_tokens))}`
+      + `　未命中 ${escapeHtml(formatTokenCount(m.cache_miss_tokens))}`
+      + `　命中率 ${escapeHtml(formatHitRatio(m.cache_hit_ratio))}</div></div>`);
+  }
+  if (m.best_of_n) {
+    parts.push(`<div class="tp-block"><div class="tp-title">本次采样</div>`
+      + `<div class="tp-line">每位医家采 ${escapeHtml(String(m.best_of_n))} 次`
+      + `　推理档 ${escapeHtml(String(m.reasoning_effort || "未开思考"))}`
+      + `　推理 token ${escapeHtml(formatTokenCount(m.reasoning_tokens))}</div></div>`);
+  }
+  const td = usage && usage.tokens_today;
+  if (td) {
+    parts.push(`<div class="tp-block"><div class="tp-title">今日累计</div>`
+      + `<div class="tp-line">命中 ${escapeHtml(formatTokenCount(td.cache_hit))}`
+      + `　未命中 ${escapeHtml(formatTokenCount(td.cache_miss))}`
+      + `　输出 ${escapeHtml(formatTokenCount(td.output))}`
+      + `　命中率 ${escapeHtml(formatHitRatio(td.cache_hit_ratio))}</div></div>`);
+  }
+  if (!parts.length) return "";
+  return `<details class="token-panel-details"><summary>token 与缓存</summary>`
+    + parts.join("") + `</details>`;
+}
+
+function renderTokenPanel(manifest, usage) {
+  const box = document.getElementById("token-panel");
+  if (!box) return;
+  box.innerHTML = tokenPanelHtml(manifest, usage);
+}
+
+// R24：顶栏折叠。**默认展开**——一个默认藏起来的控件区会让人以为功能不存在。
+const TOPBAR_COLLAPSED_KEY = "tcm.topbarCollapsed";
+
+function topbarCollapsed() {
+  try {
+    return localStorage.getItem(TOPBAR_COLLAPSED_KEY) === "1";
+  } catch (e) {
+    // 隐私模式/禁用存储时读会抛。折叠状态是个便利，读不到就按默认（展开）来，
+    // 不是让页面炸掉。
+    return false;
+  }
+}
+
+function applyTopbarCollapsed(collapsed) {
+  const box = document.getElementById("topbar-controls");
+  const btn = document.getElementById("topbar-toggle");
+  if (box) box.classList.toggle("is-collapsed", !!collapsed);
+  if (btn) btn.setAttribute("aria-expanded", String(!collapsed));
+}
+
+function toggleTopbar() {
+  const next = !topbarCollapsed();
+  try {
+    localStorage.setItem(TOPBAR_COLLAPSED_KEY, next ? "1" : "0");
+  } catch (e) { /* 存不了就只在本次生效，不影响功能 */ }
+  applyTopbarCollapsed(next);
+}
+
 function degradeBannerText(u) {
   if (!u || !u.degraded) return null;
   return u.reason || "站点共享额度已用完，已切换到回放模式：结果来自预先录制的真实推理。";
@@ -748,14 +852,23 @@ function splitHerbGroupsForFold(groups) {
   return { visible, folded, nFolded: folded.reduce((n, g) => n + g.herbs.length, 0) };
 }
 
+// R24：君臣佐使改成**两列密排注解**——左列一个角色字（窄，像批注的鱼尾号），
+// 右列这一组的药味。原来是 `<div class="field"><b>君</b>…</div>` 的逐行流式排版，
+// 三列并排时每行都要重新找"角色字在哪儿结束、药名从哪儿开始"。
+//
+// 两列网格让四组的药味**左边界对齐**，眼睛竖着扫一遍就知道君臣各几味；
+// 角色字变小变灰，因为它是注解不是内容（内容是药名）。
+// 结构用 grid 而不是 table：table 在窄屏上不会换行，而这一块要跟着列宽走。
 function herbRowsHtml(groups) {
-  return groups
+  const rows = groups
     .map((g) => {
       const text = g.herbs.map((h) => escapeHtml(herbItemLabel(h))).join("、");
       const inner = g.role === "君" ? `<span class="herb-jun">${text}</span>` : text;
-      return `<div class="field"><b>${escapeHtml(g.role)}</b>${inner}</div>`;
+      return `<div class="hg-role">${escapeHtml(g.role)}</div>`
+        + `<div class="hg-herbs">${inner}</div>`;
     })
     .join("");
+  return rows ? `<div class="herb-grid">${rows}</div>` : "";
 }
 
 // fold=false 给医生模式/导出这类"要看全量"的场景留的口子：折叠是阅读密度的
@@ -1324,6 +1437,44 @@ function bandSegments(epsilon, divergenceValue) {
   };
 }
 
+// R24：对照带改成 SVG，并把 ε 那一段画成**斜纹**而不是一块灰。
+//
+// 为什么斜纹：3px 高的两段纯色带，在投影和小屏上"灰"和"黑"的区别几乎看不出，
+// 而这条带子是整页的主角（§3.1 第三条）——它要回答的是"差异有没有超出噪声"。
+// 斜纹和实心的区别是**纹理**，不依赖亮度，投影仪压暗了也还在。
+// 带高从 3px 提到 18px：这是页面上唯一需要被隔着几米看清的东西。
+//
+// pattern 的 id 写成常量：整页只有一条带，每次重渲染时整个 SVG 被替换，
+// 不会出现两个同 id 的 pattern。
+const RX_HATCH_ID = "rx-hatch";
+const RX_BAND_HEIGHT = 18;
+
+function rxBandSvgHtml(seg) {
+  if (!seg) {
+    return `<div class="rx-line rx-line-unmeasured" role="img"`
+      + ` aria-label="没有噪声地板可比"></div>`;
+  }
+  const label = seg.exceeds
+    ? `斜纹段是噪声地板，实心段是超出噪声的真实分歧`
+    : `整条都在噪声地板之内`;
+  // width 用百分比、height 用固定值：百分比宽让它跟着栏宽走，
+  // 固定高让斜纹的角度在任何宽度下都一样（斜纹的可读性靠角度）。
+  return `<svg class="rx-band" viewBox="0 0 100 ${RX_BAND_HEIGHT}" preserveAspectRatio="none"
+       height="${RX_BAND_HEIGHT}" role="img" aria-label="${escapeHtml(label)}">
+    <defs>
+      <pattern id="${RX_HATCH_ID}" width="4" height="4" patternUnits="userSpaceOnUse"
+               patternTransform="rotate(45)">
+        <rect width="4" height="4" fill="var(--surface-2)"></rect>
+        <line x1="0" y1="0" x2="0" y2="4" stroke="var(--noise)" stroke-width="2"></line>
+      </pattern>
+    </defs>
+    <rect class="rx-band-noise" x="0" y="0" width="${seg.epsPct}" height="${RX_BAND_HEIGHT}"
+          fill="url(#${RX_HATCH_ID})"></rect>
+    <rect class="rx-band-real" x="${seg.epsPct}" y="0" width="${seg.realPct}"
+          height="${RX_BAND_HEIGHT}" fill="var(--real)"></rect>
+  </svg>`;
+}
+
 function epsilonLabel(epsForQuery) {
   const e = epsForQuery || {};
   if (e.value === null || e.value === undefined) return "噪声地板 未测";
@@ -1348,10 +1499,7 @@ function rxCompareHtml(divergence, results) {
   }
   const value = divergence.pairs_mean;
   const seg = bandSegments((divergence.epsilon_for_query || {}).value, value);
-  const line = seg
-    ? `<div class="rx-line"><span class="rx-seg rx-seg-noise" style="width:${seg.epsPct}%"></span>`
-      + `<span class="rx-seg rx-seg-real" style="width:${seg.realPct}%"></span></div>`
-    : `<div class="rx-line rx-line-unmeasured"></div>`;
+  const line = rxBandSvgHtml(seg);
   const right = value === null || value === undefined
     ? "三家平均差异 未算出"
     : `三家平均差异 ${value}`;
@@ -1574,6 +1722,67 @@ function columnShellHtml(physician, name, meta, state, body) {
   </div>`;
 }
 
+// R24：R23 的建议层渲染。**按 severity 分三档视觉**，不是一串同样的灰字：
+// blocking（配伍禁忌/超剂量）用 --danger、warning（寒热）用 --caution、
+// suggestion（缺引经/重复）用普通正文色——严重度是这一层唯一有信息量的维度，
+// 把三档画成一样就等于没渲染。
+//
+// **patient 角色下这三个键根本不在响应里**（api/main.py::_role_gets_advice
+// 服务端就摘掉了），所以这里不需要再判角色：没有数据就渲染不出东西。
+// 前端再判一遍角色的话，"谁决定患者能看什么"就有了两个答案。
+function adviceListHtml(advice) {
+  if (!advice || !advice.length) return "";
+  const rows = advice.map((a) => {
+    // **不单独渲染 herbs**：`check_formula` 五条规则的 reason 里**都已经点名了
+    // 涉及的药**（「甘草 与 甘遂 属配伍禁忌」「白术 与 苍术 性味功效重合 100%」），
+    // 前面再重复一遍读起来像是数据出错了——这是截图里当场看出来的，
+    // 而 DOM 断言只查"药名在不在"，两种写法都能过。
+    // herbs 仍然进 data 属性：它是给机器读的（比如以后要点药名跳到药材层）。
+    const herbsAttr = (a.herbs || []).length
+      ? ` data-herbs="${escapeHtml((a.herbs || []).join("、"))}"` : "";
+    const span = a.source_span
+      ? `<span class="adv-source">${escapeHtml(a.source_span)}</span>` : "";
+    return `<li class="adv-row adv-${escapeHtml(a.severity || "suggestion")}"${herbsAttr}>`
+      + `<span class="adv-reason">${escapeHtml(a.reason || "")}</span>`
+      + span + "</li>";
+  }).join("");
+  return `<ul class="advice-list">${rows}</ul>`;
+}
+
+// 没跑的规则如实列出来。**不折叠、不省略**：「这条规则没给出建议」和
+// 「这条规则根本没跑」在界面上长得一模一样，而含义相反（R23 的 skipped 字段
+// 存在的全部理由）。
+function adviceSkippedHtml(skipped) {
+  if (!skipped || !skipped.length) return "";
+  const rows = skipped.map((s) => {
+    const flag = s.available === false ? "缺数据" : "不适用";
+    return `<li class="adv-skipped-row"><span class="adv-skipped-flag">${escapeHtml(flag)}</span>`
+      + `<span>${escapeHtml(s.reason || "")}</span></li>`;
+  }).join("");
+  return `<ul class="advice-skipped">${rows}</ul>`;
+}
+
+// 一整块：分 + 建议 + 没跑的规则。分数**带口径说明**（"粗排序尺，不是疗效评分"）
+// ——一个 0~1 的分摆在方子旁边而不说它是什么，读者只会当成"这方有多好"。
+function adviceBlockHtml(result) {
+  const advice = result.advice;
+  const skipped = result.advice_skipped;
+  const score = result.formula_score;
+  if (!advice && !skipped && (score === undefined || score === null)) return "";
+  const scoreHtml = (score === undefined || score === null)
+    ? ""
+    // 固定两位小数：0 / 0.7 / 0.9 三列并排时，`String(0)` 出来是「0」，
+    // 跟「0.7」不在同一个数量级的读感上——三列对照页里这种不齐会被读成别的意思。
+    : `<span class="adv-score" title="1.0 − Σ规则权重，粗排序尺，不是疗效评分">`
+      + `方剂评分 <b>${escapeHtml(Number(score).toFixed(2))}</b></span>`;
+  const bodyHtml = adviceListHtml(advice) + adviceSkippedHtml(skipped);
+  const emptyHtml = (advice && advice.length) ? "" :
+    `<div class="adv-none">规则层没有发现问题</div>`;
+  return `<div class="advice-block">`
+    + `<div class="advice-head"><span class="advice-title">方剂建议</span>${scoreHtml}</div>`
+    + bodyHtml + emptyHtml + `</div>`;
+}
+
 function columnHtml(result, mode = "researcher") {
   const s3 = result.s3;
   const hallucinationHtml = result.hallucinated && result.hallucinated.length > 0
@@ -1626,6 +1835,7 @@ function columnHtml(result, mode = "researcher") {
       ${revisedHtml}
       ${noRefHtml}
       ${hallucinationHtml}
+      ${adviceBlockHtml(result)}
       ${doctorSectionHtml(result.physician, mode)}
       ${refFoldHtml(result.refs)}
       <details class="col-reasoning" ${openAttr}>
@@ -1907,6 +2117,8 @@ function renderConsultResult(data) {
   // 每次问诊都刷新一次：页面加载时那次 /health 可能失败，而这一条是必须出现的
   renderDemoMode(data.demo_mode);
   const m = data.manifest;
+  lastManifest = m || null;
+  renderTokenPanel(m, lastUsage);
   document.getElementById("manifest-footer").textContent = m
     ? `${m.model}　prompt ${m.prompt_version}　语料 ${m.cases_sha256 || "?"}　${m.llm_calls} 次调用　${(m.elapsed_ms / 1000).toFixed(1)}s`
     : "";
@@ -2366,3 +2578,19 @@ setGraphHooks({
   onOpenEvidence: openEvidence,
   onCloseEvidence: closeEvidence,
 });
+
+
+// ---------- R24：自绘下拉 ----------
+//
+// 放在最后：`enhanceAllSelects()` 要在两个下拉的 change 监听器都绑好之后再包，
+// 顺序反了的话自绘层派发的第一次 change 会落在空气上。
+// 图谱浏览器那两个下拉的选项是运行时填的，包一层不影响后填选项——
+// 列表每次打开时现渲染（见 select.js 的 open()）。
+enhanceAllSelects();
+
+// R24：顶栏折叠。绑事件 + 按上次的选择恢复。
+{
+  const _tb = document.getElementById("topbar-toggle");
+  if (_tb) _tb.addEventListener("click", toggleTopbar);
+  applyTopbarCollapsed(topbarCollapsed());
+}

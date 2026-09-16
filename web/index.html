@@ -22,7 +22,12 @@
          不是另起一块只在医生模式下才出现的提示。 -->
     <div class="tb-sub" id="disclaimer-text">教学与研究用途，非诊断工具，不能替代执业医师</div>
   </div>
-  <div class="tb-controls">
+  <!-- R24：顶栏折叠。首屏不需要看到角色/检索/BYOK 三组控件——它们是"这次怎么跑"
+       的设置，而首屏要问的是"输入主诉"。折叠状态存 localStorage，
+       但**默认展开**：一个默认藏起来的控件区会让人以为功能不存在。 -->
+  <button id="topbar-toggle" type="button" aria-expanded="true"
+          aria-controls="topbar-controls" title="折叠/展开顶栏设置">设置</button>
+  <div class="tb-controls" id="topbar-controls">
     <!-- §5.1：额度看板在顶栏右侧。80% 变 --caution，降级变 --danger，
          降级的原话由顶栏下方那一行给（它不是错误，是"换了个后端继续跑"）。 -->
     <span id="quota-chip" role="status" aria-live="polite"></span>
@@ -44,14 +49,14 @@
       </div>
     </details>
     <label id="role-select-label" for="role-select">查看模式</label>
-    <select id="role-select">
+    <select id="role-select" data-custom-select>
       <option value="researcher" selected>研究者（完整信息）</option>
       <option value="student">学生（教学展开）</option>
       <option value="doctor">医生（可编辑处方）</option>
       <option value="patient">患者（导诊，不提供方药）</option>
     </select>
     <label id="retriever-mode-label" for="retriever-mode">检索模式</label>
-    <select id="retriever-mode">
+    <select id="retriever-mode" data-custom-select>
       <option value="">默认</option>
       <option value="hybrid">hybrid（稠密+BM25 融合）</option>
       <option value="dense">dense（稠密向量）</option>
@@ -85,6 +90,18 @@
   <div id="safety-block" role="alert" aria-live="assertive" hidden></div>
 
   <div id="consult-page" class="state-first">
+    <!-- R24：首屏题记。**只在 .state-first 下显示**（输入过一次就让位给结果）。
+         写这个项目自己的话，不引古人——一句带"《某书》云"的题记必须能核对到原文，
+         而这台机器上核不了（books/ 是 gitignore 的）。编一句假出处比不放题记糟得多。
+         三行的分工：第一行说这是什么、第二行说它给什么、第三行说它不给什么。 -->
+    <div id="epigraph">
+      <!-- **不写医家数**：注册表现在跑三位（R18 之后可开到五位），题记里写死
+           「两位」「三位」就是 CLAUDE.md 那条「写死的常量也算一处实现」——
+           加一位医家时这行字不会跟着改，而它就在首屏正中央。 -->
+      <div class="eg-line eg-1">同一个病人，请几位名医各自辨证，把他们分道的地方摆出来。</div>
+      <div class="eg-line eg-2">每条结论都带它依据的医案编号；分歧度旁边永远有一条噪声地板。</div>
+      <div class="eg-line eg-3">教学与研究用途。它不做诊断，也不替医生开方。</div>
+    </div>
     <div id="error-box" role="alert" aria-live="assertive"></div>
     <div id="safety-flag-note" role="alert" aria-live="assertive"></div>
     <div id="triage-box"></div>
@@ -140,6 +157,10 @@
         </div>
         <div id="progress-log" role="status" aria-live="polite"></div>
         <div id="manifest-footer"></div>
+        <!-- R24：R21 的 token 面板。**挂在 manifest 旁边而不是顶栏**：
+             它回答的是"这一次问诊的知识是怎么进模型的、命中了多少缓存"，
+             跟 manifest（模型/调用数/语料版本）是同一类元数据。 -->
+        <div id="token-panel"></div>
       </div>
     </details>
 
@@ -182,11 +203,11 @@
     <input type="text" id="gb-search" placeholder="搜索症状 / 证素 / 证型…" />
     <button class="ghost-btn" id="gb-search-btn">搜索</button>
     <span id="gb-search-status"></span>
-    <select id="gb-physician-select"></select>
+    <select id="gb-physician-select" data-custom-select></select>
     <button class="ghost-btn" id="gb-layer-toggle" hidden>切换到医案层</button>
     <!-- R16 §3.2 规格 9：「加载更多证型」换成「按门类浏览」。翻页在一堆互不
          相连的证型上没有意义——翻到第 3 页看到的还是一堆孤立方块。 -->
-    <select id="gb-category-select" hidden></select>
+    <select id="gb-category-select" data-custom-select hidden></select>
     <button class="ghost-btn" id="gb-reset-btn">重置视图</button>
   </div>
   <div id="gb-panel">
@@ -194,6 +215,8 @@
     <div id="gb-tooltip" class="gt-tooltip"></div>
     <div id="gb-empty-hint">加载中…</div>
   </div>
+  <!-- R24：两环图例。环的含义写出来，不靠人猜（gbRingLegendText 一处产出）。 -->
+  <div id="gb-ring-legend"></div>
   <div id="gb-stats"></div>
 </div>
 </main>
@@ -206,6 +229,7 @@
   <div id="evidence-body"></div>
 </aside>
 
+<script src="ui/select.js"></script>
 <script src="graph.js"></script>
 <script src="app.js"></script>
 

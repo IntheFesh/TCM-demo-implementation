@@ -211,12 +211,15 @@
   }
   #graph-note { bottom: 8px; }
   #divergence-banner {
+    /* R24 去卡片化：语义靠左侧标记线 + 文字色，不靠一个圆角框。
+       整框 + 底色 + 圆角这三件一起上，会让每一块内容都长成同一个"卡片"，
+       而这一页有七八块这样的内容——那时版面读起来就是一串模板方块。 */
     display: none;
-    background: var(--caution-bg);
-    border: 1px solid var(--warn-border);
+    background: transparent;
+    border: 0;
+    border-left: 3px solid var(--caution);
     color: var(--caution);
-    padding: 10px 14px;
-    border-radius: var(--r-lg);
+    padding: 6px 0 6px 12px;
     font-size: 13.5px;
     margin-bottom: 16px;
     /* 1.3（E2）：第二行列三对两两配对的分歧，textContent 里用 \n 分行 */
@@ -227,10 +230,12 @@
      第一次进入（.state-first）时居中放大——此时页面上没有别的东西，
      把输入框摆在底部等于让人对着一片空白往下找。 */
   #input-panel {
-    background: var(--surface);
-    border: 1px solid var(--rule);
-    border-radius: var(--r-lg);
-    padding: var(--s4);
+    /* 输入区是动作不是内容块：去掉框之后 textarea 自己的边框就是唯一的框，
+       "要在哪里打字"因此更明确（原来是框里还有一个框）。 */
+    background: transparent;
+    border: 0;
+    border-top: var(--edge);
+    padding: var(--s4) 0 0;
     margin-bottom: var(--s5);
   }
   .state-first #input-panel {
@@ -247,6 +252,35 @@
   /* 示例只在首屏出现：有结果之后它们就成了干扰。 */
   #examples { display: none; }
   .state-first #examples { display: block; margin-bottom: var(--s4); }
+
+  /* ---- R24：首屏题记 ---- */
+  /* 默认不显示：输入过一次之后它就该让位给结果（题记是"这是什么"，
+     而一旦有了结果，"这是什么"已经由结果本身回答了）。 */
+  #epigraph { display: none; }
+  .state-first #epigraph {
+    display: block;
+    max-width: 34em;          /* ≈34 汉字：跟主诉正文同一条行宽纪律 */
+    margin: var(--s6) auto var(--s7);
+    text-align: left;
+  }
+  .eg-line { line-height: 1.85; }
+  /* 三行三种字重/字号/颜色：它们是三句不同性质的话，不是一段话的三行。 */
+  .eg-1 {
+    font-family: var(--font-classic);
+    font-size: 22px; font-weight: 600; color: var(--ink);
+    margin-bottom: var(--s3);
+  }
+  .eg-2 {
+    font-family: var(--font-classic);
+    font-size: 15px; color: var(--ink-2);
+    margin-bottom: var(--s3);
+  }
+  .eg-3 {
+    font-family: var(--font-ui);
+    font-size: 12.5px; color: var(--muted);
+    border-top: var(--edge-soft);
+    padding-top: var(--s2);
+  }
   #examples .ex-title { font-size: 12.5px; color: var(--muted); margin-bottom: var(--s3); }
   #examples .ex-list { display: flex; flex-direction: column; gap: var(--s2); }
   #examples .example {
@@ -285,12 +319,15 @@
   /* ---- 用药对照带（§3.1 第三条：页面的主角） ---- */
   #rx-compare { display: none; }
   #rx-compare.show {
+    /* 页面的主角不需要一个框把它圈起来（§3.1 第三条）——上下两条细线
+       已经足够说明"这一块是一个整体"，而框会跟三列的顶边抢结构感。 */
     display: block;
-    border: 1px solid var(--rule-soft);
-    border-radius: var(--r-lg);
-    padding: var(--s4);
+    border: 0;
+    border-top: var(--edge-soft);
+    border-bottom: var(--edge-soft);
+    padding: var(--s4) 0;
     margin-bottom: var(--s5);
-    background: var(--surface);
+    background: transparent;
   }
   .rx-title { font-size: 12.5px; color: var(--muted); margin-bottom: var(--s3); }
   .rx-dots { display: flex; flex-wrap: wrap; gap: var(--s5); margin-bottom: var(--s3); }
@@ -299,6 +336,9 @@
   .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
   .dot-shared { background: var(--ink); }
   /* .dot-own 的底色由 JS 逐点注入 var(--phys-<id>)，这里只定形状 */
+  /* R24：带子本体改成 SVG（斜纹 = 噪声地板、实心 = 真实分歧）。
+     18px 而不是 3px：这是页面上唯一需要隔着几米看清的东西。 */
+  .rx-band { display: block; width: 100%; margin: var(--s3) 0 4px; }
   .rx-line { display: flex; height: 3px; border-radius: var(--r-sm); overflow: hidden; margin: var(--s3) 0 4px; }
   .rx-seg-noise { background: var(--noise); }
   .rx-seg-real { background: var(--real); }
@@ -492,9 +532,9 @@
     white-space: pre-wrap;
     max-height: 130px;
     overflow-y: auto;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--r-lg);
+    background: transparent;
+    border: 0;
+    border-top: var(--edge-soft);
   }
   #progress-log.show { display: block; }
   #need-input-box {
@@ -592,16 +632,49 @@
   .col-body { color: var(--ink); font-size: 13.5px; line-height: 1.7; }
   .col-syndrome {
     font-family: var(--font-classic);
-    font-size: 16px;
     font-weight: 600;
     margin-bottom: var(--s3);
   }
-  .col-principle { margin-bottom: var(--s3); }
+  /* R24：一列之内**四级层次**，四级各有一种区分手段，不靠同一种手段的四个刻度：
+       ①证型   宋体 17px 600     —— 这一列的结论
+       ②治法   黑体 13.5px 常规  —— 怎么治（字体换族，跟结论明显不同）
+       ③方名   宋体 15px 600 + 上方细线 —— 用哪张方（线是"从判断进入处方"的界）
+       ④药味   13.5px + 两列密排 —— 具体开了什么（缩进，从属于方名）
+     只调字号的话四级会读成"一样的东西四种大小"，而它们是四种不同的东西。 */
+  .col-syndrome { font-size: 17px; }
+  .col-principle {
+    font-family: var(--font-ui);
+    font-size: 13.5px;
+    color: var(--ink-2);
+    margin-bottom: var(--s3);
+  }
   .col-formula {
     font-family: var(--font-classic);
+    font-size: 15px;
     font-weight: 600;
-    margin-bottom: var(--s3);
+    border-top: var(--edge-soft);
+    padding-top: var(--s2);
+    margin-bottom: var(--s2);
   }
+  /* 君臣佐使两列密排：左列角色字（注解），右列药味（内容）。
+     1.4em 是"一个汉字 + 一点气"，再宽就变成一栏表格了。 */
+  .herb-grid {
+    display: grid;
+    grid-template-columns: 1.4em 1fr;
+    column-gap: var(--s2);
+    row-gap: 2px;
+    margin-left: var(--s2);
+    font-size: 13.5px;
+    line-height: 1.55;
+  }
+  .hg-role {
+    font-family: var(--font-classic);
+    font-size: 12px;
+    color: var(--muted);
+    text-align: center;
+    padding-top: 2px;
+  }
+  .hg-herbs { color: var(--ink); }
   .col .field {
     font-size: 13.5px;
     margin-bottom: 4px;
@@ -703,12 +776,12 @@
   /* 「参西用药」是医家特征展示，不是警告——刻意用青蓝，跟 .hallucination-warning
      的红、.safety-thermal 的橙分开，避免读成"这里有问题"。 */
   .western-drugs {
-    background: var(--surface-2);
-    border: 1px solid var(--verified);
+    background: transparent;
+    border: 0;
+    border-left: 2px solid var(--verified);
     color: var(--verified);
     font-size: 13px;
-    padding: 8px 10px;
-    border-radius: var(--r-md);
+    padding: 4px 0 4px 10px;
     margin: 8px 0;
   }
   .safety-thermal {
@@ -728,12 +801,16 @@
 
   /* ---------- M8：医生模式可编辑处方表 ---------- */
   .doctor-disclaimer {
+    /* 去卡片化在这一块**只去框和圆角、保留紫底**：它是法律声明（医生模式下
+       "这不是处方"那句话），弱化到只有一条左线会让它读起来像一条普通提示。
+       tests/test_doctor_sequence.py 那条判据要求这里用 --purple-* 三个令牌、
+       不写死颜色，保留底色正好跟它一致。 */
     background: var(--purple-bg);
-    border: 1px solid var(--purple-border);
+    border: 0;
+    border-left: 2px solid var(--purple-border);
     color: var(--purple-text);
     font-size: 12px;
-    padding: 8px 10px;
-    border-radius: var(--r-md);
+    padding: 4px 0 4px 10px;
     margin: 8px 0;
     line-height: 1.6;
   }
@@ -847,11 +924,11 @@
      只有 #residual-note 这个 **id** 选择器，同名的类选择器从来不存在——这个
      框一直是完全没样式的裸文本。 */
   .followup-note {
-    background: var(--warn-bg);
-    border: 1px solid var(--warn-border);
+    background: transparent;
+    border: 0;
+    border-left: 3px solid var(--caution);
     color: var(--caution);
-    padding: 10px 14px;
-    border-radius: var(--r-lg);
+    padding: 6px 0 6px 12px;
     font-size: 12.5px;
     line-height: 1.7;
     margin-bottom: 16px;
@@ -860,11 +937,11 @@
   #triage-box { display: none; margin-bottom: 16px; }
   #triage-box.show { display: block; }
   .triage-card {
-    background: var(--panel);
-    border: 1px solid var(--border);
+    /* 左侧那条 4px 线本来就是它的标记，外面再套一个框是重复的。 */
+    background: transparent;
+    border: 0;
     border-left: 4px solid var(--accent);
-    border-radius: var(--r-lg);
-    padding: 12px 14px;
+    padding: 6px 0 6px 12px;
     font-size: 13.5px;
     line-height: 1.7;
   }
@@ -1264,3 +1341,134 @@
 .ref-note { font-size: 13px; line-height: 1.6; color: var(--ink-2); }
 .ref-empty { font-size: 13px; color: var(--muted); }
 .ref-error { color: var(--danger); }
+
+/* ============================================================================
+   R24：自绘下拉。原生 `<select>` 的弹出层由操作系统画、不吃页面字体，
+   在一屏截图里非常扎眼——而"宋体说中医的话、黑体说系统的话"是这个项目的
+   视觉主张，下拉是唯一一处说了别人的话的地方。
+   逻辑在 web/ui/select.js，那里写了"为什么包在原生元素外面而不是换掉它"。
+   ============================================================================ */
+.cs-wrap { position: relative; display: inline-block; }
+/* 原生元素留在 DOM 里（它是值的唯一来源，Playwright 的 select_option 也要它），
+   只是视觉上让位。**不用 display:none**：那样 Playwright 判定它不可交互。 */
+.cs-native {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  opacity: 0; pointer-events: none;
+}
+.cs-button {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  padding: 3px 22px 3px 8px;
+  cursor: pointer;
+  text-align: left;
+  min-width: 8em;
+  position: relative;
+}
+/* 箭头自己画：用字符的话不同系统字体里的 ▾ 大小差很多。 */
+.cs-button::after {
+  content: "";
+  position: absolute; right: 8px; top: 50%;
+  width: 6px; height: 6px;
+  border-right: 1px solid var(--muted);
+  border-bottom: 1px solid var(--muted);
+  transform: translateY(-70%) rotate(45deg);
+}
+.cs-button:hover { border-color: var(--ink-2); }
+.cs-button:focus-visible { outline: 2px solid var(--verified); outline-offset: 1px; }
+.cs-button[aria-expanded="true"] { border-color: var(--ink-2); }
+.cs-list {
+  position: absolute; top: calc(100% + 2px); left: 0; z-index: 40;
+  min-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  /* 浮层才允许用阴影（§2.3：不用阴影做层次）。用 --shadow-float 这一个令牌，
+     不另调一个值——"这个阴影跟那个阴影是不是同一件事"只有集中定义时才看得出来。 */
+  box-shadow: var(--shadow-float);
+  max-height: 60vh; overflow-y: auto;
+}
+.cs-option {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  color: var(--ink);
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cs-option.is-highlighted { background: var(--surface-2); }
+.cs-option[aria-selected="true"] { color: var(--verified); font-weight: 500; }
+.cs-option[aria-disabled="true"] { color: var(--muted); cursor: default; }
+
+/* ---------- R24：顶栏折叠 ---------- */
+#topbar-toggle {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  color: var(--ink-2);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-sm);
+  padding: 3px 10px;
+  cursor: pointer;
+  align-self: center;
+  margin-right: var(--s2);
+}
+#topbar-toggle:hover { border-color: var(--ink-2); color: var(--ink); }
+.tb-controls.is-collapsed { display: none; }
+
+/* ---------- R24：R23 建议层 ---------- */
+.advice-block { margin: var(--s3) 0 0; }
+.advice-head {
+  display: flex; align-items: baseline; gap: var(--s2);
+  border-bottom: 1px solid var(--rule-soft);
+  padding-bottom: 2px;
+}
+.advice-title {
+  font-family: var(--font-ui); font-size: 12.5px;
+  color: var(--muted); letter-spacing: .04em;
+}
+.adv-score { font-family: var(--font-num); font-size: 12.5px; color: var(--ink-2); }
+.advice-list, .advice-skipped { list-style: none; margin: 4px 0 0; padding: 0; }
+.adv-row, .adv-skipped-row {
+  font-family: var(--font-ui); font-size: 12.5px;
+  line-height: 1.6; padding: 2px 0 2px 8px;
+  border-left: 2px solid var(--rule);
+}
+/* 严重度是这一层唯一有信息量的维度：三档画成一样就等于没渲染。 */
+.adv-row.adv-blocking { border-left-color: var(--danger); color: var(--danger); }
+.adv-row.adv-warning { border-left-color: var(--caution); color: var(--caution); }
+.adv-row.adv-suggestion { border-left-color: var(--rule); color: var(--ink-2); }
+.adv-herbs { font-family: var(--font-classic); margin-right: 4px; }
+.adv-source { color: var(--muted); margin-left: 4px; }
+.adv-none { font-size: 12.5px; color: var(--muted); padding: 2px 0; }
+.adv-skipped-row { border-left-style: dashed; color: var(--muted); }
+.adv-skipped-flag {
+  font-size: 11px; color: var(--muted);
+  border: 1px solid var(--rule); border-radius: var(--r-sm);
+  padding: 0 3px; margin-right: 4px;
+}
+
+/* ---------- R24：token 面板（R21 的数据） ---------- */
+.token-panel-details { margin-top: var(--s2); }
+.token-panel-details > summary {
+  font-family: var(--font-ui); font-size: 12.5px;
+  color: var(--muted); cursor: pointer;
+}
+.tp-block { margin: 4px 0 0; }
+.tp-title { font-family: var(--font-ui); font-size: 11px; color: var(--muted); }
+.tp-line { font-family: var(--font-num); font-size: 12.5px; color: var(--ink-2); }
+.tp-table { border-collapse: collapse; font-size: 12.5px; }
+.tp-table td { padding: 1px 10px 1px 0; color: var(--ink-2); }
+.tp-table td.tp-num { font-family: var(--font-num); text-align: right; }
+
+/* R24：两环图例。环的含义要写出来——一张同心圆图上"内圈是什么"
+   如果要靠人猜，这个布局就只是好看而没有信息。 */
+#gb-ring-legend {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: var(--s2);
+}
