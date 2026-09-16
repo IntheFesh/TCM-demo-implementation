@@ -63,8 +63,11 @@ def round_report_paths(reports_dir: Path = ROUND_REPORTS_DIR) -> tuple[Path, ...
     return tuple(path for _, path in sorted(found))
 
 
+# R25：材料索引也进核对器。**竞赛材料里的每个数都要可核**——那份文件的全部
+# 作用就是"把这些话讲给别人听"，而一句没有凭据的话在那种场合代价最大。
 DEFAULT_CHECK_PATHS = (DEFAULT_RESULTS_MD, ROOT / "README.md",
                        ROOT / "docs" / "R11-R19_report.md", ROOT / "DEMO.md",
+                       ROOT / "docs" / "MATERIALS.md",
                        *round_report_paths())
 
 EPSILON_JSON = "epsilon.json"

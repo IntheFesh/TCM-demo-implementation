@@ -79,8 +79,16 @@ def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents(
     # 评测仍是最贵的一段，且性能基准在它之后。
     i_bench = next(i for i, n in enumerate(names) if "性能基准" in n)
     assert calls[i_eval] > calls[i_bench], "不被依赖的三段里，评测仍该是最贵的那个"
-    assert i_bench == len(rows) - 1, "性能基准必须是最后一段"
     assert i_pharm < i_bench, "性能基准必须在药理层抽取之后（开 ReAct 那次要读它的产出）"
+    # **R25 起最后一段是 R21~R24 的上机项**（又一次有意的契约变更，理由跟 R11 那次
+    # 同一形状）：原断言是「性能基准必须是最后一段」，它钉的本意是"最贵的放后面、
+    # 依赖别人的放后面"。段 9 只有 33 次调用，不违反前半句；而它必须在最后有硬依据
+    # ——它要的东西前面几段都得先有（前缀规模要 cases.json、命中率要真实 API、
+    # full_context 下的 E3/E4 要评测框架跑通、字体子集化要联网取原始字体）。
+    i_last = next(i for i, n in enumerate(names) if "R21~R24" in n)
+    assert i_last == len(rows) - 1, "R21~R24 那一段必须是最后一段"
+    assert i_bench < i_last, "性能基准在它之前（那一段要量的是跑完前面所有段之后的系统）"
+    assert calls[i_eval] > calls[i_last], "评测仍是最贵的一段"
 
 
 def test_exactly_two_human_gates_and_they_are_segments_3_and_5():

@@ -125,6 +125,7 @@ SEGMENTS=(
   "6|录制回放|278|no|record_fixtures（--dry-run 实测 278）+ verify_replay"
   "7|全套评测重跑|1200|no|最贵的一段：run_eval 四项 + SDT Test（会写台账）"
   "8|性能基准|38|no|bench_startup 冷/热各一次（0 调用）+ bench_consult 不开 ReAct ×3、开 ReAct ×1"
+  "9|R21~R24 的上机项|320|no|前缀规模 0 + 缓存命中率 2 次问诊 ×11 = 22 + full_context 下 E3/E4（9 条主诉 × own/swapped/none 三种 × 11 次/问诊 ≈ 297）+ 字体子集化 0。**这个 11 是 R22 之后的 calls_per_consult()**（2 + 3 医家 × 采样 3 次）"
 )
 
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -172,7 +173,7 @@ is_peak() { python3 -c "import sys; from core.usage import is_peak; sys.exit(0 i
 
 # 这几段是花钱的大头（段 5 药理层抽取、段 6 录制、段 7 全套评测、段 8 性能基准）。
 # 高峰时段启动它们只提醒、**不阻止**：有时就是得现在跑。
-COSTLY_SEGMENTS=" 5 6 7 8 "
+COSTLY_SEGMENTS=" 5 6 7 8 9 "
 
 warn_if_peak() {
   local n="$1"
@@ -204,7 +205,9 @@ print_plan() {
   echo
   echo "段 0/1 零调用，先跑它们：免费的问题先发现掉。段 5 最贵，但段 6/7 要用它落盘的"
   echo "药理层数据（core/tools.py 读 data/materia_medica.jsonl），所以它在两者之前。"
-  echo "段 7 是最贵的一段；段 8 性能基准排在最后，因为它量的必须是跑完前面所有段之后的这套系统。"
+  echo "段 7 是最贵的一段；段 8 性能基准要量的是跑完前面所有段之后的这套系统，所以排在它后面。"
+  echo "段 9（R21~R24 的上机项）排最末：它要的东西前面几段都得先有——前缀规模要 cases.json、"
+  echo "命中率要真实 API、full_context 下的 E3/E4 要评测框架跑通、字体子集化要联网取原始字体。"
 }
 
 gate() {   # $1 = 段号, $2 = 这一步要人确认什么
@@ -368,6 +371,35 @@ seg_8() {
   python -m scripts.bench_consult --backend real --repeat 1 --react
 }
 
+seg_9() {
+  # R21~R24 攒下来的上机项，合成一段。**排在最后**：它要的东西前面几段都得先有
+  # （前缀规模要 cases.json、命中率要真实 API、E3/E4 要评测框架跑通）。
+  #
+  # ⚠ **这一段跑出来的数跟段 7 的历史数不可比**：R21 把检索默认换成
+  # full_context、R22 把 S3 改成采 3 次 + effort=max。三个旋钮都换了实验条件，
+  # 所以下面 E3/E4 的结果是**新起的一行**（eval/RESULTS.md 的 full_context 系），
+  # 不是覆盖上面那张 top3 系的表。
+  echo "--- ① 前缀真实规模（0 调用）。判据：三位医家各自 ≤ 500K，且没有段被裁 ---"
+  python -m core.context_prefix --report || return 1
+
+  echo "--- ② 前缀缓存命中率。**判据：第二次 ≥ 0.9**（第一次必然接近 0，那是对的） ---"
+  python -m scripts.bench_consult --backend real --repeat 2 || return 1
+
+  echo "--- ③ full_context 下的 E3/E4。判据：两个 change_rate 各自 ≥ 0.4 ---"
+  echo "--- **跟 top3 系那两个数（0.451 / 0.497）并列报，不相减**：换掉的量不同 ---"
+  RETRIEVER_MODE=full_context python -m eval.run_eval --e3 --e4 || return 1
+
+  echo "--- ④ 字体子集化（0 调用，要网络取原始字体）。判据：每个面 < 原始的 10% ---"
+  python -m scripts.subset_fonts --check-deps || {
+    echo "（缺 fonttools：pip install \"fonttools[woff]\" brotli，然后重跑这一段）"
+    return 1
+  }
+  python -m scripts.subset_fonts --download || return 1
+  python -m scripts.subset_fonts || return 1
+  echo "--- 把上面打印的四段 @font-face 贴进 web/app.css，再跑一次演示自检 ---"
+  python -m scripts.demo_preflight || true
+}
+
 run_segment() {
   local n="$1" name="$2" gate_flag="$3"
   echo
@@ -397,6 +429,7 @@ run_segment() {
     6) seg_6 || rc=$? ;;
     7) seg_7 || rc=$? ;;
     8) seg_8 || rc=$? ;;
+    9) seg_9 || rc=$? ;;
   esac
   echo "--------------------------------------------------------------------------"
   echo "[段 $n] $name    结束 $(date -Is)    退出码 $rc"

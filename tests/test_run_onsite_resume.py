@@ -14,7 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "run_onsite.sh"
-SEGMENTS = ("0", "1", "2", "3", "4", "5", "6", "7", "8")
+# R25 加了段 9（R21~R24 的上机项）。**这个元组是"脚本里有哪几段"的期望值**，
+# 不是段数的第二处定义——下面那条测试拿它跟脚本里现数出来的比，两者不一致就红。
+# 加段时改这一处是有意的：它是一道"你知道自己加了一段"的确认。
+SEGMENTS = ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
 
 
 def _run(args, state: Path | None = None):
@@ -32,8 +35,9 @@ def _state(tmp_path: Path, rcs: dict[str, int]) -> Path:
     return p
 
 
-def test_the_script_still_has_nine_segments():
-    """九段是这一轮交付判据的一部分。数字从脚本里数，不写死在两处。"""
+def test_the_script_segments_match_the_expected_list():
+    """**R25 起十段**（原来九段，名字也跟着改）。段号从脚本里现数，
+    跟上面那个期望元组比——不是在两处各写一个段数。"""
     src = SCRIPT.read_text(encoding="utf-8")
     block = src[src.index("SEGMENTS=("):src.index("\n)", src.index("SEGMENTS=("))]
     nums = re.findall(r'^\s*"(\w+)\|', block, re.M)

@@ -120,10 +120,17 @@ def test_the_runbook_does_not_compute_the_timezone_itself():
 
 
 def test_only_the_costly_segments_get_the_warning():
-    """段 0/1 零调用，提醒它们只是噪声；提醒多了就没人看了。"""
+    """段 0/1 零调用，提醒它们只是噪声；提醒多了就没人看了。
+
+    **有意的契约变更（R25）**：期望值从 5/6/7/8 变成 5/6/7/8/9。第 9 段
+    （R21~R24 的上机项）估 320 次真实调用，是全剧本里第二贵的一段，
+    不提醒它等于这条判据漏了一个应该提醒的段。这里必须改期望值、
+    不能改成"只要 5 在里面就算过"——后者会让这条测试从此再也发现不了
+    "某段花钱但没被登记进 COSTLY_SEGMENTS"这类漏登记。
+    """
     src = (ROOT / "scripts" / "run_onsite.sh").read_text(encoding="utf-8")
     line = next(ln for ln in src.splitlines() if ln.startswith("COSTLY_SEGMENTS="))
-    assert line.split("=", 1)[1].strip().strip('"').split() == ["5", "6", "7", "8"]
+    assert line.split("=", 1)[1].strip().strip('"').split() == ["5", "6", "7", "8", "9"]
 
 
 def test_the_warning_does_not_block():
