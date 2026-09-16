@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Literal
 
 # 不开 ReAct 的一次问诊大约花多少次调用：S1 + S2 + 三位医家各一次 S3。
@@ -58,6 +58,41 @@ def estimate_calls(use_react: bool, n_physicians: int) -> int:
     if use_react:
         base += max(n_physicians, 1) * REACT_STEPS_PER_PHYSICIAN
     return base
+
+
+# R21：DeepSeek 2026-08-17 起按峰谷分时计价。**高峰 UTC 01:00–04:00 与
+# 06:00–10:00**（= 北京 09–12 与 14–18），其余时段五折。
+#
+# 只在这里定义一次：`scripts/run_onsite.sh` 开头那行提示、账本的 `peak` 标记、
+# 前端用量面板都从这里取。写两处的话夏令时/时区换算会有一处算错，
+# 而算错的表现是"按五折估的预算，实际按原价扣"。
+#
+# **只记不改额度**：额度仍按调用数算（`CALLS_PER_CONSULT`），峰谷只影响钱。
+# 让额度跟着时段变会让"今天还能问几次"这个数每隔几小时跳一次，没人看得懂。
+PEAK_UTC_HOUR_RANGES = ((1, 4), (6, 10))
+
+
+def is_peak(now: datetime | None = None) -> bool:
+    """现在是不是高峰时段（UTC 小时落在 PEAK_UTC_HOUR_RANGES 的任一区间内）。
+
+    区间按 `start <= hour < end` 判：UTC 01:00–04:00 含 01/02/03 三个整点，
+    不含 04——04:00:00 那一刻已经是谷段了。写成半开区间是为了让两个区间
+    之间不会有一个既算高峰又算低谷的整点。
+    """
+    hour = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).hour
+    return any(start <= hour < end for start, end in PEAK_UTC_HOUR_RANGES)
+
+
+def peak_note(now: datetime | None = None) -> str:
+    """给人看的一句话。高峰/五折两种情况都说清楚，不是只在高峰时才提醒
+    ——"现在没提醒"跟"现在是五折"是两件事，前者可能只是忘了看。"""
+    n = now or datetime.now(timezone.utc)
+    beijing = n.astimezone(timezone(timedelta(hours=8)))
+    stamp = beijing.strftime("%Y-%m-%d %H:%M")
+    if is_peak(n):
+        return (f"北京时间 {stamp}：**高峰时段**（北京 09–12、14–18），"
+                "按原价计费。跑贵的段建议等到谷段（五折）。")
+    return f"北京时间 {stamp}：谷段，**五折**计费。适合跑贵的段。"
 
 
 @dataclass(frozen=True)
@@ -103,6 +138,13 @@ class UsageLedger:
         self._global_used = 0
         self._reservations: dict[int, tuple[str, int]] = {}
         self._next_token = 1
+        # R21：今天的 token 用量（命中/未命中/输出三项分开）。
+        # **跟调用数分开记、不参与限额**：限额按调用数算（见 PEAK_UTC_HOUR_RANGES
+        # 上面那段），token 数是给人看成本的——命中和未命中差 30 倍价钱，
+        # 合成一个"总 token"就看不出这次问诊到底便不便宜。
+        self._tokens: dict[str, int] = {"cache_hit": 0, "cache_miss": 0, "output": 0}
+        # 高峰时段发生的调用数。只记不改额度。
+        self._peak_calls = 0
         self._since = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     # ---- 内部 ----
@@ -113,6 +155,8 @@ class UsageLedger:
             self._day = today
             self._by_ip.clear()
             self._global_used = 0
+            self._tokens = {"cache_hit": 0, "cache_miss": 0, "output": 0}
+            self._peak_calls = 0
             # 预占**不清**：跨天时刻还在跑的那次请求，结算时要有地方落账。
             # 它落到新的一天，宁可多算一点也不要凭空消失。
 
@@ -149,6 +193,20 @@ class UsageLedger:
                 "used_ratio": round(
                     _warn_ratio(ip_used, self._per_ip, self._global_used, self._global), 4
                 ),
+                # R21：今天的 token 三项 + 命中率。前端在「…」菜单的用量面板显示。
+                # 命中率在这里算一次，前端不自己除（除法写两处，分母改一次就会有
+                # 一处忘了改——R17 额度三档那一条踩过同一个形状）。
+                "tokens_today": {
+                    **self._tokens,
+                    "cache_hit_ratio": (
+                        round(self._tokens["cache_hit"]
+                              / (self._tokens["cache_hit"] + self._tokens["cache_miss"]), 4)
+                        if (self._tokens["cache_hit"] + self._tokens["cache_miss"]) else None
+                    ),
+                },
+                "peak_calls_today": self._peak_calls,
+                "is_peak_now": is_peak(),
+                "peak_note": peak_note(),
             }
 
     def decide(self, ip: str, *, has_own_key: bool, force_replay: bool | None = None) -> QuotaDecision:
@@ -222,6 +280,23 @@ class UsageLedger:
             self._by_ip[ip] = max(self._by_ip.get(ip, 0) + delta, 0)
             self._global_used = max(self._global_used + delta, 0)
 
+
+    def record_tokens(self, usage: dict | None, *, calls: int = 0,
+                      now: datetime | None = None) -> None:
+        """把一次问诊的 token 用量记进今天的账。
+
+        `usage` 是 `core.llm.current_usage_stats()` 的形状；None（后端不报这些
+        字段）时只记高峰调用数，不往 token 上加 0——加 0 和"没报"在
+        `snapshot()` 里长得一样，而它们要分得开。
+        """
+        with self._lock:
+            self._roll_locked()
+            if usage:
+                self._tokens["cache_hit"] += int(usage.get("prompt_cache_hit_tokens") or 0)
+                self._tokens["cache_miss"] += int(usage.get("prompt_cache_miss_tokens") or 0)
+                self._tokens["output"] += int(usage.get("completion_tokens") or 0)
+            if calls and is_peak(now):
+                self._peak_calls += int(calls)
 
     def bucket_for(self, ip: str, max_tracked: int) -> str:
         """把 IP 映射到一个计数桶，桶数有上限。

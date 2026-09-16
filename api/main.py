@@ -566,8 +566,23 @@ def _settle(token: int | None, outcome: dict | None) -> None:
     if not outcome:
         ledger.release(token)
         return
-    calls = int((outcome.get("manifest") or {}).get("llm_calls") or 0)
+    manifest = outcome.get("manifest") or {}
+    calls = int(manifest.get("llm_calls") or 0)
     ledger.settle(token, calls)
+    # R21：token 用量与高峰调用数在结算的同一处记——记在别处就会有一条路径
+    # （断流、异常）漏记，而漏记的表现是用量面板上的数偏小、看不出漏了哪次。
+    # 从 manifest 取而不是再问一次 ContextVar：那份统计是**这一次问诊**的，
+    # 而 _settle 可能在别的线程/更晚的时刻跑，ContextVar 那时已经不是同一份了。
+    ledger.record_tokens(
+        {
+            "prompt_cache_hit_tokens": manifest.get("cache_hit_tokens"),
+            "prompt_cache_miss_tokens": manifest.get("cache_miss_tokens"),
+            # 输出 token manifest 里没有单列（它在 usage 统计里），命中/未命中
+            # 两项才是这一轮要看的；输出量用 0 占位会让面板上那个数假装是真的，
+            # 所以干脆不传这一项（record_tokens 用 or 0，缺键就是不加）。
+        } if manifest.get("cache_hit_tokens") is not None else None,
+        calls=calls,
+    )
 
 
 def _refund(token: int | None) -> None:
@@ -641,7 +656,43 @@ def api_validate_key(x_llm_key: str | None = Header(default=None)) -> dict:
     key = _byok_key(x_llm_key)
     if not key:
         raise HTTPException(status_code=400, detail="没有收到 key。")
-    return check_api_key(key)
+    out = dict(check_api_key(key))
+    # R21：BYOK 的第一次问诊要把 50–90 万 token 的知识前缀送上去（未命中价），
+    # 之后每次几乎全命中。**验 key 的时候就说**——等他跑完第一次看到账单
+    # 再说就晚了。两个数从 context_prefix 现算，不写死：前缀变大它们就跟着变。
+    out["prefix_warmup_note"] = _prefix_warmup_note()
+    return out
+
+
+#: 每百万 token 的价格（美元，DeepSeek 2026-08-17 起的峰谷分时表，高峰价）。
+#: 谷段五折。汇率按 7.2 折成人民币——**这是估算**，不是账单，
+#: 用途是让人在填 key 之前知道量级。
+PRICE_USD_PER_MTOK_MISS = 1.32
+PRICE_USD_PER_MTOK_HIT = 0.044
+PRICE_USD_PER_MTOK_OUT = 3.96
+USD_TO_CNY = 7.2
+
+
+def _prefix_warmup_note() -> str:
+    """「首次问诊会预热知识前缀，约 ¥X；之后每次约 ¥Y」。数字现算。
+
+    取不到前缀大小（没有 cases.json / 药理层文件）时**说取不到**，
+    不给一个编的数——一个编出来的成本数比不给更糟。
+    """
+    try:
+        from core.context_prefix import budget_plan
+
+        plan = budget_plan()
+        per_phys = [sum(v.values()) for v in plan.tokens_by_physician_after.values()]
+    except Exception:  # noqa: BLE001 —— 提示语不该让验 key 失败
+        return ("首次问诊会预热知识前缀（这台机器上算不出它有多大：缺 cases.json "
+                "或药理层文件），之后每次几乎全部命中缓存、便宜一个数量级。")
+    total = sum(per_phys)
+    first = total / 1_000_000 * PRICE_USD_PER_MTOK_MISS * USD_TO_CNY
+    later = total / 1_000_000 * PRICE_USD_PER_MTOK_HIT * USD_TO_CNY
+    return (f"首次问诊会预热知识前缀（{total:,} token，{len(per_phys)} 位医家合计），"
+            f"约 ¥{first:.1f}；之后每次约 ¥{later:.2f}（缓存命中价差 30 倍）。"
+            "谷段（北京 12–14、18–09）再打五折。")
 
 
 @app.get("/api/usage")

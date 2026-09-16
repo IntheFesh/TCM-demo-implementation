@@ -34,6 +34,13 @@ python -m scripts.collect_results --rerender   # 把跟自己 .json 对不上的
 - 沙盒（写代码的环境）没有 cases.json / embedding 模型 / 网络，**本文件里凡是标着
   「沙盒模拟」的行都不是真机值**。
 
+**⚠ 第 5 件（R21 加的）：下面这张表里 1–9 号每一个数都是 `top3` 系的。**
+R21 把知识进模型的方式换成了 `full_context`（该医家全部医案进前缀缓存，
+`RETRIEVER_MODE` 默认值从 `hybrid` 改成 `full_context`，见 `core/context_prefix.py`），
+而**两系的数不可比**：top3 系每次只喂 3 条最相似医案、full_context 系喂全部。
+所以这张表**不改一个字**（它是 top3 系的历史行），full_context 系的数另起一节
+并列在下面。覆盖它等于把唯一的对照物销毁。
+
 | # | 指标 | 后端 | 当前值 | 对照 | 闸门 | 状态 | 凭据 |
 |---|---|---|---|---|---|---|---|
 | 1 | ε_online（噪声地板） | deepseek-chat | mean **0.2611** / p50 0.1818 / p95 0.7857（9 条主诉 × 3 重复 = 81 个值） | 它本身就是别的指标的对照物。**按证型分层**，逐条地板 0.0 ~ 0.6742，见下面单独一节 | — | ⚠ 段 4 已重跑（2026-09-14T15:21:26Z，212 次调用）。旧值 mean 0.241 / p50 0.000 / p95 0.857 是 R1 改 S3 prompt **之前**的，新旧之间既隔着一次 prompt 改动、又隔着模型自身的随机性，**两者不可分离归因**，不要把差异当成 prompt 改动的效果 | ✅ `epsilon.json:epsilon_online.mean=0.2611` `epsilon.json:epsilon_online.p95=0.7857` `epsilon.json:epsilon_online.n_queries_used=9` |
@@ -49,6 +56,35 @@ python -m scripts.collect_results --rerender   # 把跟自己 .json 对不上的
 | 11 | ε_adjunct（佐使层噪声地板，R1 新增） | 沙盒（无 LLM，合成用药集合） | 无真机数；沙盒模拟 mean 0.8426 | 同 #10。平均药味数（整方 9.0 / 君臣 4.0 / 佐使 5.0）是配套对照，用来辨「药少了所以碰巧一样」的假改善 | — | ⏳ **待 AutoDL**：同 #10 | ⏳ 还没跑过（同 #10） |
 | 12 | MES 盲评（人评） | —（未做） | 未做 | 三对两两 McNemar（`python -m eval.mes.collect --all-pairs`） | 20 条评完、三对 p 值 | ⏳ **待做**：导出要真实 LLM，评分要人。**这是训练的第三个前提** | ⏳ 还没跑过——盲评要人评分，没有任何脚本能替它产出 |
 
+## full_context 系：新起的行，跟上面的 top3 系并列（R21）
+
+R21 之后**默认走 full_context**：一位医家的全部医案 + 本草/方剂速查表进 DeepSeek
+的前缀缓存，S3 不再只看 3 条检索结果。命中缓存的输入 token 便宜 30 倍
+（$0.044/M vs $1.32/M，见 `core/context_prefix.py` 模块注释里的官方文档链接），
+所以「全量进上下文」不是更贵而是更便宜——前提是前缀逐字节稳定、真能命中。
+
+**这一节的每个数都还没有真机值**，因为它们要真实 API 才产生。⏳ 的含义跟上面一样：
+不是文件丢了，是这个数不存在。沙盒里能量的是它们的**结构**（前缀确定性、
+命中率的算法、裁剪顺序），已经由 `tests/test_context_prefix.py` 等 85 条测试盖住。
+
+| # | 指标 | 后端 | 当前值 | 对照 | 闸门 | 状态 | 凭据 |
+|---|---|---|---|---|---|---|---|
+| 13 | E3 own vs swapped（full_context：换成另一位医家的全量语料） | deepseek-v4-pro | ⏳ 无真机数 | 同一指标的 top3 系值 **0.451**（上表 #3）。**两个数不相减**：换掉的量不同（3 条 vs 全量），只看各自过不过 0.4 | ≥ 0.4（**跟 top3 系同一个闸门**，没有因为换了检索方式就放宽） | ⏳ 待上机：`RETRIEVER_MODE=full_context python -m eval.run_eval --e3` | ⏳ 还没跑过——凭据键沿用 `report_e3.json:e3.change_rate`，跑完落盘即生效 |
+| 14 | E4 own vs none（full_context：整块语料不给） | deepseek-v4-pro | ⏳ 无真机数 | 同一指标的 top3 系值 **0.497**（上表 #4） | ≥ 0.4（同上，不放宽） | ⏳ 待上机：`RETRIEVER_MODE=full_context python -m eval.run_eval --e4` | ⏳ 还没跑过——同 #13 |
+| 15 | 前缀缓存命中率（第二次起） | deepseek-v4-pro | ⏳ 无真机数；沙盒**模拟**命中率末次 0.996（`--simulate-cache`，按 64-token 块对齐算最长公共前缀，manifest 里标 `simulated_cache: true`） | 第一次跑必然接近 0（全 miss），所以对照是「同一脚本第 1 次 vs 第 2 次」。闸门定 0.9 不定 1.0：§6 那段（本次主诉）永远不命中，占 prompt 约 1% | ≥ 0.9（第二次跑） | ⏳ 待上机：`python -m scripts.bench_consult --backend real --repeat 2` | ⏳ 还没跑过——沙盒里没有真实 `usage.prompt_cache_hit_tokens`，模拟值不是真机值 |
+| 16 | 一次问诊的钱 | deepseek-v4-pro | ⏳ 无真机数 | 对照是同一次问诊在 miss 价上的钱（首次）。按官方价算：单医家 ≈180K token 首次 $0.24、之后 $0.008；三医家一次问诊 ≈¥0.17 | ≤ ¥0.5（第二次起） | ⏳ 待上机：看 `/api/usage` 看板的 `tokens_today`，或 bench 产物里的 hit/miss token 数 | ⏳ 还没跑过——算式在 `api/main.py` 的 `_prefix_warmup_note`，它自己也会说明当前是估算 |
+| 17 | 每位医家的稳定前缀 token 数 | —（不调 LLM） | ⏳ 无真机数；沙盒**合成语料**（每位 20 条造的医案）下 5,868 ~ 6,008 | 预算 500,000 / 医家。对照是「裁了没裁」：合成规模下一段未裁；`--budget 6000` 能看到按固定顺序裁掉方剂速查表 | 不设闸门，超预算按固定顺序裁（医案永不裁） | ⏳ 待上机：`python -m core.context_prefix --report`（不带 `--synthetic`，读真 `cases.json`） | ⏳ 还没跑过——沙盒没有 `cases.json`，合成语料的绝对值不是真机数 |
+
+**E8 和 E9 两条留在 top3 系，不跟着换**：
+
+- **E8（四种检索模式差异率）**按定义就是 top3 系内部的对照，把 full_context
+  加成第五种模式会改变这个指标测的东西，跟历史值 0.437 / 0.366 也不再可比。
+  代码里这一点是写死的：`eval/run_eval.py` 的 E8 只遍历 `TOP3_MODES`。
+- **E9（ReAct 开 / 关）在 full_context 下不存在**：ReAct 的工具是去检索语料的，
+  而语料已经全在上下文里，所以 `full_context` 下 ReAct 一律关
+  （`core/react.py::react_enabled`，即使 `USE_REACT=1` 也关，并打印一行说明）。
+  E9 因此是**只在 top3 系有意义的指标**，0.463 那个数继续挂在上表 #6。
+
 ## 性能：沙盒能量的四项 + 上机才能量的三项（R19）
 
 **这一节的每个数都必须能被 `--check` 核对，或者标 ⏳。** 之前沙盒里量出来的数
@@ -58,16 +94,16 @@ python -m scripts.collect_results --rerender   # 把跟自己 .json 对不上的
 
 | # | 指标 | 当前值 | 对照基准 | 量法 | 凭据 |
 |---|---|---|---|---|---|
-| P1 | 冷进程 `import api.main` | **0.517** s（3 次取中位数） | 它是 `bench_startup` 四段里的第一段。另外三段（construct / model_load / encode）要 cases.json 和真模型，沙盒量不了——所以这一段是沙盒里唯一跟真机可比的 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.import_api_main_s=0.517` |
-| P2 | `/health` p50（**五位**医家，R18 后） | **12.237** ms（200 次请求） | 见 P3 那一行——单看这个数说明不了任何事 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_five=12.237` |
-| P3 | `/health` p50（**三位**医家，R17 对照） | **12.554** ms（同一个进程、同一份代码，只把注册表砍回三位） | P2。⚠ 三次量下来方向**来回翻**：这一次五位 12.237 / 三位 12.554（三位更慢），同一天早些两次分别是五位 13.806 / 三位 12.666（三位更快）和五位 12.762 / 三位 13.676（三位更慢）——**注册表从三位扩到五位的代价落在测量噪声里**，不能说"多两位医家慢了 1ms"，也不能说"更快了" | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_three=12.554` |
-| P4 | 全量测试：条数 / 墙钟 | **2693** passed / **10** skipped / **0** failed，墙钟 **89.9** s | R17 结束时 2495 passed / 6 skipped；R18 结束时 2643 / 10；R19 中途一次 2668 / 10。条数只增不减是硬约束 | `python -m scripts.bench_sandbox --all` | ✅ `bench/sandbox.json:bench.pytest_passed=2693` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` `bench/sandbox.json:bench.pytest_wall_s=89.9` |
-| P5 | Playwright 前端状态：通过数 / 墙钟 | **16** 种全过，墙钟 **38.4** s | R14 起 6 种 → R15 10 种 → R16 13 种 → R17 15 种 → R18 16 种。墙钟的对照是「值不值得每轮都跑」——38 秒的答案是值得（它这一轮抓到了一个所有 Python 测试都绿的回归） | `python -m scripts.screenshot_states` | ✅ `bench/sandbox.json:bench.playwright_states_passed=16` `bench/sandbox.json:bench.playwright_wall_s=38.4` |
+| P1 | 冷进程 `import api.main` | **0.431** s（3 次取中位数，R21 重量；R19 那次 0.517） | 它是 `bench_startup` 四段里的第一段。另外三段（construct / model_load / encode）要 cases.json 和真模型，沙盒量不了——所以这一段是沙盒里唯一跟真机可比的 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.import_api_main_s=0.431` |
+| P2 | `/health` p50（**五位**医家，R18 后） | **8.481** ms（200 次请求，R21 重量） | 见 P3 那一行——单看这个数说明不了任何事 | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_five=8.481` |
+| P3 | `/health` p50（**三位**医家，R17 对照） | **8.603** ms（同一个进程、同一份代码，只把注册表砍回三位） | P2。⚠ **四次量下来方向来回翻**：R21 这次五位 8.481 / 三位 8.603（三位更慢），R19 那次五位 12.237 / 三位 12.554（三位更慢），再往前两次是五位 13.806 / 三位 12.666（三位更快）和五位 12.762 / 三位 13.676（三位更慢）。四次里两次一个方向、两次另一个方向，且 R21 整体比 R19 快 3~4ms（同一份代码、只隔了几轮，所以这个「变快」是机器负载而不是代码）——**注册表从三位扩到五位的代价落在测量噪声里**，不能说"多两位医家慢了 1ms"，也不能说"更快了" | `python -m scripts.bench_sandbox` | ✅ `bench/sandbox.json:bench.health_p50_ms_three=8.603` |
+| P4 | 全量测试：条数 / 墙钟 | **2783** passed / **10** skipped / **0** failed，墙钟 **66.2** s | R17 结束时 2495 passed / 6 skipped；R18 结束时 2643 / 10；R19 结束时 2693 / 10。条数只增不减是硬约束（R21 新增 90 条）。墙钟 89.9 → 66.2 s **不是变快了**：条数多了 90 条而墙钟少了 23.7 s，说明这两个数之间夹着机器负载，不能相减当成优化 | `python -m scripts.bench_sandbox --all` | ✅ `bench/sandbox.json:bench.pytest_passed=2783` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` `bench/sandbox.json:bench.pytest_wall_s=66.2` |
+| P5 | Playwright 前端状态：通过数 / 墙钟 | **16** 种全过，墙钟 **37.1** s | R14 起 6 种 → R15 10 种 → R16 13 种 → R17 15 种 → R18 16 种 → R21 仍 16 种（R21 没动前端，所以这一轮它测的是「没有回归」）。墙钟的对照是「值不值得每轮都跑」——38 秒的答案是值得（它这一轮抓到了一个所有 Python 测试都绿的回归） | `python -m scripts.screenshot_states` | ✅ `bench/sandbox.json:bench.playwright_states_passed=16` `bench/sandbox.json:bench.playwright_wall_s=37.1` |
 | P6 | 热启动（第二次起进程） | ⏳ 还没跑过 | 闸门 ≤ 20 s（docs/DESIGN.md §9 第 1 行）。对照是冷启动同一个数 | `python -m scripts.bench_startup` 跑**两次进程**，看第二次 | ⏳ 还没跑过——要真模型和 cases.json，沙盒里 `--self-test` 出来的是合成语料 + 假编码器，那个数不是热启动 |
 | P7 | 一次问诊（不开 ReAct ×3 / 开 ReAct ×1） | ⏳ 还没跑过 | 闸门 ≤ 90 s（不开）/ ≤ 240 s（开）。对照是两者之差 = ReAct 那几次工具调用的代价 | `python -m scripts.bench_consult --backend real --repeat 3 --no-react`，再 `--repeat 1 --react` | ⏳ 还没跑过——要真 LLM |
 | P8 | ε 两套设置（思考开 / 关）的耗时与调用数 | ⏳ 还没跑过 | 两套数**不可比**（README「S3_THINKING」那一行），并列报、不相减。这一对数回答「思考模式值不值那几十倍的时间」 | 段 4 会跑两次：默认那次落 `eval/epsilon.json`，`S3_THINKING=disabled` 那次落 `eval/epsilon_s3_disabled.json` | ⏳ 还没跑过——凭据键已经就位（`epsilon_s3_disabled.*`），文件一落盘自动生效 |
 
-**P2/P3 这一对是这一节最该被读到的地方**：两次测量方向相反，所以正确的结论是
+**P2/P3 这一对是这一节最该被读到的地方**：四次测量方向相反（两次一头、两次另一头），所以正确的结论是
 「这个开销量不出来」，不是「涨了 1ms」或「降了 0.9ms」。挑一次合意的方向写进文档
 就是这个项目在 E2 那条（师承内 vs 跨学派两轮结论相反）上已经学过的教训。
 

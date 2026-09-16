@@ -267,44 +267,56 @@ def apply_low_discrimination_cutoff(
     return hits, False
 
 
+def load_cases(cases_path: Path = CASES_PATH) -> tuple[list[CaseRecord], list[str], list[str]]:
+    """读 cases.json → (可检索的医案, 各自的检索文本, 被跳过的 case_id)。
+
+    R21 从 `DenseRetriever.__init__` 抽出来：`FullContextRetriever`（不需要
+    embedding 模型）和 `core/context_prefix.py`（拼缓存前缀）都要读同一份医案，
+    而"哪些医案算可用"这个判断只能有一处——三处各读一遍 cases.json 的话，
+    full_context 下喂给模型的医案集合可能跟 top3 下检索的那一套不一样，
+    两组数就不可比了（CLAUDE.md 第 31 条）。
+
+    P0-6：既无 symptoms 也无 raw_excerpt 的医案编码不出任何有意义的文本
+    （_case_to_text 返回 None），不能勉强塞进索引——那样它在向量空间里
+    落点是未定义的（旧实现会落在"（无记录症状）"这个人工占位点，跟其他
+    同样没内容的医案完全重合，变成检索噪声）。
+    """
+    if not cases_path.exists():
+        raise FileNotFoundError(
+            f"未找到 {cases_path}。请先运行 `python -m offline.extract_cases` "
+            "生成 cases.json，再使用检索功能。"
+        )
+    with cases_path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    cases: list[CaseRecord] = []
+    texts: list[str] = []
+    skipped: list[str] = []
+    for r in raw:
+        case = CaseRecord.model_validate(r)
+        text = _case_to_text(case)
+        if text is None:
+            skipped.append(case.case_id)
+            continue
+        cases.append(case)
+        texts.append(text)
+    if skipped:
+        print(
+            f"[retrieval] {len(skipped)} 条医案既无 symptoms "
+            f"也无 raw_excerpt，编码不出任何文本，已从检索索引跳过（不影响 cases.json "
+            f"本身，只影响能否被检索到）：{skipped[:10]}"
+            + ("……" if len(skipped) > 10 else ""),
+            file=sys.stderr,
+        )
+    return cases, texts, skipped
+
+
 class DenseRetriever(Retriever):
     """用 sentence-transformers 的 bge-small-zh-v1.5 做稠密检索。惰性加载模型，
     禁止在模块顶层实例化（加载模型是重操作，不该在 import 时就发生）。"""
 
     def __init__(self, cases_path: Path = CASES_PATH):
-        if not cases_path.exists():
-            raise FileNotFoundError(
-                f"未找到 {cases_path}。请先运行 `python -m offline.extract_cases` "
-                "生成 cases.json，再使用检索功能。"
-            )
-        with cases_path.open("r", encoding="utf-8") as f:
-            raw = json.load(f)
-
-        # P0-6：既无 symptoms 也无 raw_excerpt 的医案编码不出任何有意义的文本
-        # （_case_to_text 返回 None），不能勉强塞进索引——那样它在向量空间里
-        # 落点是未定义的（旧实现会落在"（无记录症状）"这个人工占位点，跟其他
-        # 同样没内容的医案完全重合，变成检索噪声）。这里在构造时一次性过滤、
-        # 一次性把 _case_to_text 的结果缓存进 self._case_texts，_load()/BM25
-        # 语料构建都复用这份缓存，不重复调用 _case_to_text。
-        self._cases: list[CaseRecord] = []
-        self._case_texts: list[str] = []
-        self.skipped_no_content_ids: list[str] = []
-        for r in raw:
-            case = CaseRecord.model_validate(r)
-            text = _case_to_text(case)
-            if text is None:
-                self.skipped_no_content_ids.append(case.case_id)
-                continue
-            self._cases.append(case)
-            self._case_texts.append(text)
-        if self.skipped_no_content_ids:
-            print(
-                f"[retrieval] {len(self.skipped_no_content_ids)} 条医案既无 symptoms "
-                f"也无 raw_excerpt，编码不出任何文本，已从检索索引跳过（不影响 cases.json "
-                f"本身，只影响能否被检索到）：{self.skipped_no_content_ids[:10]}"
-                + ("……" if len(self.skipped_no_content_ids) > 10 else ""),
-                file=sys.stderr,
-            )
+        self._cases, self._case_texts, self.skipped_no_content_ids = load_cases(cases_path)
 
         self._model = None  # 惰性加载，避免 import 阶段就下载/加载模型
         self._embeddings = None  # 惰性编码，随 _model 一起初始化
@@ -483,6 +495,67 @@ _retriever_singleton: Retriever | None = None
 # _encode_lock 是每实例一把（保护的是那个实例的 _model/_embeddings），
 # 两个实例之间本来就不该互相排队。
 _retriever_lock = threading.Lock()
+
+
+#: `full_context` 模式下 refs 的分数。**1.0 不是 0.0 也不是 None**：
+#: 0.0 会被读成"完全不相关"，而语义恰恰相反——这一条确实是这位医家的医案，
+#: 只是没有算相似度这件事；None 会在前端变成 null。
+FULL_CONTEXT_SCORE = 1.0
+
+
+def full_context_hits(cases: list[CaseRecord], physician: str) -> list[tuple[CaseRecord, float]]:
+    """该医家全部医案，按 case_id 排序、分数恒 FULL_CONTEXT_SCORE。
+
+    **只此一处实现**：`FullContextRetriever.search` 和 `HybridRetriever.search`
+    的 full_context 分支都调它。两处各写一遍排序的话，两条路给出的医案顺序
+    可能不同，而顺序不同 = 缓存前缀 byte 不同 = 缓存永远不命中。
+    """
+    mine = sorted((c for c in cases if c.physician == physician), key=lambda c: c.case_id)
+    return [(c, FULL_CONTEXT_SCORE) for c in mine]
+
+
+class FullContextRetriever(Retriever):
+    """R21：**不检索**——把该医家的全部医案原样交出去，交给缓存前缀。
+
+    为什么它也是一个 Retriever 而不是绕过检索层：`run_physician` 只认识
+    `search(query, physician, k, ...)` 这一个入口，E3/E4/E8 消融脚本也都从
+    这个入口换 mode。做成一个 mode 之后，`full_context` 跟 `top3` 系是同一条
+    代码路径上的两个取值，两组数才可比；绕过检索层的话它就成了另一条路径，
+    "换了检索模式"这个对照里混进了"换了代码路径"这个额外变量。
+
+    `score` 恒为 **1.0** 而不是 0.0 或 None：
+      - 下游 `refs` 要把它当相似度展示，None 会在前端变成 `null`；
+      - 0.0 会被读成"完全不相关"，而这里的语义恰恰相反——**这一条确实是
+        这位医家的医案**，只是没有算相似度这件事。
+    分数在这个模式下不参与排序也不参与筛选，顺序是 case_id 排序（确定性，
+    缓存前缀的前提）。`k` 和 `min_score` 一律忽略，并在第一次被传非默认值时
+    说一句——静默忽略会让调用方以为自己限了条数。
+    """
+
+    #: 兼容别名，真值在模块级 FULL_CONTEXT_SCORE（HybridRetriever 的
+    #: full_context 分支也要用同一个数，写两处就会漂）。
+    FIXED_SCORE = FULL_CONTEXT_SCORE
+
+    def __init__(self, cases_path: Path = CASES_PATH):
+        self._cases, _, self.skipped_no_content_ids = load_cases(cases_path)
+        self._warned_about_k = False
+
+    def case_count(self, physician: str) -> int | None:
+        return sum(1 for c in self._cases if c.physician == physician)
+
+    def search(
+        self,
+        query: str,
+        physician: str,
+        k: int = 3,
+        min_score: float = 0.0,
+        **kwargs,
+    ) -> list[tuple[CaseRecord, float]]:
+        if (k != 3 or min_score != 0.0) and not self._warned_about_k:
+            self._warned_about_k = True
+            print(f"[retrieval] full_context 模式忽略 k={k} / min_score={min_score}"
+                  "：这个模式的全部意义就是不筛。", file=sys.stderr)
+        return full_context_hits(self._cases, physician)
 
 
 def get_retriever() -> Retriever:

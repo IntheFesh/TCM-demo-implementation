@@ -879,7 +879,16 @@ def test_react_does_not_weaken_the_hallucination_check(monkeypatch):
 
 
 def test_use_react_none_reads_environment(monkeypatch):
+    """R21 **有意的契约变更**：`USE_REACT=1` 只在 top3 系里生效。
+
+    原断言没有 `monkeypatch.setenv("RETRIEVER_MODE", "hybrid")` 这一行——那一版
+    还没有 full_context。默认模式换成 full_context 之后 ReAct 在默认路径上是关的
+    （§1.3：语料已经全在上下文里，工具是冗余的），所以这条测试要显式说明自己
+    测的是 top3 系。full_context 下那一半由 tests/test_react.py 的
+    test_react_is_off_in_full_context_even_when_asked_for 覆盖。
+    """
     _react_setup(monkeypatch)
+    monkeypatch.setenv("RETRIEVER_MODE", "hybrid")
     monkeypatch.setenv("USE_REACT", "1")
     assert chain.consult("纳差乏力")["manifest"]["use_react"] is True
     monkeypatch.setenv("USE_REACT", "0")

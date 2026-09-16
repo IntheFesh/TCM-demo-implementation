@@ -604,15 +604,23 @@ def test_repo_readme_evidence_all_checks_out():
     assert result["checked"] >= 9      # 少了说明 README 里的凭据记号被删掉了
 
 
-def test_default_check_paths_cover_all_four_documents():
-    """R19 从两份扩到四份（**有意的契约变更**）：原断言是 `== 2` 和
-    `{"RESULTS.md", "README.md"}`。加进来的是 `docs/R11-R19_report.md`
-    （九轮表里 R19 那一行的五个数）和 `DEMO.md`（它引的 4 个指标值原来是手抄的，
-    而它自己写着"不复制数字"）。同一套凭据记号、同一个核对器——
-    一份文档手抄一份数字出来漂了，跟 RESULTS.md 漂了是同一个问题。"""
-    assert len(cr.DEFAULT_CHECK_PATHS) == 4
-    assert {p.name for p in cr.DEFAULT_CHECK_PATHS} == {
-        "RESULTS.md", "README.md", "R11-R19_report.md", "DEMO.md"}
+def test_default_check_paths_cover_the_four_fixed_docs_plus_every_round_report():
+    """R19 从两份扩到四份，**R21 再改成"四份固定 + 每轮一份报告"**（两次都是
+    有意的契约变更）。R19 那次加进来的是 `docs/R11-R19_report.md` 和 `DEMO.md`。
+    R21 这次加的是 `docs/reports/R<N>_report.md`——**glob 进来，不写死名字**：
+    靠人记着往元组里加一个名字，忘了的那一轮，它里面的凭据记号谁都不核，
+    而它读起来跟被核过的一样。
+
+    所以这条不再断言"恰好 N 份"（那会变成每轮都要改一次的数），
+    改成断言四份固定的都在、且 `docs/reports/` 下的每一份都在。"""
+    names = {p.name for p in cr.DEFAULT_CHECK_PATHS}
+    assert {"RESULTS.md", "README.md", "R11-R19_report.md", "DEMO.md"} <= names
+    round_names = {p.name for p in cr.round_report_paths()}
+    assert round_names, "docs/reports/ 下一份轮次报告都没有"
+    assert round_names <= names
+    # 排序是按**轮次号**的：字符串排序下 R9 会排在 R21 后面
+    nums = [int(p.name[1:].split("_")[0]) for p in cr.round_report_paths()]
+    assert nums == sorted(nums)
 
 
 def test_metric_rows_only_looks_inside_a_table_with_an_evidence_column():

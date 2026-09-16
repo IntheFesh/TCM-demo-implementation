@@ -68,9 +68,11 @@ from core.retrieval import MIN_RETRIEVAL_SCORE
 from core.chain import EPSILON_PATH, load_epsilon_online, load_epsilon_online_detail
 from core.herbs import normalized_herb_set
 from core.physicians import PHYSICIANS
-# E8 的四种默认模式取自检索层自己的合法集合，不在这里另抄一份——
-# 见 core/chain.py 对 ALLOWED_MODES 的同一条理由。
-from core.retrieval_hybrid import ALLOWED_MODES
+# E8 的四种模式取自检索层自己的 TOP3_MODES，不在这里另抄一份——
+# 见 core/chain.py 对 ALLOWED_MODES 的同一条理由。R21 起用 TOP3_MODES 而不是
+# ALLOWED_MODES：full_context 跟那四种的差异是"看三条 vs 看全量"，不是
+# "换了排序算法"，混进同一个差异率里会让 E8 这一行跟历史值不可比。
+from core.retrieval_hybrid import TOP3_MODES
 # E9 dry-run 的调用数上界要按 MAX_STEPS 算，不能只说"可能更高"——
 # 从 core/react.py 现读，不在这里另定一个数字（那样 MAX_STEPS 改了这里会
 # 悄悄漂移）。
@@ -400,6 +402,7 @@ def collect_ablation_pairs(
 
 def collect_refs_mode_pairs(
     queries: list[str], ablated_modes: list[str], consult_fn=None,
+    retriever_mode: str | None = None,
 ) -> dict[str, list[dict]]:
     """E3/E4 专用：refs_mode="own" 每条主诉只跑一次，各 ablated_mode
     （"swapped"/"none"）各跑一次——E3+E4 一起跑时 own 不会被重复计算两遍
@@ -416,8 +419,14 @@ def collect_refs_mode_pairs(
     不受影响，也不拖累下一条查询——两种失败的波及范围不一样，不能共用一段
     except 处理成一样的效果（同 collect_ablation_pairs 的失败容忍，跟
     core.chain.consult_many 是同一个"单条失败不拖累其余"模式）。
+
+    R21：`retriever_mode` 一路传下去，好在 `full_context` 上重跑 E3/E4。
+    **own 和 ablated 必须用同一个 retriever_mode**——一半 full_context 一半
+    top3 的配对比出来的不是"换掉参考医案的效果"，是两个变量混在一起。
+    所以它是这个函数的参数、不是每次调用各自传的关键字。
     """
     consult_fn = consult_fn or _default_consult_fn()
+    extra = {} if retriever_mode is None else {"retriever_mode": retriever_mode}
     pairs_by_mode: dict[str, list[dict]] = {m: [] for m in ablated_modes}
     # **这就是"基线阶段完全静默 5 分钟"那一段**：own 那一轮跑完之前屏幕上一个字
     # 都没有，三次被误判成卡死。每条主诉 1 + len(ablated_modes) 轮。
@@ -425,7 +434,7 @@ def collect_refs_mode_pairs(
                    label=f"E3/E4 消融（own + {'/'.join(ablated_modes)}）", unit="轮")
     for query in queries:
         try:
-            baseline = consult_fn(query, refs_mode="own", use_react=False, ask_fn=None)
+            baseline = consult_fn(query, refs_mode="own", use_react=False, ask_fn=None, **extra)
             bar.advance(note=f"「{query[:12]}」own")
         except Exception as e:  # noqa: BLE001 - own 失败波及本条查询的所有 ablated_mode，不拖累其它查询
             print(f"[collect_refs_mode_pairs] 「{query}」own 调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
@@ -435,7 +444,7 @@ def collect_refs_mode_pairs(
             continue
         for mode in ablated_modes:
             try:
-                ablated = consult_fn(query, refs_mode=mode, use_react=False, ask_fn=None)
+                ablated = consult_fn(query, refs_mode=mode, use_react=False, ask_fn=None, **extra)
                 bar.advance(note=f"「{query[:12]}」{mode}")
             except Exception as e:  # noqa: BLE001 - 只影响这一个 mode
                 print(f"[collect_refs_mode_pairs] 「{query}」{mode} 调用失败：{classify_llm_failure(e)}: {e}", file=sys.stderr)
@@ -1203,6 +1212,10 @@ def render_markdown(report: dict) -> str:
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="V1：评测汇总（需要真实 LLM，跑 core.chain.consult）")
     ap.add_argument("--queries-path", type=Path, default=DEFAULT_QUERIES_PATH)
+    ap.add_argument("--retriever-mode", default=None,
+                    help="E3/E4 在哪个检索模式上跑（默认跟 RETRIEVER_MODE 环境变量，"
+                         "也就是 full_context）。**两系的数不可比**：RESULTS.md 里"
+                         "top3 那几行是历史行，full_context 另起新行，并列不覆盖")
     ap.add_argument("--out-json", type=Path, default=DEFAULT_REPORT_JSON_PATH)
     ap.add_argument("--out-md", type=Path, default=DEFAULT_REPORT_MD_PATH)
     ap.add_argument("--limit", type=int, default=None)
@@ -1236,10 +1249,10 @@ def main(argv: list[str] | None = None) -> None:
             detail.append(f"--e3/--e4 另加 {len(queries)} 条 × ~{base_calls_per_query} 次/条 × "
                            f"{1 + n_ablated_modes}轮（own 共享 1 轮 + {names} 各一轮）")
         if args.e8:
-            e8_total = len(queries) * base_calls_per_query * len(ALLOWED_MODES)
+            e8_total = len(queries) * base_calls_per_query * len(TOP3_MODES)
             total += e8_total
             detail.append(f"--e8 另加 {len(queries)} 条 × ~{base_calls_per_query} 次/条 × "
-                           f"{len(ALLOWED_MODES)}种模式（{sorted(ALLOWED_MODES)}）")
+                           f"{len(TOP3_MODES)}种模式（{sorted(TOP3_MODES)}）")
         if args.e9:
             # use_react=False 那一轮跟 base_calls_per_query 同形状；use_react=True
             # 那一轮每位医家最多 MAX_STEPS 次 ReAct 调用 + S3(含可能重开)，这是
@@ -1276,7 +1289,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"正在跑 {'/'.join('E3' if m == 'swapped' else 'E4' for m in ablated_modes)}"
               f"（own vs {'/'.join(ablated_modes)}）……")
         epsilon_detail = load_epsilon_online_detail()
-        pairs_by_mode = collect_refs_mode_pairs(queries, ablated_modes)
+        pairs_by_mode = collect_refs_mode_pairs(queries, ablated_modes,
+                                                retriever_mode=args.retriever_mode)
         for mode in ablated_modes:
             effect = ablation_output_effect(pairs_by_mode[mode], epsilon_detail, mode)
             report["ablations"].append(effect)
@@ -1285,9 +1299,14 @@ def main(argv: list[str] | None = None) -> None:
             warn_if_failure_rate_high(tag, effect["n_failed"], effect["n_total"])
 
     if args.e8:
-        print(f"正在跑 E8（{sorted(ALLOWED_MODES)} 四种检索模式）……")
-        records = collect_retriever_mode_samples(queries, sorted(ALLOWED_MODES))
-        e8 = retriever_mode_output_effect(records, sorted(ALLOWED_MODES))
+        print(f"正在跑 E8（{sorted(TOP3_MODES)} 四种检索模式，full_context 不在其中——见下面 e8_modes 的注释）……")
+        # R21：E8 比的是 **top3 系内部**四种模式的输出差异，不含 full_context。
+        # 把 full_context 塞进来会让这个指标变味：它跟那四种的差异不是"换了排序
+        # 算法"，是"看三条 vs 看全量"——那是另一个量（R25 的 #1a/#3a/#4a 新行），
+        # 混进同一个差异率里会让 RESULTS.md 里 E8 这一行跟历史值不可比。
+        e8_modes = sorted(TOP3_MODES)
+        records = collect_retriever_mode_samples(queries, e8_modes)
+        e8 = retriever_mode_output_effect(records, e8_modes)
         report["retriever_mode_effect"] = e8
         print(f"E8：{e8['note']}")
         warn_if_failure_rate_high("E8", e8["n_failed_queries"], e8["n_total"])

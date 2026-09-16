@@ -43,12 +43,18 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
+# 缓存字段名从 core.llm 取，不在这里再写一遍字面量。
+from core.llm import CACHE_HIT_FIELD
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "eval" / "bench"
 
 # 默认主诉取 eval 用的第一条（tests/queries.txt 的首行同一条）：基线和评测用同一条
 # 输入，两边的数字才能互相印证。
+# R21 的缓存验收线：同一位医家连续两次问诊，**第二次**命中率要 ≥ 这个数。
+# 0.9 而不是 1.0：§6（本次问诊那一段）是变化的，它本身永远不命中，
+# 而它占整份 prompt 的比例在 1% 量级——留出的余量就是给它的。
+CACHE_HIT_GATE = 0.9
 DEFAULT_COMPLAINT = "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。"
 
 # 假后端给字符串字段填的内容。**刻意是一句能看懂的中文**：这段文本会出现在
@@ -113,17 +119,51 @@ def _minimal(node: dict, defs: dict) -> Any:
 # ---------- 假后端 ----------
 
 
-def build_fake_backend(latency: float):
+#: 模拟缓存时的存储单位。**跟官方一致的 64 token**
+#: （https://api-docs.deepseek.com/guides/kv_cache/：不足 64 token 的内容不会被缓存）。
+#: 模拟一个跟真机不同的粒度就失去了模拟的意义。
+FAKE_CACHE_BLOCK_TOKENS = 64
+
+
+def build_fake_backend(latency: float, simulate_cache: bool = False):
     """每次调用睡 latency 秒、返回最小合法实例的后端。
 
     latency 是并发正确性的机器可验依据：三位医家串行跑 3 次调用要 3×latency，
     并发之后应该 ≈1×latency（R12 的验收判据之一）。
+
+    `simulate_cache=True` 时**按官方文档描述的机制模拟前缀缓存**：记下见过的每份
+    prompt，新来一份就算它跟见过的那些的最长公共前缀，按 64 token 一块向下取整
+    算命中。这样沙盒里也能验"第二次问诊命中率 ≥ 0.9"这条判据走的代码路径
+    （manifest → bench → 判据），而不用等上机。
+    **模拟出来的数不是真机数**：报告里 `simulated_cache: true` 会标出来。
     """
-    from core.llm import LLMBackend
+    from core.llm import CACHE_HIT_FIELD, CACHE_MISS_FIELD, LLMBackend
+    from core.context_prefix import count_tokens
 
     class FakeBenchBackend(LLMBackend):
         def __init__(self) -> None:
             self.n_calls = 0
+            self._seen: list[str] = []
+
+        def _simulated_usage(self, prompt: str) -> dict:
+            """按最长公共前缀算命中，向下取整到 64 token 的整块。"""
+            best = 0
+            for old_prompt in self._seen:
+                n = 0
+                for a, b in zip(prompt, old_prompt):
+                    if a != b:
+                        break
+                    n += 1
+                best = max(best, n)
+            self._seen.append(prompt)
+            total = count_tokens(prompt)
+            hit_tokens = count_tokens(prompt[:best])
+            # 向下取整到整块：不足一块的部分官方明确说不缓存。
+            hit_blocks = hit_tokens // FAKE_CACHE_BLOCK_TOKENS
+            hit = hit_blocks * FAKE_CACHE_BLOCK_TOKENS
+            hit = min(hit, total)
+            return {CACHE_HIT_FIELD: hit, CACHE_MISS_FIELD: total - hit,
+                    "completion_tokens": 64}
 
         def model_name(self) -> str:
             return f"fake-bench(latency={latency}s)"
@@ -140,6 +180,11 @@ def build_fake_backend(latency: float):
             self.n_calls += 1
             if latency > 0:
                 time.sleep(latency)
+            if simulate_cache:
+                from core.llm import record_usage
+
+                prompt = "\n".join(m.get("content") or "" for m in messages)
+                record_usage(self._simulated_usage(prompt))
             if schema is None:
                 return FAKE_TEXT
             return json.dumps(minimal_payload(schema), ensure_ascii=False)
@@ -398,6 +443,14 @@ def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
         "calls": recorder.calls,
         "usage_available": recorder.usage_available,
         "usage_note": recorder.usage_note,
+        # R21：前缀缓存命中。**从 manifest 取**，不自己再算一遍——manifest 里的
+        # cache_hit_ratio 已经是 core/chain.py 算好的那个（分母写两处就会有一处
+        # 忘了改）。None = 这个后端不报这些字段（fake / claude_cli / replay）。
+        "cache_hit_tokens": manifest.get("cache_hit_tokens"),
+        "cache_miss_tokens": manifest.get("cache_miss_tokens"),
+        "cache_hit_ratio": manifest.get("cache_hit_ratio"),
+        "retriever_mode": manifest.get("retriever_mode"),
+        "prefix_tokens_by_section": manifest.get("prefix_tokens_by_section"),
     }
 
 
@@ -421,6 +474,12 @@ def summarize(runs: list[dict]) -> dict:
         # 32768，"S3 还会不会截断"要靠 completion_tokens + reasoning_tokens 贴着
         # 上限没有来判断，而不是靠"这次没报错"。没有 usage 的后端这里是空字典。
         "usage_by_schema": _usage_by_schema(ok),
+        # R21 的验收判据就在这里：**同一位医家连续两次问诊，第二次命中率 ≥ 0.9**。
+        # 逐次列出来而不是只报均值：第一次必然接近 0（冷缓存），跟第二次平均
+        # 一下就看不出"第二次到底命中了没有"——而那正是要验的事。
+        "cache_hit_ratio_by_run": [r.get("cache_hit_ratio") for r in ok],
+        "cache_hit_ratio_last": (ok[-1].get("cache_hit_ratio") if ok else None),
+        "retriever_mode": (ok[-1].get("retriever_mode") if ok else None),
     }
 
 
@@ -447,9 +506,9 @@ def _usage_by_schema(runs: list[dict]) -> dict:
     }
 
 
-def build_backend(kind: str, fake_latency: float):
+def build_backend(kind: str, fake_latency: float, simulate_cache: bool = False):
     if kind == "fake":
-        return build_fake_backend(fake_latency)
+        return build_fake_backend(fake_latency, simulate_cache)
     from core.llm import get_llm
 
     return get_llm()
@@ -474,6 +533,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-auto-fake-cases", dest="auto_fake_cases", action="store_false",
                     help="关掉「假后端 + 没有 cases.json 时自动装合成医案」这个默认行为")
     ap.set_defaults(auto_fake_cases=True)
+    ap.add_argument("--simulate-cache", action="store_true",
+                    help="fake 后端下按官方描述的机制模拟前缀缓存（64 token 一块、"
+                         "最长公共前缀），好在沙盒里验「第二次命中率 ≥ 0.9」这条判据"
+                         "走的代码路径。**模拟数不是真机数**，报告里会标出来")
     ap.add_argument("--out", default=None, help="默认 eval/bench/<时间戳>.json")
     args = ap.parse_args(argv)
 
@@ -481,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
         print("--repeat 至少是 1", file=sys.stderr)
         return 2
 
-    backend = build_backend(args.backend, args.fake_latency)
+    backend = build_backend(args.backend, args.fake_latency, args.simulate_cache)
     # 假后端 + 仓库里没有 cases.json = 沙盒里的常态。这时自动装合成医案，比让人拿到
     # 一份"只跑了 S1/S2 却标着成功"的报告好——但**必须在输出里标出来**（fake_cases_auto），
     # 不然这份报告跟真语料跑出来的长得一模一样。
@@ -505,6 +568,10 @@ def main(argv: list[str] | None = None) -> int:
             "fake_latency_s": args.fake_latency,
             "fake_cases": n_fake_cases,
             "fake_cases_auto": auto,
+            # R21：模拟缓存跑出来的命中率**不是真机数**。标在 config 里而不是
+            # 藏在注释里——这份 json 会被 collect_results 读，读的人要能一眼
+            # 看出这个数是模拟的。
+            "simulated_cache": bool(args.simulate_cache),
         },
         "backend": {
             "id": backend.backend_id(),
@@ -525,6 +592,16 @@ def main(argv: list[str] | None = None) -> int:
     s = report["summary"]
     print(f"后端 {report['backend']['id']}（{report['backend']['model']}）　"
           f"{s['n_ok']}/{s['n_runs']} 次跑成功")
+    ratios = s.get("cache_hit_ratio_by_run") or []
+    if any(r is not None for r in ratios):
+        shown = "、".join("—" if r is None else f"{r:.3f}" for r in ratios)
+        print(f"前缀缓存命中率（逐次）：{shown}")
+        last = s.get("cache_hit_ratio_last")
+        if last is not None and len(ratios) >= 2:
+            verdict = "达标" if last >= CACHE_HIT_GATE else "**不达标**"
+            print(f"  最后一次 {last:.3f}，判据 ≥ {CACHE_HIT_GATE} → {verdict}")
+    else:
+        print(f"前缀缓存命中率：无（这个后端不报 {CACHE_HIT_FIELD}；真机跑 --backend real）")
     if s["elapsed_s"]:
         print(f"总耗时　mean {s['elapsed_s']['mean']}s　min {s['elapsed_s']['min']}s　"
               f"max {s['elapsed_s']['max']}s")

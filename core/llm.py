@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -435,6 +435,71 @@ def current_retry_stats() -> dict | None:
     return dict(stats) if stats is not None else None
 
 
+# R21：前缀缓存命中读数。**跟重试统计同一套机制**（ContextVar + 可变字典），
+# 理由也一样：并发的三位医家在各自线程里累加，父线程（consult 组 manifest）读得到，
+# 而并发的两次问诊各自拿到自己的数。合成一个模块级计数器会把别人的命中算到自己头上。
+#
+# 累加而不是"记最后一次"：一次问诊有 5~11 次调用，manifest 要的是整次的命中率。
+# 只留最后一次的话，S1/S2 那几次短调用（几乎全未命中）会把 S3 那次大命中盖掉。
+_usage_stats: ContextVar[dict | None] = ContextVar("_usage_stats", default=None)
+
+#: DeepSeek 响应 usage 里的缓存字段名（官方文档
+#: https://api-docs.deepseek.com/guides/kv_cache/）。写成常量是因为
+#: OpenAICompatBackend 取它、测试断言它，两处引同一个名字。
+CACHE_HIT_FIELD = "prompt_cache_hit_tokens"
+CACHE_MISS_FIELD = "prompt_cache_miss_tokens"
+
+
+def new_usage_stats() -> dict:
+    stats = {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0,
+             "reasoning_tokens": 0, "completion_tokens": 0, "n_reported": 0}
+    _usage_stats.set(stats)
+    return stats
+
+
+def current_usage_stats() -> dict | None:
+    """这一次调用链到此为止的 usage 累加；没开过统计、或者一次都没有后端报过
+    这些字段，就是 None。
+
+    `n_reported == 0` 也返回 None（不是一份全 0 的字典）：全 0 会被读成
+    "跑了但一次没命中"，而真相是"这个后端不报这个数"（claude_cli / replay /
+    vLLM 都不报）。两件事必须分得开。
+    """
+    stats = _usage_stats.get()
+    if stats is None or not stats.get("n_reported"):
+        return None
+    return dict(stats)
+
+
+def record_usage(usage) -> None:
+    """把一次响应的 usage 累加进当前统计。usage 可以是 SDK 对象或 dict。
+
+    只在**真的取到**缓存字段时才算一次 `n_reported`——非 DeepSeek 后端的 usage
+    里没有这两个键，不能因为它有 completion_tokens 就把它算成"报了缓存数"。
+    """
+    stats = _usage_stats.get()
+    if stats is None or usage is None:
+        return
+
+    def _get(name):
+        if isinstance(usage, dict):
+            return usage.get(name)
+        return getattr(usage, name, None)
+
+    hit, miss = _get(CACHE_HIT_FIELD), _get(CACHE_MISS_FIELD)
+    if hit is None and miss is None:
+        return
+    stats["prompt_cache_hit_tokens"] += int(hit or 0)
+    stats["prompt_cache_miss_tokens"] += int(miss or 0)
+    stats["completion_tokens"] += int(_get("completion_tokens") or 0)
+    details = _get("completion_tokens_details")
+    if details is not None:
+        reasoning = (details.get("reasoning_tokens") if isinstance(details, dict)
+                     else getattr(details, "reasoning_tokens", None))
+        stats["reasoning_tokens"] += int(reasoning or 0)
+    stats["n_reported"] += 1
+
+
 def _record_retry(error: BaseException) -> None:
     """记一次重试。分三类而不是只记总数：429（该降并发）、超时（该查网络或调超时）、
     其它（多半是模型输出格式问题）——这三种的处置完全不同，合成一个数就没法处置。"""
@@ -599,6 +664,25 @@ class LLMBackend(ABC):
             except BaseException as e:  # noqa: BLE001 - 原样带回主线程再抛
                 result["error"] = e
 
+        # R21：工作线程要**带着调用方的 ContextVar 上下文**跑。
+        #
+        # `threading.Thread` 起的线程拿到的是一份空 Context，调用方设的 ContextVar
+        # 在里面看不见。这件事在 R21 加缓存统计时才暴露出来：`record_usage()` 在
+        # `_complete` 里调，而 `_complete` 就在这个工作线程里跑——它读到的
+        # `_usage_stats` 永远是默认的 None，于是 manifest 里的 cache_hit_ratio 恒 None。
+        # 症状是"代码看着对、数就是不出来"，从日志看不出任何错。
+        #
+        # `copy_context().run()` 拷的是 ContextVar → 值的映射，值本身是**同一个对象**
+        # ——所以工作线程往那个可变字典里加的数，调用方读得到（跟 chain.py 给三位
+        # 医家线程用的是同一套办法）。
+        #
+        # 重试统计（`_record_retry`）不受影响：它在 generate() 的重试循环里调，
+        # 那是调用方线程。这也是为什么这个坑一直没被发现。
+        ctx = copy_context()
+
+        def _run_in_context() -> None:
+            ctx.run(_run)
+
         # 在途闸**在主线程取、在主线程放**，不放在工作线程里。第一版放在工作线程里，
         # 结果是：墙钟超时之后工作线程被丢下不管（daemon），它手里那个许可就**永远
         # 不会还**——攒够 LLM_MAX_INFLIGHT 次挂死，整个进程的 LLM 调用全部死锁。
@@ -613,7 +697,7 @@ class LLMBackend(ABC):
         sem = inflight_semaphore()
         sem.acquire()
         try:
-            worker = threading.Thread(target=_run, name="llm-call", daemon=True)
+            worker = threading.Thread(target=_run_in_context, name="llm-call", daemon=True)
             worker.start()
             worker.join(timeout=deadline)
             if worker.is_alive():
@@ -696,6 +780,7 @@ class LLMBackend(ABC):
         "这次跑的 adapter 是从哪来的"——per-physician 的实际 adapter 记在每位
         医家的结果里（见 core/chain.py::run_physician 的 "lora" 字段）。"""
         return None
+
 
     def replay_info(self) -> dict | None:
         """这一次的输出是不是回放的录制结果；None = 实时调用。
@@ -955,6 +1040,10 @@ class OpenAICompatBackend(LLMBackend):
                         else self._default_max_tokens(thinking)),
             **kwargs,
         )
+        # R21：缓存命中读数就在这里取。**取完立刻记**，不等 generate() 层——
+        # 一次 generate 可能重试多次，每次请求都有自己的 usage，漏掉重试那几次
+        # 会让命中率偏高（重试的请求前缀完全相同，几乎必定命中）。
+        record_usage(getattr(resp, "usage", None))
         content = resp.choices[0].message.content or ""
         if not content.strip():
             # HTTP 200 + 空响应体 = **模型名很可能不存在/已下线**（2026-09-15 实测：

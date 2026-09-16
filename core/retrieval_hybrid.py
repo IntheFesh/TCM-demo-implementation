@@ -39,7 +39,7 @@ import os
 import threading
 from pathlib import Path
 
-from core.retrieval import DenseRetriever, CASES_PATH
+from core.retrieval import CASES_PATH, DenseRetriever, full_context_hits
 from core.retrieval_graph import ElementRetriever
 from core.schemas import CaseRecord
 
@@ -50,7 +50,25 @@ _JIEBA_GLOBAL_LOCK = threading.Lock()
 # RRF 的经验常数，见模块文档字符串。
 RRF_K = 60
 
-ALLOWED_MODES = {"dense", "bm25", "graph", "hybrid"}
+# R21：`full_context` 加入并成为**默认**。旧四种保留为对照 arm（统称 top3 系）。
+# 默认换掉的理由：top-3 检索是在把 v4-pro 前缀缓存这个最大的杠杆扔掉
+# （见 core/context_prefix.py 的模块文档字符串）。
+ALLOWED_MODES = {"dense", "bm25", "graph", "hybrid", "full_context"}
+#: top3 系 = R21 之前的四种。RESULTS.md 里那几行历史数据属于这一系。
+TOP3_MODES = frozenset({"dense", "bm25", "graph", "hybrid"})
+DEFAULT_MODE = "full_context"
+#: 读这个模式的环境变量名。**只有本模块读它**（core/chain.py 那条源码级测试
+#: 钉住了 chain 不许碰它）；别处要在消息里提它的名字就 import 这个常量，
+#: 不要再写一遍字面量。
+RETRIEVER_MODE_ENV = "RETRIEVER_MODE"
+
+
+def effective_mode(mode: str | None = None) -> str:
+    """这次实际用哪个模式。**只此一处解析默认值**——`core/chain.py` 要知道
+    "这次是不是 full_context"来决定 prompt 怎么拼，它不该自己再读一遍
+    RETRIEVER_MODE 环境变量（两处各读一遍，改了默认值就会有一处忘了改）。
+    """
+    return mode or os.environ.get(RETRIEVER_MODE_ENV, DEFAULT_MODE)
 
 
 def _rrf_fuse(
@@ -252,7 +270,7 @@ class HybridRetriever(DenseRetriever):
         mode: str | None = None,
         query_elements: list[str] | None = None,
     ) -> list[tuple[CaseRecord, float]]:
-        mode = mode or os.environ.get("RETRIEVER_MODE", "hybrid")
+        mode = effective_mode(mode)
         if mode not in ALLOWED_MODES:
             raise ValueError(
                 f"未知的 RETRIEVER_MODE={mode!r}，目前支持 {sorted(ALLOWED_MODES)}"
@@ -275,6 +293,10 @@ class HybridRetriever(DenseRetriever):
         # "好看的展示数字"去多算一次稠密编码，白白引入了这条路径本不需要的模型
         # 依赖（K3a 的设计目标之一就是 bm25 模式应该能在没有 embedding 模型的
         # 环境里独立跑，见 tests/test_retrieval_hybrid.py）。
+        if mode == "full_context":
+            # 不排序不筛选，直接交出全部——走模块级 full_context_hits（一处实现），
+            # 不在这里另写一遍排序：顺序不同 = 缓存前缀 byte 不同 = 永不命中。
+            return full_context_hits(self._cases, physician)
         if mode == "dense":
             scored = self._dense_ranking(query, idxs, min_score)
         elif mode == "bm25":

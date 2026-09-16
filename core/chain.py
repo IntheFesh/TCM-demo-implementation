@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+from functools import lru_cache
 import sys
 import threading
 
@@ -26,13 +27,16 @@ from itertools import combinations
 from pathlib import Path
 
 from core import herbs as _herbs
+from core.context_prefix import assemble, prefix_tokens_by_section
 from core.diseases import get_disease, match_disease
 from core.elements import LOCATIONS, NATURES
 from core.llm import (
     current_retry_stats,
     get_llm,
     load_prompt,
+    current_usage_stats,
     new_retry_stats,
+    new_usage_stats,
     render,
     s3_thinking,
     thinking_by_step,
@@ -44,7 +48,12 @@ from core.followup import (
 from core.physicians import PHYSICIANS, physicians_enabled
 from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
 from core.retrieval import adaptive_min_score, apply_low_discrimination_cutoff, get_retriever
-from core.retrieval_hybrid import ALLOWED_MODES
+from core.retrieval_hybrid import (
+    ALLOWED_MODES,
+    DEFAULT_MODE,
+    RETRIEVER_MODE_ENV,
+    effective_mode,
+)
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
 from core.safety_output import assess_formula_safety, format_blocking_issues
 from core.schemas import (
@@ -591,14 +600,31 @@ def run_physician(
     refs_text = "\n\n".join(_format_case_block(case) for case, _ in hits) or "（无可用参考医案）"
 
     # S3 证候+治法+方
-    s3_prompt = load_prompt("s3_syndrome")
-    s3_system = render(
-        s3_prompt["system"],
-        name=physician_name,
-        elements_summary=_format_elements_summary(s2),
-        symptoms=symptoms_text,
-        refs=refs_text,
-    )
+    #
+    # R21：`full_context` 下整份 system prompt 由 core/context_prefix.assemble()
+    # 组装（知识速查表 → 指令 → 该医家医案全量 → 药材条目 → 本次问诊），
+    # 目的是让前面那几段进 v4-pro 的前缀缓存。**参考医案块仍然走
+    # `_format_case_block`**（assemble 内部默认就是它），所以两种模式下医案的
+    # 格式逐字节相同——E3/E4 闸门验过的那个格式没有第二份实现。
+    # `hits` 直接传进去当 §4：refs_mode 的 own/swapped/none 已经在
+    # `_search_cases` 那一步体现在 hits 里了，这里不再判一次。
+    mode_eff = effective_mode(retriever_mode)
+    if mode_eff == "full_context":
+        s3_system = assemble(
+            physician, s1=s1, s2=s2,
+            case_block=[case for case, _ in hits],
+            elements_summary=_format_elements_summary(s2),
+            symptoms=symptoms_text,
+        )
+    else:
+        s3_prompt = load_prompt("s3_syndrome")
+        s3_system = render(
+            s3_prompt["system"],
+            name=physician_name,
+            elements_summary=_format_elements_summary(s2),
+            symptoms=symptoms_text,
+            refs=refs_text,
+        )
     # G2：开了 ReAct 就先跑一轮取证，把查到的东西追加到 S3 prompt 后面。
     # 只追加、不改 s3_syndrome.yaml——不开 ReAct 时 prompt 要跟改造前逐字节一致，
     # 否则 use_react 的 A/B 里混进了 prompt 变化这个额外变量。
@@ -762,22 +788,33 @@ def cases_sha256() -> str | None:
     return hashlib.sha256(cp.read_bytes()).hexdigest()[:12]
 
 
-def _comparability_warning(llm) -> str | None:
-    """后端自己的可比性警告 + 思考设置非默认时的那一句，拼成一条。
+def _comparability_warning(llm, retriever_mode: str | None = None) -> str | None:
+    """后端自己的可比性警告 + 思考设置 + 检索模式非默认时的那几句，拼成一条。
 
-    两者是同一类事实——"这次跑的条件跟报告里那些数字的条件不一样"——所以合并成
-    一个字段，而不是再加一个 `thinking_warning` 让引用方记得同时看两处。
+    三者是同一类事实——"这次跑的条件跟报告里那些数字的条件不一样"——所以合并成
+    一个字段，而不是再加 `thinking_warning` / `retriever_warning` 让引用方记得
+    同时看三处。
     """
     parts = [llm.comparability_warning()]
     if s3_thinking() != "enabled":
         parts.append(
             "S3_THINKING=disabled：S3 这一步关掉了思考模式。**关思考跑出来的数字跟"
             "默认配置（S3 开思考 + effort=high）下的不可比**，并列报出，不要相减。")
+    mode = effective_mode(retriever_mode)
+    if mode != DEFAULT_MODE:
+        # R21：检索模式跟换模型同级地改变"模型看到了什么"——full_context 下它看到
+        # 该医家全部医案，top3 下看到三条。RESULTS.md 里 top3 那几行是历史行，
+        # full_context 另起新行，并列不覆盖。
+        parts.append(
+            f"{RETRIEVER_MODE_ENV}={mode}（默认是 {DEFAULT_MODE}）：这一轮模型看到的参考"
+            "医案跟默认配置不是一回事（top3 系只看三条，full_context 看全量）。"
+            "**两系的数不可比**，RESULTS.md 里分行报，不要相减。")
     joined = " ".join(p for p in parts if p)
     return joined or None
 
 
-def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) -> dict:
+def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
+                    retriever_mode: str | None = None) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
     cases_sha = cases_sha256()
@@ -791,7 +828,7 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) ->
         # 非默认后端时非 None。带着走，报告里就不会漏标"这个数不可比"。
         # **思考设置也算一种"换了实验条件"**：S3 关掉思考会明显更快、结果也会变，
         # 那是另一组数，不能跟默认配置下的数混着引（跟换模型同级）。
-        "comparability_warning": _comparability_warning(llm),
+        "comparability_warning": _comparability_warning(llm, retriever_mode),
         # 每一步开不开思考。换了这张表 = 数字不可比，所以它跟 model 一样是 manifest
         # 的一等字段，不是可选的调试信息。
         "thinking_by_step": thinking_by_step(),
@@ -820,6 +857,71 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False) ->
         "cases_sha256": cases_sha,
         "elapsed_ms": elapsed_ms,
         "llm_calls": llm_calls,
+        # R21：这四项是"知识怎么进模型"的全部凭据。
+        #
+        # retriever_mode 跟 model 同级地影响可比性：full_context 下模型看到的是
+        # 该医家**全部**医案，top3 下是三条——两组数不可比，所以
+        # _comparability_warning 会在它不是默认值时也开口（见那个函数）。
+        "retriever_mode": effective_mode(retriever_mode),
+        # 每位医家的稳定前缀各段多少 token。full_context 之外恒 None——
+        # 不是 0：0 会被读成"算过、是零"，而那几段在 top3 下根本不存在。
+        "prefix_tokens_by_section": _prefix_tokens_or_none(retriever_mode),
+        # 缓存命中读数，从响应 usage 取（core/llm.py::last_usage）。
+        # 非 DeepSeek 后端如实为 None。
+        **_cache_usage_fields(),
+    }
+
+
+def _prefix_tokens_or_none(retriever_mode: str | None) -> dict | None:
+    """full_context 下报各段 token，其余模式 None。
+
+    取不到（没有 cases.json / 药理层文件）时报出来的是各段**现有内容**的读数
+    ——沙盒里医案段会是 0 诊次那一行。不抛异常：manifest 不该因为一个统计项
+    取不到就让整次问诊失败。
+
+    **按 cases.json 的 sha 记忆化**：算这个数要把全部医案格式化一遍再数 token，
+    941 诊次量级下每次问诊都算一遍是白花几百毫秒，而它在语料不变时恒定。
+    sha 变了（重抽了语料）缓存自然失效——这正是它该失效的时机。
+    """
+    if effective_mode(retriever_mode) != "full_context":
+        return None
+    return _prefix_tokens_cached(_PREFIX_REPORT_PHYSICIAN, cases_sha256())
+
+
+@lru_cache(maxsize=8)
+def _prefix_tokens_cached(pid: str, cases_sha: str | None) -> dict:
+    """`cases_sha` 只用来做缓存键，函数体不读它——它代表"语料这一版"。"""
+    try:
+        return prefix_tokens_by_section(pid)
+    except Exception as e:  # noqa: BLE001 —— 统计项不许拖垮问诊
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+#: manifest 里那份 prefix_tokens_by_section 按哪位医家报。**一位就够**：
+#: 共享段对所有医家相同，医家段的量级三位接近；报三份会让 manifest 膨胀，
+#: 而要逐位看有 `python -m core.context_prefix --report`。
+_PREFIX_REPORT_PHYSICIAN = "ye_tianshi"
+
+
+def _cache_usage_fields() -> dict:
+    """前缀缓存命中读数。命中率是**算出来的**，不从响应里读——
+    响应只给 hit/miss 两个绝对数，率写在两处就会有一处忘了改分母。
+    """
+    # **不经后端拿**：统计在 ContextVar 里，是"这一次调用链"的属性，不是后端
+    # 实例的属性（并发的三位医家共用同一个后端单例）。给后端加一个转发方法
+    # 等于给同一件事开第二个入口（CLAUDE.md 第 31 条），而且会让所有测试替身
+    # 都得跟着实现那个方法。
+    usage = current_usage_stats()
+    hit = usage.get("prompt_cache_hit_tokens") if usage else None
+    miss = usage.get("prompt_cache_miss_tokens") if usage else None
+    total = (hit or 0) + (miss or 0)
+    return {
+        "cache_hit_tokens": hit,
+        "cache_miss_tokens": miss,
+        # 分母为 0（没有任何 usage）时是 None 而不是 0.0：0.0 会被读成
+        # "跑了但一次没命中"，而实际是"这个后端不报这个数"。
+        "cache_hit_ratio": (round((hit or 0) / total, 4) if total else None),
+        "reasoning_tokens": (usage.get("reasoning_tokens") if usage else None),
     }
 
 
@@ -1049,6 +1151,9 @@ def consult(
     # copy_context）加的数父线程读得到；manifest 从 current_retry_stats() 取，
     # 不用把它一路当参数传到每个 _build_manifest 调用点。
     new_retry_stats()
+    # R21：缓存命中统计跟重试统计同一处开——两者都是「这一次问诊的」，
+    # 开在两个地方就会有一处忘了开，而忘了开的表现是 manifest 里那个数恒 None。
+    new_usage_stats()
 
     def emit(name: str, **data) -> None:
         if on_step is not None:
@@ -1096,7 +1201,7 @@ def consult(
             "safety_flag": safety_flag, "retrieval_error": None,
             "s2": None, "residual": None, "followup": None,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react),
+            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react, retriever_mode=retriever_mode),
         }
 
     s2 = infer_elements(s1)
@@ -1131,7 +1236,8 @@ def consult(
             "followup": followup,
             "residual": None, "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000), 2, use_react
+                int((time.time() - _t0) * 1000), 2, use_react,
+                retriever_mode=retriever_mode,
             ),
         }
     if followup.asserted:
@@ -1146,7 +1252,7 @@ def consult(
                 "safety_flag": safety_flag, "retrieval_error": None,
                 "s2": s2, "followup": followup, "residual": None,
                 "insufficient": False, "insufficient_reason": None, "coverage": None,
-                "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react),
+                "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react, retriever_mode=retriever_mode),
             }
         # 追问确认的是国标症状名（来自图谱节点），本身已经是标准表述，不需要再过
         # S1——这不违反"S1 全局只跑一次"，S1 一次也没有多跑。
@@ -1193,7 +1299,8 @@ def consult(
             "safety_flag": safety_flag, "retrieval_error": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
-                2 + extra_calls + (1 if residual else 0), use_react
+                2 + extra_calls + (1 if residual else 0), use_react,
+                retriever_mode=retriever_mode,
             ),
         }
     results = []
@@ -1218,7 +1325,7 @@ def consult(
             "safety_flag": safety_flag or veto.reason, "retrieval_error": None,
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react),
+            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react, retriever_mode=retriever_mode),
         }
     except RetrievalUnavailable as e:
         # 选的检索模式这台机器上没有对应数据（graph 缺 element_index.json 之类）。
@@ -1243,6 +1350,7 @@ def consult(
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
                 2 + extra_calls + (1 if residual else 0), use_react,
+                retriever_mode=retriever_mode,
             ),
         }
 
@@ -1409,6 +1517,7 @@ def consult(
             # 调用数会低于实际花费，拿它算成本或比 use_react 开关的代价就都是错的。
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"]),
             use_react,
+            retriever_mode=retriever_mode,
         ),
     }
 

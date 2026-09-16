@@ -271,9 +271,10 @@ cp .env.example .env
 | `EMBEDDING_CACHE` / `EMBEDDING_CACHE_DIR` | 语料向量的磁盘缓存：`0` 关掉，或指定目录（默认 `data/cache/`，已 gitignore）。命中判据是模型名 + 语料条数 + **被编码文本的 sha256** 三者全等；缓存省的是"给全部语料编码"那一段，模型本身不管命不命中都要加载（查询要用它） |
 | `LOW_DISCRIMINATION_CUTOFF` | `0` 关闭（默认开）：检索到的候选之间没有真实区分度（top-1 与 top-k 原始相似度差 < 0.03）时只保留 top-1，避免塞几条弱相关候选进 prompt 稀释信号。这条不确定是不是净收益，做成开关是为了能跑两遍对比（`consult()` 返回的每位医家结果带 `low_discrimination` 标记） |
 
-> **检索模式不是环境变量。** `RETRIEVER_MODE` 仍然存在（离线脚本/单机评测用），
-> 但 HTTP 请求要切模式请用请求体里的 `retriever_mode` 字段——环境变量是进程级的，
-> 两个并发请求各选一种模式会互相污染。详见「检索：三路融合」一节。
+> **检索模式不是环境变量。** `RETRIEVER_MODE` 仍然存在（离线脚本/单机评测用，
+> **默认 `full_context`**），但 HTTP 请求要切模式请用请求体里的 `retriever_mode`
+> 字段——环境变量是进程级的，两个并发请求各选一种模式会互相污染。
+> 详见「检索：三路融合」和「full_context」两节。
 
 ### 第 3 步：生成 `cases.json`（医案结构化数据）
 
@@ -677,14 +678,18 @@ consult("胃脘胀痛，嗳气泛酸，纳差", ask_fn=ScriptedPatient(present=[
 `core/retrieval.py` 的 `get_retriever()` 返回的是 `core/retrieval_hybrid.py`
 的 `HybridRetriever`——`DenseRetriever`（稠密向量检索）的超集，另外叠加了
 BM25 关键词检索（K3a）和证素路检索（K3b），用 Reciprocal Rank Fusion 融合。
-`RETRIEVER_MODE` 环境变量或 `search(mode=...)` 参数选路，四种取值：
+`RETRIEVER_MODE` 环境变量或 `search(mode=...)` 参数选路，五种取值。
+**R21 之后默认值是 `full_context`**，下面表里前四种合起来叫 **top3 系**
+（每次只喂 3 条最相似医案），它们保留为对照 arm——两系的数**不可比**，
+`eval/RESULTS.md` 分两节并列报，不覆盖：
 
 | mode | 依赖 | 说明 |
 |---|---|---|
 | `dense` | embedding 模型 | 语义相似度，原有行为不变 |
 | `bm25` | `data/jieba_dict.txt`（可选，缺失时退化到 jieba 默认词典） | 关键词重合，不需要 embedding 模型 |
 | `graph` | `data/element_index.json` + `query_elements` 参数 | 证素 Jaccard 相似度；不传 `query_elements` 直接报错，不静默退化成别的模式 |
-| `hybrid`（默认） | 上面几路都可选 | 传了 `query_elements` 就三路融合，没传就退回 dense+bm25 两路，向后兼容 |
+| `hybrid` | 上面几路都可选 | 传了 `query_elements` 就三路融合，没传就退回 dense+bm25 两路，向后兼容 |
+| `full_context`（**默认**） | `cases.json`；本草/方剂速查表可选 | 不检索：该医家**全部**医案按 `case_id` 排序进 prompt，靠前缀缓存把钱压下来（见下面「full_context」一节）。展示分固定 `1.0`，不是相似度 |
 
 `min_score`（默认阈值 `MIN_RETRIEVAL_SCORE=0.70`）只作用于 dense 那一路——
 bm25 的展示分是无界原始分，graph 的展示分是证素集合通常只有两三个元素时的
@@ -696,7 +701,7 @@ Jaccard 相似度，套用为稠密余弦相似度校准的阈值没有意义，
 python -m offline.build_jieba_dict          # K3a：BM25 分词词典
 python -m offline.extract_case_triples      # X3：真实 LLM 抽取医案三元组（需要 cases.json）
 python -m offline.build_element_index       # K3b：证素索引（需要 cases.json + data/graph.json）
-RETRIEVER_MODE=hybrid ./run.sh              # 或 dense/bm25/graph
+RETRIEVER_MODE=hybrid ./run.sh              # 或 dense/bm25/graph/full_context（默认后者）
 ```
 
 ### 在线切模式：逐请求，不是环境变量
@@ -723,6 +728,74 @@ curl -X POST http://127.0.0.1:8000/api/consult \
   → `200` + 响应体里的 `retrieval_error` 一句人话，**不静默降级到别的模式**。
   降级的话调用方会以为自己看到的是证素路的结果，E8 消融那组数字也就失去意义了。
   检索层照旧大声报错，只是不再让 500 裸奔到前端。
+
+## full_context：知识不走检索，走前缀缓存（R21，默认）
+
+**为什么换。** 以前每次问诊只把 top-3 条最相似医案塞进 prompt——一位医家几十上百
+条医案里，模型每次只看得到三条。DeepSeek 的前缀缓存让"全都看"变得比"看三条"更划算：
+
+| 输入 token | 价格 | 倍数 |
+|---|---|---|
+| 缓存未命中 | $1.32 / M | —— |
+| **缓存命中** | **$0.044 / M** | **便宜 30 倍** |
+| 输出 | $3.96 / M | —— |
+
+一位医家的全量医案 ≈ 180K token：**首次** $0.24，之后每次 $0.008。三位医家一次
+问诊 ≈ ¥0.17。缓存是**默认开的、不需要改代码**，但有三条官方规矩决定了实现方式
+（原始链接在 `core/context_prefix.py` 的模块注释里）：
+
+1. 存储单位是 **64 token**，不足 64 token 的内容不进缓存；
+2. 每段缓存前缀是**独立完整的单元**，一个请求只在**完全匹配**某个前缀单元时才命中；
+3. 不再使用的缓存会自动清除，**通常几小时到几天**——所以演示前要预热，
+   `POST /api/key/validate` 的返回里带 `prefix_warmup_note` 就是提醒这件事。
+
+**prompt 按"稳定的放前面、变的放最后"排六段**（`core/context_prefix.py`）：
+
+| 段 | 内容 | 谁共享 |
+|---|---|---|
+| §2 | 本草速查表（`名｜性味｜归经｜功效｜用量上限｜禁忌`，按名排序） | 所有医家相同 |
+| §3 | 方剂速查表（`方名｜组成｜主治`，按名排序） | 所有医家相同 |
+| §1 | 辨证指令与输出 schema（**直接取自 `prompts/v1`，一个字没改**） | 所有医家相同 |
+| §4 | 该医家全部医案，按 `case_id` 排序，每条走 `_format_case_block()` | 该医家 |
+| §5 | 该医家用过的药材/方剂的**完整**条目（六个/八个谓词全给） | 该医家 |
+| §6 | 本次的 S1/S2 结果、主诉、输出要求 | 逐次都变 |
+
+§1 排在 §2/§3 **后面**不是笔误：`s3_syndrome.yaml` 的第一行就含 `$name`（医家名），
+把它放最前面会让前缀在第 10 个字节处就分叉，跨医家的共享段一个字节也命中不了。
+§2/§3 对所有医家逐字节相同，放最前面，三位医家共用同一段缓存。
+
+**生成器是确定性的**：固定排序、不带时间戳、不带随机 id，跑两次 sha256 相同
+（`tests/test_context_prefix.py` 里有一条专门钉这个）。看一眼每段多大：
+
+```bash
+python -m core.context_prefix --report                 # 读真实 cases.json
+python -m core.context_prefix --report --synthetic 20  # 沙盒里没有 cases.json 时用合成语料
+python -m core.context_prefix --report --budget 6000   # 看超预算时按什么顺序裁
+```
+
+预算 **500,000 token / 医家**。超了按固定顺序裁：方剂速查表 → 本草速查表 →
+§5 条目，**医案永不裁**（医案是这个项目的立身之本，裁它等于把要证明的东西扔了）。
+裁不裁是**按最大的那位医家全局决定的**，不是每位医家各算一次——否则共享段会
+因医家而异，跨医家缓存共享当场归零。用的 token 尺是 `tiktoken cl100k_base`
+（装了就用），没装时退化成一把**声明过的保守上界**（CJK 记 1、其他记 0.5，向上取整），
+`--report` 的第一行总会打印用的是哪一把。
+
+**命中率怎么看**：`usage.prompt_cache_hit_tokens` / `(hit + miss)`，经
+`core/llm.py` 的 `record_usage` 收进 manifest，再由 `scripts/bench_consult.py` 报出来。
+沙盒里没有真实 API，所以 bench 有个 `--simulate-cache`：按 64-token 块对齐算
+最长公共前缀，产物里标 `simulated_cache: true`——**模拟值不是真机值**。
+
+```bash
+python -m scripts.bench_consult --backend fake --simulate-cache --repeat 3
+#  前缀缓存命中率（逐次）：0.011、0.996、0.996   ← 第一次全 miss 是对的
+python -m scripts.bench_consult --backend real --repeat 2      # 上机：判据第二次 ≥ 0.9
+```
+
+闸门定 **0.9 不是 1.0**：§6（本次主诉）永远不命中，它占 prompt 约 1%。
+
+**full_context 下 ReAct 一律关**，即使 `USE_REACT=1`（会打印一行说明）。ReAct 的
+工具是去检索语料的，而语料已经全在上下文里了。因此 **E9（ReAct 开/关）是只对
+top3 系有意义的指标**，见 `eval/RESULTS.md`。
 
 ## 证素轨迹（附属，进阶功能）
 

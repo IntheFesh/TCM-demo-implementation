@@ -235,12 +235,39 @@ def test_format_trace_for_s3_empty_trace_is_empty_string():
 
 
 def test_react_enabled_defaults_off(monkeypatch):
+    """R21 **有意的契约变更**：`USE_REACT=1` 不再无条件为 True。
+
+    原断言是 `monkeypatch.setenv("USE_REACT","1"); assert react_enabled() is True`
+    ——那一版还没有 full_context 这个模式。现在默认模式是 full_context，而 ReAct
+    的两件工具就是在检索语料，语料已经全在上下文里时它是冗余的（§1.3）。
+    所以这条拆成两半：top3 系里 USE_REACT=1 照旧为 True（下一条测试），
+    full_context 下即使显式开也关（再下一条）。
+    """
     monkeypatch.delenv("USE_REACT", raising=False)
     assert react_enabled() is False
-    monkeypatch.setenv("USE_REACT", "1")
-    assert react_enabled() is True
     monkeypatch.setenv("USE_REACT", "0")
     assert react_enabled() is False
+
+
+def test_react_enabled_still_honours_the_flag_in_the_top3_modes(monkeypatch):
+    monkeypatch.setenv("USE_REACT", "1")
+    for mode in ("hybrid", "dense", "bm25", "graph"):
+        monkeypatch.setenv("RETRIEVER_MODE", mode)
+        assert react_enabled() is True, mode
+
+
+def test_react_is_off_in_full_context_even_when_asked_for(monkeypatch, capsys):
+    """**说一句再关**：静默关掉会让"我开了 ReAct 但 trace 是空的"变成一个
+    查不出原因的现象。"""
+    import core.react as react_mod
+
+    monkeypatch.setattr(react_mod, "_warned_react_off_in_full_context", False)
+    monkeypatch.setenv("USE_REACT", "1")
+    monkeypatch.setenv("RETRIEVER_MODE", "full_context")
+    assert react_enabled() is False
+    err = capsys.readouterr().err
+    assert "ReAct 在这个模式下关闭" in err
+    assert "top3" in err
 
 
 # ---------- 审查修复 ----------

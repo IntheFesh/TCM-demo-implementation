@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import re
 from typing import Callable
 
@@ -49,8 +50,38 @@ ASK_ACTION = "ask_user"
 
 def react_enabled() -> bool:
     """默认关。ReAct 每位医家多花 1-5 次调用，成本翻倍，不该是默认路径；
-    真正要它的是"给我看推理过程"这类演示场景，显式开。"""
-    return os.environ.get("USE_REACT", "0").lower() in ("1", "true", "yes")
+    真正要它的是"给我看推理过程"这类演示场景，显式开。
+
+    R21：`full_context` 下**即使显式开也关**。ReAct 的两件工具
+    （`search_cases` / `query_case_graph`）是在检索语料，而 full_context 下
+    该医家的全部语料已经在上下文里了——再查一遍是花钱把已经看得见的东西
+    再取一次。E9（react off vs on）因此变成 top3 系专属指标。
+    **说一句再关**，不静默：静默关掉会让"我开了 ReAct 但 trace 是空的"
+    变成一个查不出原因的现象。
+    """
+    asked = os.environ.get("USE_REACT", "0").lower() in ("1", "true", "yes")
+    if not asked:
+        return False
+    from core.retrieval_hybrid import effective_mode
+
+    mode = effective_mode()
+    if mode == "full_context":
+        if not _warned_react_off_in_full_context:
+            _warn_react_off_in_full_context(mode)
+        return False
+    return True
+
+
+_warned_react_off_in_full_context = False
+
+
+def _warn_react_off_in_full_context(mode: str) -> None:
+    global _warned_react_off_in_full_context
+    _warned_react_off_in_full_context = True
+    print(f"[react] USE_REACT=1 但 RETRIEVER_MODE={mode}：ReAct 在这个模式下关闭。"
+          "它的工具是在检索语料，而这个模式下该医家的语料已经全在上下文里了。"
+          "要跑 E9（react off vs on）请用 top3 系的模式（hybrid/dense/bm25/graph）。",
+          file=sys.stderr)
 
 
 def format_tools() -> str:

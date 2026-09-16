@@ -22,14 +22,30 @@ from scripts.collect_results import (
     check,
     evidence_value,
     metric_rows,
+    round_report_paths,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_all_four_docs_are_in_the_checker():
+def test_the_four_fixed_docs_and_every_round_report_are_in_the_checker():
+    """**有意的判据变更（R21）**：原来是"恰好这四份"。R21 起每轮一份
+    `docs/reports/R<N>_report.md`，报告里带 `bench/sandbox.json:…` 凭据记号，
+    所以它们也必须进核对器——而且是 glob 进来的：靠人记着往元组里加一个名字，
+    忘了的那一轮读起来跟被核过的一样。"""
     names = {p.name for p in DEFAULT_CHECK_PATHS}
-    assert names == {"RESULTS.md", "README.md", "R11-R19_report.md", "DEMO.md"}
+    assert {"RESULTS.md", "README.md", "R11-R19_report.md", "DEMO.md"} <= names
+    round_names = {p.name for p in round_report_paths()}
+    assert round_names, "docs/reports/ 下一份轮次报告都没有"
+    assert round_names <= names, f"这些轮次报告没进核对器：{round_names - names}"
+
+
+def _current_round_report():
+    """最新那一轮的报告。R11–R19 那份是**合起来的历史总账**，从 R21 起它不再
+    承担"当前轮"这个角色——当前轮的五个数挂在 `docs/reports/R<N>_report.md`。"""
+    paths = round_report_paths()
+    assert paths, "docs/reports/ 下没有任何一轮的报告"
+    return paths[-1]
 
 
 @pytest.mark.parametrize("path", DEFAULT_CHECK_PATHS, ids=lambda p: p.name)
@@ -63,9 +79,15 @@ def test_metric_table_header_needs_a_separator_row_under_it():
 
 
 def test_the_report_pins_this_rounds_five_numbers():
-    """九轮表里 R19 那一行的数要能被核。历史几轮的数是 git 可核的、不是文件可核的，
-    所以只给 R19 那一行上记号——给历史行编造凭据比不给更糟。"""
-    text = (ROOT / "docs" / "R11-R19_report.md").read_text(encoding="utf-8")
+    """**当前轮**报告里的五个数要能被核。历史几轮的数是 git 可核的、不是文件可核的，
+    所以只给当前轮上记号——给历史行编造凭据比不给更糟。
+
+    **有意的判据变更（R21）**：原来查的是 `docs/R11-R19_report.md`。R21 重跑
+    `bench_sandbox --all` 把 `eval/bench/sandbox.json` 整份覆盖成了 R21 的数，
+    于是挂在它上面的 R19 凭据当场报了 6 处不一致——**一个会被下一轮覆盖的文件，
+    不能给一个历史轮次的数当凭据**。历史值改指 git 的那个 commit，
+    「当前轮」这个角色转给 `docs/reports/R<N>_report.md`。"""
+    text = _current_round_report().read_text(encoding="utf-8")
     for key in ("bench.pytest_passed", "bench.pytest_skipped", "bench.pytest_failed",
                 "bench.pytest_wall_s", "bench.playwright_states_passed"):
         assert f"bench/sandbox.json:{key}=" in text, key
@@ -144,10 +166,25 @@ def test_the_report_records_the_nine_round_test_counts_monotonically():
     assert len(counts) == 11, f"表里只解析出 {len(counts)} 行：{counts}"
     assert counts == sorted(counts), f"条数不是单调不减：{counts}"
     assert counts[0] == 2279, "第一行是 R11 的 2279，它是这一串的起点"
-    # 最后一行不写死：它必须等于 bench 文件里**这一轮实测**的条数。
-    # 写死的话每轮改两处（文件和这里），而这两处一旦不同步，
-    # 文档里的数就变成了一个没人核的数——这个项目漂过三次的正是这种。
+    # **有意的判据变更（R21）**：原来要求最后一行 == bench 文件里的条数。
+    # 那时这份文件就是"当前轮报告"，现在它是一张**封版的历史表**（最后一行是
+    # R19 的 2693，凭据在 `git show a22398a:eval/bench/sandbox.json`）。
+    # 还能钉住的是那条硬约束本身——条数只增不减，所以历史表的末行不许超过当前实测。
     latest, path = evidence_value("bench.pytest_passed")
     if path.exists() and latest is not None:
-        assert counts[-1] == latest, (
-            f"九轮表最后一行是 {counts[-1]}，而 {path.name} 里是 {latest}")
+        assert counts[-1] <= latest, (
+            f"九轮表最后一行是 {counts[-1]}，而 {path.name} 里是 {latest}"
+            "——条数只增不减，历史表的末行不该比当前实测还大")
+
+
+def test_the_current_round_report_states_the_measured_test_count():
+    """当前轮报告里写的条数必须等于 bench 文件里**这一轮实测**的条数。
+    这一条是上面那条移交过来的责任：写死在文档里的条数一旦跟文件不同步，
+    它就变成一个没人核的数——这个项目漂过三次的正是这种。"""
+    latest, bench_path = evidence_value("bench.pytest_passed")
+    if not bench_path.exists() or latest is None:
+        pytest.skip("eval/bench/sandbox.json 还没有 pytest_passed")
+    report = _current_round_report()
+    text = report.read_text(encoding="utf-8")
+    token = f"bench/sandbox.json:bench.pytest_passed={latest}"
+    assert token in text, f"{report.name} 里没有 `{token}`"

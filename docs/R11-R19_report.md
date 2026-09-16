@@ -34,15 +34,20 @@
 | R18 之二 立论层 / 教材 / 药理层 / 五源 / 参考医家 | `deae24c` | 2643 / 10 / 0 | 干净 | 36 | 0 | 16 |
 | R19 上机剧本可续跑 + ε 按思考设置 + 性能对照 | 本轮 | **2693 / 10 / 0** | 干净 | 36 | 0 | 16 |
 
-**R19 那一行的五个数带凭据，`collect_results --check` 逐个核**（这份文件在
-`DEFAULT_CHECK_PATHS` 里，跟 README 和 RESULTS.md 同一个核对器）。一行一个数，
-因为核对器要求凭据说的数在同一行的正文里也出现：
+**R19 那一行的五个数，凭据在 git 历史里，不在当前的 `eval/bench/sandbox.json` 里。**
+⚠ R21 发现并改正了这里的一个口径问题：`eval/bench/sandbox.json` 是**"当前这一轮的
+测量"**，不是逐轮追加的日志——R21 重跑 `bench_sandbox --all` 之后它整份被覆盖成
+R21 的数（2780 passed / 墙钟 66.8s），于是这份文件里挂在它上面的 R19 凭据当场
+`--check` 报了 6 处不一致。**这不是文档写错了，是凭据挂错了对象**：一个会被下一轮
+覆盖的文件，不能给一个历史轮次的数当凭据。改法是历史值指到 git 的那个 commit
+（跟 `archive/2026-09-12/report_e3.json` 那批 📦 归档凭据同一个道理），当前值继续
+挂 `sandbox.json`：
 
-- 测试 passed **2693** —— `bench/sandbox.json:bench.pytest_passed=2693`
-- 测试 skipped **10** —— `bench/sandbox.json:bench.pytest_skipped=10`
-- 测试 failed **0** —— `bench/sandbox.json:bench.pytest_failed=0`
-- 全量测试墙钟 **89.9** 秒 —— `bench/sandbox.json:bench.pytest_wall_s=89.9`
-- Playwright 通过 **16** 种 —— `bench/sandbox.json:bench.playwright_states_passed=16`
+- 📦 R19 的五个数一次取全：`git show a22398a:eval/bench/sandbox.json`
+  —— 里面 `pytest_passed` 2693、`pytest_skipped` 10、`pytest_failed` 0、
+  `pytest_wall_s` 89.9、`playwright_states_passed` 16，跟上表 R19 那一行逐个对得上。
+- ✅ **当前轮**（R21）那五个数仍然由 `collect_results --check` 逐个核，
+  凭据记号在 `eval/RESULTS.md` 的性能表和 `docs/reports/R21_report.md` 里。
 
 `ruff`、`min_length=1` 计数、`--check` 退出码这三个数**没有凭据记号也不该有**：
 它们是命令的当场输出，不落任何文件。要核就当场跑那三条命令（第一节表头写了）。

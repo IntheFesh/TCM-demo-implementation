@@ -10,7 +10,14 @@ import numpy as np
 import pytest
 
 from core import retrieval_hybrid as rh
-from core.retrieval_hybrid import ALLOWED_MODES, HybridRetriever, _apply_bm25_floor, _rrf_fuse
+from core.retrieval_hybrid import (
+    ALLOWED_MODES,
+    DEFAULT_MODE,
+    TOP3_MODES,
+    HybridRetriever,
+    _apply_bm25_floor,
+    _rrf_fuse,
+)
 from core.schemas import CaseRecord
 
 
@@ -598,8 +605,17 @@ def test_search_empty_physician_returns_empty_without_touching_model(tmp_path):
     assert retriever._model is None  # 没有案子可比，不该去碰模型
 
 
-def test_allowed_modes_includes_graph():
-    assert ALLOWED_MODES == {"dense", "bm25", "graph", "hybrid"}
+def test_allowed_modes_includes_graph_and_full_context():
+    """R21 **有意的契约变更**：加了 `full_context` 并把它设成默认。
+
+    原断言是 `ALLOWED_MODES == {"dense","bm25","graph","hybrid"}`。改的理由：
+    top-3 检索是在把 v4-pro 前缀缓存这个最大的杠杆扔掉（见
+    core/context_prefix.py 的模块文档字符串）。旧四种一个没删，
+    它们成了对照 arm（TOP3_MODES），RESULTS.md 里那几行历史数据属于这一系。
+    """
+    assert ALLOWED_MODES == {"dense", "bm25", "graph", "hybrid", "full_context"}
+    assert TOP3_MODES == {"dense", "bm25", "graph", "hybrid"}
+    assert DEFAULT_MODE == "full_context"
 
 
 # ---------- P0-13 续：RRF 把强 bm25 信号压到 top-N 之外，bm25 保底修复 ----------

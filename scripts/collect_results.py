@@ -44,8 +44,28 @@ DEFAULT_RESULTS_MD = EVAL_DIR / "RESULTS.md"
 # （ε 全局均值、SDT 开关安全闸的两个分、旧检索层的差异率）——声称和实际对不上，
 # 是 R19 写 tests/test_docs_numbers.py 时用注册表里的真值去搜出来的。
 # 现在那 4 个数各带凭据记号，声称改成"讲解里必须出现的数每个都带凭据"。
+# R21：**每轮一份报告**（`docs/reports/R<N>_report.md`）也进核对器，而且是 glob
+# 进来的、不是一轮一轮往这个元组里加名字。加名字那种写法的失败模式很具体：
+# 忘了加 → 那一轮报告里的凭据记号谁都不核，它读起来跟被核过的一样。
+ROUND_REPORTS_DIR = ROOT / "docs" / "reports"
+
+
+def round_report_paths(reports_dir: Path = ROUND_REPORTS_DIR) -> tuple[Path, ...]:
+    """按轮次号排序的每轮报告。排序用**数字**而不是文件名字符串——
+    字符串排序下 R9 会排在 R21 后面。"""
+    if not reports_dir.is_dir():
+        return ()
+    found = []
+    for path in reports_dir.glob("R*_report.md"):
+        m = re.match(r"R(\d+)_report\.md$", path.name)
+        if m:
+            found.append((int(m.group(1)), path))
+    return tuple(path for _, path in sorted(found))
+
+
 DEFAULT_CHECK_PATHS = (DEFAULT_RESULTS_MD, ROOT / "README.md",
-                       ROOT / "docs" / "R11-R19_report.md", ROOT / "DEMO.md")
+                       ROOT / "docs" / "R11-R19_report.md", ROOT / "DEMO.md",
+                       *round_report_paths())
 
 EPSILON_JSON = "epsilon.json"
 E3_JSON = "report_e3.json"

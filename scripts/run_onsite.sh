@@ -164,6 +164,28 @@ resolve_calls() {
   esac
 }
 
+# R21：峰谷分时。**判定只有一处实现**（core/usage.py::is_peak / peak_note），
+# bash 这边不自己算时区——算两遍就会有一处把夏令时/UTC 偏移弄错，
+# 而弄错的表现是"按五折估的预算，实际按原价扣"。
+peak_note() { python3 -c "from core.usage import peak_note; print(peak_note())"; }
+is_peak() { python3 -c "import sys; from core.usage import is_peak; sys.exit(0 if is_peak() else 1)"; }
+
+# 这几段是花钱的大头（段 5 药理层抽取、段 6 录制、段 7 全套评测、段 8 性能基准）。
+# 高峰时段启动它们只提醒、**不阻止**：有时就是得现在跑。
+COSTLY_SEGMENTS=" 5 6 7 8 "
+
+warn_if_peak() {
+  local n="$1"
+  case "$COSTLY_SEGMENTS" in
+    *" $n "*) ;;
+    *) return 0 ;;
+  esac
+  if is_peak; then
+    printf '\033[33m>>> [段 %s] 现在是**高峰时段**，这一段比较贵。谷段（北京 12–14、18–09）五折。\033[0m\n' "$n"
+    printf '\033[33m>>> 不拦你——要等就 Ctrl-C，之后 `--resume` 从这一段接着跑。\033[0m\n'
+  fi
+}
+
 print_plan() {
   local total=0
   echo "段  名称                     预估调用  人工卡点  说明"
@@ -352,6 +374,7 @@ run_segment() {
   echo "=========================================================================="
   echo "[段 $n] $name    开始 $(date -Is)"
   echo "=========================================================================="
+  warn_if_peak "$n"
   local rc=0
   case "$n" in
     0) seg_0 || rc=$? ;;
@@ -389,6 +412,8 @@ if [ "$STATUS" = "1" ]; then
   exit 0
 fi
 
+echo "$(peak_note)"
+echo
 print_plan
 
 # --resume 的起点**在 --dry-run 之前算**：`--resume --dry-run` 要能回答
