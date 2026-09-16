@@ -287,8 +287,12 @@ def ambiguous_syndrome_keys(store) -> set[tuple[str, str]]:
     加病名限定之后仍有 15 组撞在一起（「热证（胃痛）」有三条、「肝火犯肺证（咳嗽）」
     有两条），而它们的 definition 各不相同且**对不上自己的名字**
     （TB-114「热证」的定义是「肝郁化火，横逆犯胃」，TB-115 的是「脾胃虚寒，胃失和降」
-    ——脾胃虚寒挂在"热证"名下）。那是教材解析时名字列跟定义列错位，是数据缺陷，
-    不是显示层能修的（见 docs/reports/R28_report.md 第七节）。
+    ——脾胃虚寒挂在"热证"名下）。
+
+    **根因 R29 查清了，不是"名字列跟定义列错位"**（R28 这么写过，描述错了机制）：
+    教材 markdown 里有些编号标题掉了行首的 `#`（原文第 3001 行的 `7.痰火扰心`），
+    `_SYN_HEADING_RE` 认不出来，上一条证型的名字就被下一条沿用。
+    那是数据/解析层的事，显示层修不了（见 docs/reports/R29_report.md 第七节第 2 条）。
     显示层能做的是**不装作它们一样**：这几组再补一个 code。
     """
     seen: dict[tuple[str, str], int] = {}
@@ -304,7 +308,8 @@ def _display_label(node_id: str, data: dict,
                    ambiguous: set[tuple[str, str]] | None = None) -> str:
     """节点在图上显示什么。证型带病名限定，其余原样。
 
-    **为什么必须带**：178 个证候节点里 66 个重名（25 个名字重复 2–4 次）。
+    **为什么必须带**：177 个证候节点里 67 个重名（26 个名字重复 2–4 次；
+    R28 当时量的是 178/66/25，R29 修 OCR 修正表之后「温疤证」并回「温疟证」）。
     「肝郁气滞证」分属腹痛/胁痛/积聚/癃闭四个病名，**病机各不同**——
     数据是对的（`data/standard/syndromes.jsonl` 有 disease 字段，build_graph 也
     把它写进了节点），丢信息的是显示层：图上并排四个一模一样的方块，
@@ -431,8 +436,12 @@ def api_graph(
         offset = max(int(cursor), 0)
         page_ids = ids[offset:offset + limit]
         keep = set(page_ids)
+        # **在循环外算一次。** `ambiguous_syndrome_keys` 要扫一遍全图的节点，
+        # 写在推导式里就是"每个节点扫一遍全图"——200 个节点的一页会扫
+        # 200 × 1312 = 26 万次，而它的结果跟节点无关。
+        ambiguous = ambiguous_syndrome_keys(store)
         graph = {
-            "nodes": [_node_payload(nid, store.g.nodes[nid], ambiguous_syndrome_keys(store))
+            "nodes": [_node_payload(nid, store.g.nodes[nid], ambiguous)
                       for nid in page_ids],
             # 只发两端都在本页里的边——跟前端 gbAddNodes 的规则同一条，
             # 不在这里另写一套"半条边"的语义。
@@ -508,13 +517,13 @@ def api_graph_neighbors(node: str, limit: int = 200, node_types: str | None = No
     picked = list(seen.items())[:max(limit, 0)] if limit and limit > 0 else list(seen.items())
     keep = {nid for nid, _ in picked} | {node}
     symptom_counts = _symptom_counts_by_syndrome_code(store)
+    ambiguous = ambiguous_syndrome_keys(store)   # 循环外算一次，见 /api/graph 那一处的注释
     return {
         "graph": {
             # `n_symptoms` 是**给前端排序用的派生字段**：图谱浏览器一次只画得下
-            # 20 个（GB_EXPAND_CAP），"是哪 20 个"得有依据，按症状数取前 20 是
+            # 14 个（GB_EXPAND_CAP），"是哪 14 个"得有依据，按症状数取前 14 是
             # 那个依据。前端算不了——它手里只有这一页，证型→症状那一层还没加载。
-            "nodes": [_node_with_symptom_count(store, nid, d, symptom_counts,
-                                               ambiguous_syndrome_keys(store))
+            "nodes": [_node_with_symptom_count(store, nid, d, symptom_counts, ambiguous)
                       for nid, d in picked],
             "edges": [e for e in edges
                       if e["data"]["source"] in keep and e["data"]["target"] in keep],
@@ -550,9 +559,10 @@ def api_graph_search(q: str, limit: int = 100, node_types: str | None = None) ->
     total = len(hits)
     picked = hits[:max(limit, 0)] if limit and limit > 0 else hits
     keep = {nid for nid, _ in picked}
+    ambiguous = ambiguous_syndrome_keys(store)   # 循环外算一次，见 /api/graph 那一处的注释
     return {
         "graph": {
-            "nodes": [_node_payload(nid, d, ambiguous_syndrome_keys(store))
+            "nodes": [_node_payload(nid, d, ambiguous)
                       for nid, d in picked],
             "edges": [_edge_payload(u, v, k, d)
                       for u, v, k, d in store.g.edges(keys=True, data=True)

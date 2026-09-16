@@ -31,6 +31,7 @@ from core.context_prefix import assemble, prefix_tokens_by_section
 from core.diseases import get_disease, match_disease
 from core.elements import LOCATIONS, NATURES
 from core.llm import (
+    LLMError,
     current_retry_stats,
     get_llm,
     load_prompt,
@@ -616,7 +617,15 @@ def _best_of_n_s3(s3_system: str, s3_schema, physician: str):
         if score > best_score:
             best_i, best_score, best_s3 = i, score, sample
     if best_s3 is None:
-        assert last_exc is not None
+        # N 次采样全失败。抛最后那个真实异常，不抛一个"没有候选方"的假结果。
+        # **不用 assert 做类型收窄**：`python -O` 会把 assert 整行删掉，
+        # 那时 `raise None` 抛的是「exceptions must derive from BaseException」,
+        # 把真正的根因（429 / 超时 / 校验失败）盖掉。
+        if last_exc is None:
+            raise LLMError(
+                f"S3 best_of_n 采样 {n} 次，既没有成功的候选也没有记下异常"
+                "——这个状态不该出现，请连同 s3_best_of_n() 的取值一起报告。"
+            )
         raise last_exc
     scored[best_i]["chosen"] = True
     return best_s3, scored

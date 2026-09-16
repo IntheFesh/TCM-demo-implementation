@@ -323,7 +323,7 @@ def query_graph(node: str, edge_type: str | None = None,
             "neighbors": [],
             "near_matches": [n for n in near if n][:10],
             "note": (
-                "图中没有这个节点。国标层只收了脾胃门 93 个标准症状，患者原话往往"
+                "图中没有这个节点。国标层收的是教材/国标的标准症状名，患者原话往往"
                 "不在其中——如果 near_matches 非空，改用其中一个名字重查。"
             ),
         }
@@ -983,6 +983,8 @@ def syndrome_posterior(
     denied_symptoms: list[str] | None = None,
     physician: str | None = None,
     disease_hint: str | None = None,
+    index: dict[str, dict] | None = None,
+    symptom_weights: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """P(证候 | 已知证素, 追问答案)。证素为空时退化为均匀先验——那是合理的初始
     状态（还没问出任何东西），不是错误。
@@ -999,11 +1001,19 @@ def syndrome_posterior(
     disease_hint 见 _scope_by_disease 的文档字符串——收窄逻辑单独抽出一个
     函数，因为 question_candidates 算 IG 时也要用同一份候选池，不能两处
     各写一套收窄规则。
+
+    `index` / `symptom_weights` 是**已经算好的两张索引**，不传就自己算。
+    加这两个参数是为了去掉一次重复扫图：`question_candidates` 先调这个函数拿
+    后验、再自己建同样的两张索引，于是 `_symptom_index`（扫 1115 个症状节点的
+    全部 indicates 边）和 `_syndrome_index` 在一次追问里各跑两遍。
+    传参而不是给它们加缓存——**这两张索引的内容完全由 (store, physician) 决定，
+    调用方手里就有，没有必要为此引进一层缓存**（CLAUDE.md：demo 阶段不加缓存）。
     """
     store = store or get_graph_store()
     if store is None:
         return {}
-    index = _syndrome_index(store)
+    if index is None:
+        index = _syndrome_index(store)
     if not index:
         return {}
     index = _scope_by_disease(index, disease_hint)
@@ -1011,7 +1021,8 @@ def syndrome_posterior(
     # 权重按同一位医家取——question_candidates 的似然也按这位医家取，两处不一致
     # 的话「问这个问题预期得到多少 bit」和「答完后验变成什么」就不再自洽。
     # 当前 λ1≡0 时各医家权重相同，这个参数没有可观测差异；等医案数据接入后会有。
-    symptom_weights = _symptom_index(store, physician)
+    if symptom_weights is None:
+        symptom_weights = _symptom_index(store, physician)
 
     scores = {}
     for code, info in index.items():
@@ -1077,7 +1088,7 @@ def question_candidates(
     **退到十问歌的触发条件（穷举，5 条）：**
       1. 图谱不可用——data/graph.json 不存在或加载失败。
       2. 图里没有可用的假设空间——非类目证候节点为 0，或一条 indicates 边都没有。
-      3. 候选症状池为空——图里 93 个标准症状全部已被患者陈述过或已经问过。
+      3. 候选症状池为空——图里的标准症状全部已被患者陈述过或已经问过。
       4. 先验熵为 0——后验已经塌缩到单一证候，此时任何问题的信息增益都是 0，
          再按 IG 排序等于随机挑一个。
       5. 全部候选的信息增益 ≤ MIN_INFORMATION_GAIN——图区分不了当前这几个候选
@@ -1104,12 +1115,17 @@ def question_candidates(
     if store is None:
         return _shiwen_fallback(k, asked_set, "图谱不可用（data/graph.json 不存在）")
 
+    # **两张索引在这里各建一次，然后传给 syndrome_posterior。**
+    # 原来的写法是先调 syndrome_posterior（它自己建一遍），回来再建一遍——
+    # `_symptom_index` 要扫 1115 个症状节点的全部 indicates 边，一次追问白扫两遍。
+    index = _syndrome_index(store)
+    symptom_weights = _symptom_index(store, physician)
     posterior = syndrome_posterior(
         current_elements, store,
         asserted_symptoms=asserted_symptoms, denied_symptoms=denied_symptoms,
         physician=physician, disease_hint=disease_hint,
+        index=index, symptom_weights=symptom_weights,
     )
-    symptom_weights = _symptom_index(store, physician)
     if not posterior or not symptom_weights:
         return _shiwen_fallback(k, asked_set, "图里没有可用的证候假设空间或 indicates 边")
 
@@ -1139,21 +1155,54 @@ def question_candidates(
             k, asked_set, "后验已塌缩到单一证候，任何问题的信息增益都是 0"
         )
 
-    index = _syndrome_index(store)
+    # 后验的键和值各拉成一条列表，内层循环就不必再按 code 建三个字典。
+    # 顺序跟 `posterior` 的迭代顺序一致，所以每一步的浮点运算次序**逐位不变**
+    # ——这是纯粹去掉字典哈希开销，不是换算法（换算法会让 `ig` 在
+    # MIN_INFORMATION_GAIN 门槛上的边界候选跳变）。
+    codes = list(posterior)
+    priors = [posterior[c] for c in codes]
+    n_codes = len(codes)
+    # 未列出的证候一律取钳位后的 P_UNLISTED。1115 个症状里绝大多数只指向一两个
+    # 证候，所以这个常量是内层循环的**绝对多数分支**——预先算一次，省掉
+    # 每个元素两次 min/max 调用。值跟 `min(max(P_UNLISTED, P_UNLISTED), P_MAX)`
+    # 逐位相同，不是近似。
+    p_unlisted_clamped = min(max(P_UNLISTED, P_UNLISTED), P_MAX)
+    log2 = math.log2          # 局部绑定：这一行在内层循环里被调用约 40 万次
     scored = []
     for name in pool:
         weights = symptom_weights[name]
-        p_yes_given = {
-            code: min(max(weights.get(code, P_UNLISTED), P_UNLISTED), P_MAX)
-            for code in posterior
-        }
-        p_yes = sum(posterior[c] * p_yes_given[c] for c in posterior)
+        w_get = weights.get
+        p_yes_given = [p_unlisted_clamped if (g := w_get(code)) is None
+                       else min(max(g, P_UNLISTED), P_MAX)
+                       for code in codes]
+        p_yes = sum(pr * g for pr, g in zip(priors, p_yes_given))
         p_no = 1.0 - p_yes
         if p_yes <= 0 or p_no <= 0:
             continue
-        post_yes = {c: posterior[c] * p_yes_given[c] / p_yes for c in posterior}
-        post_no = {c: posterior[c] * (1 - p_yes_given[c]) / p_no for c in posterior}
-        ig = prior_entropy - p_yes * _entropy(post_yes.values()) - p_no * _entropy(post_no.values())
+        # **两个后验分布、两个熵、两个 argmax 在同一遍里算完。**
+        # 原来的写法是先建 post_yes / post_no 两条 177 元素的列表，再各扫一遍求熵、
+        # 各扫一遍求 argmax——1115 个候选就是 4 次 × 177 次分配。
+        # 每个元素的浮点运算和求和次序跟原来完全一样（`-sum(v*log2 v)` 展开成
+        # 逐项 `-= v*log2(v)`，IEEE 下取负是精确的，结果逐位相同），
+        # 所以 `ig` 不会在 MIN_INFORMATION_GAIN 门槛上跳变。
+        ent_yes = ent_no = 0.0
+        iy = in_ = 0
+        best_y = best_n = -1.0
+        for i in range(n_codes):
+            pr = priors[i]
+            g = p_yes_given[i]
+            vy = pr * g / p_yes
+            vn = pr * (1 - g) / p_no
+            if vy > 0:
+                ent_yes -= vy * log2(vy)
+            if vn > 0:
+                ent_no -= vn * log2(vn)
+            # 严格大于：平局取迭代顺序里第一个，跟 `max(dict, key=dict.get)` 一致
+            if vy > best_y:
+                best_y, iy = vy, i
+            if vn > best_n:
+                best_n, in_ = vn, i
+        ig = prior_entropy - p_yes * ent_yes - p_no * ent_no
         # 这道 MIN_INFORMATION_GAIN 门槛对安全相关症状也照样生效，不单独放宽——
         # 见下面挑选阶段那段注释：放宽到"不管跟当前证候有没有关系，图里存在就必问"
         # 试过，会把追问的三轮预算全耗在跟当前主诉毫不相关的危重症状排查上
@@ -1164,8 +1213,8 @@ def question_candidates(
         # IG 排名。
         if ig <= MIN_INFORMATION_GAIN:
             continue
-        top_yes = max(post_yes, key=post_yes.get)
-        top_no = max(post_no, key=post_no.get)
+        top_yes = codes[iy]
+        top_no = codes[in_]
         scored.append({
             "question": phrase_question(name),
             "symptom": name,
@@ -1193,8 +1242,8 @@ def question_candidates(
     # 同分时按症状名排序，保证同样输入给出同样顺序（可测、可复现）
     scored.sort(key=lambda d: (-d["information_gain"], d["symptom"]))
 
-    # 安全相关症状不参与 IG 排名竞争。R2 教材扩表把症状候选池从 93 撑到 1282 个
-    # 之后，吐血/便血/黑便这类危重症状即使跟当前证候确实相关（清得过上面那道
+    # 安全相关症状不参与 IG 排名竞争。R2 教材扩表把症状候选池从 93 撑到一千多个
+    # （R29 实测 1115，这个数每重建一次图谱都会变，所以这里不写死）之后，吐血/便血/黑便这类危重症状即使跟当前证候确实相关（清得过上面那道
     # MIN_INFORMATION_GAIN 门槛），排名也很容易被成百上千个普通症状挤到 k 名
     # 开外——生产链路（core/followup.py::run_followup）固定 k=1、只取
     # candidates[0]，挤不进 top-k 就等于问不到，safety_relevant=True 那条

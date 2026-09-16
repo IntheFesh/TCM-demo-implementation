@@ -149,10 +149,31 @@ CODE_DISAMBIGUATION_HINT = (
 )
 
 GRAPH_MISS_HINT = (
-    "【提示】患者原话往往不在国标的 1282 个症状节点里（这是清代医案与"
+    "【提示】患者原话往往不在国标的症状节点里（这是清代医案与"
     "现代国标术语体系差异的已知结果，见 SOURCES.md）。继续换词查大概率"
     "还是查不到，建议改用 search_cases 检索这位医家的医案原文。"
 )
+
+
+def graph_miss_hint() -> str:
+    """GRAPH_MISS_HINT 加上**现数出来的**症状节点数。
+
+    这句提示原来写死"国标的 1282 个症状节点"。那个数每重建一次图谱就变
+    （R2 教材扩表 93 → 1282、R29 修 OCR 修正表 1117 → 1115），而它是**喂给模型的
+    文本**——写死的数字在某一轮之后就变成一句假话，而且没有任何东西会报错。
+    图谱取不到时只给不带数字的那句，不编一个数。
+
+    **不收 store 参数**：那样 `store=None` 要同时表达"没传，自己去取"和
+    "图谱不可用"两件事，而这两件事的处理不一样（CLAUDE.md 那条"工具返回空必须
+    能区分三种情况"是同一个形状）。要在测试里造"图谱不可用"就 monkeypatch
+    `core.tools.get_graph_store`——这里是**函数内 import**，所以打得到。
+    """
+    from core.tools import get_graph_store
+
+    store = get_graph_store()
+    if store is None:
+        return GRAPH_MISS_HINT
+    return f"{GRAPH_MISS_HINT}（当前图里共 {len(store.find_nodes('symptom'))} 个症状节点）"
 
 
 def _looks_like_standard_code(query: str | None) -> bool:
@@ -351,7 +372,7 @@ def run_react(
         if _should_hint_code_disambiguation(prev_action, prev_query, action, query):
             observation = f"{observation}\n{CODE_DISAMBIGUATION_HINT}"
         elif _should_hint_graph_miss(prev_action, prev_result, action, result):
-            observation = f"{observation}\n{GRAPH_MISS_HINT}"
+            observation = f"{observation}\n{graph_miss_hint()}"
 
         records.append(ReActStepRecord(
             step=step, thought=out.thought, action=action,

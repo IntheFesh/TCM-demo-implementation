@@ -392,3 +392,50 @@ def test_the_gate_cap_follows_the_budget_flag():
     cheap = dv4.CostEstimate(**{**est.__dict__, "cny_peak": 25.0, "cny_off_peak": 12.5})
     assert dv4.gate(cheap, yes_spend=True, cap_cny=20.0)[0] is False
     assert dv4.gate(cheap, yes_spend=True, cap_cny=40.0)[0] is True
+
+
+# ---------- R29 收尾复查：--estimate --json ----------
+
+def test_estimate_json_prints_the_machine_readable_shape_as_the_last_line(capsys):
+    """R26 给 `estimate_as_dict` 写的文档字符串是"给 `--json` 之外的调用方读的形状",
+    而当时**既没有 --json 也没有任何调用方**——一个函数声明了一个不存在的消费方。
+
+    R29 把它接上：`--estimate --json` 在人读的那几行之后打一行 JSON，
+    报告里的 ¥ 数字从这里取而不是手抄（手抄的下一次改单价就对不上）。
+    契约是"**最后一行**"，所以这条断言按最后一行取。
+    """
+    import json as _json
+
+    from offline.distill_from_v4 import main
+
+    assert main(["--estimate", "--json"]) == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    payload = _json.loads(lines[-1])
+    for key in ("calls", "cny_peak", "cny_off_peak", "n_samples", "n_physicians",
+                "best_of_n", "prefix_known"):
+        assert key in payload, f"{key} 不在 --json 的输出里"
+
+
+def test_estimate_json_goes_through_the_one_conversion_point():
+    """`main()` 里不许直接 `asdict(est)`——那样"这个估算对外长什么样"就散在
+    调用点上，将来给 CostEstimate 加字段时报告读到的键和测试断言的键会分叉。"""
+    src = open("offline/distill_from_v4.py", encoding="utf-8").read()
+    start = src.index("def main(")
+    # 切到**下一个顶层 def** 为止。切到文件末尾会把 `estimate_as_dict` 自己
+    # （它的文档字符串和 `return asdict(est)`）也算进来，这条判据就恒红。
+    end = src.index("\ndef ", start + 1)
+    body = src[start:end]
+    assert "asdict(" not in body, "main() 里出现了第二处 asdict"
+    assert "estimate_as_dict(est)" in body
+
+
+def test_plain_estimate_prints_no_json():
+    """不传 --json 时输出不变——这条盯的是"加了个开关没把默认行为带跑偏"。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "offline.distill_from_v4", "--estimate"],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stderr
+    last = [ln for ln in r.stdout.splitlines() if ln.strip()][-1]
+    assert not last.startswith("{"), last

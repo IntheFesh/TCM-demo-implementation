@@ -392,6 +392,12 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"这一跑的预算（默认 R26 给的 ¥{COST_CAP_CNY:.0f}）。"
                          f"--limit 不给时由它决定条数")
     ap.add_argument("--estimate", action="store_true", help="只估钱，零调用")
+    ap.add_argument(
+        "--json", action="store_true",
+        help="跟 --estimate 一起用：把估算结果按机器可读的形状打一行 JSON，"
+             "**是 stdout 的最后一行**（前面那几行人读的估算说明照旧打）。"
+             "报告里的 ¥ 数字从这里取，不手抄——手抄的数字下一次改单价就对不上了",
+    )
     ap.add_argument("--yes-spend", action="store_true",
                     help=f"确认花超过 ¥{COST_ASK_CNY:.0f}（>¥{COST_CAP_CNY:.0f} 仍然不跑）")
     ap.add_argument("--out-tokens-per-call", type=int, default=OUT_TOKENS_PER_CALL_ESTIMATE)
@@ -428,6 +434,12 @@ def main(argv: list[str] | None = None) -> int:
     ok, why = gate(est, yes_spend=args.yes_spend, cap_cny=args.budget_cny)
     print(("放行：" if ok else "不跑：") + why)
     if args.estimate:
+        if args.json:
+            # **一行 JSON，`estimate_as_dict` 是唯一的转换处。**
+            # R26 那轮这个函数的文档字符串写的是"给 `--json` 之外的调用方读的形状",
+            # 而当时根本没有 --json，也没有任何调用方——一个函数的文档字符串
+            # 声明了一个不存在的消费方，等于这件事只做了一半。
+            print(json.dumps(estimate_as_dict(est), ensure_ascii=False, sort_keys=True))
         return 0
     if not ok:
         return 2
@@ -483,7 +495,11 @@ def _run(samples: list[Sample], out_path: Path, skip: set[tuple[str, str]]) -> i
 
 
 def estimate_as_dict(est: CostEstimate) -> dict:
-    """给 `--json` 之外的调用方（报告、测试）读的形状。"""
+    """`CostEstimate` 的机器可读形状。`--estimate --json` 和测试都走这一处。
+
+    **不在 main() 里直接 `asdict(est)`**：那样"这个估算对外长什么样"就散在
+    调用点上，将来给 CostEstimate 加字段时，报告读到的键和测试断言的键会分叉。
+    """
     return asdict(est)
 
 

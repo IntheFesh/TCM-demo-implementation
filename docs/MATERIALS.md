@@ -86,9 +86,9 @@
 
 | 项 | 数 | 凭据 |
 |---|---|---|
-| 全量测试 | **3049** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=3049` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
+| 全量测试 | **3071** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=3071` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
 | 前端状态验收 | **20** 种 | `bench/sandbox.json:bench.playwright_states_passed=20` |
-| 凭据核对 | **13** 份文档，退出码 **0** | `bench/sandbox.json:bench.n_checked_docs=13` `bench/sandbox.json:bench.check_exit_code=0` |
+| 凭据核对 | **14** 份文档，退出码 **0** | `bench/sandbox.json:bench.n_checked_docs=14` `bench/sandbox.json:bench.check_exit_code=0` |
 | 知识图谱节点 | **1312** | `../data/graph.json:graph.n_nodes=1312` |
 | 知识图谱边 | **3765** | `../data/graph.json:graph.n_edges=3765` |
 | 证候 | **177** | `../data/graph.json:graph.n_syndromes=177` |
