@@ -319,6 +319,215 @@ def herbs_and_formulas_used(selected: list) -> tuple[list[str], list[str]]:
     return sorted(herbs), sorted(formulas)
 
 
+# ---------- R32：按本次问诊裁剪的知识块 ----------
+#
+# **为什么要有它。** 知识速查表（本草 9776 + 方剂 3184）此前**只在 `full_context`
+# 模式下**进提示词（走 `assemble()` 的稳定前缀），而演示与录制跑的是 `hybrid`
+# ——"让模型明白药理"在运行配置下**从未发生过**，而且所有测试全绿，
+# 因为没有一条测试断言"知识块出现在最终 prompt 里"（见 data/SOURCES.md）。
+#
+# 全量速查表在 top3 模式下塞不进去（它是给前缀缓存用的，19.8 万–49.2 万 token），
+# 所以这里按**本次问诊**裁剪：只放这次可能用到的药、方、规律。
+
+#: 裁剪后的知识块 token 上限。环境变量 `FOCUSED_KNOWLEDGE_MAX_TOKENS` 可覆盖。
+#: 3 万是这么定的：S3 的其余部分（指令 + 证素 + 症状 + 三条医案）实测约 4–6 千 token，
+#: 而 top3 模式没有前缀缓存、每一个 token 都按未命中价计费，3 万是"够用且不至于
+#: 让单次调用的输入成本翻一个量级"的量。**这个数字是取舍不是测量**，写在这里，
+#: 改它的人要知道自己在改什么。
+FOCUSED_KNOWLEDGE_MAX_TOKENS = 30_000
+
+#: 知识块里各段的标题。段序 = 优先级序：规律最先（它是"五家融合"的载体）。
+FOCUSED_SECTION_TITLES = {
+    "patterns": "## 名医用药规律（来自本项目医案库的统计，非教材）",
+    "materia": "## 本草条目（性味/归经/功效/用量/禁忌）",
+    "formulary": "## 方剂条目（组成/君臣佐使/主治/功用/加减）",
+}
+#: 超预算时的裁剪顺序。**规律永不裁**——它是本轮"融合发生在知识层"的实现，
+#: 裁掉它等于回到"只有教材、没有这五位医家"。
+FOCUSED_CUT_ORDER = ("formulary", "materia_detail", "materia_entries")
+
+
+def _focused_herb_block(h, *, detail: bool) -> str:
+    """一味药在知识块里的一行/一段。
+
+    `detail=False` 时省掉炮制与别名两项——它们对"这味药该不该用"没有判据价值，
+    是超预算时第一批该砍的（见 FOCUSED_CUT_ORDER）。
+    """
+    parts = [f"### {h.name}"]
+    if h.nature or h.flavor:
+        parts.append(f"- 性味：{h.nature or '-'}｜{('、'.join(h.flavor) or '-')}")
+    if h.meridians:
+        parts.append(f"- 归经：{'、'.join(sorted(h.meridians))}")
+    if h.effects:
+        parts.append(f"- 功效：{'、'.join(h.effects)}")
+    if h.dose_max_g is not None:
+        parts.append(f"- 用量上限（本草记载）：{h.dose_max_g}g")
+    if h.contraindications:
+        parts.append(f"- 禁忌：{'、'.join(h.contraindications)}")
+    if detail and h.preparation:
+        parts.append(f"- 炮制：{'、'.join(h.preparation)}")
+    return "\n".join(parts)
+
+
+def _focused_formula_block(f) -> str:
+    parts = [f"### {f.name}"]
+    if f.composition:
+        parts.append("- 组成：" + "、".join(
+            f"{n}{(' ' + d) if d else ''}" for n, d in f.composition))
+    for role in ("君", "臣", "佐", "使"):
+        if f.roles.get(role):
+            parts.append(f"- {role}药：{'、'.join(f.roles[role])}")
+    if f.functions:
+        parts.append(f"- 功用：{'、'.join(f.functions)}")
+    if f.indications:
+        parts.append(f"- 主治：{'、'.join(f.indications)}")
+    if f.modifications:
+        parts.append(f"- 加减：{'；'.join(f.modifications)}")
+    return "\n".join(parts)
+
+
+def _focused_pattern_block(p: dict) -> str:
+    """一条名医用药规律。**case_ids 必须带上**——它是"这条规律有据可查"的凭据，
+    也是 S3 的 `physician_influences` 能回指到医案的依据。"""
+    head = f"### {p.get('physician_name') or p.get('physician')}·{p.get('group_value')}"
+    lines = [head, f"- 类型：{p.get('kind')}｜支持案数：{p.get('support')}"]
+    if p.get("herbs"):
+        lines.append(f"- 药：{'、'.join(p['herbs'])}")
+    if p.get("dose_median_g") is not None:
+        lines.append(f"- 剂量中位数：{p['dose_median_g']}g"
+                     f"（区间 {p.get('dose_min_g')}–{p.get('dose_max_g')}g）")
+    if p.get("note"):
+        lines.append(f"- 说明：{p['note']}")
+    lines.append(f"- 医案：{'、'.join(p.get('case_ids') or [])}")
+    if p.get("has_incompatible_pair"):
+        from core.safety_output import INCOMPATIBLE_TRAINING_NOTE
+
+        lines.append(f"- ⚠ {INCOMPATIBLE_TRAINING_NOTE}")
+    return "\n".join(lines)
+
+
+def _focused_candidate_herbs(ont, s1, s2, hits, patterns) -> list:
+    """这次该放哪些药。三个来源合并去重：医案里用过的、治法常用的、规律里提到的。
+
+    顺序即优先级（超预算时从尾部砍）：规律里的药最靠前——模型要能看到
+    "李可在这个证下用附子 30g"对应的那味药到底是什么性味归经。
+    """
+    from core.herbs import normalize_herb
+
+    names: list[str] = []
+    def _add(n: str) -> None:
+        n = normalize_herb(n or "")
+        if n and n not in names:
+            names.append(n)
+
+    for p in patterns:
+        for h in (p.get("herbs") or []):
+            _add(h)
+    for case, _score in hits:
+        for h in (case.herbs or []):
+            _add(h)
+    # 证素对应治法的常用药：证素名直接当治法词查同义表（"湿热" → 清热燥湿…）
+    for e in (s2.elements if s2 is not None else []):
+        for h in ont.herbs_by_effect(e.element)[:12]:
+            _add(h.name)
+    out = []
+    for n in names:
+        h = ont.herb(n)
+        if h is not None:
+            out.append(h)
+    return out
+
+
+def _focused_candidate_formulas(ont, s2, hits, syndromes) -> list:
+    out, seen = [], set()
+    for s in syndromes:
+        for f in ont.formulas_for_syndrome(s):
+            if f.name not in seen:
+                seen.add(f.name)
+                out.append(f)
+    for case, _score in hits:
+        f = ont.formula(case.formula or "")
+        if f is not None and f.name not in seen:
+            seen.add(f.name)
+            out.append(f)
+    return out
+
+
+def build_focused_knowledge(s1, s2, hits, physicians, *,
+                            budget: int | None = None, ontology=None,
+                            syndromes: list[str] | None = None) -> tuple[str, dict]:
+    """按本次问诊裁剪的知识块。返回 `(文本, 统计)`。
+
+    统计里必须有 `n_herbs` / `n_formulas` / `n_patterns` / `tokens` / `trimmed_sections`
+    ——**"放了多少"和"砍了什么"都要可核**，否则超预算时静默少放的那部分
+    在 manifest 里看不出来。
+
+    本体不可用（药理层数据文件不在）时返回 `("", {...available: False})`——
+    调用方据此在 manifest 里如实记 `knowledge_in_prompt` 的实际效果，
+    **不是假装放了知识块**。
+    """
+    import os
+
+    from core.ontology import get_ontology
+
+    ont = ontology if ontology is not None else get_ontology()
+    budget = budget if budget is not None else int(
+        os.environ.get("FOCUSED_KNOWLEDGE_MAX_TOKENS", FOCUSED_KNOWLEDGE_MAX_TOKENS))
+    stats = {"available": bool(ont.available), "n_herbs": 0, "n_formulas": 0,
+             "n_patterns": 0, "tokens": 0, "trimmed_sections": []}
+    if not ont.available:
+        return "", stats
+
+    syndromes = syndromes or []
+    patterns = []
+    for pid in (physicians or []):
+        for s in (syndromes or [""]):
+            patterns.extend(ont.patterns_for(s, physician=pid))
+    seen_pat = set()
+    patterns = [p for p in patterns
+                if not (p.get("pattern_id") in seen_pat or seen_pat.add(p.get("pattern_id")))]
+
+    herbs = _focused_candidate_herbs(ont, s1, s2, hits, patterns)
+    formulas = _focused_candidate_formulas(ont, s2, hits, syndromes)
+
+    detail = True
+    trimmed: list[str] = []
+    while True:
+        sections = []
+        if patterns:
+            sections.append(FOCUSED_SECTION_TITLES["patterns"] + "\n\n"
+                            + "\n\n".join(_focused_pattern_block(p) for p in patterns))
+        if herbs:
+            sections.append(FOCUSED_SECTION_TITLES["materia"] + "\n\n"
+                            + "\n\n".join(_focused_herb_block(h, detail=detail) for h in herbs))
+        if formulas:
+            sections.append(FOCUSED_SECTION_TITLES["formulary"] + "\n\n"
+                            + "\n\n".join(_focused_formula_block(f) for f in formulas))
+        text = "\n\n".join(sections)
+        n_tokens = count_tokens(text)
+        if n_tokens <= budget:
+            break
+        # 按 FOCUSED_CUT_ORDER 砍。**规律永不进这个循环。**
+        if formulas:
+            formulas = []
+            trimmed.append("formulary")
+            continue
+        if detail:
+            detail = False
+            trimmed.append("materia_detail")
+            continue
+        if len(herbs) > 1:
+            herbs = herbs[: max(1, len(herbs) // 2)]
+            if "materia_entries" not in trimmed:
+                trimmed.append("materia_entries")
+            continue
+        break   # 只剩规律 + 一味药还超预算：如实超出，不把规律砍掉
+
+    stats.update(n_herbs=len(herbs), n_formulas=len(formulas), n_patterns=len(patterns),
+                 tokens=count_tokens(text), trimmed_sections=trimmed)
+    return text, stats
+
+
 def _entry_block(name: str, preds: dict[str, list[str]], predicates: tuple[str, ...]) -> str:
     lines = [f"### {name}"]
     for p in predicates:
@@ -563,3 +772,32 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------- R32：KNOWLEDGE_IN_PROMPT 三档 ----------
+
+#: 知识块怎么进提示词。
+#:   full     —— 全量速查表进稳定前缀（`assemble()`），`full_context` 模式的默认
+#:   focused  —— 按本次问诊裁剪的知识块，其余四种 top3 模式的默认
+#:   off      —— 不放。**只供对照实验**：这一档下最终 prompt 必须逐字节等于
+#:               R32 改动之前，否则消融实验的 A 组就不是对照组
+KNOWLEDGE_MODES = ("full", "focused", "off")
+
+
+def knowledge_in_prompt(retriever_mode: str) -> str:
+    """这次该用哪一档。环境变量 `KNOWLEDGE_IN_PROMPT` 覆盖默认。
+
+    **默认按检索模式分**：`full_context` 已经把全量速查表放进稳定前缀了
+    （前缀缓存命中率实测 0.989，再塞一份裁剪版是纯浪费），其余模式没有前缀，
+    要靠裁剪版。
+    """
+    import os
+
+    raw = (os.environ.get("KNOWLEDGE_IN_PROMPT") or "").strip().lower()
+    if raw in KNOWLEDGE_MODES:
+        return raw
+    if raw:
+        raise ValueError(
+            f"KNOWLEDGE_IN_PROMPT={raw!r} 不认识，只能是：{' / '.join(KNOWLEDGE_MODES)}"
+        )
+    return "full" if retriever_mode == "full_context" else "focused"

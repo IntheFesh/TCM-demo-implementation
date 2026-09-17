@@ -145,6 +145,9 @@ def install_self_test(n_cases: int) -> Path:
     from core.retrieval_hybrid import HybridRetriever
 
     HybridRetriever.__init__.__defaults__ = (path,)
+    # 刚换掉 cases.json 的路径。已经建好的单例持有的是**旧路径**加载出来的医案，
+    # 不丢掉的话这一跑量的还是旧语料，而且一声不响。
+    retrieval.reset_retriever_singleton()
     return path
 
 
@@ -182,6 +185,18 @@ def main(argv: list[str] | None = None) -> int:
     cases_path = install_self_test(args.self_test) if synthetic else None
     encoder_note = instrument_encoder(watch)
 
+    # 冷启动只发生一次。同一进程里别人先建过单例，`construct`/`model_load`
+    # 这两段压根不会跑，量出来是 None——跟"没装 sentence_transformers"在报告里
+    # 长得一模一样。**先说清楚是哪一种**，再决定要不要接着量。
+    from core.retrieval import retriever_is_built
+
+    warm_singleton_note = None
+    if retriever_is_built():
+        warm_singleton_note = (
+            "进程里已经有建好的检索器单例，这一跑量到的 construct / model_load / "
+            "encode 不是冷启动。要量冷启动就换个新进程，或先调 "
+            "core.retrieval.reset_retriever_singleton()。")
+
     import_error = None
     if not args.skip_import:
         try:
@@ -206,6 +221,9 @@ def main(argv: list[str] | None = None) -> int:
         "config": {"self_test": args.self_test, "repeat": args.repeat,
                    "skip_import": args.skip_import},
         "encoder_note": encoder_note,
+        # 「量不到」有两种原因，报告里必须分得开：编码器装不上（encoder_note）
+        # 和单例已经是热的（warm_singleton_note）。
+        "warm_singleton_note": warm_singleton_note,
         "segments_s": {name: watch.seconds.get(name) for name in SEGMENTS},
         "runs": runs,
         "import_error": import_error,
@@ -229,8 +247,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ import api.main 失败：{import_error}", file=sys.stderr)
     if encoder_note:
         print(f"✗ {encoder_note}", file=sys.stderr)
+    if warm_singleton_note:
+        print(f"✗ {warm_singleton_note}", file=sys.stderr)
     print(f"→ {out}")
-    return 0 if (error is None and import_error is None and encoder_note is None) else 1
+    return 0 if (error is None and import_error is None and encoder_note is None
+                 and warm_singleton_note is None) else 1
 
 
 if __name__ == "__main__":

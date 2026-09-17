@@ -558,6 +558,29 @@ class FullContextRetriever(Retriever):
         return full_context_hits(self._cases, physician)
 
 
+def cases_path() -> Path:
+    """检索层实际会打开的 cases.json。
+
+    不要另写 `CASES_PATH.exists()` 来判断"这台机器有没有检索数据"：检索器的
+    路径是绑在 `DenseRetriever.__init__` 的默认值上的，脚本和测试换路径换的是
+    那个默认值，而模块级常量 `CASES_PATH` 不跟着变——同一个问题两处实现，两边
+    会给出相反的答案（CLAUDE.md 第 31 条）。实测踩到过：bench_consult 用
+    `CASES_PATH.exists()` 判断要不要装合成医案，测试把构造函数默认值指到一个
+    不存在的文件上模拟"没有检索数据"，两者不一致，于是检索真的不可用而合成医案
+    没装上。
+    """
+    defaults = DenseRetriever.__init__.__defaults__
+    return defaults[0] if defaults else CASES_PATH
+
+
+def cases_available() -> bool:
+    """检索数据在不在。空文件按"不在"算——`load_cases` 在空文件上只会给出
+    0 条医案，而调用方想知道的是"检索能不能用"，不是"这个路径上有没有 inode"。
+    """
+    p = cases_path()
+    return p.is_file() and p.stat().st_size > 0
+
+
 def get_retriever() -> Retriever:
     """惰性单例。返回 HybridRetriever（DenseRetriever 的超集，见
     core/retrieval_hybrid.py）——这样 RETRIEVER_MODE 环境变量能在每次
@@ -574,6 +597,30 @@ def get_retriever() -> Retriever:
 
                 _retriever_singleton = HybridRetriever()
     return _retriever_singleton
+
+
+def retriever_is_built() -> bool:
+    """单例建好了没有。
+
+    量冷启动的脚本必须先问这一句：`get_retriever()` 是进程级单例，同一进程里
+    只要有人先建过，后面那次 `construct` / `model_load` 根本不会发生，
+    量出来的是 None——而 None 在报告里跟"这台机器没装 sentence_transformers"
+    长得一模一样。两件事必须分得开（实测踩到过：cases.json 进版本控制之后，
+    `bench_startup --self-test` 在全量测试里量到的 model_load 恒为 None，
+    单跑却正常）。
+    """
+    return _retriever_singleton is not None
+
+
+def reset_retriever_singleton() -> None:
+    """丢掉已建好的单例，下次 `get_retriever()` 重新建。
+
+    **换了 cases.json 路径之后必须调它**：单例持有的是旧路径加载出来的医案，
+    不重置的话后面所有检索都还在读旧语料，而且一声不响。
+    """
+    global _retriever_singleton
+    with _retriever_lock:
+        _retriever_singleton = None
 
 
 if __name__ == "__main__":

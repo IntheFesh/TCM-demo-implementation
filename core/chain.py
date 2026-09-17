@@ -27,7 +27,12 @@ from itertools import combinations
 from pathlib import Path
 
 from core import herbs as _herbs
-from core.context_prefix import assemble, prefix_tokens_by_section
+from core.context_prefix import (
+    assemble,
+    build_focused_knowledge,
+    knowledge_in_prompt,
+    prefix_tokens_by_section,
+)
 from core.diseases import get_disease, match_disease
 from core.elements import LOCATIONS, NATURES
 from core.llm import (
@@ -707,6 +712,21 @@ def run_physician(
     # `hits` 直接传进去当 §4：refs_mode 的 own/swapped/none 已经在
     # `_search_cases` 那一步体现在 hits 里了，这里不再判一次。
     mode_eff = effective_mode(retriever_mode)
+    # R32：知识块进**所有**检索模式。
+    #
+    # 在此之前知识速查表只在 `full_context` 下进提示词（走 assemble 的稳定前缀），
+    # 而演示与录制跑的是 `hybrid`——"让模型明白药理"在运行配置下从未发生过，
+    # 且所有测试全绿（没有一条测试断言"知识块出现在最终 prompt 里"）。
+    knowledge_text, knowledge_stats = "", {"available": False, "n_herbs": 0,
+                                           "n_formulas": 0, "n_patterns": 0,
+                                           "tokens": 0, "trimmed_sections": []}
+    knowledge_mode = knowledge_in_prompt(mode_eff)
+    if knowledge_mode == "focused":
+        knowledge_text, knowledge_stats = build_focused_knowledge(
+            s1, s2, hits, list(physicians_enabled(PHYSICIANS)),
+            # 候选证型取自本次检索到的医案——S3 还没跑，这是此刻能拿到的最好线索。
+            syndromes=[c.syndrome for c, _ in hits if c.syndrome],
+        )
     if mode_eff == "full_context":
         s3_system = assemble(
             physician, s1=s1, s2=s2,
@@ -716,12 +736,19 @@ def run_physician(
         )
     else:
         s3_prompt = load_prompt("s3_syndrome")
+        # 知识块插在参考医案块**之前**。`_format_case_block` 的输出与它在 $refs
+        # 里的位置一字未动——E3/E4 闸门验过的就是那个格式与那个相对次序。
+        # `knowledge_text` 为空时 `refs` **逐字节等于**改造之前（这正是
+        # KNOWLEDGE_IN_PROMPT=off 那一档要的"对照组"语义）。
+        refs_with_knowledge = (
+            f"{knowledge_text}\n\n## 参考医案\n\n{refs_text}" if knowledge_text else refs_text
+        )
         s3_system = render(
             s3_prompt["system"],
             name=physician_name,
             elements_summary=_format_elements_summary(s2),
             symptoms=symptoms_text,
-            refs=refs_text,
+            refs=refs_with_knowledge,
         )
     # G2：开了 ReAct 就先跑一轮取证，把查到的东西追加到 S3 prompt 后面。
     # 只追加、不改 s3_syndrome.yaml——不开 ReAct 时 prompt 要跟改造前逐字节一致，
@@ -840,6 +867,10 @@ def run_physician(
         "physician_name": physician_name,
         "s2": s2,
         "s3": s3,
+        # R32：这次给这位医家的提示词里放了什么知识块。
+        # **记在结果里而不是只记 manifest**：知识块是按医家的 hits 裁剪的，
+        # 整次问诊一个数说不清楚谁看到了什么——跟 lora 字段同一个理由。
+        "knowledge": {"mode": knowledge_mode, **knowledge_stats},
         "disease_candidates": disease_candidates,
         "refs": refs,
         # E3/E4 消融要按 (主诉, 医家) 配对比较不同 refs_mode 的结果；结果自带
@@ -926,8 +957,29 @@ def _comparability_warning(llm, retriever_mode: str | None = None) -> str | None
     return joined or None
 
 
+def _aggregate_knowledge(results: list[dict] | None) -> dict | None:
+    """把各位医家结果里的 `knowledge` 汇成一份给 manifest。
+
+    条目数取**最大值**而不是求和：几位医家的知识块高度重叠（同一批本草条目），
+    求和会报出一个比实际放进去的多好几倍的数——而 manifest 里的数字是要被引进
+    报告的。token 数同理取最大（"单次调用最多塞了多少"才是成本口径）。
+    """
+    rows = [r.get("knowledge") for r in (results or []) if isinstance(r.get("knowledge"), dict)]
+    if not rows:
+        return None
+    return {
+        "mode": rows[0].get("mode"),
+        "available": any(r.get("available") for r in rows),
+        "tokens": max((r.get("tokens") or 0) for r in rows),
+        "n_herbs": max((r.get("n_herbs") or 0) for r in rows),
+        "n_formulas": max((r.get("n_formulas") or 0) for r in rows),
+        "n_patterns": max((r.get("n_patterns") or 0) for r in rows),
+    }
+
+
 def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
-                    retriever_mode: str | None = None) -> dict:
+                    retriever_mode: str | None = None,
+                    knowledge: dict | None = None) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
     cases_sha = cases_sha256()
@@ -989,6 +1041,21 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
         # 实验条件比不记更糟。
         "reasoning_effort": (s3_reasoning_effort() if s3_thinking() == "enabled" else None),
         "best_of_n": s3_best_of_n(),
+        # R32：知识块怎么进的提示词。**这三项是"让模型明白药理"这件事的凭据**
+        # ——在此之前知识速查表只在 full_context 下进提示词，而演示跑的是
+        # hybrid，"懂药理"在运行配置下从未发生过且所有测试全绿。
+        "knowledge_in_prompt": (knowledge or {}).get("mode")
+        or knowledge_in_prompt(effective_mode(retriever_mode)),
+        # 这一次实际放进去多少 token。0 且 mode 不是 off = 本体层数据不在
+        # （药理层 jsonl 未生成），**跟"放了 0 个 token"是两件事**，
+        # 所以 entries 里还带一个 available。
+        "knowledge_tokens": (knowledge or {}).get("tokens", 0),
+        "knowledge_entries": {
+            "available": (knowledge or {}).get("available", False),
+            "herbs": (knowledge or {}).get("n_herbs", 0),
+            "formulas": (knowledge or {}).get("n_formulas", 0),
+            "patterns": (knowledge or {}).get("n_patterns", 0),
+        },
     }
 
 
@@ -1451,7 +1518,9 @@ def consult(
             "safety_flag": safety_flag or veto.reason, "retrieval_error": None,
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react, retriever_mode=retriever_mode),
+            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
+                                        retriever_mode=retriever_mode,
+                                        knowledge=_aggregate_knowledge(results)),
         }
     except RetrievalUnavailable as e:
         # 选的检索模式这台机器上没有对应数据（graph 缺 element_index.json 之类）。
@@ -1645,6 +1714,7 @@ def consult(
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"]),
             use_react,
             retriever_mode=retriever_mode,
+            knowledge=_aggregate_knowledge(results),
         ),
     }
 
