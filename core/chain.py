@@ -47,6 +47,7 @@ from core.llm import (
     S3_MODES,
     s3_best_of_n,
     s3_mode,
+    s1s2_merged,
     s3_reasoning_effort,
     s3_thinking,
     thinking_by_step,
@@ -84,6 +85,7 @@ from core.schemas import (
     FollowupResult,
     ReActTrace,
     S1Normalize,
+    S1S2Merged,
     S2Elements,
     S3Structured,
     S3StructuredUnreferenced,
@@ -397,6 +399,40 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
                               **thinking_for("s2"))
 
 
+def normalize_and_infer_merged(complaint: str) -> tuple[S1Normalize, S2Elements]:
+    """R36：S1 + S2 **一次调用**。返回拆好的 `(s1, s2)`，跟分两次拿到的同型。
+
+    ## 这条路默认关着，而且关着是有理由的
+
+    `S1S2_MERGED` 默认 **0**。省下的是一次 2~4 秒的调用，代价是次序：
+    CLAUDE.md 那条铁律要求**危重症状的拦截发生在证素推断之前**，而合一之后
+    证素推断与症状标准化在同一次调用里完成——拦截最早也只能早到"那一次调用
+    之前"，也就是只能拿**原始主诉的字面**去查。S1 归一之后才露出来的危重词
+    （原文「呕吐咖啡色物」经 S1 归一成「呕血」）就挡不住证素推断了。
+
+    调用方（`consult`）在合一模式下命中安全否决时**把已经推出来的证素丢掉、
+    返回 `s2: None`**，所以对外可见的行为跟分两次那条路逐字段一致（不产出证素、
+    不产出方药）。但"丢掉"是流程约定，"没算过"才是结构保证——把一条结构保证换成
+    一条流程约定，不该由一个性能开关顺手做掉。
+
+    R36 的调用数验收（一次问诊 ≤4 次）不靠它也达到：S1 + S2 + S3 = 3 次。
+    所以这条路完整实现、有测试、`S1S2_MERGED=1` 随时可开（R38 的消融要拿它
+    量"合一之后证素质量变没变"），但默认不开。
+    """
+    prompt = load_prompt("s1s2_merged")
+    system = render(
+        prompt["system"],
+        complaint=complaint,
+        elements=(
+            f"病位证素（kind 填 location）：{'、'.join(LOCATIONS)}\n"
+            f"  病性证素（kind 填 nature）：{'、'.join(NATURES)}"
+        ),
+    )
+    merged = get_llm().generate(system=system, user="", schema=S1S2Merged,
+                                **thinking_for("s1s2"))
+    return merged.to_s1(), merged.to_s2()
+
+
 def _search_cases(
     query: str, physician: str, s2: S2Elements, retriever_mode: str | None
 ) -> tuple[list[tuple[CaseRecord, float]], bool]:
@@ -633,8 +669,113 @@ def _score_candidate(s3) -> tuple[float, dict]:
     }
 
 
-def _best_of_n_s3(s3_system: str, s3_schema, physician: str):
+def _streaming_note(n_samples: int) -> str | None:
+    """这次 S3 为什么没有增量。能流式就返回 None。
+
+    **三种"没流式"要分开**（后端不支持 / 是模拟的 / best-of-N 这一路不流式），
+    合成一句"未启用"的话，前端转着圈等的时候没人知道该修哪儿。
+    后端那两种由 `LLMBackend.streaming_note()` 回答（判据在后端自己身上，
+    不在这里抄一份）。
+    """
+    if n_samples > 1:
+        return (f"这次 S3 采了 {n_samples} 次（best-of-N），几路同时在飞，"
+                "增量混在一条流里没法用，所以这一路不流式。设 S3_BEST_OF_N=1 可开")
+    llm = get_llm()
+    note = getattr(llm, "streaming_note", None)
+    if callable(note):
+        return note()
+    # 鸭子类型的后端（测试替身、第三方实现）没有这个方法。**不抛异常**——
+    # manifest 的一个统计项取不到不该让整次问诊失败（同 `_prefix_tokens_or_none`
+    # 那条），而"这个后端没报"跟"报了说不支持"要能分开。
+    backend_id = getattr(llm, "backend_id", None)
+    who = backend_id() if callable(backend_id) else type(llm).__name__
+    return f"后端 {who} 没有实现 streaming_note()，这次有没有流式无从判断"
+
+
+class S3DeltaEmitter:
+    """R36：把 S3 的流式增量合并成 `s3_delta` 事件。
+
+    **必须合并。** 一个 token 一帧的话，一次 S3 输出几千帧 SSE，前端每帧都要
+    JSON.parse + 重排一次；而人眼分辨不出 30ms 和 120ms 的差别。合并判据是
+    "攒够 80 字 或 距上次 ≥120ms"，收尾无条件冲一次——不冲的话最后一段永远发不出。
+
+    **思考与正式输出分两路累积。** 合成一路会把思考过程拼进方药文本里
+    （`core.llm._delta_texts` 那一层已经把两者分开了，这里不许合回去）。
+
+    计数（`chars` / `events` / `first_delta_s`）是给 bench 与 manifest 用的：
+    "首字延迟"这个验收项没有计数就只能靠掐表。
+    """
+
+    FLUSH_CHARS = 80
+    FLUSH_SECONDS = 0.12
+
+    def __init__(self, on_step: StepFn | None, physician: str, physician_name: str) -> None:
+        self._on_step = on_step
+        self._physician = physician
+        self._physician_name = physician_name
+        self._buf: dict[str, str] = {"content": "", "reasoning": ""}
+        self._last_flush: dict[str, float] = {"content": 0.0, "reasoning": 0.0}
+        self._t0 = time.monotonic()
+        self.chars: dict[str, int] = {"content": 0, "reasoning": 0}
+        self.events = 0
+        self.first_delta_s: float | None = None
+
+    def __call__(self, text: str, kind: str) -> None:
+        if not text:
+            return
+        if kind not in self._buf:
+            # 认不出的种类**当正式输出处理并计数**，不静默丢：丢掉的表现是
+            # "前端少了一段"，而那时没人知道少了什么。
+            kind = "content"
+        if self.first_delta_s is None:
+            self.first_delta_s = round(time.monotonic() - self._t0, 4)
+        self.chars[kind] += len(text)
+        self._buf[kind] += text
+        now = time.monotonic()
+        if (len(self._buf[kind]) >= self.FLUSH_CHARS
+                or now - self._last_flush[kind] >= self.FLUSH_SECONDS):
+            self._emit(kind)
+
+    def flush(self) -> None:
+        for kind in list(self._buf):
+            if self._buf[kind]:
+                self._emit(kind)
+
+    def _emit(self, kind: str) -> None:
+        text, self._buf[kind] = self._buf[kind], ""
+        self._last_flush[kind] = time.monotonic()
+        if not text:
+            return
+        self.events += 1
+        if self._on_step is not None:
+            self._on_step("s3_delta", {
+                "physician": self._physician,
+                "physician_name": self._physician_name,
+                "kind": kind,
+                "text": text,
+                # 到这一帧为止这一路累计多少字：前端要能判断自己有没有漏帧，
+                # 而只发增量的话漏了一帧没人看得出来。
+                "chars": self.chars[kind],
+                "seq": self.events,
+            })
+
+    def summary(self) -> dict:
+        """写进 `s3_done` 与 manifest 的那几个数。"""
+        return {
+            "events": self.events,
+            "chars_content": self.chars["content"],
+            "chars_reasoning": self.chars["reasoning"],
+            "first_delta_s": self.first_delta_s,
+        }
+
+
+def _best_of_n_s3(s3_system: str, s3_schema, physician: str, *, on_delta=None):
     """采 N 次 S3，按 `score_formula` 挑分最高的一次。返回 (s3, candidates_scored)。
+
+    `on_delta`（R36）**只在 N=1 时往下传**。N>1 时几路采样同时在飞，
+    把它们的增量混在一条流里发出去，前端拼出来的是几张方交错的乱码——
+    与其发一堆没法用的帧，不如这一路不流式（`streaming_skipped_reason`
+    会如实说出原因，不让人以为是后端不支持）。
 
     **N=1 时逐字节走回 R21 及之前的那条路径**（一次 generate、不建线程池、
     candidates_scored 只有一条）——把"关掉 best-of-N"做成一条独立代码路径会让
@@ -653,14 +794,15 @@ def _best_of_n_s3(s3_system: str, s3_schema, physician: str):
     n = s3_best_of_n()
     thinking = thinking_for("s3")
 
-    def one():
+    def one(stream=False):
+        extra = {"on_delta": on_delta} if (stream and on_delta is not None) else {}
         return get_llm().generate(
             system=s3_system, user="", schema=s3_schema, physician=physician,
-            **thinking,
+            **extra, **thinking,
         )
 
     if n == 1:
-        s3 = one()
+        s3 = one(stream=True)
         score, row = _score_candidate(s3)
         return s3, [{**row, "index": 0, "chosen": True}]
 
@@ -822,6 +964,9 @@ def run_physician(
         # 没开 ReAct 时这是这位医家唯一一次要等的 LLM 调用；开了 ReAct 也要报——
         # 取证结束不代表马上有结果，S3 本身也要等一次真实调用。
         on_step("s3_start", {"physician": physician, "physician_name": physician_name})
+    # R36：流式。`emitter` 在没有 on_step 时也建（它自己判 None），这样
+    # `s3_done` 里的计数在 CLI / eval 那条路上照样是真的。
+    emitter = S3DeltaEmitter(on_step, physician, physician_name)
     # 混进 herbs 的西药（模型没照 prompt 的要求分开写）在 schema 构造时就已经被
     # core.schemas._S3Base 的 model_validator 挑到 western_drugs 了，这里不用
     # 再包一层 _split_western_into_s3——这一步以前是代码层面的兜底，现在兜底
@@ -833,7 +978,13 @@ def run_physician(
     # （DeepSeek）如实忽略它，见 core/llm.py::LLMBackend._complete 的文档。
     # S3 是这条链上唯一真正需要推理的一步，默认开思考（S3_THINKING 可整体关掉，
     # 关掉之后跑出来的数字跟默认配置不可比——manifest 会带上这句话）。
-    s3, candidates_scored = _best_of_n_s3(s3_system, s3_schema, physician)
+    s3, candidates_scored = _best_of_n_s3(s3_system, s3_schema, physician,
+                                          on_delta=emitter)
+    emitter.flush()
+    if on_step is not None:
+        on_step("s3_done", {"physician": physician, "physician_name": physician_name,
+                            **emitter.summary(),
+                            "streaming_note": _streaming_note(len(candidates_scored))})
 
     # X2 输出侧安全（M2 起覆盖五条规则，见 core/safety_output.assess_formula_safety
     # 的文档字符串）：给每个候选方都算一份 FormulaSafety，不是只算 selected 那个——
@@ -901,6 +1052,11 @@ def run_physician(
         # **记在结果里而不是只记 manifest**：知识块是按医家的 hits 裁剪的，
         # 整次问诊一个数说不清楚谁看到了什么——跟 lora 字段同一个理由。
         "knowledge": {"mode": knowledge_mode, **knowledge_stats},
+        # R36：这次 S3 有没有真的流式、发了多少帧、首字多久。
+        # **记在结果里而不是只记 manifest**：理由同 knowledge——manifest 一个数
+        # 说不清楚哪位医家那一路流了、哪一路没流。
+        "streaming": {**emitter.summary(),
+                      "note": _streaming_note(len(candidates_scored))},
         "disease_candidates": disease_candidates,
         "refs": refs,
         # E3/E4 消融要按 (主诉, 医家) 配对比较不同 refs_mode 的结果；结果自带
@@ -1197,7 +1353,18 @@ def run_synthesis(
             bypass_safety=bypass_safety, on_step=on_step,
         )
 
-    raw, candidates_scored = _best_of_n_s3(s3_system, s3_schema, SYNTHESIS_PHYSICIAN_ID)
+    if on_step is not None:
+        on_step("s3_start", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                             "physician_name": SYNTHESIS_PHYSICIAN_NAME})
+    emitter = S3DeltaEmitter(on_step, SYNTHESIS_PHYSICIAN_ID, SYNTHESIS_PHYSICIAN_NAME)
+    raw, candidates_scored = _best_of_n_s3(s3_system, s3_schema, SYNTHESIS_PHYSICIAN_ID,
+                                           on_delta=emitter)
+    emitter.flush()
+    if on_step is not None:
+        on_step("s3_done", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                            "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+                            **emitter.summary(),
+                            "streaming_note": _streaming_note(len(candidates_scored))})
     # R34：符号验证闭环。**这一层取代了 legacy 那条"安全层拦截 → 重开一次"**
     # ——不是两个循环并存：那两条判据（配伍禁忌、超量）现在由验证器的
     # `incompatible_pair` / `dose_exceeds` 两条规则**委托给同一个 safety_output**
@@ -1259,6 +1426,8 @@ def run_synthesis(
                       # structured 不走 assemble()，所以没有稳定前缀可缓存。
                       # 如实记一条，别让人看到 mode="full" 就以为缓存命中了。
                       "prefix_assembled": False},
+        "streaming": {**emitter.summary(),
+                      "note": _streaming_note(len(candidates_scored))},
         "disease_candidates": disease_candidates,
         "refs": refs,
         "refs_mode": refs_mode,
@@ -1337,6 +1506,33 @@ def _aggregate_knowledge(results: list[dict] | None) -> dict | None:
         "n_herbs": max((r.get("n_herbs") or 0) for r in rows),
         "n_formulas": max((r.get("n_formulas") or 0) for r in rows),
         "n_patterns": max((r.get("n_patterns") or 0) for r in rows),
+    }
+
+
+def _aggregate_streaming(results: list[dict] | None) -> dict | None:
+    """把各路 S3 的流式情况汇成一份给 manifest。
+
+    `streamed` 是"**有没有任何一路真的流了**"：一路流了一路没流时，写 True 会
+    让人以为整次都是流式的，所以同时报 `n_streamed / n_total`。
+    首字延迟取**最大值**——验收要问的是"最慢那一路多久才有字"，取最小值等于
+    拿最好看的那个数当结论。`note` 收集所有不同的原因（去重保序），
+    一路一个原因合成一句会丢掉信息。
+    """
+    rows = [r.get("streaming") for r in (results or []) if isinstance(r.get("streaming"), dict)]
+    if not rows:
+        return None
+    streamed = [r for r in rows if (r.get("events") or 0) > 0]
+    firsts = [r.get("first_delta_s") for r in streamed if r.get("first_delta_s") is not None]
+    notes = list(dict.fromkeys(r.get("note") for r in rows if r.get("note")))
+    return {
+        "streamed": bool(streamed),
+        "n_streamed": len(streamed),
+        "n_total": len(rows),
+        "events": sum(r.get("events") or 0 for r in rows),
+        "chars_content": sum(r.get("chars_content") or 0 for r in rows),
+        "chars_reasoning": sum(r.get("chars_reasoning") or 0 for r in rows),
+        "first_delta_s_max": max(firsts) if firsts else None,
+        "notes": notes,
     }
 
 
@@ -1427,7 +1623,8 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
                     retriever_mode: str | None = None,
                     knowledge: dict | None = None,
                     s3_mode_used: str | None = None,
-                    synthesis: dict | None = None) -> dict:
+                    synthesis: dict | None = None,
+                    streaming: dict | None = None) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
     cases_sha = cases_sha256()
@@ -1518,6 +1715,14 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
         # 缺谓词计数一起记：归经缺一半的本体上，"归经覆盖规则通过了"这句话
         # 要能被读者自己打折扣。
         "ontology": _ontology_manifest(),
+        # R36：这次 S3 有没有真的边生成边吐、首字多久、发了多少帧。
+        # None = 这条路径没跑到 S3（被拦截 / 信息不足）——**跟"跑了但没流式"
+        # 是两件事**，后者是 `{"streamed": false, "notes": [原因]}`。
+        # 首字延迟是 R36 的验收项之一（≤3 秒），没有这个字段就只能掐表。
+        "streaming": streaming,
+        # 这次 S1/S2 是合成一次调用还是分两次（R36）。它直接改 llm_calls，
+        # 不记的话两份 manifest 放一起比时，调用数差 1 看不出是配置还是代码。
+        "s1s2_merged": s1s2_merged(),
     }
 
 
@@ -1873,7 +2078,17 @@ def consult(
     # demo 模式下这次请求会被拦截的原因（最早触发的那个）。EVAL_MODE 打开时
     # 链路继续往下走，但这个字段仍然如实记着"本来会被拦"，两种模式同一套语义。
     safety_flag: str | None = None
-    s1 = normalize(complaint)
+    # R36：S1+S2 合不合**一次 consult 只判一次**（同 use_react / bypass / mode 那条
+    # 纪律）：中途有人改环境变量时，同一个请求的调用数结算和实际发生的次数不会错位。
+    merged_s1s2 = s1s2_merged()
+    if merged_s1s2:
+        s1, s2_pending = normalize_and_infer_merged(complaint)
+    else:
+        s1, s2_pending = normalize(complaint), None
+    # 这一段实际花了几次调用。**不问 `core.usage.fixed_steps_per_consult()`**——
+    # 那个函数会再读一次环境变量，而本次请求的判断已经落在 merged_s1s2 上了；
+    # 两处各读一次就可能一处 1 一处 2，账本跟实际发生的次数错位。
+    s1s2_calls = 1 if merged_s1s2 else 2
     emit("s1_done", symptoms=s1.symptoms, tongue=s1.tongue, pulse=s1.pulse, unmapped=s1.unmapped)
 
     # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
@@ -1884,6 +2099,11 @@ def consult(
     safety_flag = safety_flag or reject_reason
     if reject_reason is not None and not bypass:
         # 键集跟正常路径保持一致：api/前端按同一份契约读，缺键就是 KeyError。
+        #
+        # **合一模式下 `s2_pending` 里已经有证素了，这里把它丢掉、照旧返回
+        # `s2: None`。** 对外可见的行为跟分两次那条路逐字段一致（被拦截的请求
+        # 不产出证素、不产出方药）。这也正是 `normalize_and_infer_merged` 默认
+        # 关着的理由：丢掉是流程约定，没算过才是结构保证。
         return {
             "s1": s1,
             "results": [],
@@ -1897,7 +2117,8 @@ def consult(
                                         retriever_mode=retriever_mode, s3_mode_used=mode),
         }
 
-    s2 = infer_elements(s1)
+    # 合一模式下这一步不再调模型（证素跟症状是同一次调用的产出）。
+    s2 = s2_pending if s2_pending is not None else infer_elements(s1)
     emit("s2_done", elements=[
         {"element": h.element, "kind": h.kind, "confidence": h.confidence} for h in s2.elements
     ], unexplained_symptoms=s2.unexplained_symptoms)
@@ -1929,7 +2150,7 @@ def consult(
             "followup": followup,
             "residual": None, "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000), 2, use_react,
+                int((time.time() - _t0) * 1000), s1s2_calls, use_react,
                 retriever_mode=retriever_mode, s3_mode_used=mode,
             ),
         }
@@ -1945,8 +2166,9 @@ def consult(
                 "safety_flag": safety_flag, "retrieval_error": None,
                 "s2": s2, "followup": followup, "residual": None,
                 "insufficient": False, "insufficient_reason": None, "coverage": None,
-                "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react,
-                                        retriever_mode=retriever_mode, s3_mode_used=mode),
+                "manifest": _build_manifest(int((time.time() - _t0) * 1000), s1s2_calls,
+                                        use_react, retriever_mode=retriever_mode,
+                                        s3_mode_used=mode),
             }
         # 追问确认的是国标症状名（来自图谱节点），本身已经是标准表述，不需要再过
         # S1——这不违反"S1 全局只跑一次"，S1 一次也没有多跑。
@@ -1993,7 +2215,7 @@ def consult(
             "safety_flag": safety_flag, "retrieval_error": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
-                2 + extra_calls + (1 if residual else 0), use_react,
+                s1s2_calls + extra_calls + (1 if residual else 0), use_react,
                 retriever_mode=retriever_mode, s3_mode_used=mode,
             ),
         }
@@ -2008,7 +2230,7 @@ def consult(
         # ReAct 追问问出了危重症状：跟初始主诉命中同一道否决，已经跑完的医家结果
         # 也不返回——被拦截的请求不产出任何方药。
         calls = (
-            2 + extra_calls + (1 if residual else 0) + veto.llm_calls
+            s1s2_calls + extra_calls + (1 if residual else 0) + veto.llm_calls
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
             # R22：**不是 len(results)**。每位医家的 S3 采了 N 次（best-of-N），
             # 按医家数计等于漏掉 N−1 次真实调用——manifest 的调用数是额度结算的
@@ -2027,7 +2249,8 @@ def consult(
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
                                         retriever_mode=retriever_mode, s3_mode_used=mode,
-                                        knowledge=_aggregate_knowledge(results)),
+                                        knowledge=_aggregate_knowledge(results),
+                                        streaming=_aggregate_streaming(results)),
         }
     except SymbolicVeto as veto:
         # R34：符号验证的 veto 级违规改了 MAX_REVISE_ROUNDS 轮还在——这张方不下发。
@@ -2035,7 +2258,7 @@ def consult(
         # （见 SymbolicVeto 的文档字符串），而合并之后响应里只能说一句
         # "被拦截了"，患者分不出是"你该立刻就医"还是"系统改不出合规的方"。
         calls = (
-            2 + extra_calls + (1 if residual else 0)
+            s1s2_calls + extra_calls + (1 if residual else 0)
             + sum(len(r["candidates_scored"]) for r in results)
             + veto.llm_calls
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
@@ -2055,7 +2278,8 @@ def consult(
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
                                         retriever_mode=retriever_mode, s3_mode_used=mode,
-                                        knowledge=_aggregate_knowledge(results)),
+                                        knowledge=_aggregate_knowledge(results),
+                                        streaming=_aggregate_streaming(results)),
         }
     except RetrievalUnavailable as e:
         # 选的检索模式这台机器上没有对应数据（graph 缺 element_index.json 之类）。
@@ -2079,7 +2303,7 @@ def consult(
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
-                2 + extra_calls + (1 if residual else 0), use_react,
+                s1s2_calls + extra_calls + (1 if residual else 0), use_react,
                 retriever_mode=retriever_mode, s3_mode_used=mode,
             ),
         }
@@ -2233,12 +2457,12 @@ def consult(
         "insufficient": False,
         "insufficient_reason": None,
         "coverage": round(coverage, 3),
-        # S1 一次 + S2 一次 + 每位医家 S3 一次 + 残差一次 + 配伍禁忌重开若干次。
-        # 重开必须计进来：漏算的话 manifest 报的调用数会低于实际花费，
-        # 拿它算成本或比配置就都是错的。
+        # S1/S2 这一段（合一 1 次、分开 2 次，见 s1s2_calls）+ 每位医家 S3 一次
+        # + 残差一次 + 配伍禁忌重开若干次。重开必须计进来：漏算的话 manifest 报的
+        # 调用数会低于实际花费，拿它算成本或比配置就都是错的。
         "manifest": _build_manifest(
             int((time.time() - _t0) * 1000),
-            2
+            s1s2_calls
             + extra_calls
             # R22：每位医家采了 N 次 S3，见上面 SafetyVeto 分支里那段注释。
             + sum(len(r["candidates_scored"]) for r in results)
@@ -2251,6 +2475,7 @@ def consult(
             retriever_mode=retriever_mode,
             s3_mode_used=mode,
             knowledge=_aggregate_knowledge(results),
+            streaming=_aggregate_streaming(results),
             synthesis=_synthesis_summary(results, mode),
         ),
     }

@@ -143,7 +143,12 @@ def _isolate_runtime_env(monkeypatch):
                 # R33：S3_MODE 决定 S3 产出哪种 schema，也就决定 results 有
                 # 几个元素。开发者 shell 里留一个值会让一整批测试红在跟改动
                 # 无关的地方（跟 S3_BEST_OF_N 那条完全同理）。
-                "S3_MODE", "KNOWLEDGE_IN_PROMPT", "FOCUSED_KNOWLEDGE_MAX_TOKENS"):
+                "S3_MODE", "KNOWLEDGE_IN_PROMPT", "FOCUSED_KNOWLEDGE_MAX_TOKENS",
+                # R36：S1S2_MERGED 决定 S1/S2 是一次调用还是两次，直接改 llm_calls；
+                # FOCUSED_MAX_PATTERNS_PER_PHYSICIAN（R35）决定知识块放几条规律。
+                # 同上：shell 里留一个值会让一批数调用数/数条数的测试红在
+                # 跟改动无关的地方。
+                "S1S2_MERGED", "FOCUSED_MAX_PATTERNS_PER_PHYSICIAN"):
         monkeypatch.delenv(var, raising=False)
     # 清掉之后**再钉成 legacy**。这一句跟上面那一行做的是两件不同的事。
     #

@@ -33,7 +33,22 @@ from typing import Callable, Literal
 #
 # 追问、安全否决、校验重试都会让真实值上下浮动，所以它仍然是"折算系数"不是
 # "定值"（真实花费由 `manifest.llm_calls` 结算）。
-CALLS_PER_CONSULT_FIXED_STEPS = 2   # S1 + S2，跟医家数和 N 都无关
+#: S1/S2 分两次调用时的固定步数。**R36 起它不是这个公式里唯一的取值**：
+#: `S1S2_MERGED`（默认开）把这两步合成一次，那时是 1。所以公式里要问
+#: `fixed_steps_per_consult()`，不要直接用这个常量——它现在只是"分开跑那条路"
+#: 的那个数，留着是为了让两条路的差在代码里看得见。
+CALLS_PER_CONSULT_FIXED_STEPS = 2   # S1 + S2 分两次，跟医家数和 N 都无关
+CALLS_PER_CONSULT_FIXED_STEPS_MERGED = 1   # R36：S1+S2 合一
+
+
+def fixed_steps_per_consult() -> int:
+    """S1/S2 这一段几次调用。**全项目只有这一处实现**：`core/chain.py` 结算
+    `llm_calls` 时也问它，两处各写一个 `2` 的话，合一之后账本会持续多扣一次，
+    而多扣不会报错（R22 那个"少扣不报错"的镜像）。"""
+    from core.llm import s1s2_merged
+
+    return (CALLS_PER_CONSULT_FIXED_STEPS_MERGED if s1s2_merged()
+            else CALLS_PER_CONSULT_FIXED_STEPS)
 
 
 def calls_per_consult(n_physicians: int | None = None, best_of_n: int | None = None,
@@ -78,8 +93,8 @@ def calls_per_consult(n_physicians: int | None = None, best_of_n: int | None = N
         # 医家数不进公式：五家在**同一次**调用里融合。n_physicians 仍然接在
         # 参数表里且被校验，好让调用方（前端的"约剩 N 次"、README）不用记住
         # "这个模式下那个参数会被忽略"——它会被忽略这件事写在这里，只写一次。
-        return CALLS_PER_CONSULT_FIXED_STEPS + best_of_n
-    return CALLS_PER_CONSULT_FIXED_STEPS + n_physicians * best_of_n
+        return fixed_steps_per_consult() + best_of_n
+    return fixed_steps_per_consult() + n_physicians * best_of_n
 # 开了 ReAct 之后每位医家额外的取证循环步数（估算用，结算时会被真实值覆盖）。
 REACT_STEPS_PER_PHYSICIAN = 5
 

@@ -259,7 +259,7 @@ cp .env.example .env
 | `LLM_BASE_URL` | 默认 `https://api.deepseek.com` |
 | `LLM_MODEL` | 默认 `deepseek-v4-pro`。**原来的默认值 `deepseek-chat` 已于 2026-09 下线**——拿它发请求得到的是 HTTP 200 + **空响应体**（不是 404），症状是每次调用返回空串、校验失败、重试三次后 `LLMError`，看不出根因在模型名上。段 0 现在会查 `$LLM_BASE_URL/models`把这种情况在花第一分钱之前挡掉。⚠ 换模型 = 本仓库所有既有数字（ε/E3/E4/E8/E9/SDT）都不可直接比较，见 `eval/RESULTS.md` |
 | `LLM_MODE` 取 `claude_cli` | 走本机 `claude` CLI，**仅用于没有 API 网络时的冒烟**：模型不是 deepseek-chat、单次约 $0.06（DeepSeek 约 $0.0007），跑出来的分数不可与他人比较。`manifest.comparability_warning` 会把这一点一路带进报告 |
-| `LLM_TIMEOUT_SECONDS` | 单次调用的读超时秒数（旧名 `LLM_TIMEOUT` 仍然认）。不设时按后端取默认值：云端 API 读 120 秒 / 墙钟 180 秒，本地 vLLM server 600/900，进程内 vLLM 1800（首次调用要加载权重）。四个 HTTP 相位（connect/read/write/pool）**分别设**，另有一层墙钟兜底——理由见下面「超时」一节。SDK 自带重试已关，重试统一由 `generate()` 负责 |
+| `LLM_TIMEOUT_SECONDS` | 单次调用的读超时秒数（旧名 `LLM_TIMEOUT` 仍然认）。不设时按后端取默认值：云端 API 读 **600** 秒 / 墙钟 **900** 秒（**R36 从 120/180 放宽**：R32 起 S3 的提示词带 1.1 万~3 万 token 知识块、R33 起输出的是 `S3Structured`、而 S3 开着思考且 effort 可到 max——非流式调用整个响应是一次 socket 读，读超时盖不住整代生成时间的表现是"三倍的钱换一个超时错误"），本地 vLLM server 600/900，进程内 vLLM 1800（首次调用要加载权重）。四个 HTTP 相位（connect/read/write/pool）**分别设**，另有一层墙钟兜底——理由见下面「超时」一节。SDK 自带重试已关，重试统一由 `generate()` 负责 |
 | `LLM_MAX_TOKENS` | 单次输出上限。不设时按模型分两档：非推理模型 **8192**（DeepSeek 默认 4096，S0 抽多病人粗段会被截断）、推理模型 **16384**。推理模型要更大是因为 **max_tokens 同时盖住不可见的 reasoning tokens**：deepseek-v4-pro 实测「你好」一句就花 45 个 token、其中 36 个是 reasoning，8192 下 S3 的可见输出在 2081 字符处被砍断。判据在 `core/llm.py` 的 `_default_max_tokens()`（`REASONING_MODELS` 列出已知的推理模型），不靠人记着在 `.env` 里设对 |
 | `CLAUDE_CLI_MODEL` / `CLAUDE_CLI_TIMEOUT` | `claude_cli` 模式下的模型名与超时，默认 `claude-sonnet-5` / 180 |
 | `USE_REACT` | `1` 打开 ReAct 取证（默认关，见「ReAct 取证模式」一节） |
@@ -270,7 +270,9 @@ cp .env.example .env
 | `LLM_MAX_INFLIGHT` | 进程内**同时在途**的 LLM 请求数上限，默认 6。**跟 `MAX_CONCURRENT_CONSULTS` 是两件事**：那个限"同时几次问诊"，这个限"同时几个请求打到模型"。R12 三位医家改成并发之后两者相乘——4 个问诊槽 × 3 位医家 = 12 路同时打 API，会撞 DeepSeek 的速率限制（429）。只留一个闸拦不住 |
 | `S3_THINKING` | S3（按医家开方）开不开思考模式，`enabled`（默认，配 `reasoning_effort=high`）/ `disabled`。S1/S2/追问/ReAct **一律关思考**（结构化抽取，思考无增益却慢几十倍），这张表在 `core/llm.py::STEP_THINKING`。⚠ **关掉 S3 思考跑出来的数字跟默认配置下的不可比**，`manifest.comparability_warning` 会带上这句话；另外**思考模式下 temperature 不生效**，所以 `manifest.temperature_effective` 按步分别记 |
 | `S3_REASONING_EFFORT` | S3 想多久，`low`/`medium`/`high`/`max`。**不设时按检索方式取默认**：`full_context`（默认）→ `max`、top3 系 → `high`。理由在 `core/llm.py::s3_reasoning_effort`——full_context 下输入已经十几万 token 且靠缓存便宜 30 倍，这时限推理深度是省小钱费大钱；top3 保持 `high` 是为了跟 R1~R21 的数字可比。`max` 那一档的 `max_tokens` 默认升到 65536（推理 token 也算在里面） |
-| `S3_BEST_OF_N` | S3 采几次、按分最高的那次出结果，默认 **3**。`1` = 关掉（逐字节走回 R21 及之前那条路径）。打分用 R23 的 `score_formula`，见下面「best-of-N」一节。**这个数直接决定钱**：一次问诊的调用数是 `2 + 医家数 × N`，默认配置下 11 次。`FAST_MODE=1` 时它降到 1 |
+| `S3_BEST_OF_N` | S3 采几次、按分最高的那次出结果，**R36 起默认 1**（R22~R35 是 3）。打分用 R23 的 `score_formula`，见下面「best-of-N」一节。**这个数直接决定钱**：structured 下调用数是 `S1/S2 段 + N`、legacy 下是 `S1/S2 段 + 医家数 × N`，当前默认 3 次。改回 3 是 R38 消融的对照组。`FAST_MODE=1` 时它也是 1 |
+| `S1S2_MERGED` | S1（症状标准化）与 S2（证素推断）合成一次调用，`1` 打开、**默认 0（关）**。省的是一次 2~4 秒的往返；不默认开的理由是**次序**：合一之后证素推断跟症状标准化在同一次调用里完成，而 CLAUDE.md 那条铁律要求危重症状的拦截发生在**证素推断之前**——合一之后拦截最早只能早到"那一次调用之前"（只能拿原始主诉的字面查），S1 归一之后才露出来的危重词（原文「呕吐咖啡色物」→ 归一「呕血」）就挡不住证素推断了。打开时命中安全否决的请求照样**丢掉已推出的证素、返回 `s2: null`**，对外行为不变，但"丢掉"是流程约定、"没算过"才是结构保证。R36 的调用数验收（≤4）不靠它也达到 |
+| `S3_STREAM`（无需设置） | 流式没有开关：**后端支持就流**（`LLMBackend.SUPPORTS_STREAMING`）。云端 OpenAI 兼容 API 支持真流式；回放后端把录好的整段切开发、标成 `simulated`；`claude_cli`/进程内 vLLM 不支持。三种"没流式"各自会在 `s3_done` 事件与 `manifest.streaming.notes` 里写出**为什么**——界面上转圈而说不出原因是这一轮专门要防的事 |
 | `EMBEDDING_CACHE` / `EMBEDDING_CACHE_DIR` | 语料向量的磁盘缓存：`0` 关掉，或指定目录（默认 `data/cache/`，已 gitignore）。命中判据是模型名 + 语料条数 + **被编码文本的 sha256** 三者全等；缓存省的是"给全部语料编码"那一段，模型本身不管命不命中都要加载（查询要用它） |
 | `LOW_DISCRIMINATION_CUTOFF` | `0` 关闭（默认开）：检索到的候选之间没有真实区分度（top-1 与 top-k 原始相似度差 < 0.03）时只保留 top-1，避免塞几条弱相关候选进 prompt 稀释信号。这条不确定是不是净收益，做成开关是为了能跑两遍对比（`consult()` 返回的每位医家结果带 `low_discrimination` 标记） |
 
@@ -465,8 +467,8 @@ curl -N -X POST http://127.0.0.1:8000/api/consult/stream \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `QUOTA_PER_IP_DAILY_CALLS` | `55`（= 5 次问诊 × 每次 11 调用） | 每个 IP 每天的**模型调用**上限。**R22 起这个默认值是算出来的**：`calls_per_consult() * 5`，而 `calls_per_consult()` = `2 + 医家数 × S3_BEST_OF_N` = 2 + 3×3 = 11。把 `S3_BEST_OF_N` 调回 1 时它自动变回 25 |
-| `QUOTA_GLOBAL_DAILY_CALLS` | `2200`（= 200 次问诊 × 每次 11 调用） | 全站每天的模型调用上限，防一个人换 IP 刷爆。同上，`calls_per_consult() * 200` |
+| `QUOTA_PER_IP_DAILY_CALLS` | `15`（= 5 次问诊 × 每次 3 调用） | 每个 IP 每天的**模型调用**上限。**R22 起这个默认值是算出来的**：`calls_per_consult() * 5`。**R36 起当前默认配置下 `calls_per_consult()` = 3**（structured 五家融合成一次 S3 + `S3_BEST_OF_N` 默认 1，即 S1 + S2 + S3）；R22~R35 是 11（legacy 三位医家 × N=3 + 2）。把 `S3_BEST_OF_N` 或 `S3_MODE` 调回去它自动跟着变——**这一行永远不要手抄一个数**，写死过一次就漂过一次 |
+| `QUOTA_GLOBAL_DAILY_CALLS` | `600`（= 200 次问诊 × 每次 3 调用） | 全站每天的模型调用上限，防一个人换 IP 刷爆。同上，`calls_per_consult() * 200` |
 | `QUOTA_MAX_TRACKED_IPS` | `5000` | 额度表里最多记多少个 IP。**这是内存保护**：不设上限的话，用海量伪造 IP 发请求能把进程内存撑爆 |
 | `TRUSTED_PROXY_HOPS` | `0` | **默认 0 = 完全不读 `X-Forwarded-For`。** 直接信任 XFF 等于把限额送人——任何人加一个头就换一个"IP"。只有部署在**自己的**反代后面时才设成反代跳数（nginx 一层就是 1），此时从右往左数第 N 跳才是真实客户端；**绝不取最左跳**，最左跳是客户端自己写的 |
 | `FORCE_REPLAY` | 未设 | `1` 强制全站走回放（演示日用）。零成本、断网可用、每次一致 |
@@ -1546,14 +1548,23 @@ N 张方之间挑一张（R22）。跨问诊比这个分没有意义——不同
 判据是 `api/main.py::_role_gets_advice` 一个函数，`/api/prescription/validate`
 和 `results[i]` 两处都问它。
 
-## best-of-N：同一位医家采 N 次，按分挑一张（R22，默认 N=3）
+## best-of-N：同一位医家采 N 次，按分挑一张（R22 加，**R36 起默认 N=1**）
 
-S3 不再只采一次：每位医家**并发**采 `S3_BEST_OF_N` 次（默认 3），用上面那把
-`score_formula` 给每次打分，挑分最高的一次出结果。
+S3 可以采 `S3_BEST_OF_N` 次、用上面那把 `score_formula` 给每次打分、挑分最高的
+一次出结果。**R36 把默认值从 3 改回 1**，理由不是否定 R22——R22 要的"把不合规的
+方挑掉"这件事在 R34 之后由**符号验证器**做了（拿本体原文判 veto/revise，判据可核、
+反例可读，比"分最高的那一次"强）。两者叠着用等于同一件事付两次钱：S3 调用数三倍、
+墙钟跟着三倍，而验证器的闭环最多还要再开 3 次。旋钮留着，R38 的消融要拿它当对照组。
 
 ```
-一次问诊的调用数 = 2 + 医家数 × N        ← core/usage.py::calls_per_consult()
-默认配置（3 位医家、N=3）= 2 + 9 = 11 次   （R21 及之前是 5 次）
+一次问诊的调用数：
+  structured（产品默认）  = S1/S2 段 + N              ← core/usage.py::calls_per_consult()
+  legacy（对照组）        = S1/S2 段 + 医家数 × N
+S1/S2 段 = 2（分两次，默认）或 1（S1S2_MERGED=1 合成一次，R36 加，默认关）
+
+R36 默认配置（structured、N=1、不合并）= 2 + 1 = 3 次
+R22~R35 默认（legacy、3 位医家、N=3）   = 2 + 9 = 11 次
+R21 及之前                              = 5 次
 ```
 
 这个折算系数**只有一处实现**：额度默认值、看板上的"约剩几次问诊"、

@@ -58,13 +58,19 @@ def test_the_three_layers_and_four_hard_requirements_are_all_there():
     assert "不做通用代理" in section
 
 
-def test_the_quota_defaults_in_the_doc_match_the_code():
+def test_the_quota_defaults_in_the_doc_match_the_code(monkeypatch):
     """文档里的默认值是**从代码里核过的**，不是拍的。`QUOTA_PER_IP_DAILY_CALLS`
     的默认是 `CALLS_PER_CONSULT * 5`——写成"5 次/天"是对的（那是问诊数），
     但环境变量的单位是**调用数**，两者差 CALLS_PER_CONSULT 倍。这一条就是
     防那个换算被写反。"""
     import api.main as api_main
     from core.usage import calls_per_consult
+
+    # **按产品默认配置算**（R36 补）：README 写的是"默认值"，而 conftest 为了让
+    # 上百条老测试继续测 legacy 把 `S3_MODE` 钉成了 legacy——照那个钉子算出来的是
+    # 对照组的数（25/1000），跟文档要说的那件事不是一回事。
+    for var in ("S3_MODE", "S3_BEST_OF_N", "S1S2_MERGED"):
+        monkeypatch.delenv(var, raising=False)
     section = README[README.index("## 公开部署"):README.index("## 前端页面")]
     # R22：折算系数从常量变成函数（`2 + 医家数 × S3_BEST_OF_N`）。
     # 这条判据的作用没变——文档里那两个数必须跟代码算出来的一致。

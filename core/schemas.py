@@ -356,6 +356,42 @@ class S2Elements(BaseModel):
     unexplained_symptoms: list[str] = Field(default_factory=list)
 
 
+class S1S2Merged(BaseModel):
+    """R36：S1（症状标准化）+ S2（证素推断）合成一次调用的产出。
+
+    **只是形状合一，语义一字未改**：`to_s1()` / `to_s2()` 拆出来的两个对象跟分两次
+    调用拿到的逐字段同型，下游（残差、检索、S3、构图、前端）一行都不用改。
+
+    为什么不是"把 S2Elements 塞成 S1Normalize 的一个子字段"：那样 `S1Normalize`
+    这个类型就跟"这次合没合"耦合了，而它是全项目最上游的形状，改它会波及所有把
+    S1 当参数的函数签名。新建一个只在边界上活的 schema，拆完就扔。
+
+    **刻意不校验 `supporting_symptoms ⊆ symptoms`。** 分两次调用的那条路也不校验：
+    模型经常把症状名改写（「胃脘胀痛」→「脘腹胀痛」），那件事由
+    `core.chain.explained_symptoms()` 一处处理（见它的文档）。在这里加一条只在新路
+    上生效的更严校验，会让两条路的证素质量不可比——而"合一之后证素质量变没变"
+    正是 R38 要量的东西，不能先被一条校验改掉一次。
+    """
+
+    # 以下四个字段跟 S1Normalize 逐字段同型
+    symptoms: list[str] = Field(default_factory=list)
+    tongue: str | None = None
+    pulse: str | None = None
+    unmapped: list[str] = Field(default_factory=list)
+    # 以下两个跟 S2Elements 逐字段同型（ElementHit.supporting_symptoms 的
+    # min_length=1 防幻觉约束照旧生效——合并不放松任何约束）
+    elements: list[ElementHit] = Field(default_factory=list)
+    unexplained_symptoms: list[str] = Field(default_factory=list)
+
+    def to_s1(self) -> S1Normalize:
+        return S1Normalize(symptoms=list(self.symptoms), tongue=self.tongue,
+                           pulse=self.pulse, unmapped=list(self.unmapped))
+
+    def to_s2(self) -> S2Elements:
+        return S2Elements(elements=list(self.elements),
+                          unexplained_symptoms=list(self.unexplained_symptoms))
+
+
 # ---------- 在线：病名层（M4） ----------
 
 

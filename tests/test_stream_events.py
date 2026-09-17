@@ -63,7 +63,11 @@ def _prefix_and_per_physician(events):
     不许假设顺序。）
     """
     names = [e[0] for e in events]
-    physician_events = {"physician_start", "react_step", "s3_start", "physician_done"}
+    # R36：`s3_delta` / `s3_done` 也是医家事件（带 physician 字段、前端按它路由）。
+    # 加进这个集合不是为了让断言过——下面那条 `assert name in physician_events`
+    # 正是"新事件没人接"的守卫，漏掉的话新事件会被当成"混进来的东西"。
+    physician_events = {"physician_start", "react_step", "s3_start",
+                        "s3_delta", "s3_done", "physician_done"}
     first = next(i for i, n in enumerate(names) if n in physician_events)
     per_physician: dict[str, list[str]] = {}
     for name, data in events[first:]:
@@ -87,7 +91,11 @@ def test_on_step_emits_expected_sequence_without_react(monkeypatch):
     assert prefix == ["s1_done", "s2_done", "followup_done"]
     assert set(per_physician) == {"ye_tianshi", "wu_jutong"}
     for pid, seq in per_physician.items():
-        assert seq == ["physician_start", "s3_start", "physician_done"], (pid, seq)
+        # R36 起 S3 结束也发一个事件（`s3_done`，带流式计数与"为什么没流式"）。
+        # **它排在 physician_done 之前**：s3_done 说的是"模型的文本出完了"，
+        # physician_done 说的是"这一位的结论定了"（中间还有安全层/验证器）。
+        assert seq == ["physician_start", "s3_start", "s3_done",
+                       "physician_done"], (pid, seq)
 
     s1_data = events[0][1]
     assert s1_data["symptoms"] == outcome["s1"].symptoms
@@ -134,7 +142,7 @@ def test_on_step_react_step_events_are_interleaved_between_start_and_s3(monkeypa
     # 并发只让医家之间交错，医家**内部**"先取证、再开方"的顺序一点没变。
     for pid, seq in per_physician.items():
         assert seq == ["physician_start", "react_step", "react_step",
-                       "s3_start", "physician_done"], (pid, seq)
+                       "s3_start", "s3_done", "physician_done"], (pid, seq)
     steps: dict[str, list[int]] = {}
     names_seen: dict[str, str] = {}
     for name, data in events:
@@ -221,7 +229,11 @@ def test_on_step_emits_full_sequence_when_one_physician_has_empty_retrieval(monk
     assert prefix == ["s1_done", "s2_done", "followup_done"]
     assert set(per_physician) == {"ye_tianshi", "wu_jutong"}
     for pid, seq in per_physician.items():
-        assert seq == ["physician_start", "s3_start", "physician_done"], (pid, seq)
+        # R36 起 S3 结束也发一个事件（`s3_done`，带流式计数与"为什么没流式"）。
+        # **它排在 physician_done 之前**：s3_done 说的是"模型的文本出完了"，
+        # physician_done 说的是"这一位的结论定了"（中间还有安全层/验证器）。
+        assert seq == ["physician_start", "s3_start", "s3_done",
+                       "physician_done"], (pid, seq)
     # 并发之后谁先发 start 是不确定的，能钉的是"两位都发了、各发一次"。
     # **结果的顺序仍是注册表顺序**（下面 outcome["results"] 那条）——"结果有序"
     # 是契约（前端三列按它排），"事件有序"并发之后不再成立，两件事。

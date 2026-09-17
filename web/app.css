@@ -1472,3 +1472,27 @@
   color: var(--muted);
   margin-top: var(--s2);
 }
+
+/* R36：S3 流式增量区。默认不占位（没流式时完全不显示），有内容才显示。
+   等宽字体 + 固定高度 + 自动滚到底：模型吐的是 JSON，等宽读起来才对得上；
+   不固定高度的话每帧都把页面往下顶，整页跟着抖。 */
+#s3-stream {
+  display: none;
+  margin: 8px 0;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow-y: auto;
+  border-left: 3px solid var(--ink-3);
+  background: var(--paper-2);
+  /* 走 --font-mono 这一个令牌（§3.3：等宽只准通过它用，有测试钉） */
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--ink-1);
+}
+#s3-stream.show { display: block; }
+/* 思考过程用更淡的颜色：它不是结论，不该跟正式输出一样显眼 */
+#s3-stream .s3-reasoning { color: var(--ink-3); font-style: italic; }
+#s3-stream .s3-who { font-weight: 600; color: var(--ink-2); }

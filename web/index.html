@@ -155,6 +155,11 @@
           <div id="graph-note"></div>
           <div id="graph-tooltip" class="gt-tooltip"></div>
         </div>
+        <!-- R36：S3 的流式增量。**跟 progress-log 分开**：那个是事件日志
+             （一行一件事、只增不改），这个是模型正在吐的文本（原地刷新）。
+             合成一个会让日志被几千帧增量顶得看不见。aria-live="off"：
+             逐字刷新的区域交给读屏软件会念个不停，结论出来后由结果区播报。 -->
+        <div id="s3-stream" aria-live="off"></div>
         <div id="progress-log" role="status" aria-live="polite"></div>
         <div id="manifest-footer"></div>
         <!-- R24：R21 的 token 面板。**挂在 manifest 旁边而不是顶栏**：

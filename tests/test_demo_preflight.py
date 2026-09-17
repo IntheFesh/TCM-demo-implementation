@@ -94,7 +94,11 @@ def test_the_quota_check_uses_the_computed_calls_per_consult(monkeypatch):
 
     monkeypatch.delenv("QUOTA_PER_IP_DAILY_CALLS", raising=False)
     assert str(calls_per_consult()) in dp.check_quota().detail
-    monkeypatch.setenv("QUOTA_PER_IP_DAILY_CALLS", "5")
+    # **坏值要从折算系数推，不能写死**（R36 修）：原来写死 `5`，而它能不能凑够
+    # 一次问诊取决于 `calls_per_consult()`——R22~R35 是 11（5 凑不够、fail），
+    # R36 起默认是 3（5 够一次、ok），于是这条测试红在跟它要测的东西无关的地方。
+    # 这是 SOURCES.md 第 33 条那个"动态化写死规模"的同一个形状。
+    monkeypatch.setenv("QUOTA_PER_IP_DAILY_CALLS", str(max(0, calls_per_consult() - 1)))
     bad = dp.check_quota()
     assert bad.status == "fail" and "0 次问诊" in bad.detail
     monkeypatch.setenv("QUOTA_PER_IP_DAILY_CALLS", str(calls_per_consult() * 5))

@@ -2188,6 +2188,60 @@ function clearProgress() {
   const log = document.getElementById("progress-log");
   log.textContent = "";
   log.classList.remove("show");
+  clearS3Stream();
+}
+
+// ---------- R36：S3 流式增量 ----------
+//
+// 服务端已经把增量合并过了（core/chain.py 的 S3DeltaEmitter，80 字或 120ms 一帧），
+// 所以这里**不需要再攒一层**；要做的是限制重排频率：每帧都写 DOM 的话，一次 S3
+// 几十帧 × 每帧一次 layout 仍然会让长列表卡顿。用 requestAnimationFrame 合并到
+// 一帧一次渲染（≈16ms），这是浏览器这一侧的节流点。
+const s3Stream = { text: new Map(), pending: false, order: [] };
+
+function clearS3Stream() {
+  s3Stream.text.clear();
+  s3Stream.order.length = 0;
+  const box = document.getElementById("s3-stream");
+  if (box) { box.textContent = ""; box.classList.remove("show"); }
+}
+
+function onS3Delta(data) {
+  const who = data.physician_name || data.physician || "";
+  const kind = data.kind === "reasoning" ? "reasoning" : "content";
+  const key = `${data.physician || ""}:${kind}`;
+  if (!s3Stream.text.has(key)) {
+    s3Stream.order.push({ key, who, kind });
+    s3Stream.text.set(key, "");
+  }
+  s3Stream.text.set(key, s3Stream.text.get(key) + (data.text || ""));
+  if (s3Stream.pending) return;
+  s3Stream.pending = true;
+  requestAnimationFrame(renderS3Stream);
+}
+
+function renderS3Stream() {
+  s3Stream.pending = false;
+  const box = document.getElementById("s3-stream");
+  if (!box) return;
+  box.classList.add("show");
+  // **只留尾部 1200 字**：模型吐的是几千字的 JSON，全留着 DOM 越来越大而人
+  // 只看得见最后几行。截断这件事要让人看出来（前面加省略号），不能悄悄丢。
+  box.textContent = "";
+  for (const { key, who, kind } of s3Stream.order) {
+    const full = s3Stream.text.get(key) || "";
+    const tail = full.length > 1200 ? "…" + full.slice(-1200) : full;
+    const head = document.createElement("span");
+    head.className = "s3-who";
+    head.textContent = `${who}${kind === "reasoning" ? "（思考）" : ""}：`;
+    const body = document.createElement("span");
+    if (kind === "reasoning") body.className = "s3-reasoning";
+    // textContent 而不是 innerHTML：这段文本直接来自模型输出
+    body.textContent = tail + "\n";
+    box.appendChild(head);
+    box.appendChild(body);
+  }
+  box.scrollTop = box.scrollHeight;
 }
 
 let currentStreamId = null;
@@ -2277,6 +2331,10 @@ function columnStepForEvent(name, data) {
     case "physician_start":
     case "react_step":
     case "s3_start":
+    // R36：增量与 s3 结束都仍然属于"这一列在跑 S3"这一步——
+    // 漏了它们的话，流式期间那一列的进度指示会退回上一步。
+    case "s3_delta":
+    case "s3_done":
       return { physician: data.physician, step: "s3" };
     default:
       return null;
@@ -2302,6 +2360,16 @@ function describeProgressEvent(name, data) {
       return `　${data.physician_name} 取证第 ${data.step} 步：${data.action}`;
     case "s3_start":
       return `　${data.physician_name} 正在拟定证型与方药…`;
+    case "s3_done": {
+      // 没流式的时候**把原因说出来**（后端不支持 / 是模拟的 / best-of-N），
+      // 不然界面上只是"没有增量"，看不出是不是卡了。
+      if (!data.events) {
+        return `　${data.physician_name} 输出完成（无增量${data.streaming_note ? "：" + data.streaming_note : ""}）`;
+      }
+      const first = data.first_delta_s == null ? "—" : `${data.first_delta_s}s`;
+      return `　${data.physician_name} 输出完成：${data.events} 帧流式，首字 ${first}，` +
+        `正文 ${data.chars_content} 字${data.chars_reasoning ? `，思考 ${data.chars_reasoning} 字` : ""}`;
+    }
     case "physician_done":
       return `✓ ${data.physician_name} 完成：${data.syndrome}`;
     case "followup_answered":
@@ -2443,6 +2511,13 @@ async function submitConsult() {
         errorDetail = data.detail;
       } else if (name === "done") {
         doneData = data;
+      } else if (name === "s3_delta") {
+        // R36：增量**不进日志**（几十帧会把日志顶得看不见），只刷流式区。
+        onS3Delta(data);
+      } else if (name === "heartbeat") {
+        // 心跳的全部作用是"别把这条连接当空闲连接掐掉"（见 api/main.py
+        // _HEARTBEAT_SECONDS）。armWatchdog() 上面已经调过了，这里什么都不做
+        // ——写进日志会每 15 秒刷一行噪音。
       } else {
         const line = describeProgressEvent(name, data);
         if (line) appendProgress(line);

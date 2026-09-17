@@ -1005,6 +1005,18 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
 
 ANSWER_TIMEOUT_SECONDS = 300  # 没人回答时的兜底：不能让后台线程无限期挂着
 _STREAM_POLL_SECONDS = 0.05  # 生成器轮询事件队列的间隔，见 _ConsultStream 文档
+#: R36：多久没有事件就发一帧心跳。
+#:
+#: 为什么要它：一次问诊里 S3 那一步要等几十秒，这期间**一个字节都不发**。
+#: nginx 的 `proxy_read_timeout` 默认 60 秒、多数 CDN / 反代在 30~120 秒之间掐
+#: 空闲连接——掐掉的表现是浏览器那边流突然结束、没有 error 事件、没有 done 事件，
+#: 前端只能显示"转圈转到底"。15 秒是最紧的那个默认值（30 秒）的一半，留一倍余量。
+#:
+#: 发的是**一个真事件**而不是 SSE 注释行（`: ping`）：注释行前端看不见，
+#: "还在跑"这件事就只能靠转圈暗示；而 heartbeat 事件带着已等待秒数，
+#: 界面能说"已等待 42 秒"。老前端不认这个事件名也无害
+#: （`describeProgressEvent` 对未知事件返回 null，不进日志、不报错）。
+_HEARTBEAT_SECONDS = 15.0
 
 
 class StreamClosed(Exception):
@@ -1184,14 +1196,23 @@ def api_consult_stream(
             # 发现对不上；而另起一帧会改事件顺序，那个顺序有契约测试守着
             # （test_stream_id_arrives_first_then_progress_then_done）。
             yield _sse("stream_id", {"stream_id": stream.stream_id, "usage": usage_snapshot})
+            t_open = time.monotonic()
+            last_sent = t_open
             while True:
                 try:
                     name, data = stream.events_q.get_nowait()
                 except queue.Empty:
+                    now = time.monotonic()
+                    if now - last_sent >= _HEARTBEAT_SECONDS:
+                        # 心跳只在**真的没别的东西可发**的时候发：它的作用是"别把
+                        # 这条连接当空闲连接掐掉"，不是定时汇报。
+                        last_sent = now
+                        yield _sse("heartbeat", {"elapsed_s": round(now - t_open, 1)})
                     await asyncio.sleep(_STREAM_POLL_SECONDS)
                     continue
                 if name is None:
                     return
+                last_sent = time.monotonic()
                 yield _sse(name, data)
         finally:
             # 正常收尾时后台线程早已结束，置位无害；客户端断开时 Starlette 取消

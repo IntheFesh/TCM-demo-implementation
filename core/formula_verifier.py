@@ -51,6 +51,7 @@ veto（不可下发，残余不发）：
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from typing import Literal
 
@@ -624,6 +625,51 @@ def herbs_grounded_ratio(s3: _S3StructuredBase) -> float:
     return s3.herbs_grounded_ratio()
 
 
+#: `_corpus_herb_counts` 的缓存：{(路径, mtime_ns, size): Counter}。
+#: 进程级、只增不清（一次运行里语料最多换一两次），带锁是因为 api/main.py
+#: 是多线程并发问诊。
+_corpus_counts_cache: dict = {}
+_corpus_counts_lock = threading.Lock()
+
+
+def reset_corpus_counts_cache() -> None:
+    """清缓存。测试用——**不是**给业务代码用的：业务侧靠 (mtime, size) 自然失效。"""
+    with _corpus_counts_lock:
+        _corpus_counts_cache.clear()
+
+
+def _corpus_herb_counts(path, *, cache: bool = True):
+    """医案语料里每种归一药名出现多少次。缓存纪律见
+    `ontology_coverage_of_corpus` 的文档字符串。"""
+    import collections
+    import json
+
+    key = None
+    if cache:
+        try:
+            st = path.stat()
+            key = (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None            # stat 不了就不缓存，别为了缓存去猜一个键
+        if key is not None:
+            hit = _corpus_counts_cache.get(key)
+            if hit is not None:
+                return hit
+    from core.herbs import normalize_herb
+
+    counts: collections.Counter = collections.Counter()
+    for case in json.loads(path.read_text(encoding="utf-8")):
+        for raw in (case.get("herbs") or []):
+            name = normalize_herb(raw)
+            if name:
+                counts[name] += 1
+    # 空表不缓存（文件可能在进程起来之后才生成）
+    if key is not None and counts:
+        with _corpus_counts_lock:
+            _corpus_counts_cache[key] = counts
+    return counts
+
+
 def ontology_coverage_of_corpus(*, ontology: Ontology | None = None,
                                 cases_path=None) -> dict:
     """本体覆盖了医案语料里多少种药名。**这是数据质量指标，不是模型指标。**
@@ -635,24 +681,30 @@ def ontology_coverage_of_corpus(*, ontology: Ontology | None = None,
     同时报"按种数"和"按出现次数"两个比值：实测 230/578 = 39.8%（按种数）
     但 3380/4799 = 70.4%（按次数）——常用药覆盖得好，古籍特有写法的长尾覆盖差。
     只报前者会低估它对真实问诊的支撑，只报后者会掩盖长尾缺口。
-    """
-    import collections
-    import json
-    from pathlib import Path
 
-    from core.herbs import normalize_herb
+    ## 药名计数按文件签名缓存（R36 补）
+
+    这个函数每次 consult 都会被 manifest 调一次，而它要读 1MB 的 `cases.json`
+    再把 4799 次药名逐个归一——实测 **52ms/次**，纯属白花（语料不变时结果恒定）。
+
+    缓存的三条纪律跟 `context_prefix.build_entry_index` 那处一致：
+      1. **只缓存"从默认路径读全量语料"这一路**：调用方自己给了 `cases_path`
+         的那一路不碰缓存（测试常拿 tmp_path 造小语料，缓存会让下一个调用
+         读到别人的表）；
+      2. **空结果不缓存**：文件可能在进程起来之后才生成；
+      3. 键带上文件的 `(mtime_ns, size)`——重抽了语料就自然失效，那正是它该
+         失效的时机（同 `_prefix_tokens_or_none` 按 sha 记忆化的做法，只是这里
+         不必再读一遍文件算 sha）。
+    本体不进键：`ont.herb()` 的查表在缓存之外，换本体照样重算命中集合。
+    """
+    from pathlib import Path
 
     ont = ontology if ontology is not None else get_ontology()
     p = Path(cases_path) if cases_path else (
         Path(__file__).resolve().parent.parent / "cases.json")
     if not p.exists():
         return {"available": False, "note": f"{p.name} 不在，覆盖率算不了"}
-    counts: collections.Counter = collections.Counter()
-    for case in json.loads(p.read_text(encoding="utf-8")):
-        for raw in (case.get("herbs") or []):
-            name = normalize_herb(raw)
-            if name:
-                counts[name] += 1
+    counts = _corpus_herb_counts(p, cache=cases_path is None)
     if not counts:
         return {"available": False, "note": "语料里没有药名"}
     hit = [n for n in counts if ont.herb(n) is not None]
