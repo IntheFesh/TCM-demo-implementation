@@ -1,7 +1,13 @@
 .env
 __pycache__/
 *.pyc
-cases.json
+# cases.json 曾经在这里被整体忽略（没有注释、没有理由）。2026-09-17 改成入库：
+# 判据是 SOURCES.md 反复写的那条——**花过 API 钱的产物存，纯本地从版本控制里的
+# 输入能重算的不存**。它是 ¥2 + 15 分钟的 LLM 抽取产物，重算不出来；而同一天
+# data/standard/materia_medica.jsonl 正因为没入库、一次失败的抽取把 10248 条
+# 清成了 0 条、只能重花钱重抽。6.4MB 远在 GitHub 的单文件上限之内。
+# extract_warnings.json 留在忽略里：它是那次抽取的告警快照，随 cases.json 重生成，
+# 不构成独立证据。
 extract_warnings.json
 *.jsonl
 !data/standard/*.jsonl
