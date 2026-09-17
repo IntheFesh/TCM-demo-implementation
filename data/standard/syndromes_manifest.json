@@ -1,0 +1,13 @@
+{
+  "book": "中医内科学",
+  "generated_at": "2026-09-17T00:37:12Z",
+  "headings_bare_numbered": 38,
+  "layout": "neike",
+  "n_duplicate_name_disease_groups": 5,
+  "n_lines": 337,
+  "n_suspicious": 27,
+  "n_textbook": 320,
+  "ocr_fixes_sha256": "1a4e46d1d46e0abdebc63250da336fa7aacfff5973cfb401745351079a1613cf",
+  "parser_sha256": "541bec4fdb8de8ddfd3ce3654c23772f29641d7273a64f200d1ad5e489a32784",
+  "syndromes_sha256": "ccc7a2b8111fc62f3eba31fab605c465803d7ba47874eb59fca6b95ed3802dbc"
+}

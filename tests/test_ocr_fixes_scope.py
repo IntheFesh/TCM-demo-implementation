@@ -30,6 +30,7 @@ import pytest
 
 from offline.build_syndrome_textbook import (
     LAYOUTS,
+    OCR_ALL_BOOKS,
     OCR_FIXES_PATH,
     OCR_SCOPES,
     OcrFix,
@@ -43,11 +44,10 @@ ROOT = Path(__file__).resolve().parent.parent
 SYNDROMES = ROOT / "data" / "standard" / "syndromes.jsonl"
 
 # 重名组数（(name, disease) 撞在一起的组）的上限。**这个数只能降不能升。**
-# R29 之前是 30，R29 重新生成之后实测 **28**（两组是被解析器已有的改进解开的：
-# TB-102 阳痫证→阴痫证、TB-185 出血证→神昏证——落盘的那份 jsonl 是旧解析器的
-# 产物，重跑本身就会解开这两组，跟 OCR 表无关，见 R29 报告第七节）。
+# R29 之前 30 → R29 重新生成之后 28 → **R31 实测 5**（R31 把扫描件里四种证型
+# 标题写法统一成一处判定，33 条条目拿回了自己的名字）。
 # 升了说明解析器退化了——不是把这个上限抬高，是去查哪一步把名字弄丢了。
-AMBIGUOUS_GROUPS_CEILING = 28
+AMBIGUOUS_GROUPS_CEILING = 5
 
 
 def _write(tmp_path, text: str) -> Path:
@@ -58,7 +58,7 @@ def _write(tmp_path, text: str) -> Path:
 
 def _table(tmp_path, rows: str) -> Path:
     p = tmp_path / "f.tsv"
-    p.write_text("错\t对\t说明\tscope\n" + rows, encoding="utf-8")
+    p.write_text("错\t对\t说明\tscope\tbooks\n" + rows, encoding="utf-8")
     return p
 
 
@@ -317,8 +317,74 @@ def _committed_textbook_entries():
 
 
 def test_ocr_fix_is_a_named_tuple_so_the_columns_have_names():
-    """`(错, 对)` 二元组扩到四列之后，位置解包（`for w, r in fixes`）会静默错位。
+    """`(错, 对)` 二元组扩到五列之后，位置解包（`for w, r in fixes`）会静默错位。
     用命名元组：字段名写在代码里，错位当场报错。"""
-    f = OcrFix(wrong="a", right="b", why="c", scope="all")
+    f = OcrFix(wrong="a", right="b", why="c", scope="all", books=frozenset({OCR_ALL_BOOKS}))
     assert f.wrong == "a" and f.scope == "all"
-    assert tuple(f) == ("a", "b", "c", "all")
+    assert tuple(f) == ("a", "b", "c", "all", frozenset({OCR_ALL_BOOKS}))
+
+
+# ---------- R31：第五列 books ----------
+
+def test_a_row_without_a_books_column_applies_to_every_textbook(tmp_path):
+    """旧行只有四列。默认 `*` 是为了**行为逐字节不变**。"""
+    fixes = load_ocr_fixes(_table(tmp_path, "便唐\t便溏\t同上\tall\n"))
+    assert fixes[0].books == frozenset({OCR_ALL_BOOKS})
+    assert fixes[0].applies_to_book("waike") and fixes[0].applies_to_book(None)
+
+
+def test_the_two_single_character_rules_are_pinned_to_neike():
+    """**这一条是 R31 那件事的验收。**
+
+    「疽→疸」和「疤→疟」的安全依据是"《中医内科学》的这一列是闭集合、逐个核过"。
+    那个依据对外科教材**不成立**——那本书里「疽」（附骨疽、痈疽）本身就是病名。
+    R29 只把这件事写在说明列里，而说明列不拦任何东西。
+    """
+    single_char = [f for f in load_ocr_fixes() if len(f.wrong) == 1]
+    assert {f.wrong for f in single_char} == {"疽", "疤"}, [f.wrong for f in single_char]
+    for f in single_char:
+        assert f.books == frozenset({"neike"}), f"{f.wrong} 的 books 是 {sorted(f.books)}"
+
+
+def test_every_whole_word_rule_applies_to_all_textbooks():
+    """整词错字在任何中医文本里都是错的，安全性不依赖哪本书——只有单字规则才钉书名。
+    这条反过来盯着"别给整词规则也钉上书名"（那会让五本专科教材白白留着错字）。"""
+    for f in load_ocr_fixes():
+        if len(f.wrong) > 1:
+            assert f.books == frozenset({OCR_ALL_BOOKS}), f"{f.wrong} 被钉在 {sorted(f.books)}"
+
+
+def test_the_neike_only_rule_does_not_fire_on_another_textbook():
+    assert apply_ocr_fixes("诸疽", scope="disease", book="neike") == "诸疸"
+    assert apply_ocr_fixes("诸疽", scope="disease", book="waike") == "诸疽"
+    assert apply_ocr_fixes("痈疽", scope="disease", book="waike") == "痈疽"
+    # 整词规则在任何一本下都生效
+    assert apply_ocr_fixes("大便唐薄", book="waike") == "大便溏薄"
+
+
+def test_not_passing_a_book_means_no_book_filtering():
+    """`book=None` = 不限教材，所有条目都参与。限定了教材的条目在不传教材的
+    调用里**静默失效**比误伤更糟——单测和历史调用方都不传。"""
+    assert apply_ocr_fixes("诸疽", scope="disease") == "诸疸"
+
+
+def test_an_unknown_book_is_rejected_at_load_time(tmp_path):
+    with pytest.raises(ValueError, match="认不出的教材"):
+        load_ocr_fixes(_table(tmp_path, "疽\t疸\t形近字\tdisease\tzhongyi\n"))
+
+
+def test_an_unknown_book_is_rejected_at_apply_time():
+    with pytest.raises(ValueError, match="LAYOUTS"):
+        apply_ocr_fixes("黄疽", scope="disease", book="zhongyi")
+
+
+def test_parse_textbook_passes_the_layout_key_as_the_book():
+    """`parse_textbook` 必须把教材 key 传下去——不传的话 books 这一列等于没写。"""
+    src = open("offline/build_syndrome_textbook.py", encoding="utf-8").read()
+    body = src[src.index("def parse_textbook("):src.index("\ndef load_committed_textbook_entries")]
+    assert body.count("apply_ocr_fixes(") == body.count("book=lay.key") == 4
+
+
+@pytest.mark.parametrize("key", sorted(LAYOUTS))
+def test_every_layout_key_is_a_legal_book_value(key):
+    assert apply_ocr_fixes("测试", book=key) == "测试"

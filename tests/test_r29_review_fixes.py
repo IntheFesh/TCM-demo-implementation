@@ -109,18 +109,24 @@ def test_syndrome_posterior_still_builds_its_own_indexes_when_not_given():
 
 # ---------- 3. 融合后的内层循环跟教科书公式逐位相同 ----------
 
-def _reference_candidates(store, current_elements, physician=None):
-    """**教科书写法**：先建两条分布的字典，再各求一次熵、各求一次 argmax。
+def _reference_candidates(store, current_elements, physician=None, **posterior_kw):
+    """**教科书写法**：先建两条 177 元素的分布字典，再各求一次熵、各求一次 argmax。
 
-    这就是 R29 优化之前 `question_candidates` 内层循环的形状。放在测试里重写一遍
+    这就是 R30 优化之前 `question_candidates` 内层循环的形状。放在测试里重写一遍
     是为了让"优化没改数"这件事有判据——不是靠 git 历史里那一版比对
     （那个比对跑过一次，但它不会在下一次改动时自动重跑）。
+
+    返回值里 `nums_yes` / `nums_no` 是**未除以 p_yes / p_no 的分子**，
+    下面那条判据要用它区分"真的选错了"和"两个候选差 1 个 ulp"。
     """
     index = tools._syndrome_index(store)
     symptom_weights = tools._symptom_index(store, physician)
+    # `posterior_kw` 转发 asserted_symptoms / denied_symptoms / disease_hint
+    # ——不转发的话参考实现算的是**没有追问答案的先验**，跟 `question_candidates`
+    # 比出来会是"1056 条全不一样"，那不是分叉结论的问题，是比错了对象。
     posterior = tools.syndrome_posterior(
         current_elements, store, physician=physician,
-        index=index, symptom_weights=symptom_weights,
+        index=index, symptom_weights=symptom_weights, **posterior_kw,
     )
     prior_entropy = tools._entropy(posterior.values())
     out = {}
@@ -140,36 +146,106 @@ def _reference_candidates(store, current_elements, physician=None):
               - p_no * tools._entropy(post_no.values()))
         if ig <= tools.MIN_INFORMATION_GAIN:
             continue
-        out[name] = (
-            round(ig, 4), round(p_yes, 3),
-            index[max(post_yes, key=post_yes.get)]["name"],
-            index[max(post_no, key=post_no.get)]["name"],
-        )
+        out[name] = {
+            "ig": round(ig, 4),
+            "raw_ig": ig,
+            "p_yes": round(p_yes, 3),
+            "if_yes_top": index[max(post_yes, key=post_yes.get)]["name"],
+            "if_no_top": index[max(post_no, key=post_no.get)]["name"],
+            "nums_yes": sorted((posterior[c] * p_yes_given[c] for c in posterior), reverse=True),
+            "nums_no": sorted((posterior[c] * (1 - p_yes_given[c]) for c in posterior), reverse=True),
+        }
     return out
 
 
 @pytest.mark.parametrize("elements", [["肝", "胃"], ["脾", "湿"], ["心"], []])
-def test_the_fused_ig_loop_matches_the_textbook_formula_bit_for_bit(elements):
-    """**这一条是那次优化的验收。**
+def test_the_prefix_sum_ig_matches_the_textbook_formula(elements):
+    """**这一条是 R30 融合循环 + R31 前缀和两次优化的共同验收。**
 
-    融合后的循环把两条后验分布、两个熵、两个 argmax 在同一遍里算完，省掉每个
-    候选 4 次 177 元素的列表分配。每个元素的浮点运算和求和次序跟教科书写法一样
-    （`-sum(v·log2 v)` 展开成逐项 `-= v·log2(v)`，IEEE 下取负是精确的），
-    所以 `ig` 不会在 MIN_INFORMATION_GAIN 门槛上跳变——**逐位相同，不是约等于**。
-    用 `==` 比浮点在这里是对的：判据正是"一位都不许差"。
+    R31 把内层从 O(证候数) 降到 O(这个症状实际指向的证候数)：未列出的证候一律取
+    同一个常数 q，那一整块用两个前缀和（Σp·log2 p、Σp）两次乘加算完。
+    **数学上等价，浮点上不逐位相同**（R30 那一版是逐位相同的，R31 起不是了）。
+    所以判据从"逐位相同"改成三条：
+
+      - `round(ig, 4)`、`p_yes`、**候选集合与整个排名**逐条相同；
+      - 未取整的 ig 相对差 < 1e-10（实测最大 2.2e-11）；
+      - 分叉结论（`if_yes_top` / `if_no_top`）相同，**除了并列到 1 ulp 的那几条**
+        ——见下面那条单独的判据。
+
+    门槛 `MIN_INFORMATION_GAIN` 是 1e-6，而扰动是 1e-14 量级，比门槛小 8 个数量级；
+    候选集合逐条相同这一条就是在盯它。
     """
     store = get_graph_store()
     assert store is not None
     expected = _reference_candidates(store, elements)
-    got = {
-        c["symptom"]: (c["information_gain"], c["p_yes"], c["if_yes_top"], c["if_no_top"])
-        for c in tools.question_candidates(elements, k=10_000)
-    }
-    # 安全症状可能被插队到队首，但它本来就在 scored 里，键集不受影响
+    got = {c["symptom"]: c for c in tools.question_candidates(elements, k=10_000)}
+
     assert set(got) == set(expected), \
         f"候选集合变了：多 {sorted(set(got) - set(expected))[:5]}，少 {sorted(set(expected) - set(got))[:5]}"
-    diff = {k: (expected[k], got[k]) for k in expected if expected[k] != got[k]}
-    assert not diff, f"{len(diff)} 条的 IG / p_yes / 分叉结论变了：{list(diff.items())[:3]}"
+    for name, exp in expected.items():
+        assert got[name]["information_gain"] == exp["ig"], name
+        assert got[name]["p_yes"] == exp["p_yes"], name
+        # 对外只暴露取整到 4 位的 ig，所以这里只能比"取整值是不是参考裸值的
+        # 忠实舍入"——**绝对界 5e-5（半个舍入步长）**，不能用相对差：
+        # ig 小到 1e-4 量级时，舍入本身就是 50% 的相对差，跟算法差异无关。
+        assert abs(got[name]["information_gain"] - exp["raw_ig"]) <= 5e-5, name
+
+    # 排名（IG 降序、同分按症状名）逐条相同
+    rank_exp = sorted(expected, key=lambda n: (-expected[n]["ig"], n))
+    rank_got = sorted(got, key=lambda n: (-got[n]["information_gain"], n))
+    assert rank_exp == rank_got, "排名变了"
+
+
+@pytest.mark.parametrize("elements,kw", [
+    (["肝", "胃"], {}),
+    (["肝"], {"asserted_symptoms": ["口苦"], "denied_symptoms": ["口渴"]}),
+])
+def test_a_differing_branch_conclusion_only_happens_on_a_one_ulp_tie(elements, kw):
+    """**分叉结论只在"两个候选差 1 个 ulp"时才会跟教科书写法不同。**
+
+    实测那一组（证素「肝」+ 肯定「口苦」+ 否认「口渴」）：1056 个候选里有 3 条不同。
+    逐条打出来之后是这个形状——「烦躁易怒」的前三名分子是
+
+        肝胃郁热证 0.0099638125613346565507
+        气郁发热证 0.0099638125613346565507
+        肝阳上亢证 0.0099638125613346548159   ← 小 1 个 ulp
+
+    除以 p_yes 之后三个**舍入到同一个 float**，教科书写法"按下标顺序扫、
+    严格大于才换"于是选了下标最小的肝阳上亢证；R31 比的是**分子**
+    （不含 p_yes，所以不受 p_yes 怎么加出来的影响），选了分子确实最大的那个。
+
+    **两个答案都站得住，新的更贴近数学意图**；而真正该被记住的是：
+    并列到 1 ulp 时"这个问题偏向哪个证候"本身不是一个有意义的区分
+    ——那 3 条的正确读法是"好几个候选分不开"，而这个字段表达不了。
+    记在 R31 报告第五节。
+    """
+    store = get_graph_store()
+    posterior_kw = {k: v for k, v in kw.items()
+                    if k in ("asserted_symptoms", "denied_symptoms", "disease_hint")}
+    expected = _reference_candidates(store, elements, physician=kw.get("physician"),
+                                     **posterior_kw)
+    got = {c["symptom"]: c for c in tools.question_candidates(elements, k=10_000, **kw)}
+    # 只比两边都有的：传了 asserted/denied 时 `question_candidates` 会把已经问过的
+    # 症状从候选池里去掉（「口苦」把「口干或口苦」也匹配掉了），而参考实现不做这一步。
+    shared = set(expected) & set(got)
+    assert shared, "两边没有共同候选，这条判据测不到东西"
+    differing = [n for n in shared
+                 if (got[n]["if_yes_top"], got[n]["if_no_top"])
+                 != (expected[n]["if_yes_top"], expected[n]["if_no_top"])]
+    assert len(differing) <= 3, f"分叉结论不同的候选有 {len(differing)} 条：{differing[:6]}"
+    for n in differing:
+        # **只查真的变了的那一侧**：「烦躁易怒」只有 if_yes_top 变了，
+        # 它的 nums_no 前两名差 0.89（完全不并列），一起查会假红。
+        for key, field in (("nums_yes", "if_yes_top"), ("nums_no", "if_no_top")):
+            if got[n][field] == expected[n][field]:
+                continue
+            top = expected[n][key][:2]
+            assert len(top) == 2, n
+            gap = (top[0] - top[1]) / top[0] if top[0] else 0.0
+            assert gap < 1e-15, (
+                f"{n} 的 {key} 前两名差 {gap:.2e}，不是 1 ulp 量级"
+                "——这说明分叉结论真的选错了，不是并列"
+            )
 
 
 def test_the_inner_loop_has_no_per_candidate_list_allocation():

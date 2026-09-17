@@ -28,7 +28,7 @@ import threading
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,10 @@ from core.graph.store import NetworkXStore
 from core.herbs import normalize_herb
 from core.physicians import physician_choices_text, resolve_physician_id
 from core.schemas import MateriaMedicaPredicate, ReferenceSource
+# 模块级导入：`core.syndrome_norm` 不导入 core 里的任何东西，没有循环。
+# R31 之前这一句写在 `_symptom_text_matches` 函数体里，而那个函数在一次
+# `check_residual` 里被调用三千多次——函数内 import 每次都要查一遍 sys.modules。
+from core.syndrome_norm import normalize as _syndrome_canonical
 
 ROOT = Path(__file__).resolve().parent.parent
 GRAPH_PATH = ROOT / "data" / "graph.json"
@@ -574,7 +578,24 @@ def _symptom_fragments(name: str) -> list[str]:
     return [p for p in parts if len(p) >= 2 and p not in _GENERIC_FRAGMENTS]
 
 
-def _symptom_text_matches(name: str, patient_symptom: str) -> bool:
+class SymptomMatchKeys(NamedTuple):
+    """一个标准症状名的匹配材料。**只取决于 `name`**，所以按名字算一次就够。
+
+    批量匹配（`_match_graph_symptoms_many`）拿它省掉的是这个乘法：图里一千多个
+    标准症状名 × 患者症状条数，每一对都要切一次并列片段、查一次 SYNONYMS。
+    按名字算一次之后是"名字数"次，不是"名字数 × 患者症状数"次。
+    """
+
+    fragments: list[str]
+    concepts: frozenset[str]
+
+
+def _match_keys(name: str) -> SymptomMatchKeys:
+    return SymptomMatchKeys(_symptom_fragments(name), frozenset(_syndrome_canonical(name)))
+
+
+def _symptom_text_matches(name: str, patient_symptom: str,
+                          keys: SymptomMatchKeys | None = None) -> bool:
     """标准症状名（或三元组里的症状文本）跟患者原话对不对得上：双向包含，
     对不上再按并列片段试一次，字面都够不到再查一遍 core.syndrome_norm 的
     SYNONYMS 表。**全模块唯一的症状文本匹配器**——_match_graph_symptoms 和
@@ -600,25 +621,52 @@ def _symptom_text_matches(name: str, patient_symptom: str) -> bool:
         return False
     if name in patient_symptom or patient_symptom in name:
         return True
-    if any(f in patient_symptom for f in _symptom_fragments(name)):
+    k = keys if keys is not None else _match_keys(name)
+    if any(f in patient_symptom for f in k.fragments):
         return True
-    from core.syndrome_norm import normalize as _syndrome_canonical
+    # `k.concepts` 为空时**不必**再算患者那一侧——省掉的是那一整遍 SYNONYMS 扫描，
+    # 而绝大多数标准症状名在 SYNONYMS 里没有条目。
+    return bool(k.concepts) and bool(k.concepts & _syndrome_canonical(patient_symptom))
 
-    name_concepts = _syndrome_canonical(name)
-    return bool(name_concepts) and bool(name_concepts & _syndrome_canonical(patient_symptom))
+
+def _match_graph_symptoms_many(
+    store: NetworkXStore, patient_symptoms: list[str]
+) -> dict[str, list[str]]:
+    """一次匹配多条患者原话 -> {患者原话: [图里的标准症状节点 id]}。
+
+    **为什么要有批量版**：图里一千多个标准症状名，逐条患者症状各扫一遍的话，
+    每个名字的并列片段和 SYNONYMS 概念会被重算"患者症状条数"次。
+    `check_residual` 一次传三五条症状，那就是三五倍的重复计算。
+    这里把"按名字算一次"提到外层循环——**不是加缓存**，是把循环嵌套的顺序换过来。
+
+    同名的患者症状只算一次（用 dict 收结果），返回的 id 顺序跟
+    `store.find_nodes("symptom")` 的遍历顺序一致，跟单条版逐字节相同。
+    """
+    out: dict[str, list[str]] = {s: [] for s in patient_symptoms}
+    if not out:
+        return out
+    wanted = list(out)
+    for sym_id in store.find_nodes("symptom"):
+        name = (store.get_node(sym_id) or {}).get("name", "")
+        if not name:
+            continue
+        keys = _match_keys(name)
+        for s in wanted:
+            if _symptom_text_matches(name, s, keys):
+                out[s].append(sym_id)
+    return out
 
 
 def _match_graph_symptoms(store: NetworkXStore, patient_symptom: str) -> list[str]:
     """患者原话 -> 图里的标准症状节点 id。刻意只做字面（片段级双向包含）匹配，
     不引入向量相似度：这一层必须离线可跑、确定性可测。匹配不上的症状会被单独
     报成 off_graph，而不是默默算进"未解释"——把"图里没有这个词"和"这个症状
-    确实没被证素解释"混为一谈，会把覆盖率算成一个假数。"""
-    hits = []
-    for sym_id in store.find_nodes("symptom"):
-        name = (store.get_node(sym_id) or {}).get("name", "")
-        if _symptom_text_matches(name, patient_symptom):
-            hits.append(sym_id)
-    return hits
+    确实没被证素解释"混为一谈，会把覆盖率算成一个假数。
+
+    **是批量版的一层投影**，不是第二份实现（CLAUDE.md 第 31 条）：
+    单条和多条走的是同一个循环，不会出现"两个工具对同一个词给出相反答案"。
+    """
+    return _match_graph_symptoms_many(store, [patient_symptom])[patient_symptom]
 
 
 def check_residual(symptoms: list[str], elements: list[str] | None = None) -> dict:
@@ -629,8 +677,9 @@ def check_residual(symptoms: list[str], elements: list[str] | None = None) -> di
     element_ids = {f"element::{e}" for e in elements}
 
     explained, unexplained, off_graph = [], [], []
+    matched_by_symptom = _match_graph_symptoms_many(store, symptoms)
     for s in symptoms:
-        matched = _match_graph_symptoms(store, s)
+        matched = matched_by_symptom[s]
         if not matched:
             off_graph.append(s)
             continue
@@ -1004,8 +1053,8 @@ def syndrome_posterior(
 
     `index` / `symptom_weights` 是**已经算好的两张索引**，不传就自己算。
     加这两个参数是为了去掉一次重复扫图：`question_candidates` 先调这个函数拿
-    后验、再自己建同样的两张索引，于是 `_symptom_index`（扫 1115 个症状节点的
-    全部 indicates 边）和 `_syndrome_index` 在一次追问里各跑两遍。
+    后验、再自己建同样的两张索引，于是 `_symptom_index`（扫全部症状节点的
+    indicates 边，R31 实测 1087 个）和 `_syndrome_index` 在一次追问里各跑两遍。
     传参而不是给它们加缓存——**这两张索引的内容完全由 (store, physician) 决定，
     调用方手里就有，没有必要为此引进一层缓存**（CLAUDE.md：demo 阶段不加缓存）。
     """
@@ -1117,7 +1166,8 @@ def question_candidates(
 
     # **两张索引在这里各建一次，然后传给 syndrome_posterior。**
     # 原来的写法是先调 syndrome_posterior（它自己建一遍），回来再建一遍——
-    # `_symptom_index` 要扫 1115 个症状节点的全部 indicates 边，一次追问白扫两遍。
+    # `_symptom_index` 要扫全部症状节点的 indicates 边（R31 实测 1087 个），
+    # 原来一次追问白扫两遍。
     index = _syndrome_index(store)
     symptom_weights = _symptom_index(store, physician)
     posterior = syndrome_posterior(
@@ -1138,8 +1188,8 @@ def question_candidates(
         + list(denied_symptoms or [])
     known_ids = {
         sym_id
-        for ks in all_known
-        for sym_id in _match_graph_symptoms(store, ks)
+        for ids in _match_graph_symptoms_many(store, all_known).values()
+        for sym_id in ids
     }
     known_names = {(store.get_node(i) or {}).get("name") for i in known_ids}
     pool = [
@@ -1159,60 +1209,110 @@ def question_candidates(
     # 顺序跟 `posterior` 的迭代顺序一致，所以每一步的浮点运算次序**逐位不变**
     # ——这是纯粹去掉字典哈希开销，不是换算法（换算法会让 `ig` 在
     # MIN_INFORMATION_GAIN 门槛上的边界候选跳变）。
+    # ---------- 前缀和：内层从 O(证候数) 降到 O(这个症状实际指向的证候数) ----------
+    #
+    # **为什么可以这样算。** 一个症状对某个证候的似然 g_c 只有两种来源：
+    # 它在这个证候的 indicates 边上（`weights` 里有这个 code），或者没有——没有的
+    # 一律取钳位后的 `P_UNLISTED`，**同一个常数 q**。实测：图里一千多个症状平均只
+    # 指向 3 个证候（3282 条 indicates 边 / 1087 个症状节点），所以 174 个证候里
+    # 171 个走的是同一个 q。
+    #
+    # 记 S = 这个症状列出了的证候，U = 其余。对 U 里每个 c：
+    #   post_yes_c = p_c·q/p_yes = p_c·ry        （ry = q/p_yes，与 c 无关）
+    #   −Σ_U v·log2 v = −ry·Σ_U p_c·log2 p_c − ry·log2(ry)·Σ_U p_c
+    # 而 Σ_U p_c·log2 p_c = A − A_S、Σ_U p_c = B − B_S，A/B 是全集的量、**只算一次**。
+    # 所以 U 那一整块退化成两次乘加，不必逐个遍历。post_no 同理（rn = (1−q)/p_no）。
+    #
+    # **数学上等价，浮点上不逐位相同。** 实测（1087 个候选 × 6 组证素）：
+    # `round(ig, 4)`、`p_yes`、两个分叉结论、以及**整个排名**全部一致；
+    # 未取整的 ig 最大绝对差 3.3e-14、相对差 2.2e-11。
+    # 唯一的理论风险是 `ig <= MIN_INFORMATION_GAIN`（1e-6）这道门槛上的边界候选
+    # ——扰动比门槛小 8 个数量级，实测 6 组证素下候选集合一条不差。
+    # 判据在 tests/test_r29_review_fixes.py：跟教科书写法比排名和取整后的值。
     codes = list(posterior)
     priors = [posterior[c] for c in codes]
-    n_codes = len(codes)
-    # 未列出的证候一律取钳位后的 P_UNLISTED。1115 个症状里绝大多数只指向一两个
-    # 证候，所以这个常量是内层循环的**绝对多数分支**——预先算一次，省掉
-    # 每个元素两次 min/max 调用。值跟 `min(max(P_UNLISTED, P_UNLISTED), P_MAX)`
+    pos = {c: i for i, c in enumerate(codes)}
+    log2 = math.log2          # 局部绑定：这几行在内层循环里被调用几万次
+    # 未列出的证候一律取钳位后的 P_UNLISTED。值跟 `min(max(P_UNLISTED, P_UNLISTED), P_MAX)`
     # 逐位相同，不是近似。
-    p_unlisted_clamped = min(max(P_UNLISTED, P_UNLISTED), P_MAX)
-    log2 = math.log2          # 局部绑定：这一行在内层循环里被调用约 40 万次
+    q = min(max(P_UNLISTED, P_UNLISTED), P_MAX)
+    total_p = sum(priors)
+    total_plogp = sum(p * log2(p) for p in priors if p > 0)
+    # U 里 prior 最大的那个下标。`post_yes` 和 `post_no` 在 U 上都是 prior 的单调
+    # 增函数，所以两边的 argmax 是同一个；平局取下标小的，跟原来
+    # 「按迭代顺序扫、严格大于才换」的解法一致。
+    by_prior_desc = sorted(range(len(codes)), key=lambda i: (-priors[i], i))
     scored = []
     for name in pool:
         weights = symptom_weights[name]
-        w_get = weights.get
-        p_yes_given = [p_unlisted_clamped if (g := w_get(code)) is None
-                       else min(max(g, P_UNLISTED), P_MAX)
-                       for code in codes]
-        p_yes = sum(pr * g for pr, g in zip(priors, p_yes_given))
+        listed = sorted((pos[c], min(max(g, P_UNLISTED), P_MAX))
+                        for c, g in weights.items() if c in pos)
+        b_s = 0.0
+        a_s = 0.0
+        yes_from_s = 0.0
+        for i, _g in listed:
+            p = priors[i]
+            b_s += p
+            if p > 0:
+                a_s += p * log2(p)
+        for i, g in listed:
+            yes_from_s += priors[i] * g
+        p_yes = yes_from_s + q * (total_p - b_s)
         p_no = 1.0 - p_yes
         if p_yes <= 0 or p_no <= 0:
             continue
-        # **两个后验分布、两个熵、两个 argmax 在同一遍里算完。**
-        # 原来的写法是先建 post_yes / post_no 两条 177 元素的列表，再各扫一遍求熵、
-        # 各扫一遍求 argmax——1115 个候选就是 4 次 × 177 次分配。
-        # 每个元素的浮点运算和求和次序跟原来完全一样（`-sum(v*log2 v)` 展开成
-        # 逐项 `-= v*log2(v)`，IEEE 下取负是精确的，结果逐位相同），
-        # 所以 `ig` 不会在 MIN_INFORMATION_GAIN 门槛上跳变。
+        # S 那一段逐个算（平均 3 项），顺带记下 S 内的 argmax
+        #
+        # **argmax 比的是分子 `p·g`，不是商 `p·g/p_yes`。** 两者的数学序完全一样
+        # （p_yes > 0 是公共除数），但分子**不含 p_yes**，于是"谁赢"不再取决于
+        # p_yes 是怎么加出来的。这一点是实测逼出来的：主诉证素「肝」+ 肯定「口苦」+
+        # 否认「口渴」时，「大便秘结」这一条的三个候选证候
+        # （热重于湿证 0.0099636 / 气郁化火证 同值 / 肝阳上亢证 0.0099638）
+        # 分子差在 1 个 ulp 上，比商的话前缀和算出的 p_yes 跟全量求和差 1e-17,
+        # 就足够让"谁赢"翻过来——**一个 1 ulp 决定的展示字段**。
+        # 比分子把这份敏感性去掉了：它只剩原本就存在的"三个候选确实几乎相等"。
         ent_yes = ent_no = 0.0
-        iy = in_ = 0
+        iy = in_ = -1
         best_y = best_n = -1.0
-        for i in range(n_codes):
-            pr = priors[i]
-            g = p_yes_given[i]
-            vy = pr * g / p_yes
-            vn = pr * (1 - g) / p_no
+        for i, g in listed:
+            p = priors[i]
+            vy = p * g / p_yes
+            vn = p * (1 - g) / p_no
             if vy > 0:
                 ent_yes -= vy * log2(vy)
             if vn > 0:
                 ent_no -= vn * log2(vn)
-            # 严格大于：平局取迭代顺序里第一个，跟 `max(dict, key=dict.get)` 一致
-            if vy > best_y:
-                best_y, iy = vy, i
-            if vn > best_n:
-                best_n, in_ = vn, i
+            num_y = p * g
+            num_n = p * (1 - g)
+            if num_y > best_y:
+                best_y, iy = num_y, i
+            if num_n > best_n:
+                best_n, in_ = num_n, i
+        # U 那一整块：两次乘加
+        ry = q / p_yes
+        rn = (1.0 - q) / p_no
+        rest_plogp = total_plogp - a_s
+        rest_p = total_p - b_s
+        ent_yes += -ry * rest_plogp - ry * log2(ry) * rest_p
+        ent_no += -rn * rest_plogp - rn * log2(rn) * rest_p
         ig = prior_entropy - p_yes * ent_yes - p_no * ent_no
         # 这道 MIN_INFORMATION_GAIN 门槛对安全相关症状也照样生效，不单独放宽——
-        # 见下面挑选阶段那段注释：放宽到"不管跟当前证候有没有关系，图里存在就必问"
-        # 试过，会把追问的三轮预算全耗在跟当前主诉毫不相关的危重症状排查上
-        # （实测：主诉"两胁胀满"、证素范围胃/肝/气滞时，"不省人事""突然昏厥"这类
-        # 跟脾胃门八竿子打不着的安全词条也会被塞进候选，三轮问完一条本该问的
-        # 「两胁胀满」都没问上）。这里保留的约束只是"图区分得开当前候选证候"，
-        # 危重症状只要对当前证素范围有哪怕很小的区分度就够格，不要求它赢得
-        # IG 排名。
+        # 见下面挑选阶段那段注释。
         if ig <= MIN_INFORMATION_GAIN:
             continue
+        # U 里的最大值参与 argmax。listed 覆盖全部证候时没有 U（实测不会发生：
+        # 一个症状指向 174 个证候才可能），那时 next() 给 None。
+        listed_idx = {i for i, _ in listed}
+        u_best = next((i for i in by_prior_desc if i not in listed_idx), None)
+        if u_best is not None:
+            p = priors[u_best]
+            num_y, num_n = p * q, p * (1.0 - q)
+            # 严格大于 + U 的下标可能比 S 的小，所以平局时要取下标小的那个
+            # （原来的写法是按下标顺序扫全集、严格大于才换，等价于"并列取下标最小"）
+            if num_y > best_y or (num_y == best_y and u_best < iy):
+                best_y, iy = num_y, u_best
+            if num_n > best_n or (num_n == best_n and u_best < in_):
+                best_n, in_ = num_n, u_best
         top_yes = codes[iy]
         top_no = codes[in_]
         scored.append({
@@ -1243,7 +1343,7 @@ def question_candidates(
     scored.sort(key=lambda d: (-d["information_gain"], d["symptom"]))
 
     # 安全相关症状不参与 IG 排名竞争。R2 教材扩表把症状候选池从 93 撑到一千多个
-    # （R29 实测 1115，这个数每重建一次图谱都会变，所以这里不写死）之后，吐血/便血/黑便这类危重症状即使跟当前证候确实相关（清得过上面那道
+    # （R31 实测 1087，这个数每重建一次图谱都会变，所以这里不写死）之后，吐血/便血/黑便这类危重症状即使跟当前证候确实相关（清得过上面那道
     # MIN_INFORMATION_GAIN 门槛），排名也很容易被成百上千个普通症状挤到 k 名
     # 开外——生产链路（core/followup.py::run_followup）固定 k=1、只取
     # candidates[0]，挤不进 top-k 就等于问不到，safety_relevant=True 那条

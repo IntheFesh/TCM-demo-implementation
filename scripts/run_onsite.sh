@@ -157,7 +157,7 @@ print_status() {
 # 成 212 之后剧本、说明文字、测试断言三处同时过期——现读就不会再有这种过期。
 SEGMENTS=(
   "0|0|n/a|环境自检|0|no|零成本：pytest / ruff / 环境变量残留 / 数据文件齐不齐"
-  "1|1|n/a|零调用的验证|0|no|凭据核对 / 本地语料规范化 / 切块验证（要人看原文）/ SDT 失分分析"
+  "1|1|n/a|零调用的验证|0|no|凭据核对 / **落盘证候表是否当前代码的产物** / 本地语料规范化 / 切块验证（要人看原文）/ SDT 失分分析"
   "2|2|n/a|本地模型|2|no|起 vLLM + verify_local_backend（直接 generate() 验后端，不走检索层）"
   "3|4|top3|R1 前提：role 填充率|60|YES|**不过就停**——填充率不够，分层 ε 三个数没有意义"
   "4|5|top3|R1 验收：噪声地板 ε|auto:eval/epsilon.json|no|预估调用数**现读** eval/epsilon.json（三段 llm_calls 之和）——ε 一重跑这个数就变，不写死。钉 top3：epsilon.json 里的历史值是这一系跑的"
@@ -361,6 +361,16 @@ PY
 
 seg_1() {
   python -m scripts.collect_results || return 1
+  echo
+  echo "--- 落盘的证候表是不是当前代码的产物（零调用，要教材 markdown）---"
+  echo "--- 退出码 3 = 拿不到教材、**这一项没核**，不是核过了没问题 ---"
+  python -m scripts.verify_generated_data
+  rc_gen=$?
+  if [ "$rc_gen" = "1" ]; then
+    echo "落盘的证候表不是当前代码的产物。按上面的命令重新生成，图谱也要跟着重建。"
+    return 1
+  fi
+  [ "$rc_gen" = "3" ] && echo "⚠ 这一项没核（没有教材 markdown）。上机前 clone TCM_Datasets 再跑一次。"
   echo
   echo "--- 本地语料规范化（幂等：第二遍就是没事做）---"
   python -m scripts.normalize_local_corpora || return 1

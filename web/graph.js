@@ -491,7 +491,7 @@ function describeNodeTooltip(data) {
       }
       case "syndrome": {
         const lines = [`<b>证型</b>　${escapeHtml(data.label)}${data.is_category ? "　（类目）" : ""}`];
-        // 病名单独一行。**177 个证候里 67 个重名**（「肝郁气滞证」分属腹痛/胁痛/
+        // 病名单独一行。**174 个证候里 52 个重名**（「肝郁气滞证」分属腹痛/胁痛/
         // 积聚/癃闭，病机各不同），label 里的括号是给图上一眼区分用的，
         // 这一行是给"到底属于哪个病"一个明确的位置。
         // 17 条国标条目没有 disease——那时**不出这一行**，不留一个空的「病名：」。
@@ -1495,7 +1495,7 @@ async function loadGraphBrowserData() {
     // 只能摊平，那张图不传达任何东西。
     //
     // 证素只有 20 个（实测 data/graph.json：element 20 / syndrome 178 /
-    // symptom 1115），而且**每个证型都挂在证素下面**——它们是这张图真正的
+    // symptom 1087），而且**每个证型都挂在证素下面**——它们是这张图真正的
     // 枢纽。首屏铺证素 = 首屏就有结构：点一个证素，它的证型长在外圈。
     //
     // limit 用 GB_ELEMENT_LIMIT 而不是写 20：证素数量是数据决定的

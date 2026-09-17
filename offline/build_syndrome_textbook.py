@@ -36,10 +36,12 @@ disease_hint 收窄候选池要用的锚点。也不跟原有 17 条做名字去
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -50,12 +52,90 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_PATH = ROOT / "data" / "standard" / "syndromes.jsonl"
 
 _DISEASE_RE = re.compile(r"^#\s*第[一二三四五六七八九十百]*节\s*(.+?)\s*$")
-_SYN_HEADING_RE = re.compile(r"^#\s*\d+[\.、]\s*(.+?)\s*$")
-_SYN_SUBITEM_RE = re.compile(r"^（\d+）\s*(.+?)\s*$")
-# 三个字段标签的正则现在按教材（TextbookLayout）现编，不再是模块级常量——
-# 五本专科教材的标签跟内科不一样，写死在模块级就只能服务一本。
+# ---------- 证型标题的四种写法（R31 统一成一处判定） ----------
+#
+# 扫描件把同一件事写成了四种形状，而 R31 之前只认头两种：
+#
+#   `# 1.胃中寒冷`     带 `#` 的编号项      237 行   R18 起就认
+#   `（3）肝火犯肺`     小项                 156 行   R18 起就认
+#   `# （4）肺阴亏虚`   带 `#` 的小项          1 行   **R31 新认**
+#   `1）痰热腑实`       丢了左括号的小项        1 行   **R31 新认**
+#   `7.痰火扰心`       **丢了行首 `#` 的编号项** 38 行  **R31 新认**
+#
+# **最后一种是"证型名被上一条复用"的主导根因**：`_SYN_HEADING_RE` 锚在 `#` 上，
+# 认不出原文第 2995 行的 `7.痰火扰心`，于是 TB-054 沿用了 TB-053 的名字。
+# R29 报出来的 61 条「名字疑似被上一条复用」全是这个机制。
+#
+# **为什么不能直接把 `#` 这个锚去掉**：不带 `#` 的编号行全文有 934 行，绝大多数是
+# 正文段落（`1.辨咳嗽由于邪阻于肺，肺失宣肃……` 几百字一行）。判据要另找，
+# 而且必须从原文量出来：
+#   - 句读：237 个带 `#` 的真标题里含句读的只有 10 个，全部在前言，证型标题一个
+#     都没有；正文段落必然含句读。**这是主力判据。**
+#   - 长度：237 个真标题里 217 个正文 ≤5 字，最长 16 字（前言那条
+#     「加强数字化建设，丰富拓展教材内容」）。取 ≤14 字兜底。
+# 两条一起筛，934 行剩 38 行，逐行核过：37 行是真证型标题，1 行是
+# `3.传统验痰法诊断法`（肺痈的诊断小节）——它后面没有紧跟「临床表现：」块，
+# 所以不产出条目，有判据盯着。
+#
+# **这两条判据只作用在"不带 `#` 的编号项"这一种形状上。** 带 `#` 的、
+# 带括号的三种形状本身就无歧义（正文段落不会以 `（1）` 开头），照旧不设门槛
+# ——给它们也加长度限制会把前言里那几条合法的长标题误杀。
+_HASH_PREFIX_RE = re.compile(r"^#\s*")
+_SYN_NUMBERED_RE = re.compile(r"^\d+[\.、]\s*(\S.*?)\s*$")
+_SYN_PAREN_RE = re.compile(r"^(?:（\d+）|\d+）)\s*(\S.*?)\s*$")
+_HEADING_MAX_LEN = 14
+# 只排句读，**不排「（」**：扫描件把分期小标题和编号项挤到同一行时会出现
+# `2.缓解期（1）肺虚` 这种，那是真标题（8 处，见 _strip_embedded_subitem）。
+_HEADING_PUNCT = frozenset("。，；：、？！,;:?!")
+# `2.缓解期（1）肺虚`：`缓解期` 是分期小标题、`（1）肺虚` 才是证型，取最后一个
+# `（N）` 之后的部分。实测只在"不带 `#` 的编号项"这一种形状上出现（8 处），
+# 带 `#` 的 237 个标题和 156 个 `（N）` 小项里一个都没有——统一施加是因为它
+# 对不含嵌入形式的标题是恒等变换，比分三种情况写三遍更不容易出错。
+_SYN_EMBEDDED_SUBITEM_RE = re.compile(r"^.*（\d+）\s*(\S.+)$")
 
-_ELEMENT_VOCAB = LOCATIONS + NATURES  # 匹配顺序：先长的病位/病性词，见下面的排序
+
+def _strip_embedded_subitem(text: str) -> str:
+    m = _SYN_EMBEDDED_SUBITEM_RE.match(text)
+    return m.group(1) if m else text
+
+
+# `syndrome_heading` 第二个返回值的取值。**报出来是为了盯那个启发式的一类**：
+# `bare_numbered` 的判据是长度 + 无句读，条数一变就说明原文排版跟当初量的那份
+# 不一样了，那时该重新逐行核一遍，不是调阈值。
+HEADING_HASH_NUMBERED = "hash_numbered"    # `# 1.胃中寒冷`     无歧义
+HEADING_PAREN = "paren"                    # `（3）肝火犯肺` / `# （4）…` / `1）…`  无歧义
+HEADING_BARE_NUMBERED = "bare_numbered"    # `7.痰火扰心`      **靠启发式判据**
+
+
+def syndrome_heading(line: str) -> tuple[str, str] | None:
+    """这一行是不是证型标题；是就返回 (证型名, 哪一类写法)，不是返回 None。
+
+    **全模块唯一的"这是不是证型标题"判定**（CLAUDE.md 第 31 条）——四种写法在
+    这里分流，不在 `parse_textbook` 的主循环里摊成四个分支。
+    返回写法类别而不是只返回名字：`bare_numbered` 那一类是启发式的，
+    调用方要能单独数它有多少条（见 `stats["headings_bare_numbered"]`）。
+    单独抽成函数也让判据可测：`tests/test_heading_anchor.py` 直接喂真实原文里
+    那 38 行、几条正文段落、和四种写法各自的样本。
+    """
+    s = line.strip()
+    had_hash = s.startswith("#")
+    if had_hash:
+        s = _HASH_PREFIX_RE.sub("", s, count=1)
+
+    m = _SYN_PAREN_RE.match(s)
+    if m:
+        return _strip_embedded_subitem(m.group(1)), HEADING_PAREN
+
+    m = _SYN_NUMBERED_RE.match(s)
+    if not m:
+        return None
+    text = m.group(1)
+    if had_hash:
+        return _strip_embedded_subitem(text), HEADING_HASH_NUMBERED
+    # 长度/句读两道门槛**只管这一种形状**，见上面那段注释
+    if len(text) > _HEADING_MAX_LEN or (_HEADING_PUNCT & set(text)):
+        return None
+    return _strip_embedded_subitem(text), HEADING_BARE_NUMBERED
 
 
 # ---------- R18-E：五本专科教材的排版差异 ----------
@@ -71,11 +151,21 @@ OCR_FIXES_PATH = ROOT / "data" / "standard" / "ocr_fixes.tsv"
 # 在另一列会把对的原文改错——所以规则必须能说清自己管哪一列。
 OCR_SCOPES = ("name", "disease", "symptom", "all")
 
+# 第五列 `books`：这一条只对哪几本教材成立。`*` = 所有教材。
+#
+# **为什么必须有这一列**：「疽→疸」限定在 disease 列，依据是《中医内科学》的病名
+# 是 51 个值的闭集合、里面没有一个合法含「疽」。**这个依据对《中医外科学》不成立**
+# ——那本书里「疽」（附骨疽、流注、痈疽）本身就是正式病名，这条规则会把它改成
+# 「疸」。R29 把这件事写在了那一行的说明列里，但**说明列是给人看的，不拦任何东西**：
+# 谁跑一次 `--layout waike` 就会静默弄坏一批病名。
+# 这一列把它变成判据：`apply_ocr_fixes` 按教材筛，跑外科时那条规则根本不参与。
+OCR_ALL_BOOKS = "*"
+
 
 class OcrFix(NamedTuple):
     """修正表的一行。字段顺序跟文件里的列顺序一致。
 
-    用命名元组而不是 `(错, 对)` 二元组：从两列扩到四列之后，位置解包
+    用命名元组而不是 `(错, 对)` 二元组：从两列扩到五列之后，位置解包
     （`for w, r in fixes`）会静默错位成「把说明当右列」，而命名元组当场报错。
     """
 
@@ -83,6 +173,13 @@ class OcrFix(NamedTuple):
     right: str
     why: str
     scope: str
+    books: frozenset[str]
+
+    def applies_to_book(self, book: str | None) -> bool:
+        """`book` 传 None = 不限教材（单测和 `apply_ocr_fixes` 的默认），
+        那时**所有条目都参与**——否则限定了教材的条目在不传教材的调用里会静默失效。
+        """
+        return book is None or OCR_ALL_BOOKS in self.books or book in self.books
 
 
 def load_ocr_fixes(path: Path | None = None) -> list[OcrFix]:
@@ -121,6 +218,9 @@ def load_ocr_fixes(path: Path | None = None) -> list[OcrFix]:
         # 旧行只有三列（错/对/说明），默认 all——这是为了**行为逐字节不变**：
         # 默认成别的值会让已经落盘的教材条目重跑出不一样的结果。
         scope = cols[3].strip() if len(cols) > 3 and cols[3].strip() else "all"
+        # 第五列不写 = 所有教材。跟 scope 默认 all 同一个理由：**旧行行为不变**。
+        books_raw = cols[4].strip() if len(cols) > 4 and cols[4].strip() else OCR_ALL_BOOKS
+        books = frozenset(b.strip() for b in books_raw.split(",") if b.strip())
         if not wrong or not right:
             raise ValueError(f"{p}:{lineno} 两列都不许空：{line!r}")
         if wrong == right:
@@ -134,7 +234,14 @@ def load_ocr_fixes(path: Path | None = None) -> list[OcrFix]:
                 f"{p}:{lineno}（{wrong}→{right}）scope 是 {scope!r}，"
                 f"合法值只有：{' / '.join(OCR_SCOPES)}"
             )
-        fixes.append(OcrFix(wrong=wrong, right=right, why=why, scope=scope))
+        unknown = books - {OCR_ALL_BOOKS} - set(LAYOUTS)
+        if unknown:
+            raise ValueError(
+                f"{p}:{lineno}（{wrong}→{right}）books 里有认不出的教材："
+                f"{sorted(unknown)}。合法值是 {OCR_ALL_BOOKS}（所有教材）"
+                f"或 LAYOUTS 的键：{' / '.join(sorted(LAYOUTS))}"
+            )
+        fixes.append(OcrFix(wrong=wrong, right=right, why=why, scope=scope, books=books))
     fixes.sort(key=lambda f: -len(f.wrong))
     _reject_non_idempotent(fixes, p)
     return fixes
@@ -163,17 +270,24 @@ def apply_ocr_fixes(
     fixes: list[OcrFix] | None = None,
     *,
     scope: str = "all",
+    book: str | None = None,
 ) -> str:
     """整词替换。**不逐字替换**——只写「唐→溏」会把「唐代」一起改掉。
 
     `scope` 是**正在修的那一列**，不是"筛哪些规则"。一条规则参与进来的判据是
     「这条规则管不管这一列」：`fix.scope == "all"` 或 `fix.scope == scope`。
     所以默认 `scope="all"` 就是旧行为——只施加不限列的那些规则。
+
+    `book` 是**正在解析哪本教材**（`LAYOUTS` 的键）。不传就是不限教材，
+    那时所有条目都参与——限定了教材的条目在不传教材的调用里静默失效比误伤更糟。
+    `parse_textbook` 一律传，所以「疽→疸」跑外科教材时根本不参与。
     """
     if scope not in OCR_SCOPES:
         raise ValueError(f"scope 只能是 {' / '.join(OCR_SCOPES)}，收到 {scope!r}")
+    if book is not None and book not in LAYOUTS:
+        raise ValueError(f"book 要是 LAYOUTS 的键（{' / '.join(sorted(LAYOUTS))}），收到 {book!r}")
     for f in (fixes if fixes is not None else load_ocr_fixes()):
-        if f.scope == "all" or f.scope == scope:
+        if (f.scope == "all" or f.scope == scope) and f.applies_to_book(book):
             text = text.replace(f.wrong, f.right)
     return text
 
@@ -399,13 +513,17 @@ def parse_textbook(
     # 规则（「疽→疸」只管病名）在下面各列抽出来的那一刻单独施加，
     # 顺序仍然是"修正在切分之前"：病名/证型名不再切分，症状那一列是在
     # `_extract_symptoms_and_tongue` 之前修的。
-    raw_text = apply_ocr_fixes(md_path.read_text(encoding="utf-8"), fixes)
+    raw_text = apply_ocr_fixes(md_path.read_text(encoding="utf-8"), fixes, book=lay.key)
     lines = raw_text.splitlines()
     stats: dict = {
         "layout": lay.key, "book": lay.book,
         "clinical_blocks_seen": 0, "extracted": 0,
         "skipped_no_disease": 0, "skipped_no_syndrome_name": 0,
         "skipped_no_pathogenesis": 0, "skipped_no_elements_matched": 0,
+        # 靠启发式判据认下来的证型标题条数（`7.痰火扰心` 这一类）。**要报出来**：
+        # 判据是长度 + 无句读，条数一变就说明原文排版跟当初量的那份不一样了，
+        # 那时该做的是重新逐行核一遍，不是调阈值。
+        "headings_bare_numbered": 0,
     }
     current_disease: str | None = None
     current_syndrome_name: str | None = None
@@ -425,22 +543,19 @@ def parse_textbook(
             # 病名列单独过一遍 scope=disease 的规则（「疽→疸」：病名列是闭集合，
             # 里面没有一个合法含「疽」，而正文里「痈疽》」是对的）
             current_disease = apply_ocr_fixes(
-                _clean_disease_name(m.group(1)), fixes, scope="disease")
+                _clean_disease_name(m.group(1)), fixes, scope="disease", book=lay.key)
             disease_lineno = i + 1
             i += 1
             continue
 
-        m = _SYN_HEADING_RE.match(line)
-        if m:
-            current_syndrome_name = apply_ocr_fixes(m.group(1).strip(), fixes, scope="name")
+        heading = syndrome_heading(line)
+        if heading is not None:
+            name_text, kind = heading
+            current_syndrome_name = apply_ocr_fixes(
+                name_text, fixes, scope="name", book=lay.key)
             name_lineno = i + 1
-            i += 1
-            continue
-
-        m = _SYN_SUBITEM_RE.match(line)
-        if m:
-            current_syndrome_name = apply_ocr_fixes(m.group(1).strip(), fixes, scope="name")
-            name_lineno = i + 1
+            if kind == HEADING_BARE_NUMBERED:
+                stats["headings_bare_numbered"] += 1
             i += 1
             continue
 
@@ -480,7 +595,7 @@ def parse_textbook(
                 continue
             # 症状/舌脉那一列：scope=symptom 的规则在**切分之前**施加
             symptoms, tongue_pulse = _extract_symptoms_and_tongue(
-                apply_ocr_fixes(clinical_text, fixes, scope="symptom"))
+                apply_ocr_fixes(clinical_text, fixes, scope="symptom", book=lay.key))
             if not symptoms:
                 stats["skipped_no_elements_matched"] += 1
                 continue
@@ -516,6 +631,67 @@ def parse_textbook(
     stats["suspicious"] = find_suspicious_entries(entries, linenos)
     stats["n_suspicious"] = len(stats["suspicious"])
     return entries, stats
+
+
+# ---------- R31：生成物与当前代码一致的判据 ----------
+
+MANIFEST_PATH = ROOT / "data" / "standard" / "syndromes_manifest.json"
+PARSER_PATH = Path(__file__).resolve()
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def build_manifest(out_path: Path, entries: list[SyndromeDefinition], stats: dict) -> dict:
+    """写 `data/standard/syndromes_manifest.json` 用的那个字典。
+
+    **为什么要有这份 manifest**：R29 发现落盘的 `syndromes.jsonl` 跟仓库里的复现
+    命令跑出来的**不一样**——3 个证型名、8 条症状列表不同，而且落盘那份里还留着
+    「纳呆便唐」，而 `ocr_fixes.tsv` 明明有「便唐→便溏」这一条。落盘的是旧解析器的
+    产物，README 的复现命令给的是新解析器，**两者之间没有任何判据**。
+
+    三个 sha256 各管一件事：
+      - `syndromes_sha256`：有人手改过落盘的 jsonl 吗（tests 里能查）
+      - `ocr_fixes_sha256`：修正表改过但没重新生成吗（tests 里能查，**R29 那个
+        缺陷正是这一条能抓到的**）
+      - `parser_sha256`：解析器改过但没重新生成吗（**tests 里查不了**——重新生成
+        要教材 markdown，而它不在版本控制里。这一条由
+        `scripts/verify_generated_data.py` 在有教材的机器上查）
+    """
+    groups = Counter((e.name, e.disease) for e in entries)
+    return {
+        "syndromes_sha256": _sha256(out_path),
+        "ocr_fixes_sha256": _sha256(OCR_FIXES_PATH),
+        "parser_sha256": _sha256(PARSER_PATH),
+        "layout": stats["layout"],
+        "book": stats["book"],
+        "n_lines": sum(1 for line in out_path.read_text(encoding="utf-8").splitlines()
+                       if line.strip()),
+        "n_textbook": len(entries),
+        "n_duplicate_name_disease_groups": sum(1 for c in groups.values() if c > 1),
+        "n_suspicious": stats["n_suspicious"],
+        "headings_bare_numbered": stats["headings_bare_numbered"],
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def write_manifest(out_path: Path, entries: list[SyndromeDefinition], stats: dict) -> Path:
+    data = build_manifest(out_path, entries, stats)
+    MANIFEST_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return MANIFEST_PATH
+
+
+def read_manifest(path: Path | None = None) -> dict | None:
+    """没有 manifest 返回 None，不抛——R31 之前生成的那些 jsonl 就没有。
+    调用方要能区分"没有这份记录"和"有记录但对不上"。"""
+    p = path or MANIFEST_PATH
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def load_committed_textbook_entries(path: Path | None = None) -> list[SyndromeDefinition]:
@@ -631,6 +807,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"跳过：无病名上下文 {stats['skipped_no_disease']}，无证型名 {stats['skipped_no_syndrome_name']}，"
           f"无证机概要 {stats['skipped_no_pathogenesis']}，"
           f"匹配不到症状或病位/病性证素 {stats['skipped_no_elements_matched']}")
+    print(f"其中 {stats['headings_bare_numbered']} 个证型标题是"
+          f"「丢了行首 # 的编号项」（启发式判据：长度 ≤{_HEADING_MAX_LEN} 且无句读）")
     diseases = sorted({e.disease for e in entries if e.disease})
     print(f"覆盖 {len(diseases)} 个病名")
     if not entries:
@@ -653,6 +831,16 @@ def main(argv: list[str] | None = None) -> None:
 
     total = len(existing_lines) + len(entries)
     print(f"已写出 {args.out}（{'追加，' if args.append else ''}共 {total} 条）")
+
+    # **写完 jsonl 就写 manifest，不靠人记得补。** 漏写的那一刻，
+    # 「落盘的东西跟当前代码跑出来的一致」这件事就没人盯着了——R29 踩的就是这个。
+    if args.out.resolve() == DEFAULT_OUT_PATH.resolve():
+        mpath = write_manifest(args.out, entries, stats)
+        print(f"已写出 {mpath}（三个 sha256 + 五个计数，判据见 "
+              f"tests/test_generated_data_manifest.py 与 scripts/verify_generated_data.py）")
+    else:
+        print(f"--out 不是默认路径（{DEFAULT_OUT_PATH.name}），**没写 manifest**"
+              "——manifest 记的是那一份落盘产物的指纹，给别处的输出写会指错对象")
 
 
 if __name__ == "__main__":
