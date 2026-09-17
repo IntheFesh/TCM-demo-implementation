@@ -72,14 +72,33 @@ MAX_ANSWER_CHARS = 500
 
 
 def _warmup() -> None:
-    """启动时预热检索器，把首请求那几十秒（加载模型 + 编码 839 条医案）
-    挪到启动阶段。失败不阻塞启动——没有 cases.json 时服务仍应能起来。"""
+    """启动时预热，把首请求那几十秒挪到启动阶段。**每一项失败都不阻塞启动**
+    ——数据不全时服务仍应能起来，预热不是前置条件。
+
+    两项，各自 try：
+      1. 检索器（加载模型 + 编码医案）
+      2. **本体层**（R34 加）：药理层数据进版本控制之后，
+         `get_ontology()` 首次加载实测 **2057 ms**（1232 味 / 235 首），
+         而它是在**第一个问诊请求里**被惰性触发的——R32 的知识块、R34 的七条规则
+         都要它。不预热的话那 2 秒算在首个患者的等待时间里。
+         实测发现的方式很偶然：`test_chain_parallel` 那条并发计时测试
+         从 0.3s 级涨到 1.02s，而它测的是并发、不是本体。
+    """
     try:
         from core.retrieval import get_retriever
 
         get_retriever()._ensure_encoded()
     except Exception as e:  # noqa: BLE001 - 预热失败只是没有预热，服务照常起
         print(f"[warmup] 检索器预热跳过：{e}", file=sys.stderr)
+    try:
+        from core.ontology import get_ontology
+
+        ont = get_ontology()
+        if ont.available:
+            print(f"[warmup] 本体层已就绪：{len(ont.herbs)} 味 / {len(ont.formulas)} 首",
+                  file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 - 同上
+        print(f"[warmup] 本体层预热跳过：{e}", file=sys.stderr)
 
 
 # 预热最多等这么久，超过就先开始服务。真实冒烟里踩到的：有 cases.json 但连不上

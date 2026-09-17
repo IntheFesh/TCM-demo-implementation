@@ -71,6 +71,12 @@ from core.retrieval_hybrid import (
 )
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
 from core.formula_check import advice_dicts, check_formula
+from core.formula_verifier import (
+    format_violations_for_revise,
+    max_revise_rounds,
+    verifier_metrics,
+    verify_formula,
+)
 from core.safety_output import assess_formula_safety, format_blocking_issues
 from core.schemas import (
     S3_CHAIN_STEPS,
@@ -993,6 +999,96 @@ def _run_react_round(
     return s3_system + format_trace_for_s3(trace), trace, react_safety_flag
 
 
+def _verify_and_revise(raw, s3_system: str, s3_schema, *, on_step: StepFn | None = None):
+    """R34 闭环：验 → 有问题就带着**本体原文反例**重开 → 再验，最多
+    `max_revise_rounds()` 轮。返回 `(最终 raw, 最终 s3, 每轮的验证结果, 重开次数)`。
+
+    ## 三条设计决定
+
+    **一、重开时关思考**（`thinking="disabled"`）。这一步不是"再想一遍怎么辨证"
+    ——证型、治法、五步链都已经定了，要改的是"把这味药换成归肝经的"这种
+    照着反例改的局部修补。开思考在这一步是纯浪费（实测数据见 §0.4：单次 S3
+    开思考 260–479 秒），而且**反而更容易把已经对的部分重新想一遍想坏**。
+
+    **二、veto 残余不下发。** 轮数用完还有 veto 级违规就抛 `SymbolicVeto`，
+    整次问诊不产出方药——跟安全否决同一条语义（被拦截的请求不产出任何方药），
+    但是两个不同的异常（见 `SymbolicVeto` 的文档字符串）。
+    revise 级残余**照常下发**并如实标在 `verification` 里：那些是"拟得不够好"，
+    不是"不能用"，压着不发等于因为一条归经覆盖建议就不给患者任何东西。
+
+    **三、每一轮的结果都留着。** `verify_rounds` 是 list 而不是只留最后一个：
+    `verifier_first_pass_rate` 要的是**第一轮**的状态，而"改了三轮才过"和
+    "一次就过"在最终态上看起来一模一样。
+
+    ## unverifiable 不进回灌
+
+    本体缺数据时那条规则判不了（归经缺 49%、用量缺 55%）。把这些写进回灌文本
+    只会让模型以为自己错了、去改一个本来可能对的地方——它改方也改不出数据来。
+    它们的去处是 `verification` 字段与 manifest（如实显示"这几条判不了"）。
+    """
+    rounds: list = []
+    revise_calls = 0
+    s3 = _as_s3_syndrome(raw)
+    limit = max_revise_rounds()
+    while True:
+        result = verify_formula(raw)
+        rounds.append(result)
+        if not result.violations or revise_calls >= limit:
+            break
+        feedback = format_violations_for_revise(result)
+        if not feedback:            # 理论上不会到：violations 非空时它必非空
+            break
+        if on_step is not None:
+            on_step("verify_revise", {
+                "round": revise_calls + 1, "status": result.status,
+                "n_veto": len(result.vetoes), "n_revise": len(result.revisables),
+                "rules": sorted({v.rule for v in result.violations}),
+            })
+        raw = get_llm().generate(
+            system=s3_system + feedback, user="", schema=s3_schema,
+            physician=SYNTHESIS_PHYSICIAN_ID,
+            # 关思考：这一步是照着反例做局部修补，不是重新辨一遍证（见上面第一条）。
+            thinking="disabled", reasoning_effort=None,
+        )
+        s3 = _as_s3_syndrome(raw)
+        revise_calls += 1
+    if rounds[-1].vetoes:
+        raise SymbolicVeto(rounds[-1].vetoes, llm_calls=revise_calls,
+                           rounds=revise_calls)
+    return raw, s3, rounds, revise_calls
+
+
+class SymbolicVeto(Exception):
+    """R34：符号验证器的 veto 级违规在 `MAX_REVISE_ROUNDS` 轮之后仍未消除。
+
+    **跟 `SafetyVeto` 是两件不同的事**，所以是两个异常而不是复用一个：
+      - `SafetyVeto`：**输入侧**——主诉或追问的回答里有危重症状，整个请求不该辨证
+      - 本异常：**输出侧**——辨完了、方也开了，但方本身有配伍禁忌/超量/编造出处，
+        改了三轮还在，这张方不下发
+    合并成一个异常的话，前端会把"你的症状需要立刻就医"和"系统改不出一张合规的方"
+    显示成同一句话，而这两件事患者该做的完全不同。
+
+    `violations` 带上，好让响应里能如实说出是哪几条——不是一句"验证失败"。
+    """
+
+    def __init__(self, violations, llm_calls: int = 0, rounds: int = 0):
+        self.violations = tuple(violations)
+        self.llm_calls = llm_calls
+        self.rounds = rounds
+        detail = "；".join(f"[{v.rule}] {v.reason}" for v in self.violations)
+        super().__init__(f"符号验证有 {len(self.violations)} 条不可下发的问题"
+                        f"（已重开 {rounds} 轮）：{detail}")
+
+    @property
+    def reason(self) -> str:
+        """给响应用的一句人话。**不含本体原文**——那是给模型看的反例，
+        对患者来说是噪音；界面要看细节时读 `verification` 字段。"""
+        rules = "、".join(dict.fromkeys(v.rule for v in self.violations))
+        return (f"这张方在符号验证中有不可下发的问题（{rules}），"
+                f"系统已按本体原文重开 {self.rounds} 轮仍未消除，因此不给出方药。"
+                "请换用人工复核，或补充更多症状信息后重试。")
+
+
 #: 结构化模式下这份"综合诊断"在 `results` 里的身份。
 #:
 #: `results` 的元素结构是既有契约（前端、分歧度、eval 收集器都按它读），
@@ -1102,27 +1198,21 @@ def run_synthesis(
         )
 
     raw, candidates_scored = _best_of_n_s3(s3_system, s3_schema, SYNTHESIS_PHYSICIAN_ID)
-    s3 = _as_s3_syndrome(raw)
-
+    # R34：符号验证闭环。**这一层取代了 legacy 那条"安全层拦截 → 重开一次"**
+    # ——不是两个循环并存：那两条判据（配伍禁忌、超量）现在由验证器的
+    # `incompatible_pair` / `dose_exceeds` 两条规则**委托给同一个 safety_output**
+    # 去查（见 core/formula_verifier.py 那两条规则的文档字符串）。
+    # 两个循环各自决定"要不要重开"的话，同一张方可能被改两遍、llm_calls 不可预测，
+    # 而 manifest 里那个数是额度结算与成本比较的依据。
+    raw, s3, verify_rounds, revise_calls = _verify_and_revise(
+        raw, s3_system, s3_schema, on_step=on_step,
+    )
+    # `cand.safety` 仍然要填：前端按它挂红/黄标签，M2 那套字段一个没变。
+    # 填它跟"要不要重开"是两件事——重开只由验证器决定。
     for cand in s3.formula_candidates:
         cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
     selected_safety = s3.formula_candidates[s3.selected].safety
-    revised = False
-    if selected_safety.blocking:
-        retry_system = s3_system + (
-            f"\n\n【安全问题】上一次拟的方存在以下必须修正的问题："
-            f"{format_blocking_issues(selected_safety)}。请重新拟方解决这些问题，"
-            "其余要求不变（五步链与引用要求一条都不许省）。"
-        )
-        raw = get_llm().generate(
-            system=retry_system, user="", schema=s3_schema,
-            physician=SYNTHESIS_PHYSICIAN_ID, **thinking_for("s3"),
-        )
-        s3 = _as_s3_syndrome(raw)
-        for cand in s3.formula_candidates:
-            cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
-        revised = True
-        selected_safety = s3.formula_candidates[s3.selected].safety
+    revised = len(verify_rounds) > 1
 
     ref_ids = {r["case_id"] for r in refs}
     if trace is not None:
@@ -1159,6 +1249,12 @@ def run_synthesis(
         "physicians_cited": raw.physicians_cited,
         "herbs_grounded_ratio": raw.herbs_grounded_ratio(),
         "n_ontology_refs": len(raw.ontology_refs),
+        # R34：符号验证的最终结论 + 三指标。**最后一轮的结果**，不是第一轮——
+        # 前端要显示的是"这张方现在的状态"。第一轮的状态在 metrics 里
+        # （`verifier_first_pass` / `first_pass_status`），两者都要有：
+        # 只报最终态会让"改了三轮才过"和"一次就过"看起来一样。
+        "verification": verify_rounds[-1].to_dict(),
+        "verifier_metrics": verifier_metrics(verify_rounds, raw),
         "knowledge": {"mode": knowledge_mode, **knowledge_stats,
                       # structured 不走 assemble()，所以没有稳定前缀可缓存。
                       # 如实记一条，别让人看到 mode="full" 就以为缓存命中了。
@@ -1244,6 +1340,57 @@ def _aggregate_knowledge(results: list[dict] | None) -> dict | None:
     }
 
 
+def _reopen_calls(results: list[dict]) -> int:
+    """重开一共花了几次调用。**只此一处实现**——`consult()` 有两处在算 llm_calls
+    （安全否决那条早返回路径、正常返回路径），两处各写一遍必然有一处忘了改。
+
+    两种模式的重开次数来源不同：
+      - legacy：安全层最多重开**一次**，`safety_output.revised` 是个布尔值，
+        计 1 次就是对的；
+      - structured（R34）：符号验证闭环最多重开 `MAX_REVISE_ROUNDS` 轮，
+        布尔值会把 3 次算成 1 次。
+
+    R34 实测撞到过：加了闭环之后这里仍然按布尔算，manifest 报 4 次而实际花了 6 次
+    ——而 manifest 里那个数是额度结算与成本比较的依据，少算不会报错。
+    """
+    total = 0
+    for r in results:
+        m = r.get("verifier_metrics")
+        if m is not None:
+            total += int(m.get("revise_rounds") or 0)
+        elif r.get("safety_output", {}).get("revised"):
+            total += 1
+    return total
+
+
+def _ontology_manifest() -> dict:
+    """本体的规模、缺谓词分布、对医案语料的覆盖率。写进 manifest。
+
+    **为什么要进 manifest 而不是只写在报告里**：引用"符号验证通过"这句话的人
+    必须能同时看到"验证依据的那份本体缺了多少"。归经缺 49%、用量缺 55% 的情况下，
+    七条规则里有两条在大多数药上判不了——这件事不在同一个地方出现，
+    那句话就会被当成"全验过了"。
+
+    本体不可用时只报 `available: False`，不编数。
+    """
+    from core.formula_verifier import ontology_coverage_of_corpus
+    from core.ontology import get_ontology
+
+    ont = get_ontology()
+    if not ont.available:
+        return {"available": False}
+    s = ont.stats()
+    return {
+        "available": True,
+        "n_herbs": s["n_herbs"],
+        "n_formulas": s["n_formulas"],
+        "n_patterns": s["n_patterns"],
+        "missing_predicate_counts": s["missing_predicate_counts"],
+        "empty_span_refs": s["empty_span_refs"],
+        "corpus_coverage": ontology_coverage_of_corpus(ontology=ont),
+    }
+
+
 def _synthesis_summary(results: list[dict] | None, mode: str) -> dict | None:
     """结构化模式下这一次融合的可核数据。legacy 下返回 **None**。
 
@@ -1262,10 +1409,17 @@ def _synthesis_summary(results: list[dict] | None, mode: str) -> dict | None:
         "physicians_available": len(physicians_for_synthesis(PHYSICIANS)),
         "physicians_cited": r.get("physicians_cited") or [],
         "n_physicians_cited": len(r.get("physicians_cited") or []),
+        # R34b：**分母说清楚是哪一层。** 这个比率的分母是**这张方**的药味数，
+        # 不是本体总药味数（1232）——两个集合完全不同。数据质量那个比率在
+        # `ontology_coverage` 里单独报，见 formula_verifier 那两个函数的文档。
         "herbs_grounded_ratio": r.get("herbs_grounded_ratio"),
+        "herbs_grounded_denominator": "本次方的药味数",
         "n_ontology_refs": r.get("n_ontology_refs"),
         "n_herbs": len(r["s3"].herbs),
         "chain_steps": list(S3_CHAIN_STEPS),
+        # R34：符号验证的三指标 + 最终状态。
+        "verification": r.get("verification"),
+        "verifier_metrics": r.get("verifier_metrics"),
     }
 
 
@@ -1357,6 +1511,13 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
             "formulas": (knowledge or {}).get("n_formulas", 0),
             "patterns": (knowledge or {}).get("n_patterns", 0),
         },
+        # R34b：本体这份数据本身的质量。**跟 `synthesis.herbs_grounded_ratio`
+        # 是两个不同的分母**，放在两处、各自注明，就是为了它们不会被混用：
+        #   这里：分母 = 医案语料里出现过的药名种数（数据指标）
+        #   那里：分母 = 本次方的药味数（模型指标）
+        # 缺谓词计数一起记：归经缺一半的本体上，"归经覆盖规则通过了"这句话
+        # 要能被读者自己打折扣。
+        "ontology": _ontology_manifest(),
     }
 
 
@@ -1856,12 +2017,40 @@ def consult(
             # 不是全局 s3_best_of_n()：中途改环境变量、或某位医家采样部分失败时，
             # 全局那个数跟实际发生的次数会不一致。
             + sum(len(r["candidates_scored"]) for r in results)
-            + sum(1 for r in results if r["safety_output"]["revised"])
+            + _reopen_calls(results)
         )
         return {
             "s1": s1, "results": [], "divergence": None,
             "rejected": True, "reject_reason": veto.reason,
             "safety_flag": safety_flag or veto.reason, "retrieval_error": None,
+            "s2": s2, "followup": followup, "residual": residual,
+            "insufficient": False, "insufficient_reason": None, "coverage": None,
+            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
+                                        retriever_mode=retriever_mode, s3_mode_used=mode,
+                                        knowledge=_aggregate_knowledge(results)),
+        }
+    except SymbolicVeto as veto:
+        # R34：符号验证的 veto 级违规改了 MAX_REVISE_ROUNDS 轮还在——这张方不下发。
+        # **跟 SafetyVeto 分两个分支而不是合成一个**：两者该对用户说的话不同
+        # （见 SymbolicVeto 的文档字符串），而合并之后响应里只能说一句
+        # "被拦截了"，患者分不出是"你该立刻就医"还是"系统改不出合规的方"。
+        calls = (
+            2 + extra_calls + (1 if residual else 0)
+            + sum(len(r["candidates_scored"]) for r in results)
+            + veto.llm_calls
+            + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
+        )
+        return {
+            "s1": s1, "results": [], "divergence": None,
+            "rejected": True, "reject_reason": veto.reason,
+            # `safety_flag` 留给安全层，**不复用**：它的语义是"危重症状"，
+            # 而这里的原因是"方不合规"。前端按这两个字段走不同的提示文案。
+            "safety_flag": safety_flag,
+            "verification_veto": [
+                {"rule": v.rule, "herbs": list(v.herbs), "reason": v.reason,
+                 "counterexample": v.counterexample} for v in veto.violations
+            ],
+            "retrieval_error": None,
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
@@ -2054,7 +2243,7 @@ def consult(
             # R22：每位医家采了 N 次 S3，见上面 SafetyVeto 分支里那段注释。
             + sum(len(r["candidates_scored"]) for r in results)
             + (1 if residual else 0)
-            + sum(1 for r in results if r["safety_output"]["revised"])
+            + _reopen_calls(results)
             # ReAct 的每一步都是一次真实调用，必须计进来：漏算的话 manifest 报的
             # 调用数会低于实际花费，拿它算成本或比 use_react 开关的代价就都是错的。
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"]),

@@ -396,7 +396,9 @@ def test_the_result_dict_has_the_same_keys_as_the_legacy_path(structured, monkey
     assert legacy - got == set(), f"structured 少了这些键：{legacy - got}"
     assert got - legacy == {"s3_structured", "physician_influences",
                             "physicians_cited", "herbs_grounded_ratio",
-                            "n_ontology_refs"}
+                            "n_ontology_refs",
+                            # R34 加的两个：符号验证的最终结论 + 三指标
+                            "verification", "verifier_metrics"}
 
 
 def test_stream_events_still_route_by_physician_field(structured):

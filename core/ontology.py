@@ -504,6 +504,14 @@ def reset_ontology_for_tests() -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="本体层自检（零 LLM 调用）")
     ap.add_argument("--stats", action="store_true", help="打印加载统计")
+    # R34c：**先看清楚再决定改不改。** 3184 条方剂三元组归并出 235 首方，
+    # 平均 13.5 条/首，而《方剂学》教材的方数远多于此——这两个数放在一起说明
+    # 归并那一步有问题，但"问题在哪"要看方名的实际形态才知道（归一把不同方并到
+    # 一起了？还是抽取时方名带了章节前缀？）。这两个开关只打印，不动任何数据。
+    ap.add_argument("--dump-formulas", action="store_true",
+                    help="逐行打印方名与它的谓词条数（看方名形态用，不改数据）")
+    ap.add_argument("--dump-herbs", action="store_true",
+                    help="逐行打印药名与它的谓词条数")
     args = ap.parse_args(argv)
     ont = get_ontology()
     s = ont.stats()
@@ -516,8 +524,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"本草 {s['n_herbs']} 味 / 方剂 {s['n_formulas']} 首 / 用药规律 {s['n_patterns']} 条")
     print("缺谓词条数：" + "，".join(f"{p} {n}" for p, n in s["missing_predicate_counts"].items()))
     print(f"出处 span 为空的引用：{s['empty_span_refs']} 条")
-    if args.stats:
-        return 0
+    if args.dump_formulas:
+        print("\n--- 方名（名字 | 谓词数 | 组成药味数 | 主治条数）---")
+        for name, f in sorted(ont.formulas.items()):
+            print(f"{name}\t{len(f.refs)}\t{len(f.composition)}\t{len(f.indications)}")
+    if args.dump_herbs:
+        print("\n--- 药名（名字 | 谓词数 | 性 | 归经数 | 功效数）---")
+        for name, h in sorted(ont.herbs.items()):
+            print(f"{name}\t{len(h.refs)}\t{h.nature or '-'}"
+                  f"\t{len(h.meridians)}\t{len(h.effects)}")
     return 0
 
 

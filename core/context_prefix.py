@@ -54,6 +54,8 @@
 """
 from __future__ import annotations
 
+import threading
+
 import argparse
 import hashlib
 import json
@@ -184,15 +186,53 @@ def _load_triples(kind: str) -> list[dict]:
     return rows
 
 
+#: `build_entry_index` 的缓存（只缓存**不传 rows** 那一路）。
+#:
+#: **R34 加。为什么以前不需要**：药理层数据进版本控制之前 `_load_triples` 恒返回
+#: 空列表，建索引不花时间。数据一进来（本草 9776 条 / 方剂 3184 条），
+#: 建一次索引实测 **41 ms**，而这个函数在**一次问诊里被调四处**：
+#:   `formula_check.materia_index`（每位医家一次）、`context_prefix.build_shared_prefix`
+#:   （每位医家一次，109 KB 文本）、`build_entries_section`（每位医家一次）、
+#:   `core.ontology._build_herbs/_build_formulas`（本体构造时一次）
+#: 三位医家一次问诊白花 ~300 ms，在请求路径上、GIL 下串行。
+#:
+#: **缓存加在这一处而不是四个调用方各加一层**（第 31 条）：四处各缓存一份的话
+#: 清缓存要清四处，漏一处就读到脏数据。
+_entry_index_cache: dict[str, dict[str, dict[str, list[str]]]] = {}
+_entry_index_lock = threading.Lock()
+
+
+def reset_entry_index_cache() -> None:
+    """只给测试用：换了数据文件之后清掉缓存。生产代码不该调它。"""
+    with _entry_index_lock:
+        _entry_index_cache.clear()
+
+
 def build_entry_index(kind: str, rows: list[dict] | None = None) -> dict[str, dict[str, list[str]]]:
     """{主语: {谓词: [值…]}}。同一 (s,p) 多条时**全留**并按值排序去重——
-    本草里一味药常有多个来源的功效描述，只留第一条等于挑了一个没有理由的赢家。"""
+    本草里一味药常有多个来源的功效描述，只留第一条等于挑了一个没有理由的赢家。
+
+    **不传 `rows` 的那一路带缓存**（双重检查锁）。传了 `rows` 的不碰缓存：
+    那是调用方自带的数据（测试、`Ontology(materia_rows=…)`），缓存它会让下一个
+    无参调用读到别人的表。
+
+    空索引**不缓存**：文件可能在进程起来之后才生成（run_onsite.sh 段 5 落盘、
+    服务先起来），缓存一个空结果会让它永远读不到新文件——跟
+    `core/tools.py::_materia_medica_path` 那条回退同一个理由。
+    """
+    if rows is None:
+        cached = _entry_index_cache.get(kind)
+        if cached is not None:
+            return cached
     out: dict[str, dict[str, list[str]]] = {}
     for row in (rows if rows is not None else _load_triples(kind)):
         out.setdefault(row["s"], {}).setdefault(row["p"], []).append(row["o"])
     for preds in out.values():
         for p, vals in preds.items():
             preds[p] = sorted(dict.fromkeys(vals))
+    if rows is None and out:
+        with _entry_index_lock:
+            _entry_index_cache[kind] = out
     return out
 
 

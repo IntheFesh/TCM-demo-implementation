@@ -126,6 +126,9 @@ def materia_index(materia: dict | None = None) -> dict | None:
 
     None 和 `{}` 必须分开：前者是"这张表还没建出来"，后者是"表建好了但是空的"。
     调用方据此给出两种完全不同的 skipped 理由。
+
+    **不在这里缓存**：`build_entry_index` 自己带缓存（R34 加的，见那个函数的
+    文档字符串）。在这里再加一层就是同一个概念两处缓存——清了一处另一处还脏。
     """
     if materia is not None:
         return materia

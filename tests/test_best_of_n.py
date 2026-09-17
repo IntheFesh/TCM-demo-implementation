@@ -108,15 +108,29 @@ def test_n_equals_one_takes_the_single_sample_path(monkeypatch):
 
 
 def test_it_picks_the_highest_scoring_sample(monkeypatch):
-    """三次采样分别是 0.0（十八反）/ 0.5（超剂量）/ 1.0（干净方）→ 选第三个。"""
+    """三次采样：十八反（最低）< 超剂量（中）< 干净方（1.0）→ 选第三个。
+
+    **中间那个分数刻意不写死。** 它取决于药理层本草表在不在：表不在时
+    `missing_channel_guide` / `duplicate_effect` 两条规则进 skipped（不扣分），
+    超量方拿 0.5；表在时（R34 起数据进了版本控制）那两条真的跑，
+    实测降到 0.35。把它写死会让"数据齐全了"变成一条红测试，
+    而这条测试要验的是**排序与挑选**，不是某个绝对分值。
+
+    两端仍然写死：十八反必须是 **0.0**（拦截级，分数封底），
+    干净方必须是 **1.0**（没有任何建议）——这两个是规则本身的定义，跟数据无关。
+    """
     scripted = [_s3("禁忌方", FORBIDDEN), _s3("超量方", OVERDOSE), _s3("四君子汤", CLEAN)]
     out, _ = _run(monkeypatch, scripted, n="3")
     for r in out["results"]:
         rows = r["candidates_scored"]
-        assert sorted(row["score"] for row in rows) == [0.0, 0.5, 1.0]
+        scores = sorted(row["score"] for row in rows)
+        assert len(scores) == 3
+        assert scores[0] == 0.0, "十八反那一张必须封底 0.0"
+        assert scores[2] == 1.0, "干净方必须 1.0"
+        assert 0.0 < scores[1] < 1.0, f"超量方应当落在中间，实际 {scores[1]}"
         assert r["s3"].formula_candidates[r["s3"].selected].name == "四君子汤"
         chosen = [c for c in rows if c["chosen"]]
-        assert len(chosen) == 1 and chosen[0]["score"] == 1.0
+        assert len(chosen) == 1 and chosen[0]["score"] == max(scores)
 
 
 def test_the_scores_come_from_the_shared_ruler_not_a_second_one(monkeypatch):

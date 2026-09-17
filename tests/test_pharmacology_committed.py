@@ -26,7 +26,18 @@ from core.schemas import FormularyRecord, MateriaMedicaRecord
 ROOT = CANONICAL_DIR.parent.parent
 KINDS = ("materia_medica", "formulary")
 # 实测规模（R10 那一轮在 AutoDL 上跑出来的，eval/RESULTS.md 里有凭据记号）。
-EXPECTED_ROWS = {"materia_medica": 10248, "formulary": 3737}
+# 落盘实测（R34，两份 jsonl 进版本控制之后第一次可核）。
+#
+# **这两个数换过一次，换的理由要留着**：R18-F 到 R33 期间这里写的是
+# 10248 / 3737 —— 那是 AutoDL 上一次抽取的**手抄**数字（eval/RESULTS.md 自己标着
+# ⏳「两个 jsonl 还没提交进来」）。R34 数据进版本控制后实测是 9776 / 3184，
+# 比手抄的少 472 / 553 条：落盘这一份是**另一次抽取**的产物（`c9ac580` 那轮把
+# 离线抽取改成关思考模式重跑过），不是同一批。
+#
+# 现在这两个数是**可核的**（`pharmacology.n_materia_medica` /
+# `pharmacology.n_formulary` 两个凭据键直接数文件行数），所以它们从"手抄"
+# 变成了"落盘即判据"——这正是 RESULTS.md 那一节说的"文件一进来凭据键就自动生效"。
+EXPECTED_ROWS = {"materia_medica": 9776, "formulary": 3184}
 
 
 # ---------- 落盘目录：必须是进版本控制的那个 ----------
