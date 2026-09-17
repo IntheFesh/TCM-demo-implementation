@@ -386,6 +386,24 @@ FOCUSED_SECTION_TITLES = {
 #: 裁掉它等于回到"只有教材、没有这五位医家"。
 FOCUSED_CUT_ORDER = ("formulary", "materia_detail", "materia_entries")
 
+#: 每位医家最多放几条规律。
+#:
+#: **"永不裁"说的是这一段不会被整段砍掉，不是这一段无上限。** R35 实测：
+#: `patterns_for` 的医家档（`group_value=""`）恒命中任何证型，1924 条规律里
+#: 1869 条是医家档，全放进去光规律段就吃掉整个 3 万 token 预算，本草与方剂
+#: 一条都放不下——而规律段又不进裁剪循环，结果是知识块只剩规律。
+#:
+#: 上限按**医家**而不是按总数：叶天士 854 诊次、吴鞠通 221 诊次，按总数取
+#: 前 N 条会让案多的医家把案少的挤干净，"融合五家"就名存实亡了。
+#: 12 条 × 约 70 token ≈ 每位 850 token，五家约 4 千 token（预算的 14%）。
+#: **这是取舍不是测量。**
+FOCUSED_MAX_PATTERNS_PER_PHYSICIAN = 12
+
+#: 一条规律在知识块里最多列几个 case_id。support 上限 223，全列出来一条规律
+#: 就能吃掉 2 千 token。列前 8 条 + 写明总数：凭据的作用是"能回查"，
+#: 回查 8 条和回查 223 条是一样的，而**总数必须写出来**（数字要带对照）。
+FOCUSED_MAX_CASE_IDS = 8
+
 
 def _focused_herb_block(h, *, detail: bool) -> str:
     """一味药在知识块里的一行/一段。
@@ -429,7 +447,10 @@ def _focused_formula_block(f) -> str:
 def _focused_pattern_block(p: dict) -> str:
     """一条名医用药规律。**case_ids 必须带上**——它是"这条规律有据可查"的凭据，
     也是 S3 的 `physician_influences` 能回指到医案的依据。"""
-    head = f"### {p.get('physician_name') or p.get('physician')}·{p.get('group_value')}"
+    # `group_value` 空串是医家档（不分证型），要写出来——留个光秃秃的「·」
+    # 读者看不出这条规律是"这位医家全部医案"还是"这个证型下"。
+    who = p.get("physician_name") or p.get("physician")
+    head = f"### {who}·{p.get('group_value') or '不分证型（该医家全部医案）'}"
     lines = [head, f"- 类型：{p.get('kind')}｜支持案数：{p.get('support')}"]
     if p.get("herbs"):
         lines.append(f"- 药：{'、'.join(p['herbs'])}")
@@ -438,7 +459,10 @@ def _focused_pattern_block(p: dict) -> str:
                      f"（区间 {p.get('dose_min_g')}–{p.get('dose_max_g')}g）")
     if p.get("note"):
         lines.append(f"- 说明：{p['note']}")
-    lines.append(f"- 医案：{'、'.join(p.get('case_ids') or [])}")
+    cids = list(p.get("case_ids") or [])
+    shown = cids[:FOCUSED_MAX_CASE_IDS]
+    more = "" if len(cids) <= len(shown) else f"（共 {len(cids)} 条，此处列前 {len(shown)} 条）"
+    lines.append(f"- 医案：{'、'.join(shown)}{more}")
     if p.get("has_incompatible_pair"):
         from core.safety_output import INCOMPATIBLE_TRAINING_NOTE
 
@@ -508,24 +532,36 @@ def build_focused_knowledge(s1, s2, hits, physicians, *,
     """
     import os
 
-    from core.ontology import get_ontology
+    from core.ontology import get_ontology, sort_patterns
 
     ont = ontology if ontology is not None else get_ontology()
     budget = budget if budget is not None else int(
         os.environ.get("FOCUSED_KNOWLEDGE_MAX_TOKENS", FOCUSED_KNOWLEDGE_MAX_TOKENS))
     stats = {"available": bool(ont.available), "n_herbs": 0, "n_formulas": 0,
-             "n_patterns": 0, "tokens": 0, "trimmed_sections": []}
+             "n_patterns": 0, "n_patterns_available": 0, "tokens": 0,
+             "trimmed_sections": []}
     if not ont.available:
         return "", stats
 
     syndromes = syndromes or []
-    patterns = []
+    per_physician = int(os.environ.get("FOCUSED_MAX_PATTERNS_PER_PHYSICIAN",
+                                       FOCUSED_MAX_PATTERNS_PER_PHYSICIAN))
+    patterns: list[dict] = []
+    n_patterns_available = 0
+    seen_pat: set[str] = set()
     for pid in (physicians or []):
-        for s in (syndromes or [""]):
-            patterns.extend(ont.patterns_for(s, physician=pid))
-    seen_pat = set()
-    patterns = [p for p in patterns
-                if not (p.get("pattern_id") in seen_pat or seen_pat.add(p.get("pattern_id")))]
+        got: list[dict] = []
+        for syn in (syndromes or [""]):
+            for pat in ont.patterns_for(syn, physician=pid):
+                key = str(pat.get("pattern_id") or "")
+                if key in seen_pat:
+                    continue
+                seen_pat.add(key)
+                got.append(pat)
+        # 多个证型的结果拼在一起之后顺序乱了，要按同一套规则重排（单一实现）。
+        got = sort_patterns(got)
+        n_patterns_available += len(got)
+        patterns.extend(got[:per_physician] if per_physician > 0 else got)
 
     herbs = _focused_candidate_herbs(ont, s1, s2, hits, patterns)
     formulas = _focused_candidate_formulas(ont, s2, hits, syndromes)
@@ -535,7 +571,13 @@ def build_focused_knowledge(s1, s2, hits, physicians, *,
     while True:
         sections = []
         if patterns:
-            sections.append(FOCUSED_SECTION_TITLES["patterns"] + "\n\n"
+            # 标题里写清"放了多少 / 语料里一共多少"：模型不能以为看到的是全部，
+            # 读报告的人也要能看出这一段被取过前 N 条。
+            head = (FOCUSED_SECTION_TITLES["patterns"]
+                    + f"（本次放入 {len(patterns)} 条，按"
+                      f"「证型档优先→支持案数从高到低」取每位医家前 "
+                      f"{per_physician} 条；命中本次辨证的共 {n_patterns_available} 条）")
+            sections.append(head + "\n\n"
                             + "\n\n".join(_focused_pattern_block(p) for p in patterns))
         if herbs:
             sections.append(FOCUSED_SECTION_TITLES["materia"] + "\n\n"
@@ -563,7 +605,12 @@ def build_focused_knowledge(s1, s2, hits, physicians, *,
             continue
         break   # 只剩规律 + 一味药还超预算：如实超出，不把规律砍掉
 
+    # 规律段取了前 N 条就要记在 trimmed_sections 里——它跟被预算循环砍掉的段
+    # 性质不同（上游选取 vs 超预算裁剪），但"少放了东西"这件事都必须可核。
+    if n_patterns_available > len(patterns):
+        trimmed.append("patterns_per_physician_cap")
     stats.update(n_herbs=len(herbs), n_formulas=len(formulas), n_patterns=len(patterns),
+                 n_patterns_available=n_patterns_available,
                  tokens=count_tokens(text), trimmed_sections=trimmed)
     return text, stats
 

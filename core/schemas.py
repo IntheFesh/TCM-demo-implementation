@@ -1174,3 +1174,83 @@ class S3StructuredUnreferenced(_S3StructuredBase):
     def physician_influences(self) -> list["PhysicianInfluence"]:
         """同上，永远是空——说不出医案的"影响"这个 schema 不收。"""
         return []
+
+
+# ---------- R35：名医用药规律（确定性统计，不是 LLM 输出） ----------
+#
+# 跟 `RationaleRecord` 同一类：产出文件落 `data/standard/` 要进版本控制，
+# 所以必须是任何人在任何机器上重跑都字字相同的确定性转换。这一层**零 LLM 调用**
+# ——它是对 `cases.json` 的计数与统计，没有任何生成环节，也就没有幻觉风险。
+#
+# **但它有另一类风险：把统计巧合说成"名医经验"。** 两味药在 3 张方里一起出现过，
+# 不构成"某位医家习惯用这个药对"。所以每一条都必须带：
+#   `support`（几张方支持它）和 `case_ids`（**具体是哪几张**）
+# 缺了 `case_ids` 的规律无法回查，等于一句没有出处的话——跟 `cited_case_ids`
+# 是同一条防幻觉纪律，所以同样是 `Field(min_length=1)`。
+
+PatternKind = Literal["herb", "herb_pair", "dose", "modification"]
+
+#: 规律按什么分组。
+#:   physician            这位医家的总体习惯（`group_value` 为空串）
+#:   physician_syndrome   这位医家在某个证下的习惯（`group_value` 是证型名）
+#: **两档都要有**：`cases.json` 里 1075 诊次只有 116 条标了证型（10.8%），
+#: 只按证型分组的话绝大多数医案的信息进不了规律层；只按医家分组则丢掉了
+#: "他在这个证下怎么用药"这个更有用的粒度。
+PatternGroupBy = Literal["physician", "physician_syndrome"]
+
+
+class PrescribingPattern(BaseModel):
+    """写进 `data/standard/prescribing_patterns.jsonl` 的一条用药规律。
+
+    字段形状对齐 `core/context_prefix.py::_focused_pattern_block` 读的那几个键
+    ——知识块要把它渲染给模型看，两处对不上的话规律会渲染成一行空白。
+
+    `dose_*` 三个字段只有 `kind="dose"` 时才有值：`cases.json` 的 `herbs` 是**药名
+    列表**，没有结构化剂量，剂量要从 `raw` 原文里按"药名 + 数字 + 单位"抓
+    （见 `offline/mine_prescribing_patterns.py`）。抓不到就是 None，**不猜**。
+
+    `has_incompatible_pair`：这条规律涉及的药里有没有十八反十九畏的一对。
+    **不是过滤掉而是标出来**——古籍医案里真的有这种配伍（那是历史事实），
+    删掉等于篡改语料；标出来才能让下游（知识块、SFT 导出）决定怎么处理。
+    判据复用 `core.safety_output.INCOMPATIBLE_PAIRS`，说明文本复用
+    `INCOMPATIBLE_TRAINING_NOTE`，不另写一套。
+    """
+
+    pattern_id: str = Field(min_length=1)
+    kind: PatternKind
+    physician: str = Field(min_length=1)
+    physician_name: str = Field(min_length=1)
+    group_by: PatternGroupBy
+    #: 允许空串：`group_by="physician"` 时它就是空的（这位医家的总体习惯）。
+    #: 不设 `min_length=1` 是**刻意的**，不是放松约束——它承载的是"分组的值"，
+    #: 而"按医家分组"这个分法本来就没有第二层值。
+    group_value: str = ""
+    #: min_length=1：一条规律至少牵涉一味药。
+    herbs: list[str] = Field(min_length=1)
+    #: 几张方支持它。**下游引用这条规律时必须同时引这个数**——
+    #: 「叶天士常用党参」和「叶天士在 3 张方里用过党参」是两句不同的话。
+    support: int = Field(ge=1)
+    #: min_length=1：说不出是哪几张方的规律无法回查，等于一句没有出处的话。
+    case_ids: list[str] = Field(min_length=1)
+    dose_median_g: float | None = None
+    dose_min_g: float | None = None
+    dose_max_g: float | None = None
+    note: str | None = None
+    has_incompatible_pair: bool = False
+
+    @model_validator(mode="after")
+    def _support_matches_case_ids(self) -> "PrescribingPattern":
+        if self.support != len(self.case_ids):
+            raise ValueError(
+                f"support={self.support} 跟 case_ids 的条数 {len(self.case_ids)} 不一致"
+                "——support 就是「有几张方支持它」，两个数对不上说明统计过程里丢了东西"
+            )
+        if self.kind == "dose" and self.dose_median_g is None:
+            raise ValueError(
+                'kind="dose" 的规律必须有 dose_median_g，否则它不是一条剂量规律'
+            )
+        if self.kind == "herb_pair" and len(self.herbs) != 2:
+            raise ValueError(
+                f'kind="herb_pair" 必须恰好两味药，实际 {len(self.herbs)} 味'
+            )
+        return self

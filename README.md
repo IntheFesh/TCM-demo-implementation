@@ -209,6 +209,7 @@ python -m offline.extract_case_triples         # 7. 医案 → 三元组（要�
 python -m offline.build_syndrome_textbook \
     --md-path /tmp/tcmds/十四五教材/中医内科学.md \
     --out data/standard/syndromes.jsonl --append   # 8. 教材证候扩表（零 LLM 调用）
+python -m offline.mine_prescribing_patterns    # 9. 名医用药规律（零 LLM 调用）
 ```
 
 > ⚠ **第 5 步 `graph_stats` 名字像只读统计，它实际会写 `weight_by_physician` 回图。**
@@ -589,6 +590,7 @@ R17 把它们纳入了 `python -m scripts.collect_results --check`。
 | `offline/export_sft.py` | 从 `cases.json` 派生 alpaca 格式的 SFT 训练样本 `sft.jsonl`（`python -m offline.export_sft`）。现在数据量不够训练，这一步只是把管道建好，并在代码层面强制过滤掉 `copyright_status == "copyrighted"` 的记录 |
 | `offline/build_graph.py` | 从 `data/standard/syndromes.jsonl` 建知识图谱骨架（symptom/element/syndrome 三类节点，`python -m offline.build_graph`），并打印语料库门类覆盖检查 |
 | `offline/graph_stats.py` | 给图里的 indicates 边算并写回医家级四层收缩权重，打印节点/边分布、λ1 分布等统计（`python -m offline.graph_stats`）——**λ 相关的数字务必看下面"知识图谱权重"一节的 λ2 说明再解读** |
+| `offline/mine_prescribing_patterns.py` | R35：从 `cases.json` 统计挖名医用药规律（高频药/药对/剂量/复诊加减），写 `data/standard/prescribing_patterns.jsonl`（`python -m offline.mine_prescribing_patterns`）。**零 LLM 调用**——「叶天士常用党参白术」让模型总结出来是生成、会编，数出来是计数、每条都能回指 `case_id`。剂量从原文抓（`herbs` 没有结构化剂量），**锚在这张方已知的药名上**而不是让正则猜药名（猜法只抓到 9% 的方，见 data/SOURCES.md 第 90 条）。定位外医案（`out_of_scope`）默认排除，`--include-out-of-scope` 才带上 |
 | `offline/build_jieba_dict.py` | K3a：生成 BM25 检索用的中医术语自定义词典 `data/jieba_dict.txt` |
 | `offline/estimate_epsilon.py` | E：估计噪声地板 ε（`epsilon_online`/`epsilon_core`/`epsilon_adjunct`/`epsilon_s2`/`epsilon_extract`），写 `eval/epsilon.json`，供前端"分歧度"和 V1 的显著性判断做对照基准。`epsilon_core`/`epsilon_adjunct` 是 R1 加的君臣/佐使分层地板（见「分歧度的三层」一节），跟 `epsilon_online` 是同一批调用切出来的，不额外花钱 |
 | `offline/extract_case_triples.py` | X3：从每一诊原文用真实 LLM 抽取三元组（`{case_id,physician,s,p,o,source_span}`），写 `data/case_triples.jsonl`，`core/tools.py` 的 `query_case_graph` 工具消费这份数据 |

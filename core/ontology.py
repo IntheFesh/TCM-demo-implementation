@@ -375,6 +375,12 @@ class Ontology:
         """R35 挖出来的名医用药规律。R35 之前这份文件不存在，返回空列表。
 
         证名匹配跟 `formulas_for_syndrome` 同一条规矩（去掉尾「证」）。
+
+        **医家档（`group_value=""`）恒命中任何证型**：空串是 `group in key`
+        的子串，这是有意的——1075 诊次里只有 116 条标了证型，只放证型档
+        等于九成语料进不了知识块。代价是返回量大（医家档单个医家可上千条），
+        所以返回前必须排序（`sort_patterns`），让调用方"取前 N 条"是有意义的
+        取法而不是碰运气。**截断在调用方做并记数**，不在这里悄悄少给。
         """
         if not self._patterns:
             return []
@@ -387,7 +393,7 @@ class Ontology:
             if key and key not in group and group not in key:
                 continue
             out.append(p)
-        return out
+        return sort_patterns(out)
 
 
 # ---------- 构造 ----------
@@ -451,6 +457,23 @@ def _build_formulas(rows: list[dict]) -> dict[str, Formula]:
             refs={p: _refs_for(rows, name, p) for p in preds},
         )
     return out
+
+
+def sort_patterns(patterns: list[dict]) -> list[dict]:
+    """规律的排序规则。**只有这一处实现**：`patterns_for` 与知识块的
+    合并重排都走它，两处各写一套排序会让"取前 N 条"取到不同的 N 条。
+
+    序：证型档在前（它比医家档更贴合本次辨证）→ support 从高到低
+    → `pattern_id`（确定性兜底，同 support 的顺序不能随字典序抖动）。
+    """
+    return sorted(
+        patterns,
+        key=lambda p: (
+            0 if p.get("group_by") == "physician_syndrome" else 1,
+            -int(p.get("support") or 0),
+            str(p.get("pattern_id") or ""),
+        ),
+    )
 
 
 def _load_patterns() -> list[dict]:
