@@ -553,7 +553,7 @@ R16 起**首屏铺的是证素**（20 个 `../data/graph.json:graph.n_elements=2
 枢纽在内圈。之前首屏铺 80 个证型方块——证型之间本来就没有边，力导向对一堆
 孤立节点只能摊平，那张图不传达任何东西。
 
-这张图当前的规模：节点 1281 `../data/graph.json:graph.n_nodes=1281`、
+这张图当前的规模：节点 2222 `../data/graph.json:graph.n_nodes=2222`、
 边 3682 `../data/graph.json:graph.n_edges=3682`、
 证候 174 `../data/graph.json:graph.n_syndromes=174`、
 症状 1087 `../data/graph.json:graph.n_symptoms=1087`。

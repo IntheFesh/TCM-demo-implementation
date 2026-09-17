@@ -1102,6 +1102,15 @@ class OpenAICompatBackend(LLMBackend):
         # 也没有 LoRA adapter 可切。**不能转给 SDK**——多一个它不认的关键字
         # 参数就是 TypeError（这也是这两个参数为什么是显式形参、不塞 kwargs）。
         extra_body: dict = {}
+        if thinking is None:
+            # 离线抽取这类调用点不传 step、因而不传 thinking，会落到 API 默认——
+            # 而推理模型的默认是**开思考**。抽三元组是结构化信息提取，思考模式
+            # 对它没有价值，只烧时间和输出 token：实测 0.63 块/分，2181 块要 58 小时。
+            # 用环境变量给这类调用一个统一兜底，不改各调用点。
+            import os as _os
+            _fb = (_os.environ.get("LLM_DEFAULT_THINKING") or "").strip().lower()
+            if _fb in ("enabled", "disabled"):
+                thinking = _fb
         if thinking is not None:
             extra_body["thinking"] = {"type": thinking}
         extra: dict = {"extra_body": extra_body} if extra_body else {}

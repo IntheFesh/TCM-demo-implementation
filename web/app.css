@@ -13,22 +13,22 @@
 @font-face {
   font-family: "Noto Serif SC";
   font-style: normal; font-weight: 400; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@5.3.0/chinese-simplified-400-normal.woff2") format("woff2");
+  src: url("vendor/fonts/noto-serif-sc-400-subset.woff2") format("woff2");
 }
 @font-face {
   font-family: "Noto Serif SC";
   font-style: normal; font-weight: 600; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-serif-sc@5.3.0/chinese-simplified-600-normal.woff2") format("woff2");
+  src: url("vendor/fonts/noto-serif-sc-600-subset.woff2") format("woff2");
 }
 @font-face {
   font-family: "Noto Sans SC";
   font-style: normal; font-weight: 400; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@5.3.0/chinese-simplified-400-normal.woff2") format("woff2");
+  src: url("vendor/fonts/noto-sans-sc-400-subset.woff2") format("woff2");
 }
 @font-face {
   font-family: "Noto Sans SC";
   font-style: normal; font-weight: 500; font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@5.3.0/chinese-simplified-500-normal.woff2") format("woff2");
+  src: url("vendor/fonts/noto-sans-sc-500-subset.woff2") format("woff2");
 }
 
   :root {

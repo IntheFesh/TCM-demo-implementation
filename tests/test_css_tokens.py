@@ -5,6 +5,7 @@
 箭头、所有元素一个圆角。没有断言的话，三轮之后页面又长成通用模板，而每一次改动
 单看都合理。
 """
+import pathlib
 import re
 
 import pytest
@@ -197,8 +198,19 @@ def test_webfont_urls_are_pinned_to_a_version(css):
     assert urls, "一个 @font-face 的 URL 都没抓到"
     floating = [u for u in urls if "@latest" in u or "/latest/" in u]
     assert not floating, f"字体 URL 版本浮动：{floating}"
+    # 钉法按来源分两种，**都不许浮动**：
+    #   远程（CDN）——URL 里必须带具体版本号，否则上游一改版字形就变；
+    #   本地（vendor/）——文件本身在版本控制里，内容不会浮动，这比版本号更强；
+    #     但必须真的存在，否则页面会静默掉回系统字体（宋/黑两族的区分就没了），
+    #     而那同样不报任何错。
+    root = pathlib.Path(__file__).resolve().parent.parent
     for url in urls:
-        assert re.search(r"@\d+\.\d+\.\d+", url), f"URL 里没有具体版本号：{url}"
+        if url.startswith("vendor/"):
+            f = root / "web" / url
+            assert f.is_file(), f"本地字体文件不存在：{url}"
+            assert f.stat().st_size > 10_000, f"本地字体文件小得不像字体：{url}"
+        else:
+            assert re.search(r"@\d+\.\d+\.\d+", url), f"远程 URL 里没有具体版本号：{url}"
 
 
 def test_no_animation_outside_the_three_tokens(css, body):
