@@ -57,6 +57,7 @@ PREFIX = {
     "topbar_byok": "r17", "demo_mode": "r17",
     "reference_physicians": "r18",
     "epigraph": "r24", "select_open": "r24",
+    "structured_single": "r33",
     "advice_panel": "r24", "rings": "r24",
 }
 
@@ -244,6 +245,45 @@ DONE_PAYLOAD = {
     "followup": None, "residual": None, "demo_mode": None,
     "manifest": {"model": "deepseek-v4-pro", "prompt_version": "v1",
                  "cases_sha256": "abc1234", "llm_calls": 6, "elapsed_ms": 88000},
+}
+
+# R33：结构化模式的终态 payload——**一个 result**，physician 是保留 id
+# `synthesis`，`divergence` 是 None（一份结论没有"两两分歧"这回事）。
+#
+# **为什么必须有这一条 Playwright 状态。** CLAUDE.md 那条：涉及渲染层结构变更时
+# 真实浏览器渲染是必需的验收环节。R33 把 results 从三个元素变成一个，
+# 后端 JSON 测试全绿说明不了三列布局在只有一列时还成立——M5 那次
+# 正是"数据对了、前端 nodesByLayer 漏了新 key"。
+S33_RESULT = json.loads(json.dumps(RESULTS[0]))
+S33_RESULT.update({
+    "physician": "synthesis",
+    "physician_name": "五家综合",
+    "color": "#3B4A6B",
+    "school": None,
+    "years": None,
+    "physicians_cited": ["ye_tianshi", "li_ke"],
+    "herbs_grounded_ratio": 0.0,
+    "physician_influences": [
+        {"physician": "ye_tianshi", "step": "formula",
+         "contribution": "用药轻灵，剂量偏小", "cited_case_ids": ["ye_tianshi-0001-p0-0"]},
+        {"physician": "li_ke", "step": "herbs",
+         "contribution": "温阳一路敢用重剂", "cited_case_ids": ["ye_tianshi-0001-p0-0"]},
+    ],
+})
+S33_DONE_PAYLOAD = {
+    **json.loads(json.dumps(DONE_PAYLOAD)),
+    "results": [S33_RESULT],
+    # 一份结论没有两两分歧可言。**None 不是 0**——0 会被读成"五家完全一致"。
+    "divergence": None,
+    "manifest": {**DONE_PAYLOAD["manifest"], "s3_mode": "structured",
+                 "llm_calls": 3,
+                 "synthesis": {"physicians_available": 5,
+                               "physicians_cited": ["ye_tianshi", "li_ke"],
+                               "n_physicians_cited": 2,
+                               "herbs_grounded_ratio": 0.0,
+                               "n_ontology_refs": 0, "n_herbs": 6,
+                               "chain_steps": ["organ", "syndrome", "method",
+                                               "formula", "herbs"]}},
 }
 
 # R24：建议层 + token 面板的 fixture。三档 severity 各一条（三档画成一样就等于
@@ -687,6 +727,31 @@ STATES = {
     ),
     # 第六张：终态。不在 §3.1 的五种状态表里（那张表列的是"非终态怎么办"），
     # 但三列集注 + 用药对照带这两个 R14 的主要交付物只有在这张图上看得见。
+    "structured_single": (
+        "renderComplaintBody(COMPLAINT); renderConsultResult(S33_DONE_PAYLOAD);",
+        """() => {
+          const cols = document.querySelectorAll('#columns .col');
+          if (cols.length !== 1) return '结构化模式应该只有一列，实际 ' + cols.length;
+          const col = cols[0];
+          if (col.dataset.physician !== 'synthesis')
+            return '那一列的 data-physician 不是 synthesis，是 ' + col.dataset.physician;
+          if (col.dataset.state !== 'done') return '那一列没进终态';
+          const box = col.getBoundingClientRect();
+          const grid = document.getElementById('columns').getBoundingClientRect();
+          if (box.width < grid.width * 0.5)
+            return '一列没有铺开（宽 ' + Math.round(box.width) + ' / 容器 '
+                   + Math.round(grid.width) + '），auto-fit 塌了';
+          if (box.height < 100) return '那一列几乎没有内容，高 ' + Math.round(box.height);
+          const text = col.innerText || '';
+          if (!text.includes('五家综合')) return '列头没有显示「五家综合」';
+          if (!text.includes('肝胃不和证')) return '证型没有渲染出来';
+          // divergence 为 null 时处方对照区不该摆出一张空表
+          const cmp = document.getElementById('rx-compare');
+          if (cmp && cmp.offsetParent !== null && (cmp.innerText || '').trim())
+            return '只有一份结论时还摆出了处方对照：' + cmp.innerText.slice(0, 40);
+          return null;
+        }""",
+    ),
     "done": (
         "renderComplaintBody(COMPLAINT); renderConsultResult(DONE_PAYLOAD);",
         """() => {
@@ -947,6 +1012,8 @@ def run(only: str | None, wait_ms: int) -> int:
                                    # R24：建议层 + token 面板 + 今日用量
                                    ("R24_DONE_PAYLOAD", R24_DONE_PAYLOAD),
                                    ("R24_USAGE", R24_USAGE),
+                                   # R33：结构化模式的单列终态
+                                   ("S33_DONE_PAYLOAD", S33_DONE_PAYLOAD),
                                    ("COMPLAINT", COMPLAINT)):
                     page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
                 # setup 里可能有 await（图谱浏览器要先把数据拉回来），

@@ -4618,3 +4618,170 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     本身不是一个有意义的区分，那 3 条的正确读法是"好几个候选分不开"，
     而这个字段表达不了。凡是把一组浮点数的 argmax 当成结论展示出去的地方，
     都要想一下并列时它在说什么。
+
+79. **一段知识只在某个配置下才进提示词，而演示跑的是另一个配置——"模型懂药理"
+    从未发生过，且所有测试全绿。**
+
+    药理层（本草 9776 条 + 方剂 3184 条三元组）抽出来之后，唯一把它送进模型的
+    路径是 `core/context_prefix.py::assemble()` 的稳定前缀，而 `assemble()`
+    **只在 `retriever_mode == "full_context"` 时被调用**（`core/chain.py`
+    `run_physician` 的 if/else 两支）。其余四种 top3 模式（hybrid / dense /
+    graph / bm25）走 `render(s3_prompt["system"], …)` 那一支，`$refs` 里只有
+    医案块。于是"让模型明白药理"这件事在 top3 配置下**一个 token 都没有发生**。
+
+    **为什么整套测试看不出来。** 当时有测 `assemble()` 的输出对不对、有测
+    token 预算、有测前缀缓存命中率（实测 0.989），就是没有一条测
+    **最终发给 LLM 的那段 system 字符串里有没有药理内容**。
+    `tests/test_context_prefix.py` 测的是组装函数的返回值，
+    `tests/test_chain.py` 测的是 `raw_excerpt` 有没有进 prompt——
+    两边都绿，中间那一跳（"这个配置下会不会调用组装函数"）没有人测。
+
+    这跟第 31 条那三次是同一个形状的错，但更难发现：那三次是**两处实现打架**，
+    单独测都对、放一起矛盾；这一次是**一处实现根本没被调用**，
+    连矛盾都没有，只有沉默。
+
+    判据：凡是"某段内容要让模型看到"这类要求，测试必须断言
+    **发给 LLM 的那个字符串**，不能断言生成它的那个函数的返回值。
+    R32 的 `tests/test_knowledge_in_prompt.py` 全部是前者，
+    并且对四种 top3 模式逐个参数化——漏掉哪个模式就是漏掉一种运行配置。
+
+80. **查表顺序是判据的一部分：用粗类目的归一去查细类目的表，会把严格的限量
+    换成宽松的。**
+
+    R32 本体层的 `dose_limit()` 第一版写成
+    `DOSE_LIMITS.get(normalize_for_incompat(name)) or DOSE_LIMITS.get(normalize_herb(name))`。
+    看上去"先归一再查"更稳，实测 62 味药里 **5 味**查错：
+
+    | 写法 | 表里那条 | 归一之后落到 | 查出来 |
+    |---|---|---|---|
+    | 巴豆霜 | 0.3g | 巴豆 | **0.0g** |
+    | 黑顺片 / 白附片 / 淡附片 / 熟附片 | 各 15.0g | 乌头 | **查不到** |
+
+    根因：`normalize_for_incompat` 回答的是"这两味算不算十八反的一对"，
+    它的**类目比剂量粗**（附子/黑顺片/白附片全归到乌头）。
+    拿它查剂量 = 拿一张粗表的键去索引一张细表。
+
+    项目里本来就有正确顺序（**先原始写法、再 `normalize_herb`**），
+    `check_dose_limits` 的文档字符串把理由写得很清楚，`herb_props` 也照着做了
+    ——**但它是被"照着抄"的，不是被调用的**，所以第三处抄错了没人发现。
+    修法是抽成 `core/safety_output.py::dose_limit_entry()`，三处都调它。
+
+    **顺带记住"生"不是可以剥的前缀。** 表里同时收录
+    生附子 0.0g / 附子 15.0g、生川乌 0.0g / 川乌 3.0g、
+    生草乌 0.0g / 草乌 3.0g、生半夏 3.0g / 半夏 9.0g 四对。
+    本轮审计 `cases.json` 时「生石膏」「生牡蛎」这类写法有 **230** 次
+    （51 种写法 311 次里的 30 种），很容易被当成"漏掉的别名"补进
+    `HERB_ALIASES`——补进去就等于把四条严格限量删掉。
+    另外 81 次（白/大/鲜/嫩/老/小 前缀，21 种写法）是真的描述性修饰，
+    但改 `HERB_ALIASES` 会动 Jaccard 分歧度这个**已测量的数**，
+    要单独一轮带前后对照，本轮只记数不改。
+
+81. **进程级单例让"冷启动耗时"这个测量悄悄失效，而失效的样子跟"没装这个包"
+    一模一样。**
+
+    `cases.json` 进版本控制（`4896084`）之后，
+    `tests/test_bench_scripts.py::test_startup_bench_splits_the_four_segments`
+    在**全量跑**时红、**单跑**时绿。根因不在这个测试：
+    `core/retrieval.py::get_retriever()` 是进程级单例，全量跑时前面的测试
+    已经用真 `cases.json` 建好了它（报告里那句「1060 条医案」就是证据，
+    合成语料只有 5×N 条），于是 `bench_startup` 量的 `construct` / `model_load`
+    这两段**根本没有发生**，`watch.seconds.get("model_load")` 返回 None。
+
+    而报告里 None 打印成 `—`，跟"这台机器没装 sentence_transformers"
+    长得一模一样——两个完全不同的原因，一个符号。
+
+    修了三件事：
+    1. `install_self_test()` 换掉 cases 路径之后**必须**丢掉旧单例
+       （`reset_retriever_singleton()`）——不丢的话它持有的是旧路径加载的医案，
+       整跑量的是旧语料且一声不响；
+    2. `main()` 在量之前先问 `retriever_is_built()`，热单例写进
+       `warm_singleton_note` 并让退出码非 0，跟 `encoder_note` 分开两个字段；
+    3. 单例的这两个读写口只在 `core/retrieval.py` 里实现一次
+       （此前 5 个测试各自 `monkeypatch` 那个下划线开头的模块变量）。
+
+    判据：**任何"量冷启动"的脚本，都要先证明自己确实是冷的。**
+    量不到的时候，"为什么量不到"必须是一个独立字段，不能只留一个 `—`。
+
+82. **一个注册表字段回答两个问题：`enabled` 既是"三列集注的一员"又被要求当成
+    "参与综合分析"。**
+
+    R33 的任务书里写着「五位医家 `enabled=True`」。照着做之前先量了一遍代价：
+    李可与王云启的 `school` 都是 `None`（两份语料的前言里查不到生卒年与学派归属，
+    按项目惯例不编），五位两两配对共 **10** 对，其中 **7 对（70%）** 的学派判定会
+    变成 `unknown`——而 λ2（学派层权重）与「跨学派分歧大于师承内」这条对照
+    正是 §0.6 点名要保留的东西。
+
+    根因不是"该不该让五家参与"，是**`enabled` 被要求同时回答两个问题**：
+      - 谁算三列集注的一员（`physicians_enabled`，legacy 模式用）
+      - 谁参与这一次综合分析（structured 模式用）
+    结构化模式取消了三列，所以这两个问题**本来就不是同一个问题**。
+
+    修法是新开一个字段 `in_synthesis`（默认 True，五位全有）+
+    `physicians_for_synthesis()`，`enabled` 一个字没动；再加一个
+    `physicians_for_mode(mode)` 作为**唯一的分派点**——chain / usage / api / 前端
+    各自写一遍 `if mode == "structured"` 的话，漏一处的后果跟
+    `physicians_enabled` 文档里说的完全一样：某条路径悄悄多算或少算了两位医家。
+
+    **这是第 31 条的一个新形状**：此前三次撞的都是"匹配逻辑两处实现"，
+    这次是"一个字段两种语义"。判据也不一样：那三次问"这个判断此前有没有人做过"，
+    这次要问**"这个字段回答的是哪个问题，新场景问的是不是同一个问题"**。
+
+83. **把默认配置改掉的那一刻，上百条为旧默认写的测试会红——而怎么让它们变绿
+    决定了这次改动是真的还是假的。**
+
+    R33 把 `s3_mode()` 的默认从无（只有 legacy 一条路）改成 `structured`，
+    全量测试立刻 **115 failed**：那些测试断言的是 legacy 的形状（三位医家、
+    三个 `results`、两两配对的分歧度、三列事件序列）。
+
+    三种改法，只有一种是对的：
+
+    | 改法 | 后果 |
+    |---|---|
+    | 把默认改回 legacy | 新模式永远跑不到，等于没做（R32 那个坑的原样重演） |
+    | 逐条改那 115 条去断言新形状 | 它们本来要测的是 legacy 那一支，改完就不测了 |
+    | **钉住模式，让它们继续测 legacy** | 对 —— 它们的答案本来就是 legacy |
+
+    做法：`tests/conftest.py` 的 `_isolate_runtime_env` 把 `S3_MODE` 钉成 `legacy`
+    （跟 `tests/test_chain.py::_pin_two_physicians` 钉住两位医家是同一个手法：
+    "钉住 X，让 X 的演进与这批测试解耦"）。
+
+    **钉住之后必须补上那个被钉掉的判据**，否则就变成了"演示跑的配置从来没被测过"：
+      1. `tests/test_s3_mode.py::test_the_product_default_is_structured` 显式
+         `delenv` 之后断言默认是 `structured`——这个钉子改不掉那一条；
+      2. R33 三个新测试文件全部显式 `S3_MODE=structured`，走真的结构化路径；
+      3. 其中一条断言**发给 LLM 的 system 出自 s3_structured.yaml**
+         （R32 那条教训的判据形式：断言发出去的字符串，不是生成它的函数的返回值）。
+
+    判据：**钉一个默认值的时候，同一轮里必须新增一条"产品默认是什么"的测试**，
+    并且它不能受那个钉子影响。
+
+84. **一条测试原地改版本控制里的文件，一次被打断就把仓库弄坏，而报错指向完全
+    错误的原因。**
+
+    R31 写的 `test_the_verifier_catches_a_stale_committed_file` 为了验"指纹对不上
+    要报错"，把真的 `data/standard/syndromes_manifest.json` 的 `syndromes_sha256`
+    改成 64 个 0，在 `finally` 里恢复。R33 有一次全量跑被超时杀掉，
+    `finally` 没来得及执行，文件就留在坏状态里。
+
+    **代价不是"要 git checkout 一下"，是诊断被带向错误方向。** 下一次跑报的是：
+
+        ✗ 落盘 jsonl：记录 000000000000 / 现算 ccc7a2b8111f
+        ✗ 落盘的那份不是当前代码的产物。
+        AssertionError: 落盘的 syndromes.jsonl 跟 manifest 记的指纹对不上。
+                        要么它被手改过，要么重新生成之后 manifest 没跟着写。
+
+    这两句话都是对的，而且都指向"生成物"这条线索——而真正的原因是**测试污染**，
+    跟生成物、跟那一轮的改动都毫无关系。
+
+    修法不是"在更多地方加 try/finally"（打断就是打断，finally 不保证跑），
+    而是**让脚本能对着副本工作**：`scripts/verify_generated_data.py` 加
+    `--manifest` / `--jsonl` 两个开关，测试指向 `tmp_path` 里的副本，
+    真文件一个字节都不碰。另加一条源码级判据
+    （`test_no_test_in_this_file_writes_to_the_version_controlled_data_dir`）：
+    这个文件里不许出现 `MANIFEST_PATH.write_text` 这类调用。
+
+    **判据是源码里没有这种调用，不是"跑一遍看文件变没变"**——后者只在正好被打断
+    的那一次才看得出来，而那正是这个缺陷难查的原因。
+    （写这条判据时又踩了一次自指：一条"源码里不许出现 X"的测试，自己的源码里必然
+    出现 X，所以要先切掉自己的函数体再扫——R31 在
+    `test_parse_textbook_has_no_second_heading_matcher` 上踩过同一形状。）

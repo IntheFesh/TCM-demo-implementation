@@ -160,35 +160,63 @@ def test_the_verifier_runs_clean_on_the_committed_tree():
         assert "就是当前这套代码" in r.stdout
 
 
-def test_the_verifier_catches_a_stale_committed_file(tmp_path, monkeypatch):
-    """把 manifest 记的指纹改掉一位，脚本必须报出来——**先红后绿里的红**。"""
+def test_the_verifier_catches_a_stale_committed_file(tmp_path):
+    """把 manifest 记的指纹改掉一位，脚本必须报出来——**先红后绿里的红**。
+
+    **改的是 tmp_path 里的副本，不是版本控制里那份。** R31 的第一版原地改真文件、
+    在 `finally` 里恢复：只要那次跑被打断（Ctrl-C、超时被杀、pytest 自己崩），
+    文件就留在坏状态里，而下一次跑报的是「落盘的 jsonl 被手改过」——
+    指向一个完全错误的原因。R33 实测踩到过一次。
+    脚本因此有了 `--manifest` / `--jsonl` 两个开关。
+    """
     import subprocess
     import sys
 
-    real = MANIFEST_PATH.read_text(encoding="utf-8")
-    data = json.loads(real)
+    bad = tmp_path / "syndromes_manifest.json"
+    data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     data["syndromes_sha256"] = "0" * 64
-    MANIFEST_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        r = subprocess.run([sys.executable, "-m", "scripts.verify_generated_data"],
-                           cwd=ROOT, capture_output=True, text=True, timeout=300)
-        assert r.returncode == 1, r.stdout
-        assert "落盘 jsonl" in r.stdout
-    finally:
-        MANIFEST_PATH.write_text(real, encoding="utf-8")
+    bad.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    r = subprocess.run([sys.executable, "-m", "scripts.verify_generated_data",
+                        "--manifest", str(bad)],
+                       cwd=ROOT, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 1, r.stdout
+    assert "落盘 jsonl" in r.stdout
+    # 真文件一个字节都没动过——这条断言就是这次修复本身的判据。
+    assert json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))["syndromes_sha256"] != "0" * 64
 
 
 def test_a_missing_manifest_is_its_own_exit_code(tmp_path):
-    """"没有这份记录" 跟 "有记录但对不上" 要分开——前者去生成，后者去查哪里变了。"""
+    """"没有这份记录" 跟 "有记录但对不上" 要分开——前者去生成，后者去查哪里变了。
+
+    同上：指向一个 tmp_path 里**不存在**的路径，不去 unlink 版本控制里那份。
+    """
     import subprocess
     import sys
 
-    real = MANIFEST_PATH.read_bytes()
-    MANIFEST_PATH.unlink()
-    try:
-        r = subprocess.run([sys.executable, "-m", "scripts.verify_generated_data"],
-                           cwd=ROOT, capture_output=True, text=True, timeout=300)
-        assert r.returncode == 2, r.stdout
-        assert "没有" in r.stdout
-    finally:
-        MANIFEST_PATH.write_bytes(real)
+    r = subprocess.run([sys.executable, "-m", "scripts.verify_generated_data",
+                        "--manifest", str(tmp_path / "没有这个文件.json")],
+                       cwd=ROOT, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 2, r.stdout
+    assert "没有" in r.stdout
+    assert MANIFEST_PATH.exists(), "真文件必须还在"
+
+
+def test_no_test_in_this_file_writes_to_the_version_controlled_data_dir():
+    """判据化上面那条教训：这个文件里不许出现对 `MANIFEST_PATH` 的写操作。
+
+    判据是**源码里没有这种调用**，不是"跑一遍看文件变没变"——后者只在正好被打断
+    的那次才看得出来，而那正是这个缺陷难查的原因。
+    """
+    src = Path(__file__).read_text(encoding="utf-8")
+    # **先切掉这条测试自己的函数体**，不然它的禁用词表就是第一个命中项
+    # （R31 在 `test_parse_textbook_has_no_second_heading_matcher` 上踩过同一形状：
+    # 一条"源码里不许出现 X"的测试，自己的源码里必然出现 X）。
+    src = src[:src.index("def " + "test_no_test_in_this_file_writes")]
+    for attr in ("MANIFEST_PATH", "DEFAULT_OUT_PATH"):
+        for verb in ("write_text", "write_bytes", "unlink"):
+            forbidden = f"{attr}.{verb}"
+            assert forbidden not in src, (
+                f"{forbidden} 会原地改版本控制里的生成物；用 --manifest / --jsonl "
+                "指向 tmp_path 里的副本"
+            )

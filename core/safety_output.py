@@ -429,6 +429,28 @@ def to_grams(dose: float | None, unit: str) -> float | None:
     return None if factor is None else dose * factor
 
 
+def dose_limit_entry(name: str) -> tuple[float, str] | None:
+    """`DOSE_LIMITS` 的**唯一查法**：先原始写法，再 `normalize_herb` 归一。
+
+    顺序不能反，也不能换成 `normalize_for_incompat`：
+      - 「黑顺片」`normalize_herb` 会剥过头（剥成「黑顺」），表里已把这类写法
+        显式收录成独立键，原始写法这一步就能命中；
+      - `normalize_for_incompat` 会把「黑顺片」归到「乌头」、「巴豆霜」归到
+        「巴豆」——那张表回答的是"这两味算不算十八反的一对"，**类目比剂量粗**，
+        用它查剂量会把表里更具体的那条限量（巴豆霜 0.3g）换成粗类目那条
+        （巴豆 0.0g），实测差出一整条判据。
+      - 「生半夏」与「半夏」在表里是两条不同的限量，先查原始写法才保得住这条
+        区分，否则严格的生品限量会被宽松的制品限量盖掉。
+
+    抽成函数是因为这个顺序此前被抄在三处（`check_dose_limits`、`herb_props`
+    的同款注释、R32 本体层），而本体层那一处抄错了（用了
+    `normalize_for_incompat`）——CLAUDE.md 第 31 条说的正是这种情形。
+    """
+    if not name:
+        return None
+    return DOSE_LIMITS.get(name) or DOSE_LIMITS.get(normalize_herb(name))
+
+
 def check_dose_limits(items: list[HerbItem]) -> list[DoseViolation]:
     """逐味药核对是否超过 DOSE_LIMITS 里的上限。
 
@@ -450,7 +472,7 @@ def check_dose_limits(items: list[HerbItem]) -> list[DoseViolation]:
         grams = to_grams(item.dose, item.dose_unit)
         if grams is None:
             continue
-        entry = DOSE_LIMITS.get(item.name) or DOSE_LIMITS.get(normalize_herb(item.name))
+        entry = dose_limit_entry(item.name)
         if entry is None:
             continue
         limit_g, reason = entry

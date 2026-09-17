@@ -20,7 +20,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.audit import append_audit
-from core.chain import consult, current_asking_physician, explained_symptoms
+from core.chain import (
+    SYNTHESIS_PHYSICIAN_ID,
+    consult,
+    current_asking_physician,
+    explained_symptoms,
+)
 from core.diseases import get_disease, triage_advice
 from core.examples import EXAMPLE_COMPLAINTS
 from core.herbs import is_western_drug, strip_dose_and_parens
@@ -28,7 +33,11 @@ from core.llm import ByokBackend, LLMAuthError, check_api_key, get_llm, use_llm
 from core.react import react_enabled
 from core import usage as usage_mod
 from core.physicians import (
-    PHYSICIANS, physicians_all, physicians_enabled, resolve_physician_id,
+    PHYSICIANS,
+    SYNTHESIS_DISPLAY,
+    physicians_all,
+    physicians_enabled,
+    resolve_physician_id,
 )
 from core.prescription import compute_herb_diffs, format_pharmacy_text
 from core.formula_check import advice_dicts, check_formula
@@ -1204,7 +1213,11 @@ def _serialize_residual(residual: dict | None) -> dict | None:
 def _serialize_result(r: dict) -> dict:
     # 按 id 查元数据（姓名/配色）用全表：结果里只会有 enabled 的医家，
     # 但这个函数也被「参考医家」引用区的序列化复用。
-    info = physicians_all(PHYSICIANS).get(r["physician"], {})
+    # R33：结构化模式那份结论的 id 是保留值 `synthesis`，**不在注册表里**
+    # （见 core/physicians.py::SYNTHESIS_DISPLAY 的注释——它不是一位医家）。
+    # 查不到就退到那份展示元数据，而不是退到灰色兜底：灰色在前端表示"未知医家"。
+    info = physicians_all(PHYSICIANS).get(r["physician"]) or (
+        SYNTHESIS_DISPLAY if r["physician"] == SYNTHESIS_PHYSICIAN_ID else {})
     return {
         "physician": r["physician"],
         "physician_name": r["physician_name"],
@@ -1237,6 +1250,17 @@ def _serialize_result(r: dict) -> dict:
         "advice": r.get("advice", []),
         "advice_skipped": r.get("advice_skipped", []),
         "formula_score": r.get("formula_score"),
+        # R33：结构化模式多出来的四项。**`.get` 带默认值**——legacy 那条路和
+        # 「参考医家」引用区都没有这几个键，而缺键会让前端读到 undefined 悄悄进渲染。
+        # `s3_structured` 是五步链原件（R37 的单链问诊界面读它）；`s3` 那一份
+        # 仍然是下游既有契约的形状，两者并存不是重复——一个给新界面、一个给旧界面。
+        "s3_structured": (r["s3_structured"].model_dump()
+                          if r.get("s3_structured") is not None else None),
+        "physician_influences": r.get("physician_influences", []),
+        "physicians_cited": r.get("physicians_cited", []),
+        # 带本体引用的药味占比。**0 有两种原因**（本体不在 / 本体在但模型没引），
+        # 前端要显示这个数时必须同时看 manifest 的 knowledge_entries.available。
+        "herbs_grounded_ratio": r.get("herbs_grounded_ratio"),
     }
 
 

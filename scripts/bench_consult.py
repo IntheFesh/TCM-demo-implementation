@@ -456,6 +456,12 @@ def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
         # best_of_n 同时解释 llm_calls 为什么比 R21 高三倍。
         "best_of_n": manifest.get("best_of_n"),
         "reasoning_effort": manifest.get("reasoning_effort"),
+        # R32：知识块进没进提示词、进了多少。跟 retriever_mode 同一个理由——
+        # 两份报告放在一起比时，"这次模型看没看到药理"必须能一眼看出来，
+        # 否则又会重演"演示跑 hybrid、知识块从未进过提示词、所有测试全绿"。
+        "knowledge_in_prompt": manifest.get("knowledge_in_prompt"),
+        "knowledge_tokens": manifest.get("knowledge_tokens"),
+        "knowledge_entries": manifest.get("knowledge_entries"),
     }
 
 
@@ -487,6 +493,9 @@ def summarize(runs: list[dict]) -> dict:
         "retriever_mode": (ok[-1].get("retriever_mode") if ok else None),
         "best_of_n": (ok[-1].get("best_of_n") if ok else None),
         "reasoning_effort": (ok[-1].get("reasoning_effort") if ok else None),
+        "knowledge_in_prompt": (ok[-1].get("knowledge_in_prompt") if ok else None),
+        "knowledge_tokens": (ok[-1].get("knowledge_tokens") if ok else None),
+        "knowledge_entries": (ok[-1].get("knowledge_entries") if ok else None),
     }
 
 
@@ -555,10 +564,12 @@ def main(argv: list[str] | None = None) -> int:
     # 假后端 + 仓库里没有 cases.json = 沙盒里的常态。这时自动装合成医案，比让人拿到
     # 一份"只跑了 S1/S2 却标着成功"的报告好——但**必须在输出里标出来**（fake_cases_auto），
     # 不然这份报告跟真语料跑出来的长得一模一样。
-    from core.retrieval import CASES_PATH
+    # 判据走 core.retrieval.cases_available()，不自己读 CASES_PATH：这个问题
+    # （"这台机器有没有检索数据"）只能有一处实现，见那个函数的文档字符串。
+    from core.retrieval import cases_available
 
     auto = (args.fake_cases == 0 and args.auto_fake_cases
-            and args.backend == "fake" and not CASES_PATH.exists())
+            and args.backend == "fake" and not cases_available())
     n_per_physician = args.fake_cases or (AUTO_FAKE_CASES_PER_PHYSICIAN if auto else 0)
     n_fake_cases = install_fake_cases(n_per_physician) if n_per_physician > 0 else 0
     runs = [run_once(args.complaint, args.react, args.retriever_mode, backend)

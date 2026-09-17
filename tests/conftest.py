@@ -139,8 +139,30 @@ def _isolate_runtime_env(monkeypatch):
     # 开发者 shell 里留一个 `S3_BEST_OF_N=5` 会让一堆数调用数的测试变红，
     # 而红的地方跟改动毫无关系（这条夹具当初就是为 USE_REACT=1 这种情况加的）。
     for var in ("USE_REACT", "FAST_MODE", "EVAL_MODE", "RETRIEVER_MODE",
-                "S3_BEST_OF_N", "S3_REASONING_EFFORT", "S3_THINKING"):
+                "S3_BEST_OF_N", "S3_REASONING_EFFORT", "S3_THINKING",
+                # R33：S3_MODE 决定 S3 产出哪种 schema，也就决定 results 有
+                # 几个元素。开发者 shell 里留一个值会让一整批测试红在跟改动
+                # 无关的地方（跟 S3_BEST_OF_N 那条完全同理）。
+                "S3_MODE", "KNOWLEDGE_IN_PROMPT", "FOCUSED_KNOWLEDGE_MAX_TOKENS"):
         monkeypatch.delenv(var, raising=False)
+    # 清掉之后**再钉成 legacy**。这一句跟上面那一行做的是两件不同的事。
+    #
+    # **为什么要钉。** R33 把 `s3_mode()` 的默认改成了 `structured`（五家融合成
+    # 一份结论，`results` 恰好一个元素）。此前写下的约 115 条测试断言的是 legacy
+    # 那个形状：三位医家、三个 results、两两配对的分歧度、三列事件序列。
+    # 它们测的机制在两种模式下都存在，**要测的就是 legacy 那一支**，
+    # 所以这里钉住模式、让它们继续测自己本来要测的东西——跟
+    # `tests/test_chain.py::_pin_two_physicians` 钉住两位医家是同一个做法
+    # （"钉住 X，让 X 的演进与这批测试解耦"）。
+    #
+    # **为什么这不会把新默认藏起来。** R32 的教训正是"演示跑的那个配置从来没被
+    # 测过"。所以：
+    #   1. `tests/test_s3_mode.py` 有一条专门断言**产品默认是 structured**
+    #      （它显式 delenv 之后调 `s3_mode()`），这个钉子改不掉那条；
+    #   2. R33 三个新测试文件全部显式 `S3_MODE=structured`，走的是真的结构化路径；
+    #   3. 断言"发给 LLM 的 system 出自 s3_structured.yaml"的测试也在那里面。
+    # 钉子只影响"没有明说自己要哪一种"的那批测试，而它们的答案本来就是 legacy。
+    monkeypatch.setenv("S3_MODE", "legacy")
 
 
 @pytest.fixture(autouse=True)
