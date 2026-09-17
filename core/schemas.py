@@ -817,3 +817,360 @@ class DistillRecord(BaseModel):
     teacher_model: str = Field(min_length=1)
     teacher_saw_source_case: bool
     case_refs: list[str] = Field(default_factory=list)
+
+
+# ---------- R33：结构化推理链 S3′（S3Structured） ----------
+#
+# **为什么新建一整套 schema 而不是给 S3Syndrome 加字段。**
+# 用户的要求（§0.1 原话）是「五位医家进行综合分析，**不要给出多个答案**」、
+# 「一个专家诊断，给出解决方案、药方」。`S3Syndrome` 的形状恰好相反：它是
+# **一位**医家给出 **2–3 个**候选方，三位医家并置成三列由人来比。两者不是同一件
+# 产出，不是加几个可选字段能表达的差别——所以按 CLAUDE.md 那条铁律新建，
+# `S3Syndrome` 与 `S3SyndromeUnreferenced` 一个字没动，`S3_MODE=legacy` 仍走它们。
+#
+# **五步链条来自申报书 2.1**：「病变脏腑-证型-治法-方剂-药物组成」。
+# 每一步都显式声明自己的输入，由 `model_validator` 检查那个输入确实出现在上一步的
+# 输出里——这就是「不可跳步」的可执行形式。**判据在 schema 层而不是 prompt 层**：
+# prompt 只能请求模型别跳步，schema 能让跳了步的输出**根本构造不出来**，
+# 于是 `generate()` 的两次重试会把校验错误回灌给模型（CLAUDE.md 那条重试约定）。
+
+
+class OntologyRef(BaseModel):
+    """一条本体引用：指向本草/方剂条目的某个谓词，并**带上原文片段**。
+
+    `span` 是 `Field(min_length=1)` 而不是可选：一条"引用"如果说不出原文写了什么，
+    它就不是引用，只是又一句模型自己的话。R34 的 `herb_grounded` 规则要拿它当反例，
+    空 span 会让那条规则的反例变成空字符串——等于没有反例。
+
+    `book` 可以为空：本体条目里有 `book` 的话模型应当照填，但模型看到的是知识块里
+    的那一段，不一定带书名。**这个字段的真实性由 R34 回查本体核对**，不靠模型自觉，
+    所以这里不设 `min_length=1`——设了只会逼模型编一个书名。
+    """
+
+    kind: Literal["herb", "formula"]
+    name: str = Field(min_length=1)
+    predicate: str = Field(min_length=1)
+    span: str = Field(min_length=1)
+    book: str | None = None
+
+
+class OrganLocus(BaseModel):
+    """第 1 步：病变脏腑。
+
+    `supporting_symptoms` 必须非空——"病在脾"这个判断的依据只能是患者的症状，
+    说不出依据的脏腑定位是这条链上第一个可以凭空出现的东西。
+    """
+
+    organ: str = Field(min_length=1)
+    supporting_symptoms: list[str] = Field(min_length=1)
+    pathogenesis: str = Field(min_length=1)
+
+
+class SyndromeStep(BaseModel):
+    """第 2 步：证型。`from_organs` 必须全部来自第 1 步（`S3Structured` 校验）。
+
+    `reasoning_plain` 在这里是**必填**，跟 `_S3Base.reasoning_plain` 的可选不同：
+    那边的可选是为了不逼几十处旧式构造都补字段（历史包袱），这套 schema 没有
+    历史构造点，所以从一开始就要求给——患者模式下前端要显示的就是它。
+    """
+
+    name: str = Field(min_length=1)
+    disease: str | None = None
+    from_organs: list[str] = Field(min_length=1)
+    reasoning: str = Field(min_length=1)
+    reasoning_plain: str = Field(min_length=1)
+
+
+class MethodStep(BaseModel):
+    """第 3 步：治法。`from_syndrome` 必须**逐字等于**第 2 步的证型名。
+
+    `targets`：这个治法分别针对哪几条病机。第 5 步每味药的 `for_element` 要能在
+    「第 1 步的脏腑」∪「这里的 targets」里找到，否则那味药是凭空加的。
+    """
+
+    principle: str = Field(min_length=1)
+    from_syndrome: str = Field(min_length=1)
+    targets: list[str] = Field(min_length=1)
+
+
+class FormulaStep(BaseModel):
+    """第 4 步：方剂。**只出一张**（`candidate` 是单个而不是 list）。
+
+    §0.1 的「不要给出多个答案」落在这里：`S3Syndrome.formula_candidates` 是
+    `min_length=1, max_length=3`，让模型给 2–3 个候选再由人挑；这套 schema 只收
+    一张方，"挑"这件事由模型在第 3→4 步之间做完并在 `rationale` 里说明。
+    """
+
+    candidate: FormulaCandidate
+    from_method: str = Field(min_length=1)
+    ontology_refs: list[OntologyRef] = Field(default_factory=list)
+
+
+class HerbChoice(BaseModel):
+    """第 5 步：一味药**为什么**进这张方。
+
+    **不是 `HerbItem` 的替代**：`item` 直接复用它（剂量/炮制/煎法/君臣佐使那套字段
+    以及 M2 的剂量安全检查全部照旧生效，不在这里重写一份）。这个类加的是
+    "开它的依据"——针对哪条病机、依据哪条功效、出自本体哪一段、受哪位医家影响。
+
+    `ontology_refs` 默认空而不是 `min_length=1`：药理层数据不在的机器上
+    （沙盒、新 clone）模型没有本体可引，要求必填会让 S3 直接跑不起来。
+    **"有没有引到本体"是一个要被测量的比率**（R34 的 `herbs_grounded_ratio`），
+    不是一个 schema 硬约束——把它设成硬约束，本体缺失时会退化成"模型编 span"，
+    那比测出一个低比率糟得多。
+    """
+
+    item: HerbItem
+    for_element: str = Field(min_length=1)
+    effect_cited: str = Field(min_length=1)
+    ontology_refs: list[OntologyRef] = Field(default_factory=list)
+    physician_source: str | None = None
+
+
+class PhysicianInfluence(BaseModel):
+    """某位医家的思路在这条链的**哪一步**起了作用。
+
+    `cited_case_ids` 是 `min_length=1`：声称"李可的思路影响了这一步"必须指得出
+    是他哪一条医案。说不出医案的"influence"就是替那位医家背书他没说过的话
+    ——这是整套「综合分析」里最容易出现的一类幻觉，因为它读起来最像学术表述。
+
+    `physician` 存 **id**（`ye_tianshi` 而不是「叶天士」），跟全项目一致；
+    边界上由 `core/physicians.py::resolve_physician_id` 解析（CLAUDE.md 那条
+    「标识符只有一种规范形式」——ReAct 的 physician 参数已经踩过一次）。
+    """
+
+    physician: str = Field(min_length=1)
+    step: Literal["organ", "syndrome", "method", "formula", "herbs"]
+    contribution: str = Field(min_length=1)
+    cited_case_ids: list[str] = Field(min_length=1)
+
+
+#: 五步链条的步名，**顺序即依赖顺序**。`PhysicianInfluence.step` 的 Literal 用的是
+#: 同一组字面量；改这里要同时改那个 Literal（两处写同一组值是 pydantic 的
+#: Literal 不能引用变量所致，有一条测试钉住两者一致）。
+S3_CHAIN_STEPS: tuple[str, ...] = ("organ", "syndrome", "method", "formula", "herbs")
+
+
+class _S3StructuredBase(BaseModel):
+    """`S3Structured` 与 `S3StructuredUnreferenced` 共享的五步链与「不可跳步」校验。
+
+    分基类的形状**照抄 `_S3Base` / `S3Syndrome` / `S3SyndromeUnreferenced`**：
+    检索为空时用一个不含引用字段的子类，而不是把 `min_length=1` 放松掉
+    （CLAUDE.md 那条铁律）。项目里这个模式已经有一处，这里用同一个形状而不是
+    另发明一种——两种写法并存的话，下次改防幻觉约束的人要读懂两套。
+
+    ## 五步链条来自申报书 2.1
+
+    「病变脏腑-证型-治法-方剂-药物组成」。每一步显式声明自己的输入，
+    由校验器检查那个输入确实出现在上一步的输出里。
+
+    ## 「不可跳步」的四条 + 一条来源校验
+
+    1. `syndrome.from_organs` ⊆ 第 1 步给出的脏腑名
+    2. `method.from_syndrome` == `syndrome.name`（**逐字**）
+    3. `formula.from_method` == `method.principle`（**逐字**）
+    4. `herb_choices` 的药名集合 == `formula.candidate.herb_items` 的药名集合
+       （**双向**：方里有的药必须说得出理由，说了理由的药必须真的在方里）
+    5. 每味药的 `for_element` 落在「第 1 步脏腑 ∪ 第 3 步 targets」里
+
+    为什么 2/3 是逐字相等而不是"包含"：允许包含的话模型可以把 `from_syndrome`
+    写成「上述证型」，校验照样通过——而那正是跳步，这一步并没有真的接住上一步的
+    结论，只是提了一句。
+
+    **判据在 schema 层而不是 prompt 层**：prompt 只能请求模型别跳步，schema 能让
+    跳了步的输出**根本构造不出来**，于是 `generate()` 的两次重试会把具体的校验
+    错误回灌给模型（CLAUDE.md 那条重试约定）。
+    """
+
+    organs: list[OrganLocus] = Field(min_length=1)
+    syndrome: SyndromeStep
+    method: MethodStep
+    formula: FormulaStep
+    herb_choices: list[HerbChoice] = Field(min_length=1)
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _no_step_skipping(self) -> "_S3StructuredBase":
+        organ_names = {o.organ for o in self.organs}
+        missing = [o for o in self.syndrome.from_organs if o not in organ_names]
+        if missing:
+            raise ValueError(
+                f"第 2 步（证型）的 from_organs 里 {missing} 没有出现在第 1 步的病变脏腑 "
+                f"{sorted(organ_names)} 里——证型必须从已经定位的脏腑推出来，不能跳步。"
+            )
+        if self.method.from_syndrome != self.syndrome.name:
+            raise ValueError(
+                f"第 3 步（治法）的 from_syndrome={self.method.from_syndrome!r} "
+                f"跟第 2 步的证型 {self.syndrome.name!r} 不一致（要求逐字相同，"
+                "不接受「上述证型」这类指代——那样等于没有接住上一步的结论）。"
+            )
+        if self.formula.from_method != self.method.principle:
+            raise ValueError(
+                f"第 4 步（方剂）的 from_method={self.formula.from_method!r} "
+                f"跟第 3 步的治法 {self.method.principle!r} 不一致（要求逐字相同）。"
+            )
+        in_formula = {i.name for i in self.formula.candidate.herb_items}
+        explained = {c.item.name for c in self.herb_choices}
+        unexplained = sorted(in_formula - explained)
+        extraneous = sorted(explained - in_formula)
+        if unexplained or extraneous:
+            # **两个方向一起报**，不是先报一个。这条错误会被 generate() 回灌给模型
+            # 重试，只报一半的话它改完一半再撞另一半，白花一次重试——而重试只有两次。
+            parts = []
+            if unexplained:
+                parts.append(
+                    f"方里有 {unexplained} 但 herb_choices 里没有给出用药理由"
+                    "（每一味开出去的药都要说得出针对哪条病机、依据哪条功效）")
+            if extraneous:
+                parts.append(
+                    f"herb_choices 里的 {extraneous} 并不在这张方的 herb_items 里"
+                    "（给一味没开的药写理由，说明这两处对不上，不是多写了几句）")
+            raise ValueError(
+                "herb_choices 与 formula.candidate.herb_items 的药名集合必须完全一致："
+                + "；".join(parts) + "。"
+            )
+        allowed = organ_names | set(self.method.targets)
+        stray = sorted({c.for_element for c in self.herb_choices} - allowed)
+        if stray:
+            raise ValueError(
+                f"这几味药的 for_element {stray} 既不是第 1 步的病变脏腑、"
+                f"也不是第 3 步治法的 targets（可选：{sorted(allowed)}）——"
+                "针对一条没被辨出来的病机加药，就是无依据的加减。"
+            )
+        return self
+
+    # ---- 派生视图：下游一个调用方都不用改 ----
+
+    @property
+    def physicians_cited(self) -> list[str]:
+        """这次综合分析里真的说出了贡献的医家 id，按首次出现排序。"""
+        out: list[str] = []
+        for inf in self.physician_influences:
+            if inf.physician not in out:
+                out.append(inf.physician)
+        return out
+
+    @property
+    def ontology_refs(self) -> list["OntologyRef"]:
+        """全链条上的本体引用（方级 + 药级），去重保序。R34 回查本体、
+        R37 的节点释义都读这个，不各自去遍历一遍嵌套结构。"""
+        out: list[OntologyRef] = []
+        seen: set[tuple] = set()
+        for ref in [*self.formula.ontology_refs,
+                    *(r for c in self.herb_choices for r in c.ontology_refs)]:
+            key = (ref.kind, ref.name, ref.predicate, ref.span)
+            if key not in seen:
+                seen.add(key)
+                out.append(ref)
+        return out
+
+    def herbs_grounded_ratio(self) -> float:
+        """带本体引用的药味占比。R34 要报的三个指标之一。
+
+        分母是 `herb_choices` 的条数而不是 `herb_items`——两者在校验通过后必然
+        相等（上面第 4 条），用前者是因为"有没有引本体"这件事记在 choice 上。
+
+        **这个比率为 0 有两种完全不同的原因**：药理层数据不在（模型没有本体可引），
+        或者本体在、模型就是没引。两者要靠 manifest 的
+        `knowledge_entries.available` 分开，光看这个比率分不出来。
+        """
+        if not self.herb_choices:
+            return 0.0
+        grounded = sum(1 for c in self.herb_choices if c.ontology_refs)
+        return grounded / len(self.herb_choices)
+
+    def to_s3_syndrome(self) -> "_S3Base":
+        """转成下游认识的 `S3Syndrome`（或检索为空时的 `S3SyndromeUnreferenced`）。
+
+        **只此一处实现**——api / 前端 / 分歧度 / 安全层读的都是 `S3Syndrome`，
+        让每个调用方各自从结构化对象里取字段等于把这一跳抄五遍（第 31 条）。
+
+        引用为空时返回 `S3SyndromeUnreferenced` 而不是给 `S3Syndrome` 塞一个假 id：
+        那一步会把「这次没有任何医案支撑」这个信号洗掉，而它正是前端要明示的东西。
+
+        `formula_candidates` 恰好一个元素：结构化模式**只出一张方**，`selected`
+        因此恒为 0。`reasoning` 里追加了五步链条与五家影响的摘要——旧界面的证据链
+        侧栏读的是 `reasoning`，不追加的话「融合了五家」这件事在 R37 之前
+        完全看不见（新字段存在但没有界面读它，等于没做）。
+        """
+        chain_lines = [
+            "病变脏腑：" + "；".join(
+                f"{o.organ}（{'、'.join(o.supporting_symptoms)} → {o.pathogenesis}）"
+                for o in self.organs),
+            f"证型：{self.syndrome.name}（自 {'、'.join(self.syndrome.from_organs)}）",
+            f"治法：{self.method.principle}（针对 {'、'.join(self.method.targets)}）",
+            f"方剂：{self.formula.candidate.name}",
+        ]
+        parts = [self.syndrome.reasoning, "", "—— 五步链条 ——", *chain_lines]
+        if self.physician_influences:
+            parts += ["", "—— 名医思路影响 ——", *(
+                f"【{inf.physician}·{inf.step}】{inf.contribution}"
+                f"（医案：{'、'.join(inf.cited_case_ids)}）"
+                for inf in self.physician_influences)]
+        common = dict(
+            disease=self.syndrome.disease,
+            syndrome=self.syndrome.name,
+            reasoning="\n".join(parts),
+            reasoning_plain=self.syndrome.reasoning_plain,
+            treatment_principle=self.method.principle,
+            formula_candidates=[self.formula.candidate],
+            selected=0,
+            note=self.note,
+        )
+        if self.cited_case_ids:
+            return S3Syndrome(cited_case_ids=list(self.cited_case_ids), **common)
+        return S3SyndromeUnreferenced(**common)
+
+
+class S3Structured(_S3StructuredBase):
+    """S3′：五位医家融合后的**一份**结构化诊断。检索到了医案时用这个。
+
+    跟 `S3Syndrome` 的关系是**并列而非继承**：两者字段形状不同（一张方 vs 2–3 个
+    候选、五步链 vs 扁平结论），继承会让其中一个的约束污染另一个。
+
+    这个子类比基类多两个字段，各多一条校验：
+      - `physician_influences`（`min_length=1`）：一份"五家综合"至少要说清一家的
+        贡献。给不出任何一家的影响，这就不是综合分析，是模型自己开了个方。
+      - `cited_case_ids`（`min_length=1`）：跟 `S3Syndrome` 同一条防幻觉约束。
+      - 校验：每条 influence 引的医案 id 必须落在顶层 `cited_case_ids` 里
+        （也就是必须确实被检索到了）。
+    """
+
+    physician_influences: list[PhysicianInfluence] = Field(min_length=1)
+    cited_case_ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _influences_cite_retrieved_cases(self) -> "S3Structured":
+        pool = set(self.cited_case_ids)
+        for inf in self.physician_influences:
+            bad = [cid for cid in inf.cited_case_ids if cid not in pool]
+            if bad:
+                raise ValueError(
+                    f"{inf.physician} 在 {inf.step} 这一步引的医案 {bad} 不在本次的 "
+                    f"cited_case_ids 里——医家影响必须指得出医案，且那条医案必须是"
+                    "这次真的检索到并引用了的。"
+                )
+        return self
+
+
+class S3StructuredUnreferenced(_S3StructuredBase):
+    """一条相关医案都检索不到时用的结构化 schema。
+
+    **没有 `cited_case_ids`，也没有 `physician_influences`。** 后者一并去掉的理由
+    跟前者是同一条：一条"医家影响"必须指得出那位医家的某条医案（`min_length=1`），
+    而这个场景下一条医案都没有——留着这个字段只会逼模型编一个 id 出来，
+    那正是 `S3SyndromeUnreferenced` 当初要解决的问题。
+
+    五步链的校验一条没少：没有医案可引，不等于可以跳步。
+    """
+
+    @property
+    def cited_case_ids(self) -> list[str]:
+        """让下游按同一个接口读；这里永远是空——没有可引用的医案。
+        是 property 不是字段：`model_dump` 里不会出现。"""
+        return []
+
+    @property
+    def physician_influences(self) -> list["PhysicianInfluence"]:
+        """同上，永远是空——说不出医案的"影响"这个 schema 不收。"""
+        return []

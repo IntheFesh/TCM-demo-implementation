@@ -349,6 +349,38 @@ S3_REASONING_EFFORT_TOP3 = "high"
 S3_REASONING_EFFORT_FULL_CONTEXT = "max"
 
 
+# R33：S3 这一步产出哪种形状。
+#   structured —— 五位医家融合成**一份**结构化诊断（S3Structured，五步链、一张方）
+#   legacy     —— 各家各自一份 S3Syndrome（2–3 个候选方），三列集注并置
+# **默认 structured**：用户的要求是「五位医家进行综合分析，不要给出多个答案」。
+# legacy 保留成一档而不是删掉（§0.6）：R38 的消融要拿它当对照组，
+# 而且 R1~R32 全部数字都是在它下面跑出来的——删了那些数就没有可比的基线。
+S3_MODES = ("structured", "legacy")
+S3_MODE_ENV = "S3_MODE"
+S3_MODE_DEFAULT = "structured"
+
+
+def s3_mode() -> str:
+    """S3 这一步产出 `S3Structured` 还是各家的 `S3Syndrome`。
+
+    **拼错一档要报错，不静默走默认**——跟 `S3_BEST_OF_N` 同一条理由：这个旋钮
+    决定的不是"快一点慢一点"，是**产出的形状**。悄悄回到 legacy 的表现是
+    "怎么又出了五份答案"，而那时人会去找前端的 bug。
+
+    `s3_thinking` / `s3_reasoning_effort` 那两个未知值只打一句 stderr 就走默认，
+    是因为它们错了只影响成本与质量；这一个错了下游拿到的是另一种 schema。
+    """
+    raw = (os.environ.get(S3_MODE_ENV) or "").strip().lower()
+    if not raw:
+        return S3_MODE_DEFAULT
+    if raw not in S3_MODES:
+        raise ValueError(
+            f"{S3_MODE_ENV}={raw!r} 不认识，只能是：{' / '.join(S3_MODES)}。"
+            "这个旋钮决定 S3 产出哪种 schema，不静默按默认处理。"
+        )
+    return raw
+
+
 def s3_thinking() -> str:
     """S3 这一步开不开思考。`S3_THINKING=disabled` 关掉——**关掉之后跑出来的数字
     跟默认配置下的不可比**，manifest 会带上这句话。"""

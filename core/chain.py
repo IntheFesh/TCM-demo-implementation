@@ -44,7 +44,9 @@ from core.llm import (
     new_retry_stats,
     new_usage_stats,
     render,
+    S3_MODES,
     s3_best_of_n,
+    s3_mode,
     s3_reasoning_effort,
     s3_thinking,
     thinking_by_step,
@@ -53,7 +55,12 @@ from core.llm import (
 from core.followup import (
     AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
 )
-from core.physicians import PHYSICIANS, physicians_enabled
+from core.physicians import (
+    PHYSICIANS,
+    physician_choices_text,
+    physicians_enabled,
+    physicians_for_synthesis,
+)
 from core.react import StepFn, format_trace_for_s3, react_enabled, run_react
 from core.retrieval import adaptive_min_score, apply_low_discrimination_cutoff, get_retriever
 from core.retrieval_hybrid import (
@@ -66,7 +73,16 @@ from core.safety import check_safety, danger_confirmed_by_answer, safety_bypasse
 from core.formula_check import advice_dicts, check_formula
 from core.safety_output import assess_formula_safety, format_blocking_issues
 from core.schemas import (
-    CaseRecord, FollowupResult, S1Normalize, S2Elements, S3Syndrome, S3SyndromeUnreferenced,
+    S3_CHAIN_STEPS,
+    CaseRecord,
+    FollowupResult,
+    ReActTrace,
+    S1Normalize,
+    S2Elements,
+    S3Structured,
+    S3StructuredUnreferenced,
+    S3Syndrome,
+    S3SyndromeUnreferenced,
 )
 
 # min_score 不再是 core/retrieval.py 写死的 MIN_RETRIEVAL_SCORE=0.70，改成
@@ -422,6 +438,34 @@ def _search_cases(
         raise RetrievalUnavailable(retriever_mode or "hybrid", str(e)) from e
 
 
+def _ref_row(case: CaseRecord, score: float) -> dict:
+    """一条参考医案在响应 `refs` 里的样子。
+
+    抽成函数是因为 R33 起有两条路径产出 refs（`run_physician` 一家、
+    `run_synthesis` 五家）。**前端证据链侧栏读的就是这些键**——两处各拼一份的话，
+    加一个键时只改一处，另一条路径上那个键就是 undefined，而界面只会少显示一行，
+    不报错（第 31 条：这次的"同一概念"是"一条参考医案对外长什么样"）。
+
+    只给 (id, score) 是不够的：用户看到 `ye_tianshi-0031-p6-0` 完全不知道那是
+    什么医案，"可追溯"这个卖点就断在这里。
+    """
+    return {
+        "case_id": case.case_id,
+        "score": round(score, 3),
+        "visit_index": case.visit_index or 0,
+        "visit_label": "初诊" if not case.visit_index else f"第{case.visit_index + 1}诊",
+        "symptoms": case.symptoms or [],
+        "tongue": case.tongue,
+        "pulse": case.pulse,
+        "syndrome": case.syndrome,
+        "treatment_principle": case.treatment_principle,
+        "formula": case.formula,
+        "herbs": case.herbs or [],
+        # 该诊次对应的原文片段（不是整段粗段）
+        "excerpt": case.raw_excerpt,
+    }
+
+
 # E3/E4 消融（eval/run_eval.py）用的三种取值：
 #   own     —— 改造前的默认行为，检索这位医家自己的医案库
 #   swapped —— 检索另一位医家的医案库（见 _swap_physician_id），但仍然以这位
@@ -544,12 +588,32 @@ def pairwise_divergence(results: list[dict]) -> dict:
 
 # R22：best-of-N 打分挑选。**评分尺是 R23 的 score_formula，不是这里另算一个**
 # ——同一把尺同时给医生看建议、给这里排序，改权重只改一处。
+def _as_s3_syndrome(raw):
+    """把 S3 这一步的原始产出统一成下游认识的 `S3Syndrome`。
+
+    `S3_MODE=structured` 下 `generate()` 返回的是 `S3Structured`（五步链、一张方），
+    legacy 下返回的已经是 `S3Syndrome`。**只此一处转换**——打分、X2 输出侧安全、
+    幻觉检查、病名校验、方剂建议、分歧度、api 的角色裁剪、前端，全都只认识
+    `S3Syndrome`，让它们各自 `isinstance` 一遍等于把这一跳抄七遍（第 31 条）。
+
+    转换本身在 `_S3StructuredBase.to_s3_syndrome()` 里，不在这里——这个函数只回答
+    "要不要转"，"怎么转"是 schema 自己的事。
+    """
+    from core.schemas import _S3StructuredBase
+
+    return raw.to_s3_syndrome() if isinstance(raw, _S3StructuredBase) else raw
+
+
 def _score_candidate(s3) -> tuple[float, dict]:
     """一次采样的分 + 写进 manifest/响应的那一行。
 
     分数只看 `selected` 那张方：模型自己挑了一张，我们评的就是它挑的那张。
     评所有候选方再取最高会让"模型挑得对不对"这件事从判据里消失。
+
+    接 `S3Structured` 也接 `S3Syndrome`：开头先过 `_as_s3_syndrome` 合流，
+    structured 模式只出一张方，转换之后 `selected` 恒为 0，这段代码一个字不用改。
     """
+    s3 = _as_s3_syndrome(s3)
     selected = s3.formula_candidates[s3.selected]
     check = check_formula(s3.syndrome, selected.herb_items)
     return check.score, {
@@ -682,24 +746,7 @@ def run_physician(
     s3_schema = S3Syndrome if hits else S3SyndromeUnreferenced
     # refs 要给前端证据链侧栏用：只给 (id, score) 的话，用户看到
     # ye_tianshi-0031-p6-0 完全不知道那是什么医案，"可追溯"这个卖点就断在这里。
-    refs = [
-        {
-            "case_id": case.case_id,
-            "score": round(score, 3),
-            "visit_index": case.visit_index or 0,
-            "visit_label": "初诊" if not case.visit_index else f"第{case.visit_index + 1}诊",
-            "symptoms": case.symptoms or [],
-            "tongue": case.tongue,
-            "pulse": case.pulse,
-            "syndrome": case.syndrome,
-            "treatment_principle": case.treatment_principle,
-            "formula": case.formula,
-            "herbs": case.herbs or [],
-            # 该诊次对应的原文片段（不是整段粗段）
-            "excerpt": case.raw_excerpt,
-        }
-        for case, score in hits
-    ]
+    refs = [_ref_row(case, score) for case, score in hits]
     refs_text = "\n\n".join(_format_case_block(case) for case, _ in hits) or "（无可用参考医案）"
 
     # S3 证候+治法+方
@@ -760,33 +807,10 @@ def run_physician(
 
     trace = None
     if use_react:
-        trace = run_react(
-            name=physician_name,
-            # physician 在这里已经是 id：prompt 里的 $physician_id 直接用它，
-            # 不让 run_react 再从中文名反查一遍（反查是兜底，不是主路径）。
-            physician_id=physician,
-            symptoms=symptoms_text,
-            elements_summary=_format_elements_summary(s2),
-            on_step=on_step,
+        s3_system, trace, react_safety_flag = _run_react_round(
+            s3_system, s1, s2, physician, physician_name=physician_name,
+            ask_fn=ask_fn, bypass_safety=bypass_safety, on_step=on_step,
         )
-        # ReAct 用 ask_user 收尾 = 它要追问患者。有提问渠道就真的问，回答先过
-        # check_safety 再交给 S3；没有渠道时问题只记录，S3 拿不到答案。
-        # 此前这个问题从来没被问出去，S3 却拿着 {"terminate": true} 那条观测继续开方。
-        if trace.terminated_by == "ask_user" and trace.pending_question and ask_fn is not None:
-            answer = ask_fn(trace.pending_question)
-            if answer is not None:
-                # 回答先过 check_safety；问的本身是危重症状而患者没有明确否认时也拦
-                # （「有没有便血？」→「有」）。后一条判据跟 G3 追问共用
-                # core.safety.danger_confirmed_by_answer，不在这里另写一套。
-                reject = check_safety([answer]) or danger_confirmed_by_answer(
-                    trace.pending_question, parse_answer(answer)
-                )
-                if reject is not None:
-                    if not bypass_safety:
-                        raise SafetyVeto(reject, llm_calls=trace.llm_calls)
-                    react_safety_flag = reject
-                trace.pending_answer = answer
-        s3_system = s3_system + format_trace_for_s3(trace)
 
     if on_step is not None:
         # 没开 ReAct 时这是这位医家唯一一次要等的 LLM 调用；开了 ReAct 也要报——
@@ -918,6 +942,249 @@ def run_physician(
     }
 
 
+def _run_react_round(
+    s3_system: str, s1: S1Normalize, s2: S2Elements, physician: str | None, *,
+    physician_name: str | None = None, ask_fn: AskFn | None,
+    bypass_safety: bool, on_step: StepFn | None,
+) -> tuple[str, ReActTrace, str | None]:
+    """G2：跑一轮 ReAct 取证，把查到的东西**追加**到 S3 prompt 后面。
+    返回 `(追加后的 system, trace, 安全标记)`。
+
+    抽成函数是因为 R33 起两条路径都要它（`run_physician` 一家、`run_synthesis`
+    五家），而中间那段「追问的回答必须先过 `check_safety`」是 CLAUDE.md 点名的
+    一条硬约束——抄两份意味着将来改一边会漏另一边，那正是「安全否决的后门」
+    这条约束最怕的事。
+
+    `physician=None` 是 `run_synthesis` 用的：工具层按 physician 过滤医案，
+    传五家里的任意一位都是错的（那位的医案库不等于五家的），传 None 表示
+    **不按医家过滤**——`resolve_physician_id(None)` 返回 None，过滤处不加条件。
+    `physician_name` 同理可空，`run_react` 的 `$name` 那时填一个中性称呼。
+
+    只追加、不改任何 prompt yaml——不开 ReAct 时 prompt 要跟没有这个开关时
+    逐字节一致，否则 `use_react` 的 A/B 里混进了 prompt 变化这个额外变量。
+    """
+    react_safety_flag: str | None = None
+    trace = run_react(
+        name=physician_name or SYNTHESIS_PHYSICIAN_NAME,
+        # physician 在这里已经是 id：prompt 里的 $physician_id 直接用它，
+        # 不让 run_react 再从中文名反查一遍（反查是兜底，不是主路径）。
+        physician_id=physician,
+        symptoms="；".join(s1.symptoms),
+        elements_summary=_format_elements_summary(s2),
+        on_step=on_step,
+    )
+    # ReAct 用 ask_user 收尾 = 它要追问患者。有提问渠道就真的问，回答先过
+    # check_safety 再交给 S3；没有渠道时问题只记录，S3 拿不到答案。
+    # 此前这个问题从来没被问出去，S3 却拿着 {"terminate": true} 那条观测继续开方。
+    if trace.terminated_by == "ask_user" and trace.pending_question and ask_fn is not None:
+        answer = ask_fn(trace.pending_question)
+        if answer is not None:
+            # 回答先过 check_safety；问的本身是危重症状而患者没有明确否认时也拦
+            # （「有没有便血？」→「有」）。后一条判据跟 G3 追问共用
+            # core.safety.danger_confirmed_by_answer，不在这里另写一套。
+            reject = check_safety([answer]) or danger_confirmed_by_answer(
+                trace.pending_question, parse_answer(answer)
+            )
+            if reject is not None:
+                if not bypass_safety:
+                    raise SafetyVeto(reject, llm_calls=trace.llm_calls)
+                react_safety_flag = reject
+            trace.pending_answer = answer
+    return s3_system + format_trace_for_s3(trace), trace, react_safety_flag
+
+
+#: 结构化模式下这份"综合诊断"在 `results` 里的身份。
+#:
+#: `results` 的元素结构是既有契约（前端、分歧度、eval 收集器都按它读），
+#: structured 模式只有**一个**元素，但它仍然需要一个 `physician` 值。
+#: 用一个**不在注册表里**的保留 id 而不是随便挑一位医家的 id：挑一位的话
+#: 「这份结论是叶天士给的」这句话就是假的，而前端会照着把它显示成叶天士的方。
+SYNTHESIS_PHYSICIAN_ID = "synthesis"
+SYNTHESIS_PHYSICIAN_NAME = "五家综合"
+
+
+def run_synthesis(
+    s1: S1Normalize,
+    s2: S2Elements,
+    use_react: bool = False,
+    followup: FollowupResult | None = None,
+    ask_fn: AskFn | None = None,
+    refs_mode: str = "own",
+    bypass_safety: bool = False,
+    on_step: StepFn | None = None,
+    retriever_mode: str | None = None,
+) -> dict:
+    """R33：五位医家融合成**一份**结构化诊断（`S3_MODE=structured`）。
+
+    跟 `run_physician` 是**并列的两条路径**，不是它的一个分支：两者检索的范围
+    （五家 vs 一家）、prompt（s3_structured vs s3_syndrome）、schema
+    （S3Structured vs S3Syndrome）、调用次数（1 vs N 位）全都不同，塞进同一个
+    函数里会变成一串 `if mode == "structured"`，而那正是这个项目反复吃过亏的形状。
+
+    **返回值的键跟 `run_physician` 完全一致**，另加两个：
+      - `s3_structured`：五步链原件（R34 验证器、R37 单链前端读它）
+      - `physician_influences`：哪几家的思路在哪一步起了作用（扁平化好让前端直接渲染）
+    `s3` 是 `to_s3_syndrome()` 转出来的 `S3Syndrome`——下游一个调用方都不用改。
+
+    ## 检索：五家各自 top-3，按注册表顺序拼接
+
+    **不是把五家医案混在一起算相似度再取全局 top-3**：那样相似度高的一家会占满
+    三个位置，另外四家一条都进不去，而这一轮的全部意义就是五家都参与。
+    按注册表顺序拼接还保证了**确定性**——顺序不定 = 缓存前缀 byte 不同 =
+    前缀缓存永远不命中（`full_context_hits` 的文档字符串记的是同一条教训）。
+    """
+    if refs_mode not in ALLOWED_REFS_MODES:
+        raise ValueError(f"未知的 refs_mode={refs_mode!r}，目前支持 {sorted(ALLOWED_REFS_MODES)}")
+
+    symptoms_text = "；".join(s1.symptoms)
+    query = f"{symptoms_text}。舌{s1.tongue or '未记'}，脉{s1.pulse or '未记'}"
+
+    roster = physicians_for_synthesis(PHYSICIANS)
+    hits: list[tuple[CaseRecord, float]] = []
+    low_discrimination = False
+    if refs_mode != "none":
+        for pid in roster:
+            search_pid = pid if refs_mode == "own" else _swap_physician_id(pid)
+            got, low = _search_cases(query, search_pid, s2, retriever_mode)
+            hits.extend(got)
+            # 任一家没有区分度就标上：这个字段的语义是"这次的参考医案里有凑数的"，
+            # 五家里有一家凑数也算——按医家分别记的话前端要多一层结构，
+            # 而它目前的唯一消费方（E3 报告的比例统计）问的就是"这次有没有"。
+            low_discrimination = low_discrimination or low
+    s3_schema = S3Structured if hits else S3StructuredUnreferenced
+
+    refs = [_ref_row(case, score) for case, score in hits]
+    refs_text = "\n\n".join(_format_case_block(case) for case, _ in hits) or "（无可用参考医案）"
+
+    mode_eff = effective_mode(retriever_mode)
+    knowledge_text, knowledge_stats = "", {"available": False, "n_herbs": 0,
+                                           "n_formulas": 0, "n_patterns": 0,
+                                           "tokens": 0, "trimmed_sections": []}
+    knowledge_mode = knowledge_in_prompt(mode_eff)
+    if knowledge_mode == "focused":
+        knowledge_text, knowledge_stats = build_focused_knowledge(
+            s1, s2, hits, list(roster),
+            syndromes=[c.syndrome for c, _ in hits if c.syndrome],
+        )
+    # 知识块插在参考医案之前，跟 legacy 那条路同一个次序与同一个小标题
+    # ——`_format_case_block` 的输出与它的相对位置在两条路径上逐字节相同。
+    refs_with_knowledge = (
+        f"{knowledge_text}\n\n## 参考医案\n\n{refs_text}" if knowledge_text else refs_text
+    )
+    # full_context 下**不走 assemble()**：那个稳定前缀是按**单个医家**的全量医案
+    # 组装的（`assemble(physician, ...)`），五家综合没有"哪一位医家的全量医案"
+    # 这个概念。structured + full_context 因此走同一份 s3_structured.yaml，
+    # 只是 $refs 里的医案多（五家各自的全量）。**这件事要在 manifest 里看得出来**，
+    # 所以 knowledge_mode 照实记（full_context 下它是 "full"，而这条路径没有
+    # 前缀缓存可用）——见下面 knowledge 字段里的 prefix_assembled。
+    s3_prompt = load_prompt("s3_structured")
+    s3_system = render(
+        s3_prompt["system"],
+        physicians="、".join(info["name"] for info in roster.values()),
+        physician_ids=physician_choices_text(),
+        elements_summary=_format_elements_summary(s2),
+        symptoms=symptoms_text,
+        refs=refs_with_knowledge,
+    )
+    if followup is not None:
+        s3_system = s3_system + format_followup_for_s3(followup)
+
+    trace: ReActTrace | None = None
+    react_safety_flag: str | None = None
+    if use_react:
+        # ReAct 取证用哪位医家的身份查医案？**用五家里的第一位是错的**——工具层
+        # 的 physician 参数决定它查谁的医案库。这里传 None 让工具层不按医家过滤，
+        # 那是"五家一起看"的正确表达。ReAct 那一层本来就允许 physician 为空
+        # （`resolve_physician_id(None)` 返回 None，过滤处不加条件）。
+        s3_system, trace, react_safety_flag = _run_react_round(
+            s3_system, s1, s2, None, physician_name=None, ask_fn=ask_fn,
+            bypass_safety=bypass_safety, on_step=on_step,
+        )
+
+    raw, candidates_scored = _best_of_n_s3(s3_system, s3_schema, SYNTHESIS_PHYSICIAN_ID)
+    s3 = _as_s3_syndrome(raw)
+
+    for cand in s3.formula_candidates:
+        cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
+    selected_safety = s3.formula_candidates[s3.selected].safety
+    revised = False
+    if selected_safety.blocking:
+        retry_system = s3_system + (
+            f"\n\n【安全问题】上一次拟的方存在以下必须修正的问题："
+            f"{format_blocking_issues(selected_safety)}。请重新拟方解决这些问题，"
+            "其余要求不变（五步链与引用要求一条都不许省）。"
+        )
+        raw = get_llm().generate(
+            system=retry_system, user="", schema=s3_schema,
+            physician=SYNTHESIS_PHYSICIAN_ID, **thinking_for("s3"),
+        )
+        s3 = _as_s3_syndrome(raw)
+        for cand in s3.formula_candidates:
+            cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
+        revised = True
+        selected_safety = s3.formula_candidates[s3.selected].safety
+
+    ref_ids = {r["case_id"] for r in refs}
+    if trace is not None:
+        ref_ids |= set(trace.retrieved_case_ids)
+    hallucinated = [cid for cid in s3.cited_case_ids if cid not in ref_ids]
+    # 医家影响里引的医案同样要过幻觉检查。schema 的 `_influences_cite_retrieved_cases`
+    # 只保证它们在 `cited_case_ids` 里，而 `cited_case_ids` 本身可能是编的
+    # ——两道检查管的是不同的事，都要有。
+    for inf in raw.physician_influences:
+        hallucinated.extend(cid for cid in inf.cited_case_ids if cid not in ref_ids)
+    hallucinated = sorted(dict.fromkeys(hallucinated))
+
+    disease_candidates = match_disease(
+        s1.symptoms, [h.element for h in s2.elements if h.kind == "location"]
+    )
+    if s3.disease is not None and get_disease(s3.disease) is None:
+        warn = f"病名「{s3.disease}」不在病名参考表（含别名）里，未做规则校验。"
+        s3.note = f"{s3.note}；{warn}" if s3.note else warn
+
+    formula_check = check_formula(s3.syndrome, s3.formula_candidates[s3.selected].herb_items)
+
+    return {
+        "physician": SYNTHESIS_PHYSICIAN_ID,
+        "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+        "s2": s2,
+        "s3": s3,
+        # 五步链原件。**不是 s3 的替代**——`s3` 是下游认识的形状，这个是新增的。
+        "s3_structured": raw,
+        # 扁平化好让前端直接渲染，不必懂 pydantic 嵌套。
+        "physician_influences": [inf.model_dump() for inf in raw.physician_influences],
+        # 这次融合真的说出了贡献的医家（id）。**跟名单不是一回事**：名单是五位，
+        # 这个可能只有两位——"哪几家真的影响了结论"是要被报出来的数，
+        # 不能用"我们接了五家"顶替。
+        "physicians_cited": raw.physicians_cited,
+        "herbs_grounded_ratio": raw.herbs_grounded_ratio(),
+        "n_ontology_refs": len(raw.ontology_refs),
+        "knowledge": {"mode": knowledge_mode, **knowledge_stats,
+                      # structured 不走 assemble()，所以没有稳定前缀可缓存。
+                      # 如实记一条，别让人看到 mode="full" 就以为缓存命中了。
+                      "prefix_assembled": False},
+        "disease_candidates": disease_candidates,
+        "refs": refs,
+        "refs_mode": refs_mode,
+        "no_reference_cases": not hits,
+        "low_discrimination": low_discrimination,
+        "lora": get_llm().lora_for(SYNTHESIS_PHYSICIAN_ID),
+        "hallucinated": hallucinated,
+        "safety_flag": react_safety_flag,
+        "safety_output": {
+            "incompatible": selected_safety.incompatible,
+            "thermal_warning": selected_safety.thermal_warning,
+            "revised": revised,
+        },
+        "react_trace": trace,
+        "advice": advice_dicts(formula_check),
+        "advice_skipped": list(formula_check.skipped),
+        "formula_score": formula_check.score,
+        "candidates_scored": candidates_scored,
+        "best_of_n": len(candidates_scored),
+    }
+
+
 def cases_sha256() -> str | None:
     """cases.json 的 sha256 前 12 位，文件不存在时 None。
 
@@ -977,9 +1244,36 @@ def _aggregate_knowledge(results: list[dict] | None) -> dict | None:
     }
 
 
+def _synthesis_summary(results: list[dict] | None, mode: str) -> dict | None:
+    """结构化模式下这一次融合的可核数据。legacy 下返回 **None**。
+
+    None 而不是空字典：「这个模式没跑」和「跑了但一家都没引」是两件事，
+    后者是 `physicians_cited: []`，那是一个要被看见的结果（说明"五家综合"
+    这次名不副实），前者只是说这次不适用。
+
+    `physicians_available` 与 `physicians_cited` 都要有：前者是"我们接了五家"，
+    后者是"这次真的有几家影响了结论"。只报前者就是拿接入数冒充生效数
+    ——CLAUDE.md「任何数字都必须带对照」，这里的对照就是分母。
+    """
+    if mode != "structured" or not results:
+        return None
+    r = results[0]
+    return {
+        "physicians_available": len(physicians_for_synthesis(PHYSICIANS)),
+        "physicians_cited": r.get("physicians_cited") or [],
+        "n_physicians_cited": len(r.get("physicians_cited") or []),
+        "herbs_grounded_ratio": r.get("herbs_grounded_ratio"),
+        "n_ontology_refs": r.get("n_ontology_refs"),
+        "n_herbs": len(r["s3"].herbs),
+        "chain_steps": list(S3_CHAIN_STEPS),
+    }
+
+
 def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
                     retriever_mode: str | None = None,
-                    knowledge: dict | None = None) -> dict:
+                    knowledge: dict | None = None,
+                    s3_mode_used: str | None = None,
+                    synthesis: dict | None = None) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
     cases_sha = cases_sha256()
@@ -1041,6 +1335,13 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
         # 实验条件比不记更糟。
         "reasoning_effort": (s3_reasoning_effort() if s3_thinking() == "enabled" else None),
         "best_of_n": s3_best_of_n(),
+        # R33：S3 这一步产出的形状。**这一项决定 results 有几个元素**，
+        # 引用任何"每位医家……"的数字之前必须先看它——structured 下只有一份结论，
+        # 分歧度、ε、三列集注那些数在这个模式下压根不存在（不是 0，是不适用）。
+        "s3_mode": s3_mode_used or s3_mode(),
+        # 五家融合这一次实际怎么样。structured 之外恒为 None（不是空字典）——
+        # "这个模式没跑"和"跑了但一家都没引"是两件事。
+        "synthesis": synthesis,
         # R32：知识块怎么进的提示词。**这三项是"让模型明白药理"这件事的凭据**
         # ——在此之前知识速查表只在 full_context 下进提示词，而演示跑的是
         # hybrid，"懂药理"在运行配置下从未发生过且所有测试全绿。
@@ -1192,9 +1493,21 @@ def _run_physicians_into(
     results: list[dict], s1: S1Normalize, s2: S2Elements, *,
     use_react: bool, followup, ask_fn: AskFn | None, bypass: bool,
     on_step: StepFn | None, retriever_mode: str | None, refs_mode: str,
-    emit,
+    emit, mode: str,
 ) -> None:
-    """三位医家**并发**跑 S3，结果按 `PHYSICIANS` 的插入顺序追加进 `results`。
+    """跑 S3 并把结果追加进 `results`。**`mode` 决定跑哪一条路径。**
+
+    `structured`（R33 起的默认）：一次 `run_synthesis`，五家融合成**一份**结论，
+    `results` 恰好一个元素。`legacy`：下面那条原路——三位医家并发跑
+    `run_physician`，结果按注册表顺序追加。
+
+    分派放在这一个函数里而不是 `consult()` 里：`consult()` 外面包着 SafetyVeto 与
+    RetrievalUnavailable 两层处理，那两层对两种模式**完全一样**（被拦截的请求不产出
+    任何方药、检索不可用时什么都不给），拆到上面去就得写两遍。
+
+    ---- 以下是 legacy 那条路的四条约束，一条没变 ----
+
+    三位医家**并发**跑 S3，结果按 `PHYSICIANS` 的插入顺序追加进 `results`。
 
     改并发的理由：一次问诊 6 次调用里有 3 次是各位医家的 S3，串行时它们是
     3×单次耗时（真机实测约 198 秒 / 394.6 秒总耗时的一半）。三位医家之间没有任何
@@ -1224,6 +1537,27 @@ def _run_physicians_into(
     `get_llm()` 拿到的是进程单例，BYOK 静默失效、访问者的 key 没被用上、额度照扣。
     每个 worker 一份独立的拷贝：一个 `Context` 只能被 `run` 一次。
     """
+    if mode == "structured":
+        # 五家融合成一份。事件仍然发 physician_start / physician_done，`physician`
+        # 字段是保留 id `synthesis`——前端按这个字段路由（DESIGN §4.7），
+        # 换成别的事件名等于让 R37 之前的界面收不到任何进度。
+        if on_step is not None:
+            on_step("physician_start", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                                        "physician_name": SYNTHESIS_PHYSICIAN_NAME})
+        r = run_synthesis(
+            s1, s2, use_react=use_react, followup=followup, ask_fn=ask_fn,
+            bypass_safety=bypass, on_step=on_step,
+            retriever_mode=retriever_mode, refs_mode=refs_mode,
+        )
+        if on_step is not None:
+            on_step("physician_done", {
+                "physician": SYNTHESIS_PHYSICIAN_ID,
+                "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+                "syndrome": r["s3"].syndrome, "herbs": r["s3"].herbs,
+            })
+        results.append(r)
+        return
+
     # R18：只遍历参与集注的那几位。李可/王云启 enabled=False——他们的语料进
     # 检索、进训练、进「参考医家」区，但**不占列**：塞进三列会同时坏掉版面
     # 和对照设计（学派维度被稀释成「每人一个学派」）。
@@ -1295,6 +1629,7 @@ def consult(
     on_step: StepFn | None = None,
     retriever_mode: str | None = None,
     refs_mode: str = "own",
+    s3_mode_override: str | None = None,
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
@@ -1362,6 +1697,15 @@ def consult(
 
     if use_react is None:
         use_react = react_enabled()
+    # R33：S3 这一步产出哪种形状。跟 use_react / bypass 同一条纪律——
+    # **一次 consult 里只判一次**，之后一路把这个值传下去，不让下游各自再读一次
+    # 环境变量：进程级变量会让两个并发请求互相污染（一个请求的 S3 一半按
+    # structured 跑、一半按 legacy 跑，而两种形状的 results 长度不同）。
+    mode = s3_mode_override if s3_mode_override is not None else s3_mode()
+    if mode not in S3_MODES:
+        # 跟 retriever_mode / refs_mode 一样立刻抛，不等到 S3 那一步才失败
+        # ——那时 S1/S2 两次调用已经白花了。
+        raise ValueError(f"未知的 s3_mode={mode!r}，目前支持 {sorted(S3_MODES)}")
     # 一次 consult 里只判一次，之后一路用这个布尔值：中途有人改环境变量时，
     # 同一个请求的四个中止点也不会一半拦一半不拦。
     bypass = safety_bypassed(eval_mode)
@@ -1388,7 +1732,8 @@ def consult(
             "safety_flag": safety_flag, "retrieval_error": None,
             "s2": None, "residual": None, "followup": None,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react, retriever_mode=retriever_mode),
+            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react,
+                                        retriever_mode=retriever_mode, s3_mode_used=mode),
         }
 
     s2 = infer_elements(s1)
@@ -1424,7 +1769,7 @@ def consult(
             "residual": None, "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000), 2, use_react,
-                retriever_mode=retriever_mode,
+                retriever_mode=retriever_mode, s3_mode_used=mode,
             ),
         }
     if followup.asserted:
@@ -1439,7 +1784,8 @@ def consult(
                 "safety_flag": safety_flag, "retrieval_error": None,
                 "s2": s2, "followup": followup, "residual": None,
                 "insufficient": False, "insufficient_reason": None, "coverage": None,
-                "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react, retriever_mode=retriever_mode),
+                "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react,
+                                        retriever_mode=retriever_mode, s3_mode_used=mode),
             }
         # 追问确认的是国标症状名（来自图谱节点），本身已经是标准表述，不需要再过
         # S1——这不违反"S1 全局只跑一次"，S1 一次也没有多跑。
@@ -1487,7 +1833,7 @@ def consult(
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
                 2 + extra_calls + (1 if residual else 0), use_react,
-                retriever_mode=retriever_mode,
+                retriever_mode=retriever_mode, s3_mode_used=mode,
             ),
         }
     results = []
@@ -1495,7 +1841,7 @@ def consult(
         _run_physicians_into(
             results, s1, s2, use_react=use_react, followup=followup, ask_fn=ask_fn,
             bypass=bypass, on_step=on_step, retriever_mode=retriever_mode,
-            refs_mode=refs_mode, emit=emit,
+            refs_mode=refs_mode, emit=emit, mode=mode,
         )
     except SafetyVeto as veto:
         # ReAct 追问问出了危重症状：跟初始主诉命中同一道否决，已经跑完的医家结果
@@ -1519,7 +1865,7 @@ def consult(
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
             "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
-                                        retriever_mode=retriever_mode,
+                                        retriever_mode=retriever_mode, s3_mode_used=mode,
                                         knowledge=_aggregate_knowledge(results)),
         }
     except RetrievalUnavailable as e:
@@ -1545,7 +1891,7 @@ def consult(
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
                 2 + extra_calls + (1 if residual else 0), use_react,
-                retriever_mode=retriever_mode,
+                retriever_mode=retriever_mode, s3_mode_used=mode,
             ),
         }
 
@@ -1714,7 +2060,9 @@ def consult(
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"]),
             use_react,
             retriever_mode=retriever_mode,
+            s3_mode_used=mode,
             knowledge=_aggregate_knowledge(results),
+            synthesis=_synthesis_summary(results, mode),
         ),
     }
 

@@ -76,9 +76,9 @@
 
 ### 7. 前端不是一个模板（R24）
 
-- 20 种状态的真浏览器验收 —— `bench/sandbox.json:bench.playwright_states_passed=20`
+- 21 种状态的真浏览器验收 —— `bench/sandbox.json:bench.playwright_states_passed=21`
 - 四张 R24 截图：`r24_epigraph` / `r24_select_open` / `r24_advice_panel` / `r24_rings`
-- **对照基准**：R14 起 6 → R15 10 → R16 13 → R17 15 → R18 16 → R24 20 → R25 仍 20（这一轮没动前端，测的是没有回归）。
+- **对照基准**：R14 起 6 → R15 10 → R16 13 → R17 15 → R18 16 → R24 20 → R25 仍 20（这一轮没动前端，测的是没有回归）→ **R33 21**（结构化模式把 results 从三个元素变成一个，新加 `structured_single` 专测"只有一列时布局还成不成立"）。
 
 ---
 
@@ -86,9 +86,9 @@
 
 | 项 | 数 | 凭据 |
 |---|---|---|
-| 全量测试 | **3207** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=3207` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
-| 前端状态验收 | **20** 种 | `bench/sandbox.json:bench.playwright_states_passed=20` |
-| 凭据核对 | **16** 份文档，退出码 **0** | `bench/sandbox.json:bench.n_checked_docs=16` `bench/sandbox.json:bench.check_exit_code=0` |
+| 全量测试 | **3285** passed / **10** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=3285` `bench/sandbox.json:bench.pytest_skipped=10` `bench/sandbox.json:bench.pytest_failed=0` |
+| 前端状态验收 | **21** 种 | `bench/sandbox.json:bench.playwright_states_passed=21` |
+| 凭据核对 | **17** 份文档，退出码 **0** | `bench/sandbox.json:bench.n_checked_docs=17` `bench/sandbox.json:bench.check_exit_code=0` |
 | 知识图谱节点 | **2356** | `../data/graph.json:graph.n_nodes=2356` |
 | 知识图谱边 | **3682** | `../data/graph.json:graph.n_edges=3682` |
 | 证候 | **174** | `../data/graph.json:graph.n_syndromes=174` |

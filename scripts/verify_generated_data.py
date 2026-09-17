@@ -80,11 +80,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--md-path", type=Path, default=None,
                     help=f"教材 markdown。不传就找这几处：{', '.join(map(str, DEFAULT_MD_CANDIDATES))}")
     ap.add_argument("--layout", choices=sorted(LAYOUTS), default="neike")
+    # R33：两个路径可覆盖。**加这两个开关是为了让测试不再原地改版本控制里的文件**
+    # ——`tests/test_generated_data_manifest.py` 原来把真的 manifest 改坏、
+    # 在 finally 里恢复，只要那次跑被打断（Ctrl-C、超时被杀、pytest 自己崩）
+    # 文件就留在坏状态里，而下一次跑报的是「落盘的 jsonl 被手改过」，
+    # 指向一个完全错误的原因。实测踩到过一次，花了十几分钟才看出是测试污染而不是代码。
+    ap.add_argument("--manifest", type=Path, default=None,
+                    help="要核的 manifest（默认 data/standard/syndromes_manifest.json）")
+    ap.add_argument("--jsonl", type=Path, default=None,
+                    help="要核的 syndromes.jsonl（默认 data/standard/syndromes.jsonl）")
     args = ap.parse_args(argv)
 
-    manifest = read_manifest()
+    manifest_path = args.manifest or MANIFEST_PATH
+    jsonl_path = args.jsonl or DEFAULT_OUT_PATH
+
+    manifest = read_manifest(manifest_path)
     if manifest is None:
-        print(f"✗ 没有 {MANIFEST_PATH.name}——落盘的 jsonl 是 R31 之前生成的，"
+        print(f"✗ 没有 {manifest_path.name}——落盘的 jsonl 是 R31 之前生成的，"
               "没有任何东西记着它是哪一套代码的产物。")
         print(REGENERATE_HINT)
         return 2
@@ -95,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     # 先报三个 sha256 的现状，再决定退出码——**三条都要打出来**，
     # 只报"不一致"不说是哪一条不一致，等于让人从头查。
     rows = [
-        ("落盘 jsonl", manifest["syndromes_sha256"], _sha256(DEFAULT_OUT_PATH)),
+        ("落盘 jsonl", manifest["syndromes_sha256"], _sha256(jsonl_path)),
         ("OCR 修正表", manifest["ocr_fixes_sha256"], _sha256(OCR_FIXES_PATH)),
         ("解析器", manifest["parser_sha256"], _sha256(PARSER_PATH)),
     ]
@@ -119,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     entries, stats = parse_textbook(md, LAYOUTS[args.layout])
-    fresh = build_manifest(DEFAULT_OUT_PATH, entries, stats)
+    fresh = build_manifest(jsonl_path, entries, stats)
     # 逐条比计数，再比整份 jsonl 的内容——计数先比是因为它能说出**差在哪**，
     # 而 sha256 只能说"不一样"。
     mismatches = [
@@ -132,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  ✗ {k}：manifest 记的是 {was}，现在重抽是 {now}")
 
     # 真正的判据：把重抽的结果按同样的顺序拼出来，跟落盘那份的教材部分逐字节比。
-    committed = [ln for ln in DEFAULT_OUT_PATH.read_text(encoding="utf-8").splitlines()
+    committed = [ln for ln in jsonl_path.read_text(encoding="utf-8").splitlines()
                  if ln.strip()]
     # 按解析后的 source 判，不按字面找子串——`model_dump_json()` 不带空格
     # （`"source":"textbook"`），照字面找会一条都不匹配，于是 337 行全被当成

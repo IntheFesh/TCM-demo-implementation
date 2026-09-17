@@ -20,6 +20,7 @@ PHYSICIANS: dict[str, dict] = {
         "color": "#2C5F5A",  # 青黛 —— 温病轻清
         "color_bg": "#E6EFED",
         "enabled": True,
+        "in_synthesis": True,
         "source": "data/ye_tianshi/*.json（《临证指南医案》，公有领域）",
     },
     "wu_jutong": {
@@ -30,6 +31,7 @@ PHYSICIANS: dict[str, dict] = {
         "color": "#9C6B16",  # 黄芩 —— 苦辛通降
         "color_bg": "#F4EDDF",
         "enabled": True,
+        "in_synthesis": True,
         "source": "data/wu_jutong/*.json（《吴鞠通医案》，公有领域）",
     },
     "zhang_xichun": {
@@ -40,6 +42,7 @@ PHYSICIANS: dict[str, dict] = {
         "color": "#8A4736",  # 赭石 —— 他最标志的药就是生赭石，三条医案里出现三次
         "color_bg": "#F2E7E3",
         "enabled": True,
+        "in_synthesis": True,
         "source": "books/584-医学衷中参西录.txt（公有领域）",
     },
     # ---- R18：注册但**不参与集注**（enabled=False）----
@@ -69,6 +72,7 @@ PHYSICIANS: dict[str, dict] = {
         "color": "#4A6B4E",
         "color_bg": "#E8EEE8",
         "enabled": False,
+        "in_synthesis": True,
         "source": "data/local_corpora/李可医案.txt（用户上传，版权受限，不随仓库分发）",
     },
     "wang_yunqi": {
@@ -79,8 +83,29 @@ PHYSICIANS: dict[str, dict] = {
         "color": "#5B5470",  # 藤紫
         "color_bg": "#EAE8EF",
         "enabled": False,
+        "in_synthesis": True,
         "source": "data/local_corpora/王云启医案.txt（用户上传，版权受限，不随仓库分发）",
     },
+}
+
+
+#: R33：结构化模式下那份「五家综合」结论的展示元数据。
+#:
+#: **刻意不放进 `PHYSICIANS`。** 放进去的话 `resolve_physician_id("synthesis")`
+#: 会把它解析成一个合法医家，于是检索层会去找「synthesis 的医案库」（恒空）、
+#: 分歧度会把它当成第四位医家参与两两配对。它不是一位医家，是一份结论的署名。
+#:
+#: 但它需要姓名和配色——`api/main.py::_serialize_result` 按 id 查配色，查不到会退到
+#: 灰色兜底，而前端把灰色当「未知医家」显示。所以元数据在这里定义**一处**，
+#: 不在 api 层和前端各写一份（第 31 条：这次的"同一概念"是"这份结论长什么样"）。
+SYNTHESIS_DISPLAY: dict = {
+    "name": "五家综合",
+    "book": "叶天士《临证指南医案》/ 吴鞠通《吴鞠通医案》/ 张锡纯《医学衷中参西录》"
+            "/ 李可医案 / 王云启治癌验案录",
+    "years": None,      # 五家跨两百余年，给一个区间等于给一个假精确
+    "school": None,     # 融合的产物没有单一学派，填一个会让 λ2 统计把它算进去
+    "color": "#3B4A6B",   # 靛青。跟五位医家的身份色都不同——它不是其中任何一位
+    "color_bg": "#E7EAF1",
 }
 
 
@@ -113,6 +138,47 @@ def physicians_all(registry: dict[str, dict] | None = None) -> dict[str, dict]:
     自己问的是哪个问题。`PHYSICIANS` 本身仍然公开（注册表是数据），但**新增
     的遍历一律走这两个函数之一，不要在别处自己 filter**。"""
     return dict(registry if registry is not None else PHYSICIANS)
+
+
+def physicians_for_synthesis(registry: dict[str, dict] | None = None) -> dict[str, dict]:
+    """R33：参与**综合分析**（`S3_MODE=structured`）的医家。五位全在。
+
+    ## 为什么不是把 `enabled` 改成 True，而是新开一个字段
+
+    `enabled` 回答的是「谁算三列集注的一员」（见 `physicians_enabled` 的文档）。
+    结构化模式取消了三列——它只出**一份**融合结论，所以"谁参与"这个问题在这两种
+    模式下**本来就不是同一个问题**，一个字段答两个问题正是 CLAUDE.md 第 31 条
+    要防的形状（这次撞的不是匹配逻辑，是注册表字段的语义）。
+
+    **把 `enabled` 翻成 True 会坏掉的东西是量过的**：李可与王云启的 `school`
+    都是 None（两份语料的前言里查不到，按项目惯例不编），五位两两配对共 10 对，
+    其中 **7 对（70%）** 的学派判定会变成 "unknown"——而 λ2（学派层权重）与
+    「跨学派分歧大于师承内」这条对照正是 §0.6 要保留的东西。
+    结构化模式不需要这个代价：它要的是"五家的思路都进这次综合"，
+    靠 `in_synthesis` 就够了，不必动 `enabled`。
+
+    默认值是 **True**：新注册一位医家时，他自动参与综合分析，
+    要排除得显式写 `in_synthesis: False`。跟 `enabled` 的默认 True 一致。
+    """
+    return {pid: info for pid, info in (registry if registry is not None else PHYSICIANS).items()
+            if info.get("in_synthesis", True)}
+
+
+def physicians_for_mode(mode: str, registry: dict[str, dict] | None = None) -> dict[str, dict]:
+    """按 `S3_MODE` 选名单。**这一跳只有一处实现**——chain / usage / api / 前端
+    各自写一遍 `if mode == "structured"` 的话，漏一处的后果跟
+    `physicians_enabled` 文档里说的完全一样：某条路径悄悄多算或少算了两位医家。
+
+    `mode` 由调用方传进来、不在这里读环境变量：同一个请求的几处判断必须用同一个
+    值（跟 `run_physician` 的 `retriever_mode`、`bypass_safety` 同一条纪律——
+    进程级环境变量会让两个并发请求互相污染）。
+    """
+    from core.llm import S3_MODES
+
+    if mode not in S3_MODES:
+        raise ValueError(f"S3 模式 {mode!r} 不认识，只能是：{' / '.join(S3_MODES)}")
+    return (physicians_for_synthesis(registry) if mode == "structured"
+            else physicians_enabled(registry))
 
 
 def resolve_physician_id(value: str | None) -> str | None:

@@ -36,24 +36,49 @@ from typing import Callable, Literal
 CALLS_PER_CONSULT_FIXED_STEPS = 2   # S1 + S2，跟医家数和 N 都无关
 
 
-def calls_per_consult(n_physicians: int | None = None, best_of_n: int | None = None) -> int:
-    """`2 + n_physicians × best_of_n`。**全项目这个折算系数只有这一处实现**——
+def calls_per_consult(n_physicians: int | None = None, best_of_n: int | None = None,
+                      mode: str | None = None) -> int:
+    """一次问诊大约几次 LLM 调用。**全项目这个折算系数只有这一处实现**——
     前端不自己算（它读 `/api/usage` 给的 `calls_per_consult`），额度默认值、
     看板、README 都问这里。
 
-    两个参数都默认从当前配置取：医家数问 `core.physicians.physicians_enabled()`
-    （注册表是唯一名单，R18 扩到五位时就是靠这一点没改到别处），N 问
-    `core.llm.s3_best_of_n()`。函数内 import 是为了不把"额度账本"绑死在
+    公式**随 S3 模式变**（R33）：
+
+      legacy      `2 + n_physicians × best_of_n`  —— 每位医家各采 N 次
+      structured  `2 + best_of_n`                 —— 五家融合成**一次**调用
+
+    structured 下医家数不进公式，这是这一轮最大的一笔省：五位医家 × N=3 是
+    15 次 S3，融合成一次之后是 3 次（`best_of_n` 仍然乘上来——采样是"同一份
+    产出采几次挑最好的"，跟"几位医家"是两件不同的事）。
+    **不是把 n_physicians 当成 1**：那样写下次改公式的人会以为这里少了个变量。
+
+    三个参数都默认从当前配置取：模式问 `core.llm.s3_mode()`，医家数问
+    `core.physicians.physicians_for_mode(mode)`（**按模式取名单**——structured 下
+    是五位、legacy 下是三位，写死任一个数都会在另一种模式下虚报），
+    N 问 `core.llm.s3_best_of_n()`。函数内 import 是为了不把"额度账本"绑死在
     "推理链的注册表"上：这个模块在测试里常被单独拿来跑。
     """
-    if n_physicians is None:
-        from core.physicians import physicians_enabled
+    from core.llm import S3_MODES
 
-        n_physicians = len(physicians_enabled())
+    if mode is None:
+        from core.llm import s3_mode
+
+        mode = s3_mode()
+    if mode not in S3_MODES:
+        raise ValueError(f"S3 模式 {mode!r} 不认识，只能是：{' / '.join(S3_MODES)}")
+    if n_physicians is None:
+        from core.physicians import physicians_for_mode
+
+        n_physicians = len(physicians_for_mode(mode))
     if best_of_n is None:
         from core.llm import s3_best_of_n
 
         best_of_n = s3_best_of_n()
+    if mode == "structured":
+        # 医家数不进公式：五家在**同一次**调用里融合。n_physicians 仍然接在
+        # 参数表里且被校验，好让调用方（前端的"约剩 N 次"、README）不用记住
+        # "这个模式下那个参数会被忽略"——它会被忽略这件事写在这里，只写一次。
+        return CALLS_PER_CONSULT_FIXED_STEPS + best_of_n
     return CALLS_PER_CONSULT_FIXED_STEPS + n_physicians * best_of_n
 # 开了 ReAct 之后每位医家额外的取证循环步数（估算用，结算时会被真实值覆盖）。
 REACT_STEPS_PER_PHYSICIAN = 5

@@ -441,6 +441,12 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         "s1_normalize": {"complaint"},
         "s2_elements": {"elements", "symptoms", "tongue", "pulse"},
         "s3_syndrome": {"name", "elements_summary", "symptoms", "refs"},
+        # R33：结构化模式的第二份 s3 prompt（`S3_MODE=structured` 走它）。
+        # 没有 `name`——它不模拟某一位医家，而是把五家融合成一份结论，
+        # 所以是 `physicians`（五位中文名）+ `physician_ids`（id(中文名) 清单，
+        # 模型填 id 时照着看）。调用方是 core/chain.py::run_synthesis。
+        "s3_structured": {"physicians", "physician_ids", "elements_summary",
+                          "symptoms", "refs"},
         # physician_id 是 P1-1.1b 加的（模型要填 id 不是中文名，SOURCES.md 第 31 条），
         # 调用方 core/react.py::run_react 已同步传它——这条是有意的契约变更。
         "s3_react": {"name", "physician_id", "symptoms", "elements_summary", "tools", "history", "remaining"},
