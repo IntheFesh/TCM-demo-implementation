@@ -171,6 +171,37 @@ R55 记录的单次问诊墙钟量级（45~75 秒一档）估算**约 1~1.5 小�
 按同类调用的成本量级估算**约 ¥5**——这两个数字需要在用户自己的 AutoDL 机器
 上实测确认，此处只给量级。
 
+## 真机验收（R58）
+
+`scripts/acceptance_r58.py`——这一轮改造交付前的最后一道闸门，验四件事，
+全部要求**真实端到端**（真的问一句话、真的等模型答完），不是拿构造好的
+响应体喂渲染函数（那是 `screenshot_states.py` 干的事，两者不是同一层）：
+
+1. 3 条主诉（`tests/queries.txt` 前三条）× 3 个角色（patient/doctor/
+   researcher）= 9 次真实问诊——耗时/token/追问轮数/验证轮数。
+2. 按角色断言响应形状（`assert_response_shape`，逐字对照
+   `api/main.py::_filter_response_by_role` 的实现）。
+3. `cases.json` 原文摘录溯源——扫真实发给模型的 system prompt，凡是
+   引用医案的地方，摘录必须是那条医案 `raw_excerpt` 的真实子串
+   （`S3_MODE=derived`，即产品默认档，下这条恒是"0 处引用"，诚实答案，
+   不是没跑；真正会命中的是走 `S3_MODE=structured` 的路径）。
+4. 5 张 1920×1080 真机截图 + 每张都用 `document.body.innerText` 扫一遍
+   违禁词（词表唯一出处 `tests/test_no_demo_artifacts.py::BANNED`）。
+
+```bash
+python -m scripts.acceptance_r58                    # 前置：R57 C 组先过闸门
+python -m scripts.acceptance_r58 --backend fake --skip-gate-check   # 只验脚本本身能不能跑
+```
+
+**前置条件**：读 `eval/report_ablation_r57.json` 的 `all_gates_passed`，
+读不到或者是 `false` 都不放行（除非显式加 `--skip-gate-check` 调试脚本
+本身）——R57 没过就没有 R58，这条脚本不是另一条独立判据。**这个沙盒同样
+跑不出真机数**：`--backend fake` 下的冒烟测试验证了管道本身（9 次问诊全部
+跑通、角色裁剪判据对、`cases.json` 溯源审计对，真机 `S3_MODE=structured`
+下实测 1060 处医案引用、0 处编造），但截图这一步在假后端下会跳过（截不出
+有意义的内容）。真机跑一次的量级参照上面 R57 那条（9 次问诊 + 5 张截图，
+量级远小于 R57 的 80 次问诊）。
+
 ## 临床工作流闭环（R46）
 
 「采集 → 诊断 → 方案 → 检索 → 管理」五段。此前只有中间两段。
