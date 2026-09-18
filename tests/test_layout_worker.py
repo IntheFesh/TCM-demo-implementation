@@ -28,32 +28,54 @@ WEB = ROOT / "web"
 GRAPH_JS = (WEB / "graph.js").read_text(encoding="utf-8")
 APP_JS = (WEB / "app.js").read_text(encoding="utf-8")
 
-#: `computeLayout` / `evenY` 真正用到的、原来放错文件的那几个常量。
-LAYOUT_CONSTANTS = ("LAYER_X", "Y_MIN", "Y_MAX", "HERB_GAP")
+#: R42：布局改成 dagre 之后，Worker 里要跑起来需要的是这些——
+#: 旧的那四个手写布局常量（`LAYER_X` / `Y_MIN` / `Y_MAX` / `HERB_GAP`）
+#: **已经退役**（见 graph.js 里那段退役说明），所以判据从"它们在 graph.js 里"
+#: 换成"dagre 这条路在 graph.js 里自洽"。
+WORKER_NEEDS = ("measureLabel", "LAYER_FONT_SIZE", "dagreAvailable",
+                "fallbackLayout", "computeLayout")
+
+#: 已退役、不许回来的那几个名字。回来意味着有人又在手写间距。
+RETIRED = ("LAYER_X", "Y_MIN", "Y_MAX", "HERB_GAP", "evenY")
 
 
-def test_the_layout_constants_live_with_the_function_that_uses_them():
-    """**这条是这个文件存在的理由。** 它们必须在 graph.js 里，否则
-    `importScripts("graph.js")` 之后 Worker 里就是 undefined。"""
-    for name in LAYOUT_CONSTANTS:
-        # `Y_MIN` / `Y_MAX` 是一行里一起声明的（`const Y_MIN = 60, Y_MAX = 620;`），
-        # 所以判据是"顶层某个 const 声明里绑了这个名字"，不是"行首就是它"。
-        assert re.search(rf"^const [^;]*\b{name}\s*=", GRAPH_JS, re.M), (
+def test_everything_the_layout_needs_lives_in_graph_js():
+    """**这条是这个文件存在的理由。** Worker 只 `importScripts("graph.js")`
+    （加 dagre），布局要用的东西必须都在这一份文件里，否则 Worker 里就是
+    undefined——R41 踩的正是这个（四个常量在 app.js，Worker 报
+    `LAYER_X is not defined`，而它是被 profiler 打出 `fallback_reason`
+    才看见的：静默回落到主线程的表现就是"Worker 没有收益"）。"""
+    for name in WORKER_NEEDS:
+        assert re.search(rf"^(function|const) {name}\b", GRAPH_JS, re.M), (
             f"{name} 不在 graph.js 的顶层——Worker 里会 undefined")
 
 
-def test_app_js_no_longer_defines_them():
-    """留一份在 app.js 就是两处实现，而 graph.js 那份才是被用的那份。"""
-    for name in LAYOUT_CONSTANTS:
-        assert not re.search(rf"^const [^;]*\b{name}\s*=", APP_JS, re.M), (
-            f"app.js 里又定义了 {name}")
+def test_the_hand_written_spacing_constants_stay_retired():
+    """R42 退役了它们（dagre 拿真实盒子尺寸，重叠结构上不可能）。
+    **回来一个就说明有人又在手写间距**——那条路 R24/R37 已经走过一遍，
+    结论是压字压不动中文标签。"""
+    for name in RETIRED:
+        assert not re.search(rf"^(function|const) {name}\b", GRAPH_JS, re.M), (
+            f"{name} 又回来了——手写间距那条路 R24/R37 已经证明走不通")
+        assert not re.search(rf"^(function|const) {name}\b", APP_JS, re.M)
 
 
-def test_app_js_does_not_use_them_either():
-    """搬走的前提是对面真的不用。用的话搬完 app.js 就该炸了（而它没炸，
-    说明确实只有 graph.js 在用）。"""
-    for name in LAYOUT_CONSTANTS:
-        assert name not in APP_JS, f"app.js 还在用 {name}"
+def test_the_font_size_table_covers_every_layer():
+    """dagre 按 `LAYER_FONT_SIZE` 估盒子尺寸，渲染按 `buildStylesheet` 的字号画。
+    **两处不一致时 dagre 按一个尺寸留位、渲染按另一个尺寸画，重叠就回来了。**
+    这条至少保证那张表九层齐全（具体数值的一致性由下面那条比）。"""
+    m = re.search(r"const LAYER_FONT_SIZE = \{([^}]+)\}", GRAPH_JS, re.S)
+    assert m
+    keys = {int(k) for k in re.findall(r"(\d+):", m.group(1))}
+    assert keys == set(range(9)), f"字号表缺层：{set(range(9)) - keys}"
+
+
+def test_the_measure_errs_on_the_large_side():
+    """**估小了 dagre 留的间距不够，重叠又回来。** CJK 必须按整字宽算
+    （不是 0.5、也不是 0.8），并且有内边距与最小尺寸兜底。"""
+    assert "NODE_PAD_X" in GRAPH_JS and "NODE_MIN_W" in GRAPH_JS
+    body = GRAPH_JS.split("function measureLabel")[1][:900]
+    assert "1 : 0.55" in body or "? 1 :" in body, "CJK 不是按整字宽算的"
 
 
 def test_graph_js_can_be_imported_without_a_window():
@@ -131,7 +153,15 @@ def test_the_perf_hooks_are_not_smuggled_into_the_tcm_contract():
     i = GRAPH_JS.index("window.TCM = Object.assign")
     tcm = GRAPH_JS[i:GRAPH_JS.index("});", i)]
     assert "layoutStats" not in tcm and "layoutAsync" not in tcm
-    assert "window.__graphPerf = { layoutStats, layoutAsync, computeLayout };" in GRAPH_JS
+    # R42 又往 __graphPerf 上加了三把量具（零重叠/零穿越/层名列头快照），
+    # 所以判据从"逐字符一行"改成"这几个名字都在 __graphPerf 那个块里、
+    # 一个都不在 TCM 里"——这比比一整行强：加第四把量具时它仍然有效。
+    j = GRAPH_JS.index("window.__graphPerf = {")
+    perf = GRAPH_JS[j:GRAPH_JS.index("};", j)]
+    for name in ("layoutStats", "layoutAsync", "computeLayout",
+                 "overlapStats", "crossingStats", "bands"):
+        assert name in perf, f"__graphPerf 里没有 {name}"
+        assert name not in tcm, f"{name} 混进了 window.TCM"
 
 
 def test_grow_graph_awaits_the_async_layout():

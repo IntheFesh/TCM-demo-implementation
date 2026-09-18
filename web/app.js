@@ -18,7 +18,13 @@ let REFERENCE_PHYSICIANS = [];
 // DEMO.md 和录制清单里已经各有一份，第三份副本漂一个标点就是演示当场 LLMError。
 let EXAMPLE_COMPLAINTS = [];
 
-let cy = null;
+// R42：`let cy` 搬到 graph.js 去了。**这是 R41 那条反向依赖的第二例**：
+// 问诊图的 cytoscape 实例只有 graph.js 在用（app.js 从声明它的那天起一次都
+// 没读过），而声明在这里意味着 graph.js 单独被加载时 `cy` 不存在。
+// 浏览器里两个 script 共享全局作用域，所以从来没报错过——是 R42 给
+// `exportGraphPng` 写只加载 graph.js 的 node 测试时，第一次跑就
+// `ReferenceError: cy is not defined`。跟 `LAYER_X` 那四个常量同一个形状、
+// 同一个修法（搬到被依赖的那一侧）。
 
 // ---------- D1：BYOK + 共享额度 + 用量看板 ----------
 //
@@ -278,7 +284,7 @@ function buildEvidenceIndex(data) {
     const s2 = r.s2 || {};
     const s3 = r.s3 || {};
 
-    put(`syn::${r.physician}`, {
+    put(NODE_ID.syndrome(s3.syndrome || ""), {
       title: `${s3.syndrome || "证型"}　·　${r.physician_name}`,
       physician_name: r.physician_name,
       color: r.color,
@@ -296,7 +302,7 @@ function buildEvidenceIndex(data) {
     });
 
     for (const hit of s2.elements || []) {
-      put(`elem::${hit.element}`, {
+      put(NODE_ID.element(hit.element, hit.kind), {
         title: `证素　${hit.element}`,
         physician_name: r.physician_name,
         color: r.color,
@@ -305,7 +311,7 @@ function buildEvidenceIndex(data) {
         supporting: hit.supporting_symptoms || [],
       });
       for (const sym of hit.supporting_symptoms || []) {
-        put(`sym::${sym}`, {
+        put(NODE_ID.symptom(sym), {
           title: `症状　${sym}`,
           physician_name: r.physician_name,
           color: r.color,
@@ -321,7 +327,7 @@ function buildEvidenceIndex(data) {
     // 候选方都建索引（不是只建 selected 那个），否则点未选中的候选方节点
     // 侧栏是空的。
     (s3.formula_candidates || []).forEach((cand, i) => {
-      put(`formula::${r.physician}::${cand.name}`, {
+      put(NODE_ID.formula(cand.name), {
         title: `${cand.name}　·　${r.physician_name}`,
         physician_name: r.physician_name,
         color: r.color,
@@ -335,7 +341,7 @@ function buildEvidenceIndex(data) {
         safety: cand.safety || null,
       });
       for (const item of cand.herb_items || []) {
-        put(`herb::${r.physician}::${cand.name}::${item.name}`, {
+        put(NODE_ID.herb(cand.name, item.name), {
           title: `${item.name}　·　${cand.name}`,
           physician_name: r.physician_name,
           color: r.color,
@@ -2054,7 +2060,11 @@ function renderChainFlow(data) {
   showChainFlow();
 }
 
-// ---------- R37：节点释义面板（零 LLM，四节，取不到就整块隐藏） ----------
+// ---------- R37/R42：节点释义面板（零 LLM，八节，取不到就整块隐藏） ----------
+//
+// R42：八节（是什么/病机/药理/出处原文/名老中医经验/验证结果/循证对照/注意）。
+// **这一层不写死节的清单**——标题与顺序全由后端下发，前端只负责按顺序渲染。
+// 写死一份的话，后端加一节前端不显示，而"不显示"看起来跟"这一节没内容"一样。
 
 let NODE_EXPLAIN_SEQ = 0;
 
@@ -2093,8 +2103,12 @@ function renderNodeExplain(data) {
   el.classList.add("show");
 }
 
+//: 节点种类的中文名。**R42 补齐三类新节点**（病机/治则/治法）——漏一个的
+//: 表现是面板标题旁边冒出一个英文 id（`pathogenesis`），跟 R37 截图上那个
+//: 「meridian_coverage缺归经」是同一类事故。
 const NODE_KIND_LABEL = {
   symptom: "症状", element: "证素", syndrome: "证型",
+  pathogenesis: "病机", principle: "治则", method: "治法",
   formula: "方剂", herb: "药材", case: "医案",
 };
 
@@ -3183,21 +3197,29 @@ document.getElementById("need-input-submit").addEventListener("click", submitNee
 document.getElementById("need-input-answer").addEventListener("keydown", (e) => {
   if (e.key === "Enter") submitNeedInputAnswer();
 });
-// 没有图时这两个按钮点了什么都不会发生（lastGraph 为 null），原来仍然是
+// 没有图时这三个按钮点了什么都不会发生（lastGraph 为 null），原来仍然是
 // 可点的实心按钮，看起来像坏了。
 function updateGraphToolbar() {
-  for (const id of ["skip-btn", "replay-btn"]) {
+  for (const id of ["skip-btn", "replay-btn", "png-btn"]) {
     const b = document.getElementById(id);
     if (b) b.disabled = !lastGraph;
   }
 }
 document.getElementById("skip-btn").addEventListener("click", skipAnimation);
 document.getElementById("replay-btn").addEventListener("click", replayGraph);
+// R42：导出 PNG。文件名带当前主诉的前几个字——连导三张图在下载目录里
+// 要能分清哪张是哪张（文件名的拼装在 graph.js 那一侧，这里只给"提示"）。
+document.getElementById("png-btn").addEventListener("click", () => {
+  TCM.exportGraphPng(null, (document.getElementById("complaint") || {}).value || "");
+});
 updateGraphToolbar();
 // 保险起见运行时把面板挂到 body 末尾：只要祖先里有任何 transform/filter，
 // position:fixed 就会相对该祖先定位而不是视口，面板会跑到页面中间去。
-{
-  const _p = document.getElementById("evidence-panel");
+// R42：**释义面板也要**——它在窄屏（≤768px）下是底部抽屉（position: fixed），
+// 挂在 main 里时实测贴不到屏底（差 8px，正好是祖先那一层的偏移）。
+// 同一个理由、同一处修法，所以放在同一个块里。
+for (const _id of ["evidence-panel", "node-explain"]) {
+  const _p = document.getElementById(_id);
   if (_p && _p.parentElement !== document.body) document.body.appendChild(_p);
 }
 document.getElementById("evidence-close").addEventListener("click", closeEvidence);

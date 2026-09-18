@@ -155,15 +155,28 @@
           <div id="graph-toolbar">
             <button class="ghost-btn" id="skip-btn" title="立即显示终态">⏭ 跳过动画</button>
             <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
+            <!-- R42：导出整图 PNG（2 倍、白底）。三甲的实际用法是贴进病历讨论
+                 或教学幻灯，截屏只能拿到视口里的半条链。 -->
+            <button class="ghost-btn" id="png-btn" title="导出整图 PNG（2 倍、白底）">⤓ 导出 PNG</button>
           </div>
-          <div id="cy"></div>
+          <!-- R42：九层的层名列头。缺的那一层照样出一个列头、标成「本次没有」
+               ——后端刻意不把缺层的链条悄悄接过去，前端也不能悄悄藏掉。 -->
+          <div id="graph-layers"></div>
+          <!-- tabindex/aria-label：键盘能聚焦到画布；聚焦后 Esc 取消钉住的释义。
+               cytoscape 画在 canvas 上，读屏软件读不到图里的节点，所以真正给
+               无障碍用的是节点释义面板（#node-explain）与钉住的 tooltip。 -->
+          <div id="cy" tabindex="0" role="application"
+               aria-label="辨证链图谱，九层：症状→脏腑→病性→证型→病机→治则→治法靶位→方剂→君臣佐使。点节点可钉住释义，Esc 取消"></div>
           <!-- §3.2 规格 2：边透明度编码 λ1，而当前语料下 λ1 恒为 0、所有边
                同一透明度。**图上要有这一行说明**——不解释的话看图的人会以为
                图没建好。文字来自 offline/graph_stats.lambda1_note()，只此一处。 -->
           <div id="cy-lambda1-note"></div>
           <div id="residual-note"></div>
           <div id="graph-note"></div>
-          <div id="graph-tooltip" class="gt-tooltip"></div>
+          <!-- role=status + aria-live=polite：钉住时读屏软件会念出内容。
+               polite 而不是 assertive——它不是警报，不该打断正在念的句子。 -->
+          <div id="graph-tooltip" class="gt-tooltip" role="status"
+               aria-live="polite" aria-hidden="true"></div>
         </div>
         <!-- R36：S3 的流式增量。**跟 progress-log 分开**：那个是事件日志
              （一行一件事、只增不改），这个是模型正在吐的文本（原地刷新）。
@@ -225,6 +238,9 @@
     <select id="gb-category-select" data-custom-select hidden></select>
     <button class="ghost-btn" id="gb-reset-btn">重置视图</button>
   </div>
+  <!-- R42：聚焦路径（面包屑）。双击一个节点进入聚焦，点任一格回到那一步。
+       没有它就只能靠「重置视图」退回最外层，中间那几步全丢。 -->
+  <nav id="gb-breadcrumb" aria-label="聚焦路径" hidden></nav>
   <div id="gb-panel">
     <div id="gb-cy"></div>
     <div id="gb-tooltip" class="gt-tooltip"></div>

@@ -151,7 +151,11 @@ def test_serialize_result_fills_cited_case_ids_for_unreferenced_s3():
 
 
 def test_to_graph_emits_shared_symptom_element_edges_once():
-    """S2 全局共享，症状->证素的边只该发一遍，不按医家重复。"""
+    """S2 全局共享，症状->病位/病性的边只该发一遍，不按医家重复。
+
+    R42 把原来的「证素」层拆成 脏腑(1)/病性(2) 两层，节点 id 前缀随之从
+    `elem::` 变成 `organ::`/`nature::`。这条断言的意图没变：**同一条边不能
+    因为有两位医家就画两遍。**"""
     from api.main import to_graph
     from core.schemas import ElementHit, S1Normalize, S2Elements, S3Syndrome
 
@@ -165,7 +169,8 @@ def test_to_graph_emits_shared_symptom_element_edges_once():
         for p, n in [("ye_tianshi", "叶天士"), ("wu_jutong", "吴鞠通")]
     ]
     graph = to_graph(S1Normalize(symptoms=["纳差"]), results, s2)
-    sym_elem = [e for e in graph["edges"] if e["data"]["source"] == "sym::纳差" and e["data"]["target"] == "elem::脾"]
+    sym_elem = [e for e in graph["edges"]
+                if e["data"]["source"] == "sym::纳差" and e["data"]["target"] == "organ::脾"]
     assert len(sym_elem) == 1
 
 
@@ -184,7 +189,7 @@ def test_to_graph_residual_element_does_not_hijack_a_main_element():
                                  cited_case_ids=["ye_tianshi-001"]),
                 "refs": [], "hallucinated": []}]
     graph = to_graph(S1Normalize(symptoms=["纳差", "乏力"]), results, s2, residual)
-    node = next(n["data"] for n in graph["nodes"] if n["data"]["id"] == "elem::脾")
+    node = next(n["data"] for n in graph["nodes"] if n["data"]["id"] == "organ::脾")
     assert not node.get("residual")
     states = {n["data"]["id"]: n["data"].get("state") for n in graph["nodes"] if n["data"]["layer"] == 0}
     assert states == {"sym::纳差": "explained", "sym::乏力": "residual"}
@@ -455,12 +460,16 @@ def test_patient_role_response_never_contains_formula_candidates_key(monkeypatch
     s3 = body["results"][0]["s3"]
     for key in ("formula_candidates", "formula", "herbs", "western_drugs", "selected"):
         assert key not in s3, f"patient 响应体的 s3 里不该有键「{key}」"
-    # 图本身也不能通过 layer 3/4 节点把药名重新泄露回去（见 to_graph 的
-    # role 参数文档字符串）。
+    # 图本身也不能通过 layer 7/8 节点把药名重新泄露回去（见 to_graph 的
+    # role 参数文档字符串）。R42 之前这两层是 3/4，九层化之后方剂=7、
+    # 君臣佐使=8——层号写死在测试里会随层数变化失效，所以从 CHAIN_LAYERS
+    # 反查，不手抄数字。
+    rx_layers = {t: n for n, t, _ in api_main.CHAIN_LAYERS}
     graph_layers = {n["data"]["layer"] for n in body["graph"]["nodes"]}
-    assert 3 not in graph_layers and 4 not in graph_layers, (
-        "patient 角色的图里不该有方剂(3)/药材(4) 层，那两层节点本身带着真实药名"
-    )
+    for node_type in ("formula", "herb"):
+        assert rx_layers[node_type] not in graph_layers, (
+            f"patient 角色的图里不该有 {node_type} 层，那层节点本身带着真实药名"
+        )
 
 
 def test_researcher_role_response_matches_pre_m6_shape_byte_for_byte(monkeypatch):

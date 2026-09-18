@@ -50,6 +50,9 @@ VIEWPORT_OVERRIDES = {
     "chain_flow_1920": {"width": 1920, "height": 1080},
     "chain_flow_1366": {"width": 1366, "height": 768},
     "chain_flow_1280": {"width": 1280, "height": 800},
+    # R42：释义抽屉的断点是 768px（iPad 竖屏，也是三甲最常见的移动查房设备）。
+    # **在 1440 宽上验等于什么都没验**——那时它还是那张卡。
+    "node_explain_drawer": {"width": 768, "height": 1024},
 }
 
 COMPLAINT = "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。"
@@ -70,6 +73,9 @@ PREFIX = {
     "chain_flow_1280": "r37", "chain_running": "r37", "node_explain": "r37",
     "cancel_button": "r37",
     "single_chain_graph": "r37",
+    # R42：九层图 + 层名列头 + tooltip 钉住 + 窄屏抽屉 + 图谱浏览器聚焦
+    "graph_layer_bands": "r42", "graph_tooltip_pinned": "r42",
+    "node_explain_drawer": "r42", "browser_focus": "r42",
     "advice_panel": "r24", "rings": "r24",
 }
 
@@ -137,76 +143,116 @@ GRAPH = {"nodes": [], "edges": [], "dropped_edges": 0}
 
 # 学生模式的三跳高亮要一张真有层次的图：症状 → 证素 → 证型 → 方剂。
 # 节点少但层齐——高亮判据看的是"淡化了几个"，不是"图有多大"。
-STUDENT_GRAPH = {
-    "nodes": [
-        {"data": {"id": "sym::胃脘胀痛", "label": "胃脘胀痛", "layer": 0}},
-        {"data": {"id": "sym::口苦", "label": "口苦", "layer": 0}},
-        {"data": {"id": "el::肝郁", "label": "肝郁", "layer": 1}},
-        {"data": {"id": "el::湿热", "label": "湿热", "layer": 1}},
-        {"data": {"id": "syn::ye_tianshi", "label": "肝胃不和证", "layer": 2,
-                  "phys": "ye_tianshi"}},
-        {"data": {"id": "syn::wu_jutong", "label": "肝胆湿热证", "layer": 2,
-                  "phys": "wu_jutong"}},
-        {"data": {"id": "formula::ye_tianshi::柴胡疏肝散", "label": "柴胡疏肝散",
-                  "layer": 3, "phys": "ye_tianshi", "source": "classic"}},
-        {"data": {"id": "formula::wu_jutong::龙胆泻肝汤", "label": "龙胆泻肝汤",
-                  "layer": 3, "phys": "wu_jutong", "source": "classic"}},
-    ],
-    "edges": [
-        {"data": {"source": "sym::胃脘胀痛", "target": "el::肝郁"}},
-        {"data": {"source": "sym::口苦", "target": "el::湿热"}},
-        {"data": {"source": "el::肝郁", "target": "syn::ye_tianshi"}},
-        {"data": {"source": "el::湿热", "target": "syn::wu_jutong"}},
-        {"data": {"source": "syn::ye_tianshi", "target": "formula::ye_tianshi::柴胡疏肝散"}},
-        {"data": {"source": "syn::wu_jutong", "target": "formula::wu_jutong::龙胆泻肝汤"}},
-    ],
-    "dropped_edges": 0,
-}
+# ---------- R42：图的 fixture **由真后端生成，不再手写** ----------
+#
+# 这两张图（三列问诊图、学生模式高亮用的那张）原来是手抄的 dict。R42 把层数
+# 从 5 改成 9 之后，手抄的那两份**跟真接口漂了**：判据在验一个不存在的形状
+# （`elem::肝郁` / `layer <= 2` 这类），于是"真浏览器跑一遍"这件事的意义被抽空
+# ——它跑的不是上线的那份数据。
+#
+# 所以改成调 `api.main.to_graph` 现造。代价是 fixture 不再能随手改一个字段来
+# 造边界情况；收益是**它永远不会跟契约漂**，而这正是 CLAUDE.md 那条"改了层结构
+# 必须过 Playwright"要的东西。要造边界情况就改喂进去的 S1/S2/S3，那也更接近真实。
+def _three_physician_graph(role="researcher"):
+    from api.main import to_graph
+    from core.schemas import (ElementHit, FormulaCandidate, HerbItem, S1Normalize,
+                              S2Elements, S3Syndrome)
 
-# R16：一张有六层的问诊图，三种 source 各一个方剂。node_type 由 to_graph()
-# 按 layer 填，这里照它的输出形状写。
-SIX_LAYER_GRAPH = {
-    "nodes": [
-        {"data": {"id": "sym::胃脘胀痛", "label": "胃脘胀痛", "layer": 0,
-                  "node_type": "symptom", "state": "explained"}},
-        {"data": {"id": "elem::肝郁", "label": "肝郁", "layer": 1,
-                  "node_type": "element", "kind": "nature"}},
-        {"data": {"id": "syn::ye_tianshi", "label": "胃痛 · 肝胃不和证", "layer": 2,
-                  "node_type": "syndrome", "phys": "ye_tianshi", "pname": "叶天士"}},
-        {"data": {"id": "syn::wu_jutong", "label": "胃痛 · 肝胃气滞证", "layer": 2,
-                  "node_type": "syndrome", "phys": "wu_jutong", "pname": "吴鞠通"}},
-        {"data": {"id": "syn::zhang_xichun", "label": "胃痛 · 肝气犯胃证", "layer": 2,
-                  "node_type": "syndrome", "phys": "zhang_xichun", "pname": "张锡纯"}},
-        {"data": {"id": "formula::ye_tianshi::柴胡疏肝散", "label": "柴胡疏肝散加减",
-                  "layer": 3, "node_type": "formula", "phys": "ye_tianshi",
-                  "source": "modified", "selected": True}},
-        {"data": {"id": "formula::wu_jutong::左金丸", "label": "左金丸", "layer": 3,
-                  "node_type": "formula", "phys": "wu_jutong", "source": "classic",
-                  "selected": True}},
-        {"data": {"id": "formula::zhang_xichun::自拟和胃汤", "label": "自拟和胃汤",
-                  "layer": 3, "node_type": "formula", "phys": "zhang_xichun",
-                  "source": "composed", "selected": True}},
-        {"data": {"id": "herb::ye_tianshi::柴胡", "label": "柴胡 6g", "layer": 4,
-                  "node_type": "herb", "phys": "ye_tianshi",
-                  "parent": "formula::ye_tianshi::柴胡疏肝散"}},
-        {"data": {"id": "herb::wu_jutong::黄连", "label": "黄连 3g", "layer": 4,
-                  "node_type": "herb", "phys": "wu_jutong",
-                  "parent": "formula::wu_jutong::左金丸"}},
-        {"data": {"id": "herb::zhang_xichun::赭石", "label": "生赭石 18g", "layer": 4,
-                  "node_type": "herb", "phys": "zhang_xichun",
-                  "parent": "formula::zhang_xichun::自拟和胃汤"}},
-    ],
-    "edges": [
-        {"data": {"source": "sym::胃脘胀痛", "target": "elem::肝郁"}},
-        {"data": {"source": "elem::肝郁", "target": "syn::ye_tianshi", "phys": "ye_tianshi"}},
-        {"data": {"source": "elem::肝郁", "target": "syn::wu_jutong", "phys": "wu_jutong"}},
-        {"data": {"source": "elem::肝郁", "target": "syn::zhang_xichun", "phys": "zhang_xichun"}},
-        {"data": {"source": "syn::ye_tianshi", "target": "formula::ye_tianshi::柴胡疏肝散"}},
-        {"data": {"source": "syn::wu_jutong", "target": "formula::wu_jutong::左金丸"}},
-        {"data": {"source": "syn::zhang_xichun", "target": "formula::zhang_xichun::自拟和胃汤"}},
-    ],
-    "dropped_edges": 0,
-}
+    s1 = S1Normalize(symptoms=["胃脘胀痛", "口苦", "嗳气泛酸"])
+    s2 = S2Elements(elements=[
+        ElementHit(element="肝", kind="location",
+                   supporting_symptoms=["胃脘胀痛"], confidence="high"),
+        ElementHit(element="胃", kind="location",
+                   supporting_symptoms=["嗳气泛酸"], confidence="high"),
+        ElementHit(element="气滞", kind="nature",
+                   supporting_symptoms=["胃脘胀痛"], confidence="high"),
+        ElementHit(element="湿热", kind="nature",
+                   supporting_symptoms=["口苦"], confidence="medium"),
+    ])
+
+    def _s3(syndrome, principle, formula, source, herbs):
+        # `source="modified"` 必须带 base_formula（schema 的硬约束：不写原方就
+        # 无法追溯改了什么）——fixture 也得守这条，不然它造的就不是合法响应。
+        cand = {"name": formula, "source": source, "confidence": "high",
+                "rationale": "主治" + syndrome,
+                "herb_items": [HerbItem(name=n, role=r, dose=d, dose_unit="g")
+                               for n, r, d in herbs]}
+        if source == "modified":
+            cand["base_formula"] = "柴胡疏肝散"
+        return S3Syndrome(
+            syndrome=syndrome, disease="胃痛", reasoning="肝气犯胃，胃失和降",
+            treatment_principle=principle, cited_case_ids=["ye_tianshi-0001-p0-0"],
+            formula_candidates=[FormulaCandidate(**cand)], selected=0)
+
+    specs = [
+        ("ye_tianshi", "叶天士", "肝胃不和证", "疏肝和胃", "柴胡疏肝散加减", "modified",
+         [("柴胡", "君", 6.0), ("白芍", "臣", 12.0), ("甘草", "使", 3.0)]),
+        ("wu_jutong", "吴鞠通", "肝胆湿热证", "清利肝胆湿热", "左金丸", "classic",
+         [("黄连", "君", 3.0), ("吴茱萸", "臣", 1.0)]),
+        ("zhang_xichun", "张锡纯", "肝气犯胃证", "降胃镇逆", "自拟和胃汤", "composed",
+         [("生赭石", "君", 18.0), ("生姜", "佐", 6.0)]),
+    ]
+    results = [{"physician": pid, "physician_name": pname, "s2": s2,
+                "s3": _s3(syn, prin, formula, source, herbs),
+                "refs": [], "hallucinated": []}
+               for pid, pname, syn, prin, formula, source, herbs in specs]
+    return json.loads(json.dumps(to_graph(s1, results, s2, role=role)))
+
+
+#: 三位医家的九层图。R42 之前叫 SIX_LAYER_GRAPH（手抄的五层）。
+NINE_LAYER_GRAPH = _three_physician_graph()
+def _disjoint_graph():
+    """两条**互不相交**的链：胃脘胀痛→肝/气滞→肝胃不和证→…，
+    口苦→湿热→肝胆湿热证→…。
+
+    学生模式那条"点一个症状，它那条链全亮、另一条全淡"的判据需要这个形状，
+    而上面那张三医家图给不了：证素层是**全局共享**的那一份，于是每位医家的
+    证型都连回全部证素，从任一症状出发都能走到所有东西——一个节点都不会被淡化。
+
+    做法是给每位医家**各自的 s2**（`to_graph` 画 证素→证型 那条边时读的正是
+    `r["s2"]`），而全局 s2 仍然含两边的证素（症状层与证素层由它生成）。
+    仍然是**真后端生成**，不是手抄。
+    """
+    from api.main import to_graph
+    from core.schemas import (ElementHit, FormulaCandidate, HerbItem, S1Normalize,
+                              S2Elements, S3Syndrome)
+
+    gan = ElementHit(element="肝", kind="location",
+                     supporting_symptoms=["胃脘胀痛"], confidence="high")
+    shi = ElementHit(element="湿热", kind="nature",
+                     supporting_symptoms=["口苦"], confidence="high")
+    s1 = S1Normalize(symptoms=["胃脘胀痛", "口苦"])
+    s2_all = S2Elements(elements=[gan, shi])
+
+    def _s3(syndrome, principle, formula):
+        return S3Syndrome(
+            syndrome=syndrome, reasoning="…", treatment_principle=principle,
+            cited_case_ids=["ye_tianshi-0001-p0-0"],
+            formula_candidates=[FormulaCandidate(
+                name=formula, source="classic", confidence="high",
+                rationale="主治" + syndrome,
+                herb_items=[HerbItem(name="柴胡", role="君", dose=6.0, dose_unit="g")])],
+            selected=0)
+
+    results = [
+        {"physician": "ye_tianshi", "physician_name": "叶天士",
+         "s2": S2Elements(elements=[gan]),
+         "s3": _s3("肝胃不和证", "疏肝和胃", "柴胡疏肝散"),
+         "refs": [], "hallucinated": []},
+        {"physician": "wu_jutong", "physician_name": "吴鞠通",
+         "s2": S2Elements(elements=[shi]),
+         "s3": _s3("肝胆湿热证", "清利湿热", "龙胆泻肝汤"),
+         "refs": [], "hallucinated": []},
+    ]
+    return json.loads(json.dumps(to_graph(s1, results, s2_all)))
+
+
+#: 学生模式高亮用的那张（两条互不相交的链，见上）。
+STUDENT_GRAPH = _disjoint_graph()
+#: 患者模式的图**由后端按 role 生成**，不是在前端把方药层过滤掉
+#: （M6 的原话："根本不生成"，不是"生成了再删"）。
+PATIENT_GRAPH = _three_physician_graph(role="patient")
+
 
 # 患者模式：后端在 role=patient 时摘掉 divergence、摘掉 s3 的方剂/药材字段、
 # refs 清空，另外下发 triage / food_therapy / patent_medicines。这里照那个形状造。
@@ -218,10 +264,7 @@ PATIENT_PAYLOAD = {
                         "note": None, "selected": 0},
                  "refs": [], "hallucinated": [], "safety_output": {"flagged": False}}
                 for r in RESULTS],
-    "graph": {"nodes": [n for n in STUDENT_GRAPH["nodes"] if n["data"]["layer"] <= 2],
-              "edges": [e for e in STUDENT_GRAPH["edges"]
-                        if not e["data"]["target"].startswith("formula::")],
-              "dropped_edges": 0},
+    "graph": PATIENT_GRAPH,
     "rejected": False, "reject_reason": None, "retrieval_error": None,
     "insufficient": False, "insufficient_reason": None, "safety_flag": None,
     "followup": None, "residual": None, "demo_mode": None, "manifest": None,
@@ -386,8 +429,10 @@ def _r37_payload():
 
     st, s1, s2 = _r37_structured()
     flat = st.to_s3_syndrome()
+    # **`s3_structured` 必须一起传**：`flat` 是扁平化之后的那一份，病机与治法
+    # 两层的原件只在结构化那一份里（见 api.main.to_graph 里那段注释）。
     graph = to_graph(s1, [{"physician": "synthesis", "physician_name": "五家综合",
-                           "s3": flat, "s2": s2}], s2=s2)
+                           "s3": flat, "s3_structured": st, "s2": s2}], s2=s2)
     result = {
         **json.loads(json.dumps(S33_RESULT)),
         "s3": json.loads(flat.model_dump_json()),
@@ -734,33 +779,208 @@ STATES = {
     # ---- R16：两张图 ----
     "consult_graph": (
         "renderComplaintBody(COMPLAINT);"
-        " renderConsultResult({...DONE_PAYLOAD, graph: SIX_LAYER_GRAPH});"
+        " renderConsultResult({...DONE_PAYLOAD, graph: NINE_LAYER_GRAPH});"
         " document.getElementById('detail-zone').open = true;"
         " skipAnimation();",
         """async () => {
           await new Promise(r => setTimeout(r, 1200));
           if (!cy) return '画布没建起来';
-          if (cy.nodes().length < 11)
+          if (cy.nodes().length < 20)
             return '图没长全，只有 ' + cy.nodes().length + ' 个节点';
-          // §3.2 规格 1：方剂框按来源区分边框。用的是既有的 source 字段。
-          const modified = cy.getElementById('formula::ye_tianshi::柴胡疏肝散');
-          const composed = cy.getElementById('formula::zhang_xichun::自拟和胃汤');
-          const classic = cy.getElementById('formula::wu_jutong::左金丸');
+          // R42：**九层都要真的画出来**（缺的两层是 legacy S3 本来就没有的
+          // 病机/治法，它们在 missing_layers 里）。M5 那次事故就是前端漏了
+          // 新加的那一层 key，而后端 JSON 测试全绿。
+          const got = new Set(cy.nodes().map(n => Number(n.data('layer'))));
+          for (const L of [0, 1, 2, 3, 5, 7, 8]) {
+            if (!got.has(L)) return '第 ' + L + ' 层一个节点都没画出来';
+          }
+          // 层名列头：九格都在，缺的两层标成"本次没有"
+          const bands = window.__graphPerf.bands();
+          if (bands.length !== 9) return '层名列头不是九格，是 ' + bands.length;
+          const missing = bands.filter(b => b.missing).map(b => b.layer).sort();
+          if (String(missing) !== '4,6')
+            return '缺层没有如实标出来：' + JSON.stringify(bands);
+          // dagre 真的在用（退到 fallback 的话下面的零重叠没有意义）
+          if (!window.__graphPerf.dagreAvailable())
+            return 'dagre 没加载上，布局退到了等距铺开：'
+                   + window.__graphPerf.layoutStats.fallback_reason;
+          if (window.__graphPerf.layoutStats.fallback_reason)
+            return '布局回落了：' + window.__graphPerf.layoutStats.fallback_reason;
+          // **零重叠**：真实包围盒两两比（估算偏大也不算过，这条量的是渲染结果）
+          const ov = window.__graphPerf.overlapStats();
+          if (ov.n_overlaps) return '有 ' + ov.n_overlaps + ' 对节点压在一起：'
+                                    + JSON.stringify(ov.pairs.slice(0, 3));
+          // **交叉数不许超过数据逼出来的下界。**
+          //
+          // "零交叉"对这张图是做不到的，而且不是布局的错：证素层是全局共享的
+          // 那一份，三位医家给出三个不同证型 → 证素→证型是**全连接**，
+          // 其中每一个 K₂,₂ 都逼出一对必然交叉（换排序只换哪两条交叉）。
+          // 实测 forced = 6（脏腑 3 对 + 病性 3 对）。所以判据是 excess == 0。
+          const cr = window.__graphPerf.crossingStats();
+          if (cr.excess > 0)
+            return '布局多出了 ' + cr.excess + ' 对交叉（实测 ' + cr.n_crossings
+                   + '，数据逼出来的下界 ' + cr.forced + '）：'
+                   + JSON.stringify(cr.pairs.slice(0, 3));
+          if (cr.forced === 0 && cr.n_crossings)
+            return '没有被逼出来的交叉，却量到 ' + cr.n_crossings + ' 对';
+          // §3.2 规格 1：方剂框按来源区分边框（R42 之后 id 不带医家段）
+          const modified = cy.getElementById('formula::柴胡疏肝散加减');
+          const composed = cy.getElementById('formula::自拟和胃汤');
+          const classic = cy.getElementById('formula::左金丸');
           for (const [n, name] of [[modified,'modified'],[composed,'composed'],[classic,'classic']]) {
             if (!n.length) return '找不到 ' + name + ' 那个方剂节点';
           }
           if (modified.style('border-style') !== 'dashed') return 'modified 不是虚线';
           if (composed.style('border-style') !== 'dotted') return 'composed 不是点线';
-          if (classic.style('border-style') !== 'solid') return 'classic 不是实线';
           // §3.2 规格 2：λ1 说明必须在图上。
           const note = document.getElementById('cy-lambda1-note');
           if (!note.classList.contains('show') || !note.textContent.trim())
             return '图上没有 λ1 说明';
-          // §3.2 规格 11：证素比别的节点大一号。
-          const el = cy.getElementById('elem::肝郁');
+          // R42 视觉层级：证型层（焦点档）的字号要大过症状层（输入档）
+          const syn = cy.getElementById('syn::肝胃不和证');
           const sym = cy.getElementById('sym::胃脘胀痛');
-          if (!(parseFloat(el.style('font-size')) > parseFloat(sym.style('font-size'))))
-            return '证素字号没有比症状大';
+          if (!(parseFloat(syn.style('font-size')) > parseFloat(sym.style('font-size'))))
+            return '证型层的字号没有大过症状层——视觉层级没生效';
+          if (parseFloat(syn.style('border-width')) < 2)
+            return '证型层（这张图的结论）边框没有加粗';
+          // taxi 边：问诊图用正交折线
+          if (cy.edges()[0].style('curve-style') !== 'taxi')
+            return '边不是 taxi，是 ' + cy.edges()[0].style('curve-style');
+          return null;
+        }""",
+    ),
+    # ---------- R42：层名列头 + 导出 PNG ----------
+    "graph_layer_bands": (
+        "renderComplaintBody(COMPLAINT);"
+        " renderConsultResult({...DONE_PAYLOAD, graph: NINE_LAYER_GRAPH});"
+        " document.getElementById('detail-zone').open = true;"
+        " skipAnimation();",
+        """async () => {
+          await new Promise(r => setTimeout(r, 1000));
+          const host = document.getElementById('graph-layers');
+          if (!host || !host.children.length) return '层名列头没渲染';
+          const bands = [...host.querySelectorAll('.layer-band')];
+          if (bands.length !== 9) return '不是九格，是 ' + bands.length;
+          // 九个层名都要有字（中文名由后端下发，前端不写死）
+          for (const b of bands) {
+            if (!(b.textContent || '').trim()) return '有一格没有层名';
+          }
+          // 缺层那两格要看得出来跟别的不一样（不是灰掉，是朱砂虚线 + 一句话）
+          const gone = bands.filter(b => b.classList.contains('is-missing'));
+          if (gone.length !== 2) return '标成"本次没有"的不是两格，是 ' + gone.length;
+          for (const g of gone) {
+            if (!(g.textContent || '').includes('本次没有'))
+              return '缺层那一格没写"本次没有"';
+            const cs = getComputedStyle(g);
+            if (cs.borderStyle !== 'dashed') return '缺层那一格不是虚线';
+          }
+          // 列头要在画布上方、在首屏里（写在屏外等于没写）
+          const hb = host.getBoundingClientRect();
+          const cb = document.getElementById('cy').getBoundingClientRect();
+          if (hb.bottom > cb.top + 4) return '层名列头没在画布上方';
+          // 导出 PNG 按钮：有图时可点，点了要真的产出一个 dataURL
+          const btn = document.getElementById('png-btn');
+          if (!btn) return '没有导出 PNG 按钮';
+          if (btn.disabled) return '有图了导出按钮还是禁用的';
+          const uri = cy.png({full: true, scale: 2});
+          if (!uri.startsWith('data:image/png;base64,')) return '导出的不是 PNG';
+          if (uri.length < 5000) return '导出的 PNG 太小（' + uri.length + '），像是空图';
+          return null;
+        }""",
+    ),
+    # ---------- R42：tooltip 钉住 + 无障碍 ----------
+    "graph_tooltip_pinned": (
+        "renderComplaintBody(COMPLAINT);"
+        " renderConsultResult({...DONE_PAYLOAD, graph: NINE_LAYER_GRAPH});"
+        " document.getElementById('detail-zone').open = true;"
+        " skipAnimation();",
+        """async () => {
+          await new Promise(r => setTimeout(r, 1000));
+          const tip = document.getElementById('graph-tooltip');
+          if (tip.getAttribute('role') !== 'status') return 'tooltip 没有 role=status';
+          if (tip.getAttribute('aria-live') !== 'polite')
+            return 'aria-live 不是 polite（它不是警报，不该打断读屏）';
+          const canvas = document.getElementById('cy');
+          if (canvas.getAttribute('tabindex') !== '0') return '画布不能用键盘聚焦';
+          if (!(canvas.getAttribute('aria-label') || '').trim()) return '画布没有 aria-label';
+          // 点一个节点 → 钉住
+          const node = cy.getElementById('herb::左金丸::黄连');
+          if (!node.length) return '找不到那个药材节点';
+          node.emit('tap', [{clientX: 100, clientY: 100}]);
+          await new Promise(r => setTimeout(r, 120));
+          if (!tip.classList.contains('show')) return '点了节点 tooltip 没出来';
+          if (!tip.classList.contains('pinned')) return 'tooltip 没有钉住';
+          if (tip.getAttribute('aria-hidden') !== 'false')
+            return '钉住了但 aria-hidden 还是 true，读屏软件读不到';
+          // 钉住之后要能选中里面的字（抄剂量进病历是这个功能存在的理由）
+          if (getComputedStyle(tip).pointerEvents === 'none')
+            return '钉住的 tooltip 还是 pointer-events:none，选不中里面的字';
+          const pinnedHtml = tip.innerHTML;
+          if (!pinnedHtml.includes('黄连')) return 'tooltip 里没有这个节点的名字';
+          if (!pinnedHtml.includes('君臣佐使')) return 'tooltip 的标题不是层名';
+          // 钉住期间 hover 别的节点不许改它
+          const other = cy.getElementById('sym::口苦');
+          other.emit('mouseover', [{clientX: 300, clientY: 300}]);
+          await new Promise(r => setTimeout(r, 120));
+          if (tip.innerHTML !== pinnedHtml) return '钉住了还是被 hover 改掉了';
+          // Esc 取消
+          document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}));
+          await new Promise(r => setTimeout(r, 120));
+          if (tip.classList.contains('show')) return 'Esc 没有取消钉住';
+          if (tip.getAttribute('aria-hidden') !== 'true')
+            return '关掉了但 aria-hidden 还是 false';
+          return null;
+        }""",
+    ),
+    # ---------- R42：图谱浏览器的聚焦 + 面包屑 ----------
+    "browser_focus": (
+        "switchTab('graph-browser'); await loadGraphBrowserData();"
+        " await new Promise(r => setTimeout(r, 400));"
+        " window.__hub = gbCy.nodes()[0].id();"
+        " await gbExpandNode(window.__hub);"
+        " await new Promise(r => setTimeout(r, 400));"
+        " window.__before = gbCy.nodes().length;"
+        " window.__focus = window.__gbPerf.focus(window.__hub);",
+        """async () => {
+          await new Promise(r => setTimeout(r, 800));
+          if (!window.__focus) return '聚焦没返回任何东西（gbIndex 没建？）';
+          if (window.__focus.layout !== 'dagre')
+            return '聚焦用的不是 dagre，是 ' + window.__focus.layout;
+          const crumbs = document.getElementById('gb-breadcrumb');
+          if (crumbs.hidden) return '聚焦了面包屑还是隐藏的';
+          const items = [...crumbs.querySelectorAll('[data-gb-crumb]')];
+          if (items.length < 2) return '面包屑不足两格（少了"全图"那一格？）';
+          if (!items.some(el => el.classList.contains('is-current')))
+            return '面包屑没标出当前那一步';
+          // 聚焦之后**按跳距分列**：同一跳的节点 x 应该接近，跳距越大越靠右
+          const byHop = new Map();
+          gbCy.nodes().forEach(n => {
+            const L = Number(n.data('layer'));
+            if (!Number.isFinite(L)) return;
+            if (!byHop.has(L)) byHop.set(L, []);
+            byHop.get(L).push(n.position('x'));
+          });
+          const hops = [...byHop.keys()].sort((a, b) => a - b);
+          if (hops.length < 2) return '聚焦之后只有一列，分层没生效';
+          const avg = hops.map(h => byHop.get(h).reduce((a, b) => a + b, 0) / byHop.get(h).length);
+          for (let i = 1; i < avg.length; i++) {
+            if (!(avg[i] > avg[i - 1])) return '跳距大的那一列没有更靠右：' + JSON.stringify(avg);
+          }
+          // 聚焦模式下环图例要换成聚焦自己的说明
+          const legend = document.getElementById('gb-ring-legend');
+          if (!(legend.textContent || '').includes('聚焦'))
+            return '环图例没换成聚焦说明：' + legend.textContent;
+          // 两种布局在同一批节点上的实测耗时（R42 报告要这两个数）
+          const bench = window.__gbPerf.benchLayouts(window.__hub);
+          if (!bench || bench.dagre_ms === undefined) return '布局基准跑不出来';
+          window.__bench = bench;
+          // 退出聚焦：恢复的是**进聚焦前那批节点**，不是重铺首屏
+          window.__gbPerf.exitFocus();
+          await new Promise(r => setTimeout(r, 600));
+          if (!crumbs.hidden) return '退出聚焦了面包屑还在';
+          if (gbCy.nodes().length !== window.__before)
+            return '退出聚焦恢复的节点数不对：' + gbCy.nodes().length
+                   + ' vs 进去之前 ' + window.__before;
           return null;
         }""",
     ),
@@ -892,9 +1112,15 @@ STATES = {
         }""",
     ),
     "student_highlight": (
+        # R42：九层之后生长动画比五层长得多（每层一次 stagger + 360ms 等边），
+        # 原来那句"等 1200ms 再点"在新层数下会在**节点还没加完**的时候点下去，
+        # 表现是"那条链上靠后的节点既不在亮的里也不在淡的里"。
+        # **跳过动画**再点——这条状态验的是高亮路径，不是生长动画。
         "document.getElementById('role-select').value = 'student';"
         " renderComplaintBody(COMPLAINT);"
-        " renderConsultResult({...DONE_PAYLOAD, graph: STUDENT_GRAPH});",
+        " renderConsultResult({...DONE_PAYLOAD, graph: STUDENT_GRAPH});"
+        " document.getElementById('detail-zone').open = true;"
+        " skipAnimation();",
         """async () => {
           await new Promise(r => setTimeout(r, 1200));
           if (!cy) return '画布没建起来';
@@ -903,12 +1129,13 @@ STATES = {
           const faded = cy.nodes('.gt-faded').map(n => n.id());
           const lit = cy.nodes().not('.gt-faded').map(n => n.id());
           // 三跳：症状 → 证素 → 证型 → 方剂。起点那条链全亮，另一条链全淡。
-          for (const id of ['sym::胃脘胀痛', 'el::肝郁', 'syn::ye_tianshi',
-                            'formula::ye_tianshi::柴胡疏肝散']) {
+          // R42 九层之后这条链长了两步：症状→脏腑→证型→**治则**→方剂→君臣佐使。
+          for (const id of ['sym::胃脘胀痛', 'organ::肝', 'syn::肝胃不和证',
+                            'principle::疏肝和胃', 'formula::柴胡疏肝散']) {
             if (!lit.includes(id)) return id + ' 应该亮着，实际被淡化了';
           }
-          for (const id of ['sym::口苦', 'el::湿热', 'syn::wu_jutong',
-                            'formula::wu_jutong::龙胆泻肝汤']) {
+          for (const id of ['sym::口苦', 'nature::湿热', 'syn::肝胆湿热证',
+                            'principle::清利湿热', 'formula::龙胆泻肝汤']) {
             if (!faded.includes(id)) return id + ' 应该被淡化，实际亮着';
           }
           // **先确认节点真的在**：cytoscape 的空集合 .style() 返回 undefined，
@@ -1009,12 +1236,22 @@ STATES = {
             return '释义面板高 ' + Math.round(box.getBoundingClientRect().height) + 'px';
           const heads = [...box.querySelectorAll('.ne-head')].map(x => x.textContent);
           if (!heads.length) return '面板里一节都没有';
-          const ORDER = ['是什么', '出处原文', '名医怎么用', '注意'];
+          // R42：四节扩到八节，顺序仍然是**链**（先是什么、再凭什么、
+          // 再别人怎么用、再验过什么、再跟基准比、最后说风险）。
+          const ORDER = ['是什么', '病机', '药理', '出处原文',
+                         '名老中医经验', '验证结果', '循证对照', '注意'];
           const idx = heads.map(h => ORDER.indexOf(h));
-          if (idx.some(i => i < 0)) return '出现了四节之外的节：' + heads.join('/');
+          if (idx.some(i => i < 0)) return '出现了八节之外的节：' + heads.join('/');
           for (let i = 1; i < idx.length; i++)
-            if (idx[i] < idx[i - 1]) return '四节顺序乱了：' + heads.join('/');
+            if (idx[i] < idx[i - 1]) return '八节顺序乱了：' + heads.join('/');
           if (!box.textContent.includes('出处')) return '没有出处那一行——释义必须能回指';
+          // R42 新增的那几节要真的出现（只把标题加进 ORDER、没有 builder 产出它，
+          // 上面那两条照样绿）
+          for (const want of ['药理', '验证结果', '循证对照']) {
+            if (!heads.includes(want)) return 'R42 新增的「' + want + '」这一节没出现';
+          }
+          if (!box.textContent.includes('中医药循证临床实践指南'))
+            return '循证对照少了那句口径声明——"教材里有"会被读成"有循证支持"';
           return null;
         }""",
     ),
@@ -1035,17 +1272,22 @@ STATES = {
             const L = String(n.data('layer'));
             byLayer[L] = (byLayer[L] || 0) + 1;
           });
-          if (byLayer['2'] !== 1) return '证型层不是一个节点，是 ' + byLayer['2'];
-          if (byLayer['3'] !== 1) return '方剂层不是一个节点，是 ' + byLayer['3'];
-          if (!byLayer['4']) return '药材层（compound 子节点）没画出来';
+          // R42：结构化 S3 有病机(4)和治法(6)，所以这张图**九层都该在**。
+          // 层号写死在这里是有意的：这条状态验的就是"层号改了前端跟没跟上"，
+          // 从后端现取会让它永远绿。
+          for (const L of ['0', '1', '3', '4', '5', '6', '7', '8']) {
+            if (!byLayer[L]) return '第 ' + L + ' 层一个节点都没画出来：'
+                                    + JSON.stringify(byLayer);
+          }
+          if (byLayer['3'] !== 1) return '证型层不是一个节点，是 ' + byLayer['3'];
+          if (byLayer['7'] !== 1) return '方剂层不是一个节点，是 ' + byLayer['7'];
           // 药材必须挂在方剂下面（compound），不是另画一条边
-          const herbs = cy.nodes().filter(n => String(n.data('layer')) === '4');
+          const herbs = cy.nodes().filter(n => String(n.data('layer')) === '8');
           const bad = herbs.filter(n => !n.parent().length);
           if (bad.length) return bad.length + ' 味药没有 parent——compound 关系断了';
           // **方名必须看得见**：方剂是 compound 父节点，label 画在框的上沿
           // （`text-valign: top`），而 `fit` 只保证节点本体在视口里——父节点的
-          // label 是"框外"的东西，很容易被切掉。这条量它的 label 包围盒在不在
-          // 画布里（"这条链开的是哪张方"是这张图的主语，切掉就白画了）。
+          // label 是"框外"的东西，很容易被切掉。
           const parent = cy.nodes().filter(n => n.isParent())[0];
           if (!parent) return '没有 compound 父节点（方剂层不见了）';
           if (!(parent.data('label') || '').trim()) return '方剂节点没有 label';
@@ -1055,14 +1297,78 @@ STATES = {
               x1: Math.round(pb.x1), y1: Math.round(pb.y1),
               x2: Math.round(pb.x2), y2: Math.round(pb.y2)})
               + ' 超出画布 ' + Math.round(cy.width()) + '×' + Math.round(cy.height());
-          // 节点两两不许重叠（单链下更不该有）
-          const boxes = cy.nodes().filter(n => !n.isParent()).map(n => n.renderedBoundingBox());
-          for (let i = 0; i < boxes.length; i++)
-            for (let j = i + 1; j < boxes.length; j++) {
-              const a = boxes[i], b = boxes[j];
-              if (a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2)
-                return '有两个节点压在一起';
-            }
+          // R42：dagre 真的在用 + 零重叠 + 零穿越（用真实包围盒量）
+          if (!window.__graphPerf.dagreAvailable())
+            return 'dagre 没加载上：' + window.__graphPerf.layoutStats.fallback_reason;
+          if (window.__graphPerf.layoutStats.fallback_reason)
+            return '布局回落了：' + window.__graphPerf.layoutStats.fallback_reason;
+          const ov = window.__graphPerf.overlapStats();
+          if (ov.n_overlaps) return '有 ' + ov.n_overlaps + ' 对节点压在一起：'
+                                    + JSON.stringify(ov.pairs.slice(0, 3));
+          // **单链：这里要的是真正的零交叉。** 单链没有 K₂,₂（每层一列），
+          // 所以 forced 必然是 0，任何一对交叉都是布局的错。
+          const cr = window.__graphPerf.crossingStats();
+          if (cr.forced !== 0) return '单链图竟然有被逼出来的交叉：' + cr.forced;
+          if (cr.n_crossings) return '有 ' + cr.n_crossings + ' 对边交叉：'
+                                     + JSON.stringify(cr.pairs.slice(0, 3));
+          // 单链下**每一层都只有一列**，所以层号越大越靠右这条必须成立
+          const xs = {};
+          cy.nodes().filter(n => !n.isParent()).forEach(n => {
+            const L = Number(n.data('layer'));
+            xs[L] = Math.min(xs[L] === undefined ? Infinity : xs[L], n.position('x'));
+          });
+          const ks = Object.keys(xs).map(Number).sort((a, b) => a - b);
+          for (let i = 1; i < ks.length; i++) {
+            if (!(xs[ks[i]] > xs[ks[i - 1]]))
+              return '第 ' + ks[i] + ' 层没有排在第 ' + ks[i - 1] + ' 层右边';
+          }
+          return null;
+        }""",
+    ),
+    # ---------- R42：窄屏（768px）释义抽屉 ----------
+    "node_explain_drawer": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult(R37_DONE_PAYLOAD);"
+        " await openNodeExplain('herb::四君子汤::党参', '党参');",
+        """async () => {
+          await new Promise(r => setTimeout(r, 600));
+          const el = document.getElementById('node-explain');
+          if (!el.classList.contains('show')) return '释义面板没打开';
+          const cs = getComputedStyle(el);
+          if (cs.position !== 'fixed') return '窄屏下释义面板不是底部抽屉';
+          const box = el.getBoundingClientRect();
+          // **贴底判据按布局视口算**：`window.innerHeight` 含滚动条那一条，
+          // 而 fixed 元素的 bottom 对齐的是布局视口（documentElement.clientHeight）。
+          // 两者混用会在有横向滚动条时差十几像素——那不是"没贴底"。
+          const vh = document.documentElement.clientHeight;
+          if (Math.round(box.bottom) < vh - 2)
+            return '抽屉没贴在屏幕底部：bottom=' + Math.round(box.bottom)
+                   + ' 布局视口=' + vh + ' innerHeight=' + window.innerHeight;
+          // 768px 下不许出现横向滚动（R41 那条首屏判据在窄屏上同样成立）
+          const de = document.documentElement;
+          if (de.scrollWidth > de.clientWidth + 1)
+            return '768px 下出现了横向滚动：' + de.scrollWidth + ' > ' + de.clientWidth;
+          if (box.height > document.documentElement.clientHeight * 0.65)
+            return '抽屉占了 ' + Math.round(box.height / window.innerHeight * 100)
+                   + '% 屏高，图就看不见了';
+          // 八节里有内容的那几节都要渲染出来，每节都要有出处
+          const secs = [...el.querySelectorAll('.ne-sec')];
+          if (secs.length < 4) return '只渲染了 ' + secs.length + ' 节';
+          for (const s of secs) {
+            if (!s.querySelector('.ne-head')) return '有一节没有标题';
+            if (!s.querySelector('.ne-src')) return '有一节没有出处';
+          }
+          const text = el.innerText || '';
+          for (const want of ['药理', '验证结果', '循证对照']) {
+            if (!text.includes(want)) return 'R42 新增的「' + want + '」这一节没出现';
+          }
+          if (!text.includes('中医药循证临床实践指南'))
+            return '循证对照少了那句口径声明';
+          // 关闭按钮要够大能用手指点到（WCAG 最小 44px）
+          const close = el.querySelector('.ne-close');
+          const cb = close.getBoundingClientRect();
+          if (cb.width < 44 || cb.height < 44)
+            return '关闭按钮只有 ' + Math.round(cb.width) + '×' + Math.round(cb.height);
           return null;
         }""",
     ),
@@ -1355,7 +1661,8 @@ def run(only: str | None, wait_ms: int) -> int:
                                    ("PATIENT_HIGH_PAYLOAD", PATIENT_HIGH_PAYLOAD),
                                    ("STUDENT_GRAPH", STUDENT_GRAPH),
                                    ("DOCTOR_SAFETY", DOCTOR_SAFETY),
-                                   ("SIX_LAYER_GRAPH", SIX_LAYER_GRAPH),
+                                   ("NINE_LAYER_GRAPH", NINE_LAYER_GRAPH),
+                                   ("PATIENT_GRAPH", PATIENT_GRAPH),
                                    ("REFERENCE_HEALTH", REFERENCE_HEALTH),
                                    ("REFERENCE_FIXTURE", REFERENCE_FIXTURE),
                                    # R24：建议层 + token 面板 + 今日用量

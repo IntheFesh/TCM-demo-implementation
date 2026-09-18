@@ -646,17 +646,29 @@ def api_graph_neighbors(node: str, limit: int = 200, node_types: str | None = No
 
 
 #: 节点释义接口的入参长度上限。**不是怕慢，是怕日志/错误信息里被塞长串**
-#: （同 MAX_COMPLAINT_CHARS 那条理由）。节点 id 最长的形状是
-#: `herb::{physician}::{方名}::{药名}`，200 字绰绰有余。
+#: （同 MAX_COMPLAINT_CHARS 那条理由）。R42 之后节点 id 最长的形状是
+#: `herb::{方名}::{药名}`（去掉了医家段），200 字绰绰有余。
 MAX_NODE_ID_CHARS = 200
+
+#: 这个接口的耗时预算。**性能预算进测试**（总纲 §12）：R42 把四节扩成八节，
+#: 新增的三节要读方剂本体、功效同义表、规律层——都是惰性初始化的全量表，
+#: 第一次点开会把它们全加载一遍。预算按**热态**定（本体已加载），
+#: 判据在 tests/test_node_explain_perf.py：p95 ≤ 50 ms。
+NODE_EXPLAIN_BUDGET_MS = 50
 
 
 @app.get("/api/node_explain")
 def api_node_explain(node: str, name: str | None = None) -> dict:
-    """R37：图上一个节点的四节释义。**零 LLM 调用**，判据全在 core/node_explain.py。
+    """R37/R42：图上一个节点的**八节**释义。**零 LLM 调用**，
+    判据全在 core/node_explain.py。
 
-    `name` 是显示名覆盖：问诊图的证型节点 id 是 `syn::{physician}`（那个 id 是
-    证据链侧栏反查的键，改不得），名字只在 label 里，所以前端把 label 一起传来。
+    八节：是什么 / 病机 / 药理 / 出处原文 / 名老中医经验 / 验证结果 / 循证对照 / 注意。
+    R42 新增的四节（病机、药理、验证结果、循证对照）对应九层图新增的节点类型
+    （病机、治则、治法）和"每个数字都要有对照基准"那条铁律。
+
+    `name` 是显示名覆盖：问诊图证型节点的 label 是「病名 · 证型」拼出来的，
+    而证候表里存的是证型名；节点 id 里那一段还可能带方名。所以前端把 label
+    一起传来。
 
     取不到时返回 `available=False` + 一句 `note`，**HTTP 仍然是 200**：
     "这个节点没有释义"不是错误，而 4xx 会让前端把它当故障弹红条。
@@ -1674,46 +1686,113 @@ def _filter_response_by_role(response: dict, role: Role, results: list[dict]) ->
 # ---------- 图数据 ----------
 
 
+#: R42：**单一诊断链的九层。** 一张表定死层号、层的机器名、层的中文名。
+#:
+#: 层号是布局（第几列），`node_type` 是"这是什么东西"——两件事分开
+#: （R16 那条：混在一个字段上，样式表就只能有两份）。中文名由后端下发，
+#: 前端不写死：加层/改名时前端跟着长，不需要改两处。
+#:
+#: 为什么是九层而不是原来的五层：原来「治法」挂在 证型→方剂 那条边的 label 上、
+#: 「脏腑」和「病性」挤在一个「证素」层里、「病机」根本没有位置。那张图看得出
+#: "从症状到方"，看不出**为什么是这个证、为什么是这个治法**——而那正是辨证
+#: 这件事本身。九层把推理链的每一步摆成一层，图与 `S3Structured` 的九段一一对应。
+CHAIN_LAYERS: tuple[tuple[int, str, str], ...] = (
+    (0, "symptom", "症状"),
+    (1, "organ", "脏腑"),
+    (2, "nature", "病性"),
+    (3, "syndrome", "证型"),
+    (4, "pathogenesis", "病机"),
+    (5, "principle", "治则"),
+    (6, "method", "治法靶位"),
+    (7, "formula", "方剂"),
+    (8, "herb", "君臣佐使"),
+)
+
+#: 层号 → node_type / 中文名。从上面那张表派生，**不另写一份**。
+LAYER_NODE_TYPE: dict[int, str] = {n: t for n, t, _ in CHAIN_LAYERS}
+LAYER_LABEL: dict[int, str] = {n: z for n, _, z in CHAIN_LAYERS}
+
+#: 节点 id 的前缀 → 层号。前缀是 `core/node_explain.py::parse_node_id` 的输入，
+#: 两边必须说同一套词（那边有一张 `_PREFIX_KIND`，有测试比这两张表）。
+LAYER_PREFIX: dict[int, str] = {
+    0: "sym", 1: "organ", 2: "nature", 3: "syn",
+    4: "mech", 5: "principle", 6: "method", 7: "formula", 8: "herb",
+}
+
+
 def to_graph(
     s1: S1Normalize, results: list[dict], s2=None, residual: dict | None = None,
     role: Role = "researcher",
 ) -> dict:
-    """构造 Cytoscape 格式的图：{nodes: [{"data": {...}}], edges: [{"data": {...}}]}。
+    """构造 Cytoscape 格式的图：{nodes: [{"data": {...}}], edges: [...], ...}。
 
-    六层（M5）：症状(0) -> 证素(1) -> 病名·证型(2) -> 方剂(3) -> 药材(4)。
-    治法不单独成层，做成 layer2 -> layer3 边的 label（六层已经够宽，七层会挤到
-    看不清）。方剂(3)/药材(4) 是 compound 关系：药材节点的 `parent` 字段指向
-    它所属的方剂节点，父子关系由 cytoscape 内建机制表达，**不额外画一条
-    formula->herb 的边**——画了会在图上出现重复的连线。
+    **R42：九层单链，图上没有医家分带。**
 
-    节点去重用 seen 集合，同 id 只加一次。
+    症状(0) → 脏腑(1) → 病性(2) → 证型(3) → 病机(4) → 治则(5) → 治法靶位(6)
+    → 方剂(7) → 君臣佐使(8)
 
-    M6：role="patient" 时压根不产出方剂(3)/药材(4) 层——图节点本身就带着
-    真实药名（label/id 都是），如果先建出完整六层图、再在 `_consult_response`
-    那层把 `results[].s3.formula_candidates` 摘掉，图里这两层节点依然会把
-    同样的药名重新泄露给前端。跟"字段裁剪必须在后端做、不能指望前端藏起来"
-    是同一条安全边界：这里的做法是"根本不生成"，不是"生成了再删"。
+    第 6 层叫「治法靶位」而不是「治法」：它的内容是 `MethodStep.targets`，
+    schema 里写明那是"这个治法分别针对哪几条病机"——是**靶位**（肝、胃…），
+    不是治法本身（治法在第 5 层的 `principle` 里）。叫「治法」会让图上出现
+    一个写着「肝」的治法节点，那是错的。
+
+    ## 为什么去掉医家分带
+
+    改之前证型/方剂/药材的 node id 里带 physician（`syn::ye_tianshi`），于是
+    三位医家在图上是三条并行的带子。那张图回答的是"三个人各自怎么想"，而
+    产品要回答的是"**这一个**诊断是怎么推出来的"——分带把一条推理链切成三条，
+    每条都缺上游（症状与证素是共享的），读图的人得自己在脑子里把它们并起来。
+
+    改之后同名节点**合并成一个**，谁贡献的记在 `contributors` 里（节点属性，
+    不是空间位置）。legacy 三列模式下三位医家给出同一个证型时图上就是一个
+    证型节点、`contributors` 三个人；给出不同证型时是三个证型节点并列在
+    同一层——**并列不等于分带**：它们在同一列上，上游连回同一批证素。
+
+    ## 缺层如实报，不伪造
+
+    `病机(4)` 与 `治法靶位(6)` 只有结构化 S3（`S3Structured`）才有
+    （`organs[].pathogenesis` / `method.targets`）。legacy `S3Syndrome` 没有
+    这两样，**这时那两层就是空的**，链条直接从证型接到治则、从治则接到方剂，
+    并把层号记进 `missing_layers`。
+    从 `reasoning` 里切一句话当病机是**伪造**——那段文字是模型的自由叙述，
+    不是它标定的病机。
+
+    ## role=patient 的边界没变
+
+    仍然**压根不生成**方剂(7)/君臣佐使(8) 层，不是生成了再从响应里摘掉
+    （图节点的 label/id 本身就是真实药名）。
     """
     nodes: list[dict] = []
     edges: list[dict] = []
     seen: set[str] = set()
+    #: 已经出现过的层号——`missing_layers` 从它算，不另维护一份。
+    layers_present: set[int] = set()
 
-    # R16：**两张图共用一份 cytoscape 样式表**（问诊图 + 图谱浏览器），差异只在
-    # "是否按医家染色"这一个参数。共用的前提是两边说同一套词汇：持久图的节点
-    # 一直带 `node_type`（symptom / element / syndrome / case），问诊图只有
-    # `layer`。layer 是**布局**（第几列），node_type 是**这是什么东西**——
-    # 两件事，之前混在一个字段上，于是样式表也只能有两份。
-    LAYER_NODE_TYPE = {0: "symptom", 1: "element", 2: "syndrome",
-                       3: "formula", 4: "herb"}
-
-    def add_node(node_id: str, **data) -> None:
+    def add_node(node_id: str, layer: int, **data) -> None:
+        """同 id 只加一次。**重复时把 contributor 并进去**，不是丢掉——
+        三位医家给出同一个证型时，那个节点要记得是三个人给的。"""
+        layers_present.add(layer)
         if node_id in seen:
+            if data.get("contributor"):
+                for n in nodes:
+                    if n["data"]["id"] == node_id:
+                        who = n["data"].setdefault("contributors", [])
+                        if data["contributor"] not in who:
+                            who.append(data["contributor"])
+                        break
             return
         seen.add(node_id)
-        data.setdefault("node_type", LAYER_NODE_TYPE.get(data.get("layer")))
+        contributor = data.pop("contributor", None)
+        data["layer"] = layer
+        data["node_type"] = LAYER_NODE_TYPE[layer]
+        data["layer_label"] = LAYER_LABEL[layer]
+        if contributor:
+            data["contributors"] = [contributor]
         nodes.append({"data": {"id": node_id, **data}})
 
     dropped: list[tuple[str, str]] = []
+    seen_edges: set[tuple[str, str]] = set()
+
     # 这一次几位医家的 (证型, 病名) 里哪些撞了。**先算好再进循环**：
     # 边画边判会让第一个撞上的那位医家不带编码（它那时还不知道后面有人重名）。
     ambiguous_syn = ambiguous_syndrome_pairs(
@@ -1727,16 +1806,22 @@ def to_graph(
         if source not in seen or target not in seen:
             dropped.append((source, target))
             return
-        edges.append({"data": {"source": source, "target": target, **data}})
+        # R42：去掉医家分带之后，同一条 (source, target) 会被几位医家各贡献一次。
+        # **在这里去重**，不是让前端按 (source,target) 去重——前端去重只画第一条，
+        # 而"第一条"取决于医家顺序，颜色/标签就成了随机的那一位（R16 踩过）。
+        key = (source, target)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append({"data": {"id": f"e::{source}>>{target}",
+                               "source": source, "target": target, **data}})
 
-    # layer 0 症状：「已解释」用 core.chain.explained_symptoms 这一处实现——S2 全局共享，
+    # ---- layer 0 症状 ----
+    # 「已解释」用 core.chain.explained_symptoms 这一处实现——S2 全局共享，
     # 各医家的 r["s2"] 是同一份，这里不再各自汇总一遍
     if s2 is None and results:
-        s2 = results[0]["s2"]  # S2 全局共享，各医家拿到的是同一份
+        s2 = results[0]["s2"]
     explained: set[str] = explained_symptoms(s1, s2) if s2 is not None else set()
-
-    # 「已解释」的判据只有 core.chain.explained_symptoms 一处（上面），这里不再
-    # 叠一层对 unexplained_symptoms 的处理——叠了就会跟 coverage、残差报的数打架。
     residual_explained = set((residual or {}).get("newly_explained") or [])
 
     for sym in s1.symptoms:
@@ -1746,105 +1831,205 @@ def to_graph(
             state = "residual"  # 初轮没解释，残差辨证补上了
         else:
             state = "unexplained"
-        add_node(f"sym::{sym}", label=sym, layer=0, state=state)
+        add_node(f"sym::{sym}", 0, label=sym, state=state)
 
-    # layer 1 证素与 症状->证素 边：S2 全局共享，只发一遍，不按医家重复。
-    # 原来每位医家各发一遍完全相同的边并打上 phys 标签，前端按 (source,target) 去重
-    # 只画第一条、颜色永远是第一位医家的——第三位医家加入后重复更多、含义更误导。
+    # ---- layer 1 脏腑 / layer 2 病性 ----
+    # 原来这两样挤在一个「证素」层里。它们回答的不是同一个问题：脏腑是
+    # **病位**（病在哪），病性是**病的性质**（寒热虚实）。摆成两层之后，
+    # 「脾 + 气虚 → 脾胃气虚证」这条推理在图上是两条边汇进一个节点，
+    # 而不是两个同色方块并排。
+    def _element_layer(kind: str) -> int:
+        return 1 if kind == "location" else 2
+
+    def _element_id(hit) -> str:
+        return f"{LAYER_PREFIX[_element_layer(hit.kind)]}::{hit.element}"
+
     if s2 is not None:
         for hit in s2.elements:
-            elem_id = f"elem::{hit.element}"
-            add_node(elem_id, label=hit.element, layer=1, kind=hit.kind)
+            layer = _element_layer(hit.kind)
+            add_node(_element_id(hit), layer, label=hit.element, kind=hit.kind)
             for sym in hit.supporting_symptoms:
-                add_edge(f"sym::{sym}", elem_id)
+                add_edge(f"sym::{sym}", _element_id(hit))
 
     # 残差辨证新推出的证素，单独标出来（兼夹证的证素）。必须在主证素之后加：
     # add_node 先到先得，先加残差会把主路径里同名的证素整个标成 residual=True。
     if residual:
         for hit in residual["s2"].elements:
-            elem_id = f"elem::{hit.element}"
-            add_node(elem_id, label=hit.element, layer=1, kind=hit.kind, residual=True)
+            layer = _element_layer(hit.kind)
+            add_node(_element_id(hit), layer, label=hit.element, kind=hit.kind,
+                     residual=True)
             for sym in hit.supporting_symptoms:
-                add_edge(f"sym::{sym}", elem_id, residual=True)
+                add_edge(f"sym::{sym}", _element_id(hit), residual=True)
 
     for r in results:
         physician = r["physician"]
         pname = r["physician_name"]
-
-        # layer 2 病名·证型（M4）。node id 不变——仍是 syn::{physician}，只改
-        # label：id 是前端证据链侧栏 buildEvidenceIndex() 反查的键，改了就断链，
-        # 跟 M 药名剥剂量那次「label 剥、id 保原样」是同一条理由。disease 为
-        # None（病名判断不了，S3 prompt 允许留空）时退回只显示证型，不显示
-        # 一个悬空的"· 证型"。
-        syn_id = f"syn::{physician}"
         s3 = r["s3"]
+        # **病机(4) 与治法(6) 的原件在 `s3_structured` 里，不在 `s3` 里。**
+        #
+        # `consult()` 给下游的 `s3` 是 `to_s3_syndrome()` **扁平化之后**的那一份
+        # ——那次转换把 `organs[]`（病机）和 `method.targets`（治法）丢掉了，
+        # 只留下 `treatment_principle` 这一个字符串。所以只读 `s3` 的话，
+        # 这两层在生产里**永远**是空的，而 `missing_layers` 会如实把它们报成
+        # "本次没有"——看起来像"这一轮的模型没产出病机"，实际上是读错了字段。
+        # 这个 bug 只有把真 payload 喂进浏览器才看得见（Playwright 的
+        # `single_chain_graph` 第一次跑就红了：第 4 层一个节点都没有），
+        # 后端的 JSON 结构测试全绿——**又一次 CLAUDE.md 那条硬约定的例子**。
+        st = r.get("s3_structured") or s3
+
+        # ---- layer 3 证型（含病名） ----
+        # **id 按证型名，不按医家**（R42 去分带）。撞名补证候编码那一条不变。
         label = f"{s3.disease} · {s3.syndrome}" if s3.disease else s3.syndrome
-        # R37：两位医家给出同一个「病名 · 证型」时，图上并排两个一模一样的方块
-        # ——身份色分得开，**标签分不开**（截图、投影、打印出来都只剩标签）。
-        # 撞名就补证候编码，判断走 `syndrome_code_suffix` 那一处（跟图谱浏览器
-        # 同一个判断）。编码从证候表查，查不到就不补（不补一个空括号）。
         suffix = syndrome_code_suffix(
             ambiguous=(s3.syndrome, (s3.disease or "").strip()) in ambiguous_syn,
             code=(syndrome_row(s3.syndrome) or {}).get("code"))
-        add_node(syn_id, label=label + suffix, layer=2, phys=physician, pname=pname)
+        syn_id = f"syn::{s3.syndrome}"
+        add_node(syn_id, 3, label=label + suffix, syndrome=s3.syndrome,
+                 disease=s3.disease, contributor=physician, pname=pname)
 
+        # 证素 → 证型。**只连这一位医家真的用到的证素**（r["s2"] 是全局共享的
+        # 那一份，所以实际上是全部证素——这跟改动前一致，不在这一轮改语义）。
         for hit in r["s2"].elements:
-            elem_id = f"elem::{hit.element}"
-            add_edge(elem_id, syn_id, phys=physician)
+            add_edge(_element_id(hit), syn_id)
 
-        # layer 3 方剂 + layer 4 药材（M5）：每个候选方都出节点，不是只画
-        # selected 那一个——前端要能摆出 2-3 个方框各自装着自己的药，
-        # 「点哪个方剂看哪些药」是候选方对比的核心卖点，只画 selected 会把
-        # 另外 1-2 个候选方在图上变得不可见。
-        #
+        # ---- layer 4 病机（只有结构化 S3 有） ----
+        upstream_of_principle = [syn_id]
+        organs = list(getattr(st, "organs", ()) or ())
+        if organs:
+            upstream_of_principle = []
+            for o in organs:
+                organ_name = getattr(o, "organ", None)
+                mech = (getattr(o, "pathogenesis", "") or "").strip()
+                # 脏腑节点：结构化 S3 自己标了病位，它可能不在 S2 的证素表里
+                # （模型从症状直接判的）。**补进来而不是丢掉**：丢掉的话
+                # 病机会悬空，而"悬空"在图上看起来只是"这一段没画出来"。
+                if organ_name:
+                    add_node(f"organ::{organ_name}", 1, label=organ_name,
+                             kind="location")
+                    for sym in (getattr(o, "supporting_symptoms", ()) or ()):
+                        add_edge(f"sym::{sym}", f"organ::{organ_name}")
+                    add_edge(f"organ::{organ_name}", syn_id)
+                if not mech:
+                    continue
+                mech_id = f"mech::{mech}"
+                add_node(mech_id, 4, label=mech, organ=organ_name,
+                         contributor=physician)
+                add_edge(syn_id, mech_id)
+                upstream_of_principle.append(mech_id)
+            if not upstream_of_principle:
+                upstream_of_principle = [syn_id]
+
+        # ---- layer 5 治则 ----
+        # 结构化：`method.principle`；legacy：`treatment_principle`。
+        # 两处取值一个函数，不在这里 if/else 两遍（那是两处实现）。
+        principle = _s3_principle(st) or _s3_principle(s3)
+        principle_targets = list(getattr(getattr(st, "method", None), "targets", ()) or ())
+        upstream_of_formula: list[str] = []
+        if principle:
+            principle_id = f"principle::{principle}"
+            add_node(principle_id, 5, label=principle, contributor=physician)
+            for up in upstream_of_principle:
+                add_edge(up, principle_id)
+            upstream_of_formula = [principle_id]
+            # ---- layer 6 治法靶位（只有结构化 S3 有 targets） ----
+            method_ids = []
+            for t in principle_targets:
+                t = (t or "").strip()
+                if not t:
+                    continue
+                method_id = f"method::{t}"
+                add_node(method_id, 6, label=t, contributor=physician)
+                add_edge(principle_id, method_id)
+                method_ids.append(method_id)
+            if method_ids:
+                upstream_of_formula = method_ids
+        else:
+            upstream_of_formula = upstream_of_principle
+
         # M6：role="patient" 时整段跳过——不生成方剂/药材层，不是生成了再
         # 从响应里摘掉（见函数文档字符串）。
         if role == "patient":
             continue
+
+        # ---- layer 7 方剂 + layer 8 君臣佐使 ----
         for i, cand in enumerate(s3.formula_candidates):
-            # 同一位医家的多个候选方可能撞同一个方名（真实产出里少见，但不能假设
-            # 不会发生）——formula_id 只按 physician+name 拼，重名候选方会被
-            # add_node 的去重逻辑合并成一个节点，这是已知的、可接受的边界情况
-            # （见 tests/test_graph.py 的对应测试）：图上没有"同名候选方各画一份"
-            # 的必要，两个同名候选方本来就该被当成同一个方剂节点。
-            formula_id = f"formula::{physician}::{cand.name}"
+            formula_id = f"formula::{cand.name}"
             add_node(
-                formula_id, label=cand.name, layer=3, phys=physician,
+                formula_id, 7, label=cand.name,
                 # 前端按 source 区分边框（classic 实线/modified 虚线/composed
                 # 点线）、selected 高亮选中的那个、safety_blocking 为真时标红。
                 source=cand.source, confidence=cand.confidence,
                 selected=(i == s3.selected),
                 safety_blocking=cand.safety.blocking if cand.safety else False,
+                contributor=physician,
             )
-            # 边 label 用 treatment_principle：治法不单独成层，挂在这条边上。
-            add_edge(syn_id, formula_id, phys=physician, label=s3.treatment_principle)
+            for up in upstream_of_formula:
+                add_edge(up, formula_id)
 
             for item in cand.herb_items:
-                # herb_id 必须带方剂名：同一味药可能出现在这位医家的多个候选方里
-                # （比如"甘草"作为使药几乎每个方都有），不带方名会被 add_node 的
-                # 去重逻辑合并成一个节点、同时挂在两个 parent 上，cytoscape 会报错。
-                # id 用 item.name 原始写法（旧式合成路径下可能仍带剂量文本，见
-                # core.schemas._S3Base 的向后兼容合成），label 单独剥剂量——
-                # 跟"药名剥剂量"那次「label 剥、id 保原样」是同一条理由，前端
+                # herb_id 带方名：同一味药会出现在多个候选方里（"甘草"作为使药
+                # 几乎每个方都有），不带方名会被去重合并成一个节点、同时挂在
+                # 两个 parent 上，cytoscape 会报错。
+                # id 用 item.name 原始写法（旧式合成路径下可能仍带剂量文本），
+                # label 单独剥剂量——「label 剥、id 保原样」，前端
                 # buildEvidenceIndex() 用同一个拼法反查证据，id 一变就断链。
-                herb_id = f"herb::{physician}::{cand.name}::{item.name}"
-                label = strip_dose_and_parens(item.name) or item.name
+                herb_id = f"herb::{cand.name}::{item.name}"
                 add_node(
-                    herb_id, label=label, layer=4, phys=physician,
+                    herb_id, 8, label=strip_dose_and_parens(item.name) or item.name,
                     parent=formula_id,
                     dose=item.dose, unit=item.dose_unit,
                     processing=item.processing, decoction=item.decoction,
                     # 这里的 role（君/臣/佐/使）是 HerbItem 自己的字段，跟本函数
-                    # 参数 role（patient/doctor/...角色）只是同名，语义完全不同，
-                    # 不要看到 role= 就以为在传角色参数。
+                    # 参数 role（patient/doctor/...角色）只是同名，语义完全不同。
                     role=item.role, function_in_formula=item.function_in_formula,
                     is_western=is_western_drug(item.name),
+                    contributor=physician,
                 )
-                # 方剂 -> 药材的关系由上面的 parent 字段（compound node）表达，
-                # 这里不额外画边——画了会在图上出现重复的连线，这是这个模块
-                # 最容易漏改的一条。
+                # 方剂 → 药材的关系由 parent 字段（compound node）表达，
+                # 这里不额外画边——画了会在图上出现重复的连线。
 
-    return {"nodes": nodes, "edges": edges, "dropped_edges": len(dropped)}
+    # R42 收尾：把"谁贡献的"从列表压成两个可选择的标记。
+    #
+    # **为什么在这里算而不在前端按 contributors.length 现判**：这是同一个判断
+    # （"这个结论是一个人给的还是几个人给的"），放在两处就会在改一边时漏掉
+    # 另一边（CLAUDE.md 第 31 条）。cytoscape 的选择器也做不到按数组长度选，
+    # 前端真要判就得在 JS 里再遍历一遍节点——那正是第二处实现。
+    for n in nodes:
+        who = n["data"].get("contributors") or []
+        if len(who) == 1:
+            n["data"]["contributor_solo"] = who[0]
+        elif len(who) > 1:
+            n["data"]["multi_contributor"] = True
+
+    expected = {n for n, _, _ in CHAIN_LAYERS}
+    if role == "patient":
+        expected -= {7, 8}     # 这两层是刻意不生成的，不算"缺"
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "dropped_edges": len(dropped),
+        # R42：层的元信息**由后端下发**，前端不写死（加层时前端跟着长）。
+        "layers": [{"layer": n, "node_type": t, "label": z} for n, t, z in CHAIN_LAYERS],
+        # **缺哪一层要说出来。** 空层有两种来路：legacy S3 不产出病机/治法
+        # （合法），和上游数据出了问题（要看一眼）。前端照实显示"本次没有 X 层"，
+        # 不是悄悄把链条接过去。
+        "missing_layers": sorted(expected - layers_present),
+    }
+
+
+def _s3_principle(s3) -> str:
+    """治则。**结构化与 legacy 两种 S3 取同一个概念的唯一入口。**
+
+    结构化是 `method.principle`，legacy 是 `treatment_principle`。散在两处 if
+    的话，将来加第三种 S3 形状就会漏掉其中一处（而漏掉的表现是图上少一层，
+    不报错）。
+    """
+    method = getattr(s3, "method", None)
+    if method is not None:
+        p = (getattr(method, "principle", "") or "").strip()
+        if p:
+            return p
+    return (getattr(s3, "treatment_principle", "") or "").strip()
 
 
 def assert_graph_edges_valid(graph: dict) -> None:

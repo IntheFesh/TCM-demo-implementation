@@ -221,7 +221,7 @@ def _fixtures() -> dict:
     return {
         "R37_DONE_PAYLOAD": ss.R37_DONE_PAYLOAD,
         "DONE_PAYLOAD": ss.DONE_PAYLOAD,
-        "SIX_LAYER_GRAPH": ss.SIX_LAYER_GRAPH,
+        "NINE_LAYER_GRAPH": ss.NINE_LAYER_GRAPH,
         "COMPLAINT": ss.COMPLAINT,
     }
 
@@ -274,11 +274,11 @@ SCENES: dict[str, dict] = {
         "interactions": [],
     },
     "graph_tab": {
-        "what": ("问诊图（六层 + compound）。CLS 同 chain_done 是上界口径"
+        "what": ("问诊图（R42：九层 + compound）。CLS 同 chain_done 是上界口径"
                  "（这个场景量的是布局线程与帧率，不是 CLS）"),
         "setup": ("renderComplaintBody(window.COMPLAINT);"
                   " renderConsultResult(window.DONE_PAYLOAD);"
-                  " await growGraph(window.SIX_LAYER_GRAPH);"),
+                  " await growGraph(window.NINE_LAYER_GRAPH);"),
         "interactions": [],
         "frames": True,
     },

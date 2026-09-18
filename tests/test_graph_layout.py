@@ -7,6 +7,7 @@ Playwright 验证的是"真实渲染出来看起来对不对"（模块报告里�
 验证的是算法本身对不同形状的输入（候选方数量、每个候选方的药材数量）给出
 的坐标是不是真的不重叠，覆盖 Playwright 那一份 fixture 之外的形状。
 """
+import re
 import json
 import subprocess
 
@@ -242,14 +243,25 @@ def test_the_lambda1_note_text_has_exactly_one_source():
     assert "health.lambda1_note" in app
 
 
-def test_the_formula_margin_says_why_it_is_sixty():
-    """§3.2 规格 3：60px 不是随手定的。compound 的 padding 是**固定屏幕像素**
-    （不随缩放变化），所以"药材中心间距够了"不等于"方框边缘不重叠"——
-    第一版用 20，Playwright 截图里相邻候选方的框依然互相压住。"""
+def test_dagre_reserves_at_least_as_much_compound_padding_as_cytoscape_draws():
+    """R42：`FORMULA_MARGIN = 60` 那个常量随手写布局一起退役了，但它防的那件事
+    没有退役——**compound 的 padding 是固定屏幕像素**（不随缩放变化），
+    所以"药材中心间距够了"不等于"方框边缘不重叠"。
+
+    现在的形式是两个常量的不等式：dagre 按 `COMPOUND_PAD` 留位、cytoscape 按
+    `COMPOUND_RENDER_PAD` 画框，**留得比画得少就会压住相邻的候选方**。
+    这条比原来那条强：原来只查"注释里提到了 20 和 60"，改个数照样绿。"""
     src = _graph_js()
-    block = src[:src.index("const FORMULA_MARGIN = 60;")]
-    tail = block[-1200:]
-    assert "compound" in tail and "20" in tail and "60" in tail
+    render = int(re.search(r"const COMPOUND_RENDER_PAD = (\d+);", src).group(1))
+    reserve_expr = re.search(r"const COMPOUND_PAD = (.+?);", src).group(1)
+    # 表达式必须是"从渲染内边距推出来的"，不是又写一个字面量
+    assert "COMPOUND_RENDER_PAD" in reserve_expr, (
+        f"COMPOUND_PAD 又写成了字面量（{reserve_expr}）——两个数会漂")
+    reserve = eval(reserve_expr.replace("COMPOUND_RENDER_PAD", str(render)))  # noqa: S307
+    assert reserve >= render, f"dagre 留 {reserve}px、cytoscape 画 {render}px，方框会压住"
+    # 样式表那边也必须引用同一个常量，不是再写一个 14px
+    assert 'padding: `${COMPOUND_RENDER_PAD}px`' in src, (
+        "node:parent 的 padding 又写成了字面量")
 
 
 def _graph_js():

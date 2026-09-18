@@ -290,6 +290,26 @@ class Ontology:
             "empty_span_refs": empty_span,
         }
 
+    def source_books(self) -> dict[str, dict[str, int]]:
+        """三元组按书分布：`{"materia_medica": {书名: 条数}, "formulary": {...}}`。
+
+        R42 加的，为了「循证对照」那一节能说清**对照基准是哪几部书、各多少条**。
+        CLAUDE.md 那条铁律（任何数字都必须带对照）在这里的具体形式是：
+        「这味药有出处」是句空话，「这味药的性味出自《本草备要》，而本项目的
+        本草层一共只有五部书 9776 条」才是一个可核的说法。
+
+        从已加载的原始行现算，**不缓存**：本体是只读的（构造后不再变），
+        而这个接口只在点开一个节点时调一次，几毫秒。
+        """
+        out: dict[str, dict[str, int]] = {"materia_medica": {}, "formulary": {}}
+        for key, rows in (("materia_medica", self._materia_rows),
+                          ("formulary", self._formulary_rows)):
+            bucket = out[key]
+            for r in rows:
+                book = (r.get("book") or "").strip() or "未标注"
+                bucket[book] = bucket.get(book, 0) + 1
+        return out
+
     # -- 九个查询接口 --
 
     def herb(self, name: str) -> Herb | None:

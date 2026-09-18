@@ -117,10 +117,13 @@ def test_the_tooltip_shows_the_disease_on_its_own_line():
 
 
 def test_the_consult_graph_never_invents_a_disease_name():
-    """问诊图 layer 2 同样是「病名 · 证型」，但**S3 没给病名时原样显示证型**——
-    对不上教材条目的证型不许被补一个看起来合理的病名。"""
+    """问诊图的证型层同样是「病名 · 证型」，但**S3 没给病名时原样显示证型**——
+    对不上教材条目的证型不许被补一个看起来合理的病名。
+
+    锚点随 R42 九层化从「layer 2 病名·证型（M4）」改成「layer 3 证型（含病名）」：
+    层号变了，这条约束没变。"""
     src = (ROOT / "api" / "main.py").read_text(encoding="utf-8")
-    body = src[src.index("# layer 2 病名·证型（M4）"):]
+    body = src[src.index("# ---- layer 3 证型（含病名） ----"):]
     body = body[:body.index("for hit in r[\"s2\"].elements:")]
     assert 'label = f"{s3.disease} · {s3.syndrome}" if s3.disease else s3.syndrome' in body
 

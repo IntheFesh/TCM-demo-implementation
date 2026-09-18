@@ -147,16 +147,29 @@ def test_patient_response_contains_no_herb_name_anywhere(monkeypatch):
         assert herb not in text, f"patient 响应体里搜到了药名 {herb}"
 
 
+#: 方剂层与君臣佐使层的层号。**从 CHAIN_LAYERS 反查，不手抄数字**——R42
+#: 九层化把它们从 3/4 挪到了 7/8，写死层号的测试在那一轮会连"该红的时候
+#: 红"都做不到（3 号位现在是证型，patient 是有证型层的，断言 `3 not in`
+#: 会无理由地红）。
+def _layer_of(node_type: str) -> int:
+    return {t: n for n, t, _ in api_main.CHAIN_LAYERS}[node_type]
+
+
 def test_patient_graph_has_no_formula_or_herb_layer(monkeypatch):
-    """图只画 [0,1,2]（症状/证素/证型）。**确认现有实现是"构造时跳过"而不是
-    "生成后过滤"**：先建出完整六层再删，中间那份完整数据仍然在进程里走过一遍，
-    任何一处忘了删就泄露（M6 的原话："根本不生成"，不是"生成了再删"）。"""
+    """patient 的图里**压根没有** formula/herb 两层。**确认现有实现是"构造时
+    跳过"而不是"生成后过滤"**：先建出完整链再删，中间那份完整数据仍然在
+    进程里走过一遍，任何一处忘了删就泄露（M6 的原话："根本不生成"，不是
+    "生成了再删"）。"""
     outcome = _rich_outcome()
     monkeypatch.setattr(api_main, "consult", lambda *a, **k: outcome)
     client = TestClient(api_main.app)
     body = client.post("/api/consult", json={"complaint": "胃痛", "role": "patient"}).json()
     layers = {n["data"]["layer"] for n in body["graph"]["nodes"]}
-    assert layers <= {0, 1, 2}, f"patient 的图里出现了方剂/药材层：{sorted(layers)}"
+    banned = {_layer_of("formula"), _layer_of("herb")}
+    assert not (layers & banned), f"patient 的图里出现了方剂/药材层：{sorted(layers)}"
+    # 缺这两层是**刻意的**，所以不许出现在 missing_layers 里（那个字段是给
+    # 前端显示"本次没有 X 层"的，把安全边界报成"缺层"会诱导前端去补）。
+    assert not (set(body["graph"]["missing_layers"]) & banned)
 
     # 源码判据：跳过发生在构造循环里，不是在响应拼装那一层。
     import inspect
@@ -164,14 +177,16 @@ def test_patient_graph_has_no_formula_or_herb_layer(monkeypatch):
     assert 'if role == "patient":\n            continue' in src, "不是构造时跳过"
 
 
-def test_researcher_still_gets_the_full_six_layers(monkeypatch):
-    """对照组。没有它，上一条在"图永远只有三层"这种 bug 下也会绿。"""
+def test_researcher_still_gets_the_full_nine_layer_chain(monkeypatch):
+    """对照组。没有它，上一条在"图永远只画前几层"这种 bug 下也会绿。"""
     outcome = _rich_outcome()
     monkeypatch.setattr(api_main, "consult", lambda *a, **k: outcome)
     client = TestClient(api_main.app)
     body = client.post("/api/consult", json={"complaint": "胃痛", "role": "researcher"}).json()
     layers = {n["data"]["layer"] for n in body["graph"]["nodes"]}
-    assert 3 in layers and 4 in layers, f"researcher 的图缺了方剂/药材层：{sorted(layers)}"
+    for node_type in ("formula", "herb"):
+        assert _layer_of(node_type) in layers, (
+            f"researcher 的图缺了 {node_type} 层：{sorted(layers)}")
 
 
 def test_triage_carries_the_verified_disease_name(monkeypatch):

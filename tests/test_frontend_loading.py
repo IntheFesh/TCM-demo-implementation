@@ -47,7 +47,8 @@ def test_the_head_has_no_script_tag():
 
 def test_cytoscape_is_only_loaded_on_demand_from_the_local_copy():
     graph_js = (WEB / "graph.js").read_text(encoding="utf-8")
-    assert 'el.src = "vendor/cytoscape.min.js"' in graph_js
+    # R42 把插 <script> 那几行抽成了 `_loadScript`（dagre 走同一条路）。
+    assert '_loadScript("vendor/cytoscape.min.js"' in graph_js
     # 判据是 HTML 里没有**引用** cytoscape 的标签，不是"没出现这个词"
     # （注释里提它正是在解释为什么不在这里加载）。
     html = load_html()

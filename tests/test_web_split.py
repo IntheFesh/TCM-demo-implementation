@@ -88,17 +88,35 @@ def test_the_head_no_longer_loads_cytoscape_synchronously():
     head = html.split("<body")[0]
     assert "<script" not in head, f"<head> 里又出现了 script 标签：{head[-300:]}"
     graph_js = (WEB / "graph.js").read_text(encoding="utf-8")
-    assert 'el.src = "vendor/cytoscape.min.js"' in graph_js, (
+    # R42 把插 <script> 那几行抽成了 `_loadScript`（dagre 也要走同一条路），
+    # 所以判据从"有这一行赋值"改成"这个文件名被交给了 _loadScript"。
+    # **意图没变**：本地副本是唯一的加载路径，index.html 里不加载。
+    assert '_loadScript("vendor/cytoscape.min.js"' in graph_js, (
         "本地副本那条加载路径没了——那 index.html 里也不加载的话图就永远画不出来")
+    assert "_loadScript(DAGRE_SRC" in graph_js, "dagre 没走同一条本地加载路径"
+    assert 'DAGRE_SRC = "vendor/dagre/dagre.min.js"' in graph_js
 
 
 #: 结构文件的行数上限。R13 定 250；**R41 提到 254**，多出来的四行是
 #: 两条 `<link rel="preload">`（首屏字体，见 test_the_first_screen_fonts_are_preloaded）
 #: 加一行解释性注释再加一行余量——它们都是结构，不是逻辑。
 #:
+#: **R42 提到 272**，多出来的 18 行逐项是：
+#:   +1  `#gb-breadcrumb`（图谱浏览器的聚焦路径）
+#:   +2  它的解释性注释
+#:   +1  余量
+#:   （以下 14 行是同一轮问诊图那一侧的）
+#:   +1  `#png-btn`（导出 PNG 按钮）
+#:   +1  `#graph-layers`（九层的层名列头容器）
+#:   +2  `#cy` 加 tabindex/role/aria-label（无障碍，属性太长只能折行）
+#:   +2  `#graph-tooltip` 加 role/aria-live/aria-hidden（同上）
+#:   +8  上述四处各自的解释性注释（为什么导出要 2 倍白底、为什么缺层也要出列头、
+#:       为什么画布要能聚焦、为什么是 polite 而不是 assertive）
+#: 都是结构与无障碍属性，**一行逻辑都没有**。
+#:
 #: 这个数的用途是防"HTML 又长回 3574 行、改版面得在里面找 DOM"，不是卡到个位数。
 #: 每次提它都要在这里写明多出来的是什么，否则它会一轮一轮地被磨掉。
-INDEX_HTML_MAX_LINES = 254
+INDEX_HTML_MAX_LINES = 272
 
 
 def test_index_html_is_structure_only():
@@ -175,11 +193,21 @@ def test_the_graph_code_went_to_graph_js_and_the_rest_to_app_js():
 
 
 def _defs(text: str) -> set[str]:
-    return set(re.findall(r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", text, re.M))
+    """顶层定义的名字。**函数与常量对象都算**：R42 起 graph.js 还导出一个
+    `NODE_ID`（节点 id 的构造表），app.js 通过 `NODE_ID.syndrome(...)` 用它
+    ——只认 `function` 的话这类导出会被判成"清单里有、实际没人用"。"""
+    fns = re.findall(r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", text, re.M)
+    # 顶层 `const X = {` / `const X = new ...`：只取**大写开头或全大写**的，
+    # 那是这个项目里"导出用的常量表"的写法；小写的局部常量不算导出候选。
+    consts = re.findall(r"^const ([A-Z][\w$]*)\s*=", text, re.M)
+    return set(fns) | set(consts)
 
 
 def _calls(text: str) -> set[str]:
-    return set(re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", text))
+    """被调用/被取属性的名字。`foo(` 与 `Foo.bar` 都算——后者是常量表的用法。"""
+    called = re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", text)
+    dotted = re.findall(r"\b([A-Z][\w$]*)\.[A-Za-z_$]", text)
+    return set(called) | set(dotted)
 
 
 def _tcm_list(text: str) -> set[str]:

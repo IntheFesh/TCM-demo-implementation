@@ -227,10 +227,21 @@ def test_explainable_escapes_its_text():
 
 
 def test_the_kind_labels_cover_every_node_kind():
-    """后端 `core/node_explain.NodeKind` 有六种，前端六种都要有中文名——
-    少一种的表现是面板标题后面跟着一个英文单词。"""
+    """后端 `core/node_explain.NodeKind` 有几种，前端就要有几个中文名——
+    少一种的表现是面板标题后面跟着一个英文单词（R37 的截图上那个
+    「meridian_coverage缺归经」是同一类事故）。
+
+    **清单从后端的 Literal 现取，不手抄**：R42 加了 pathogenesis/principle/method
+    三种，手抄的那份会跟后端漂，而漂了的表现正是这条测试要抓的那个英文单词。
+    `unknown` 不在其中——它压根不会走到释义面板（explain_node 直接返回
+    available=False）。"""
+    import typing
+
+    from core.node_explain import NodeKind
+
+    want = set(typing.get_args(NodeKind)) - {"unknown"}
     labels = _eval("NODE_KIND_LABEL")
-    assert set(labels) == {"symptom", "element", "syndrome", "formula", "herb", "case"}
+    assert set(labels) == want, f"前后端的种类清单不一致：缺 {want - set(labels)}，多 {set(labels) - want}"
 
 
 def test_the_streaming_render_is_throttled_to_at_least_50ms():

@@ -94,6 +94,32 @@
     --node-font-browser: 13px;
     --element-font-consult: 15px;
     --element-font-browser: 14px; /* 浏览器首屏全是证素，比问诊图小一号才不压字 */
+
+    /* ---- R42：九层诊断链的视觉层级（web/graph.js 读）----
+
+       **层级靠字号／字重／底色深浅，不靠九种颜色。** 总纲 §2.1 定的规矩是
+       「带颜色 = 属于某位医家，或者在报警」——九层各给一个色相就是一道彩虹，
+       正好是 §1 第一条要避开的通用模板相。所以九层按**读图的四段**分成四族，
+       族内靠字号区分，另有一个焦点档给证型层（那一层是这张图的结论）：
+
+         输入（症状 0）        最轻：它是别人给的，不是系统推的
+         辨证（脏腑 1／病性 2／病机 4）
+         焦点（证型 3）        最重：一屏之内视线该先落在这里
+         治疗（治则 5／治法 6）
+         方药（方剂 7／君臣佐使 8）  方剂是 compound 框，药材在框内、比框轻一档
+
+       四族的色都取自同一族草木灰（跟 --paper 同色系），只有深浅差别；
+       **一个新色相都没有加**。 */
+    --node-input-bg:  #FAFBF8;   /* 同 --surface-2，单列出来是为了换的时候不牵连卡面 */
+    --node-input-fg:  #4A4E46;
+    --node-reason-bg: #ECEFE8;
+    --node-reason-fg: #1E211C;
+    --node-focal-bg:  #DDE3DB;   /* 证型层：最深的一档 */
+    --node-focal-fg:  #1E211C;
+    --node-treat-bg:  #E6EDEB;   /* 治则/治法：略偏青黛一侧，跟辨证族分得开 */
+    --node-treat-fg:  #22322F;
+    --node-rx-bg:     #EDEAE2;   /* 方药：略偏暖，跟治疗族分得开 */
+    --node-rx-fg:     #33301F;
     --s5: 24px; --s6: 32px; --s7: 48px; --s8: 64px;
 
     /* ---- 圆角（§2.3）：**按层级区分，不是所有元素一个值**
@@ -1215,6 +1241,18 @@
   .gt-tooltip.show { display: block; }
   .gt-tooltip b { color: var(--surface); }
   .gt-tooltip .tt-meta { color: var(--noise); margin-top: 2px; }
+  /* R42 钉住态：hover 版必须 `pointer-events: none`（否则 tooltip 跟在鼠标
+     下面会自己挡住下一次 hit-test，鼠标一进 tooltip 就触发 mouseout、
+     tooltip 闪烁）；钉住之后反过来——**要能选中里面的字**（抄剂量进病历是
+     这个功能存在的理由），所以这一条要打开。两个状态的诉求正好相反，
+     这也是为什么钉住必须是一个显式的 class 而不是"停在那里不动"。 */
+  .gt-tooltip.pinned {
+    pointer-events: auto;
+    user-select: text;
+    max-width: 320px;
+    box-shadow: var(--shadow-float);
+    outline: 2px solid var(--verified);
+  }
 
   /* ---------- 模块7：图谱浏览器页签 ---------- */
   #tab-bar {
@@ -1634,6 +1672,81 @@
 }
 .explainable:hover { border-bottom-style: solid; }
 
+/* ---------- R42：九层的层名列头 ----------
+
+   九列摆在一起，不写列头就只能靠猜哪一列是什么。列头同时承担"缺层如实报"
+   这件事：`missing_layers` 里的层照样出一个列头、标成「本次没有」——后端
+   刻意不把缺层的链条悄悄接过去（见 to_graph 的文档），前端也不能悄悄藏掉。
+
+   **不用 flex: 1 等分**：九列的宽度由 dagre 按标签算，等分的列头跟实际的列
+   对不上，看起来比没有列头更糟。所以列头是一条可横向滚动的说明条，
+   位置上与画布对齐到"第几个"而不是"第几像素"——它回答的是"这张图有哪九层"，
+   不是"第 3 列在哪"。 */
+#graph-layers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s1) var(--s2);
+  margin: 0 auto var(--s2);
+  max-width: 1180px;
+  padding: 0 var(--s4);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.layer-band {
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-sm);
+  padding: 1px var(--s2);
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+/* 缺的那一层：朱砂虚线 + 一句「本次没有」。**不是灰掉**——灰掉读起来像
+   "这一层不重要"，而实际含义是"这一层这次没有内容，你该知道"。 */
+.layer-band.is-missing {
+  border-style: dashed;
+  border-color: var(--caution);
+  color: var(--caution);
+  background: var(--caution-bg);
+}
+.layer-band-note { font-style: normal; margin-left: var(--s1); opacity: .85; }
+
+/* R42：图谱浏览器的聚焦路径（面包屑）。
+   每一格是 <button> 而不是 <a>：它不导航到别的地址，是就地换视图——
+   用 <a href="#"> 的话键盘用户按回车会跳到页首。 */
+#gb-breadcrumb {
+  max-width: 1180px;
+  margin: 0 auto var(--s2);
+  padding: 0 var(--s4);
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+  flex-wrap: wrap;
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+.gb-crumb {
+  background: none;
+  border: none;
+  padding: 2px var(--s2);
+  border-radius: var(--r-sm);
+  color: var(--verified);
+  font: inherit;
+  cursor: pointer;
+}
+.gb-crumb:hover { background: var(--surface-2); }
+.gb-crumb.is-current { color: var(--ink); font-weight: 600; cursor: default; }
+.gb-crumb-sep { color: var(--muted); }
+
+/* R42：图谱工具条（导出 PNG / 重放 / 跳过动画） */
+#graph-tools {
+  max-width: 1180px;
+  margin: 0 auto var(--s2);
+  padding: 0 var(--s4);
+  display: flex;
+  gap: var(--s2);
+  justify-content: flex-end;
+}
+
 /* ---------- R37：节点释义面板 ---------- */
 #node-explain { display: none; }
 #node-explain.show {
@@ -1653,3 +1766,45 @@
 #node-explain .ne-line { font-size: 13px; line-height: 1.7; color: var(--ink); }
 /* 出处那一行要小一号、淡一点：它是凭据，不是正文 */
 #node-explain .ne-src { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+/* ---------- R42：窄屏（≤768px）把释义面板改成底部抽屉 ----------
+
+   为什么是抽屉而不是继续用那张卡：释义有八节，窄屏上那张卡会把图整个推到
+   屏幕外——**点一个节点看它的释义，结果那个节点看不见了**，而"节点↔释义"
+   的对应关系正是这个面板存在的理由。抽屉从下面上来、只占六成屏高、图还在
+   上面看得见。
+
+   768 这个断点不是随手取的：它是 iPad 竖屏（768×1024）的宽度，也是三甲
+   里最常见的那台移动查房设备。640 那个断点保留——它管的是"一栏还是三栏"，
+   跟这里管的"释义放哪"是两件事，合成一个断点会让其中一件将就另一件。 */
+@media (max-width: 768px) {
+  #node-explain.show {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    margin: 0;
+    max-width: none;
+    max-height: 60vh;
+    overflow-y: auto;
+    z-index: 30;
+    border-radius: var(--r-lg) var(--r-lg) 0 0;
+    border: 1px solid var(--rule);
+    border-bottom: none;
+    box-shadow: var(--shadow-float);
+    /* 刘海屏/手势条：不加这一条最后一节会被手势条压住 */
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+  /* 抽屉上来之后，关闭按钮要够大能用手指点到（44px 是 WCAG 的最小目标尺寸）。 */
+  #node-explain .ne-close {
+    min-width: 44px; min-height: 44px;
+    line-height: 44px; text-align: center;
+    margin: -12px -8px 0 0;
+  }
+  /* 钉住的 tooltip 在窄屏上贴到画布底部，不跟着手指跑——手指本来就挡着那块。 */
+  .gt-tooltip.pinned {
+    left: var(--s2) !important;
+    right: var(--s2);
+    top: auto !important;
+    bottom: var(--s2);
+    max-width: none;
+  }
+}
