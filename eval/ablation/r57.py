@@ -664,6 +664,14 @@ def _fmt_rate(d: dict | None, suffix: str = "") -> str:
     return f"{text}（{detail}）"
 
 
+#: report 里"挑哪几条配对摆出来"用的阈值——纯展示判据，跟硬指标
+#: （`GATE_CD_CONSISTENCY_MARGIN`）不是一回事：R61 真机实测出的典型场景
+#: 是"证型/主方字面都对上了，只有治法相似度不算高"（q1），只按
+#: syndrome/formula 是否 match 去挑会把这类完全漏掉——低于这个值就值得
+#: 摆出来给人看看差在哪，不代表这条硬指标就判不过（判不过看 gates）。
+_METHOD_SIMILARITY_NOTABLE_DIFF = 0.9
+
+
 def _fmt_pair_cell(pair: dict, key: str) -> str:
     """report 里"配对明细"表的一个单元格：两组各自的原文，逐字相同就不用
     都印一遍。"""
@@ -736,10 +744,24 @@ def to_markdown(report: dict) -> str:
             lines.append(f"| {label} | {_fmt_rate(c_vs_d.get(key))} "
                         f"| {_fmt_rate(c_vs_noise.get(key))} |")
         # §6 要求：把不一致的配对原文并排列出来，不是只报一个汇总数字。
-        mismatched = [p for p in c_vs_d.get("pairs") or []
-                     if not p["syndrome"]["match"] or not p["formula"]["match"]]
+        # 挑"值得看"的配对：证型/主方字面不一致，或者治法相似度明显偏低——
+        # 后者是 R61 真机实测出的那类典型场景（q1：证型/主方都对上了，只有
+        # 治法措辞不同），只按 syndrome/formula 是否 match 筛会把这类
+        # 完全漏掉。这个阈值只影响报告里"挑哪几条摆出来看"，不是硬指标
+        # （硬指标是跟 C-E 噪声地板比，见上面的 gates）。
+        def _worth_showing(p: dict) -> bool:
+            if not p["syndrome"]["match"] or not p["formula"]["match"]:
+                return True
+            sim = p["method"]["similarity"]
+            return sim is not None and sim < _METHOD_SIMILARITY_NOTABLE_DIFF
+
+        mismatched = sorted(
+            (p for p in c_vs_d.get("pairs") or [] if _worth_showing(p)),
+            key=lambda p: (p["syndrome"]["match"], p["formula"]["match"],
+                          p["method"]["similarity"] if p["method"]["similarity"] is not None else 1.0))
         if mismatched:
-            lines += ["", f"不一致的 {len(mismatched)} 条（C vs D，三项原文并排）：", ""]
+            lines += ["", f"证型/主方不一致或治法措辞差异明显的 {len(mismatched)} 条"
+                          "（C vs D，三项原文并排，按差异程度排序）：", ""]
             for p in mismatched[:10]:
                 lines.append(f"- **{p['record_id']}**")
                 lines.append(f"  - 证型：{_fmt_pair_cell(p, 'syndrome')}")
