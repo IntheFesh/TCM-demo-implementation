@@ -2089,3 +2089,149 @@ html[data-product-mode="0"] .product-only { display: none !important; }
   #help-pop { max-width: calc(100vw - 2 * var(--s3)); }
   #how-to-use { font-size: 12px; }
 }
+
+/* ============================================================================
+   R46 临床工作流闭环
+   ============================================================================ */
+
+/* §7.1 结构化四诊录入。**默认折叠**——自由文本仍是主路径。 */
+#intake-box { margin-bottom: var(--s3); font-size: 13px; }
+#intake-box > summary { cursor: pointer; color: var(--ink-2); }
+#intake-panel { padding: var(--s3) 0; }
+#intake-note {
+  margin-bottom: var(--s3);
+  padding: var(--s2) var(--s3);
+  border-left: 3px solid var(--caution);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  line-height: 1.8;
+}
+.intake-part, #profile-fields {
+  border: var(--edge-soft);
+  border-radius: var(--r-sm);
+  padding: var(--s2) var(--s3) var(--s3);
+  margin-bottom: var(--s3);
+}
+.intake-part > legend, #profile-fields > legend {
+  padding: 0 var(--s2);
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.intake-field { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s2); margin-bottom: var(--s2); }
+.intake-field > label { min-width: 4em; color: var(--muted); }
+.intake-field > input { flex: 1 1 14em; }
+.qp-row { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: var(--s1); }
+/* 常用词一键选：**看起来就是可以点的一行小字**，不是按钮墙 */
+.qp {
+  background: var(--surface-2);
+  border: var(--edge-soft);
+  border-radius: var(--r-sm);
+  padding: 2px var(--s2);
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.qp:hover { color: var(--accent); }
+.pf-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s2); margin-bottom: var(--s2); }
+.pf-row > label { color: var(--muted); }
+
+/* §7.3 循证对照。一致的用 --verified，不一致的用 --caution：
+   **不一致不是错误**（不用 --danger），它是"这一次的推导有它自己的理由"。 */
+#guideline-box { display: none; margin: var(--s3) 0; }
+#guideline-box.show { display: block; }
+.gl-box > summary { cursor: pointer; font-size: 14px; }
+.gl-list { list-style: none; margin: var(--s2) 0 0; padding: 0; font-size: 13px; line-height: 1.8; }
+.gl-list > li { padding: var(--s2) 0 var(--s2) var(--s3); border-left: 2px solid var(--rule); margin-bottom: var(--s2); }
+.gl-ok { border-left-color: var(--verified) !important; }
+.gl-diff { border-left-color: var(--caution) !important; }
+.gl-list b { margin-right: var(--s2); }
+.gl-note { color: var(--ink-2); }
+.gl-src { display: block; color: var(--muted); font-size: 12px; }
+.gl-why { color: var(--muted); font-size: 12px; margin-top: var(--s2); }
+.gl-none { font-size: 13px; color: var(--ink-2); }
+
+/* §7.2 个体化调整。慎用提示用 --caution，去药用 --danger——
+   前者是"注意"，后者是"别用"，两者的分量不同。 */
+#individualization-box { display: none; margin: var(--s3) 0; }
+#individualization-box.show { display: block; }
+.iv-box > summary { cursor: pointer; font-size: 14px; }
+.iv-list { list-style: none; margin: var(--s2) 0 0; padding: 0; font-size: 13px; line-height: 1.8; }
+.iv-item { padding: var(--s2) 0 var(--s2) var(--s3); border-left: 2px solid var(--caution); margin-bottom: var(--s2); }
+.iv-item[data-kind="去药"] { border-left-color: var(--danger); }
+.iv-kind {
+  display: inline-block;
+  min-width: 4em;
+  color: var(--ink);
+  font-weight: 600;
+}
+.iv-why { color: var(--ink-2); }
+.iv-basis { color: var(--muted); font-size: 12px; }
+.iv-considered { margin-top: var(--s2); color: var(--muted); font-size: 12px; }
+.iv-considered ul { margin: var(--s1) 0 0 var(--s4); padding: 0; }
+
+/* §7.4 病历文书。逐段一个输入框——**不是一个大文本域**：
+   分段才能知道医师改的是哪一段，而审计要记的正是这个。 */
+#emr-box { margin: var(--s4) 0; }
+#emr-box > summary { cursor: pointer; }
+#emr-notice {
+  margin: var(--s2) 0;
+  padding: var(--s2) var(--s3);
+  border-left: 3px solid var(--caution);
+  background: var(--surface-2);
+  font-size: 13px;
+}
+.emr-sec { display: flex; gap: var(--s3); margin-bottom: var(--s2); align-items: flex-start; }
+.emr-sec > label { min-width: 6em; color: var(--muted); font-size: 13px; padding-top: 4px; }
+.emr-input {
+  flex: 1;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.8;
+  padding: var(--s2);
+  border: var(--edge-soft);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--ink);
+  resize: vertical;
+}
+.emr-ro { flex: 1; font-size: 13px; line-height: 1.8; color: var(--ink-2); }
+#emr-status { color: var(--muted); font-size: 12px; }
+
+/* §7.5 知识速查。浮层，Ctrl/⌘+K 唤起。 */
+#kp-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: var(--scrim);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8vh var(--s3) var(--s3);
+}
+#kp-overlay[hidden] { display: none; }
+#kp-card {
+  background: var(--surface);
+  border: var(--edge);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-float);
+  width: min(52em, 100%);
+  max-height: 78vh;
+  overflow: auto;
+  padding: var(--s4);
+}
+#kp-input { flex: 1; }
+#kp-status { color: var(--muted); font-size: 12px; min-width: 5em; }
+#kp-results { margin-top: var(--s3); }
+.kp-group { margin-bottom: var(--s4); }
+.kp-group > h3 { margin: 0 0 var(--s2); font-size: 14px; color: var(--ink-2); }
+.kp-group ul { list-style: none; margin: 0; padding: 0; font-size: 13px; line-height: 1.8; }
+.kp-group li { padding: var(--s2) 0; border-bottom: var(--edge-soft); }
+.kp-sum { color: var(--ink-2); }
+.kp-src { color: var(--muted); font-size: 12px; }
+.kp-none { color: var(--muted); font-size: 13px; }
+
+@media (max-width: 768px) {
+  .intake-field > label, .pf-row > label { min-width: 100%; }
+  .emr-sec { flex-direction: column; gap: var(--s1); }
+  #kp-overlay { padding: 4vh var(--s2) var(--s2); }
+}

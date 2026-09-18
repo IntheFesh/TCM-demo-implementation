@@ -178,11 +178,29 @@
          什么都看不见。**开关只有 `.show`**——不写 `is-hidden`（它带
          `!important`，两者同时在就永远 display:none，而"类名对、就是看不见"
          查 class 的判据查不出来：R37 四张单链截图全空白、判据全绿）。 -->
+    <!-- R46 §7.3 第 7 条：方剂区下方一行「与教材推荐方案的对照：…（点击查看）」。
+         §7.2：「人」维的个体化调整清单。两块都摆在单链之上——医师先看到的
+         应该是"这张方对这位患者合不合适、跟教材差在哪"。 -->
+    <div id="guideline-box"></div>
+    <div id="individualization-box"></div>
     <div id="chain-flow" aria-live="polite"></div>
     <!-- 帮助气泡：一处 DOM、按 data-help 取文案（app.js 的 HELP_TEXT）。
          每个复杂区域一个「?」，点开是一句话说明与一个例子。 -->
     <div id="help-pop" role="dialog" aria-label="功能说明" hidden></div>
     <div id="node-explain" role="dialog" aria-label="节点释义"></div>
+    <!-- R46 §7.4：病历文书草稿。**只在医师模式下出现**——学生与患者不签病历。
+         逐段可编辑，改动进审计链；三种导出（病历文本 / 处方笺 / 结构化 JSON）。 -->
+    <details id="emr-box" hidden>
+      <summary>病历文书草稿（可编辑，须医师审核）</summary>
+      <div id="emr-notice"></div>
+      <div id="emr-sections"></div>
+      <div class="input-row input-row-left">
+        <button type="button" class="ghost-btn" id="emr-copy-text">复制病历文本</button>
+        <button type="button" class="ghost-btn" id="emr-print">打印处方笺</button>
+        <button type="button" class="ghost-btn" id="emr-copy-json">复制结构化 JSON</button>
+        <span id="emr-status" role="status" aria-live="polite"></span>
+      </div>
+    </details>
 
     <!-- R18-I「参考医家」：注册表里 enabled=false 的那几位（李可、王云启）。
          他们不参加集注（三列里没有他们），但语料在库里——学生/研究者模式下
@@ -250,9 +268,51 @@
          由 CSS 居中放大，并显示下面那三条示例。 -->
     <div id="input-panel">
       <div id="examples"></div>
-    <div id="input-help-row">
-      <button type="button" class="help-btn" data-help="complaint" aria-label="该输入什么">?</button>
-    </div>
+      <!-- R46 §7.1：结构化四诊录入 + 「人」这一维。**默认折叠**——自由文本
+           仍然是主路径（诊室里把病历原文粘进来最快），表单是另一种录入方式，
+           二者可互转（`/api/intake/parse`）。字段表由后端下发，前端不写死：
+           写死的话 core/intake.py 加一个字段，表单上不会长出来。 -->
+      <details id="intake-box">
+        <summary>结构化四诊录入（望闻问切 + 患者概况）</summary>
+        <div id="intake-panel">
+          <div id="intake-note"></div>
+          <div id="intake-fields"></div>
+          <fieldset id="profile-fields">
+            <legend>患者概况</legend>
+            <div class="pf-row">
+              <label for="pf-age">年龄</label>
+              <input type="number" id="pf-age" min="0" max="130" class="text-field" />
+              <label for="pf-sex">性别</label>
+              <select id="pf-sex"><option value="">—</option><option>男</option><option>女</option></select>
+              <label for="pf-stage">生理阶段</label>
+              <select id="pf-stage"></select>
+              <label for="pf-const">体质倾向</label>
+              <select id="pf-const"></select>
+            </div>
+            <div class="pf-row">
+              <label for="pf-comorb">基础病</label>
+              <input type="text" id="pf-comorb" class="text-field" placeholder="顿号分隔" />
+              <label for="pf-allergy">过敏史</label>
+              <input type="text" id="pf-allergy" class="text-field" placeholder="顿号分隔" />
+              <label for="pf-meds">在服药物</label>
+              <input type="text" id="pf-meds" class="text-field" placeholder="顿号分隔" />
+            </div>
+            <div class="pf-row">
+              <label for="pf-hep">肝功能不全</label>
+              <select id="pf-hep"><option>不详</option><option>有</option><option>无</option></select>
+              <label for="pf-ren">肾功能不全</label>
+              <select id="pf-ren"><option>不详</option><option>有</option><option>无</option></select>
+            </div>
+          </fieldset>
+          <div class="input-row input-row-left">
+            <button type="button" class="ghost-btn" id="intake-to-text">填入主诉框</button>
+            <button type="button" class="ghost-btn" id="intake-from-text">从主诉框拆分</button>
+          </div>
+        </div>
+      </details>
+      <div id="input-help-row">
+        <button type="button" class="help-btn" data-help="complaint" aria-label="该输入什么">?</button>
+      </div>
       <textarea id="complaint" placeholder="请输入患者主诉，例如：胃脘胀痛，食后加重，嗳气泛酸，舌淡红苔薄白，脉弦。"></textarea>
       <div class="input-row">
         <span id="status-text"></span>
@@ -338,6 +398,21 @@
       <button type="button" id="ob-skip" class="ghost-btn">跳过</button>
       <button type="button" id="ob-done">知道了</button>
     </div>
+  </div>
+</div>
+
+<!-- R46 §7.5 第 13 条：诊中知识速查。**快捷键唤起**（Ctrl/⌘ + K），
+     独立于问诊流程——医师在诊中要查的是"黄连什么性味"，跟这一次辨证无关。
+     四类分开摆，不混成一个列表。 -->
+<div id="kp-overlay" role="dialog" aria-modal="true" aria-label="知识速查" hidden>
+  <div id="kp-card">
+    <div class="input-row input-row-left">
+      <input type="text" id="kp-input" class="text-field"
+             placeholder="查药名 / 方名 / 证型 / 医家名，Esc 关闭" />
+      <span id="kp-status" role="status" aria-live="polite"></span>
+      <button type="button" class="ghost-btn" id="kp-close">关闭</button>
+    </div>
+    <div id="kp-results"></div>
   </div>
 </div>
 

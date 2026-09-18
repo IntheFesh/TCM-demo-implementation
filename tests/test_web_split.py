@@ -131,7 +131,15 @@ def test_the_head_no_longer_loads_cytoscape_synchronously():
 #:   +6   `#help-pop` 与两个 `?` 帮助按钮（§8.4 第 35 条）
 #: 全部是结构与文案，**一行逻辑都没有**——产品模式的分派在 core/product_mode.py，
 #: 应用到 DOM 上的那一处在 app.js 的 `applyProductMode()`。
-INDEX_HTML_MAX_LINES = 362
+#: R46 从 362 提到 **436**（实际 432 行 + 4 行余量）。净增 74 行，逐块交代：
+#:   +42  `#intake-box`：结构化四诊录入（望闻问切四组 + 患者概况 9 个字段
+#:        + 两个互转按钮）与它的注释。字段**行**是后端下发后由 JS 渲染的，
+#:        这 42 行只是容器与患者概况那一张固定表。
+#:   +5   `#guideline-box` / `#individualization-box` 两个容器与注释
+#:   +14  `#emr-box`：病历文书草稿容器 + 三个导出按钮 + 注释
+#:   +13  `#kp-overlay`：知识速查浮层（输入框 + 结果区）与注释
+#: 仍然是结构与文案，**一行逻辑都没有**。
+INDEX_HTML_MAX_LINES = 436
 
 
 def test_index_html_is_structure_only():

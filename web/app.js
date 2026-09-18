@@ -1446,6 +1446,8 @@ function updateDoctorFieldsVisibility() {
 // ——切换后页面立刻进 running 状态、进度条走起来、取消按钮出现，跟手动点
 // 「辨证」看到的完全一样。replay 模式下这一次是命中 fixture、零调用。
 let LAST_COMPLAINT = "";
+//: R46：最近一次问诊的完整响应。病历文书按它排版（`buildEmrFromLastResult`）。
+let LAST_RESULT = null;
 
 document.getElementById("role-select").addEventListener("change", () => {
   updateDisclaimer();
@@ -2690,6 +2692,13 @@ function buildConsultRequestBody(complaint) {
   // 永远有一个合法选中值（默认 researcher），没有"不传等于用服务端默认"这种
   // 需要区分的场景。
   body.role = getSelectedRole();
+  // R46：结构化四诊与「人」维**只在填了的时候带**。带一份全空的表单会让
+  // 后端把"没填"当成"填了但都是空的"，而这两者在个体化那一层是不同的结论
+  // （见 core/individualize.py 对 `profile.is_empty()` 的处理）。
+  const intake = collectIntake();
+  if (Object.keys(intake).length) body.intake = intake;
+  const profile = collectProfile();
+  if (profile) body.patient_profile = profile;
   return body;
 }
 
@@ -2736,6 +2745,22 @@ function renderConsultResult(data) {
   renderEvidenceStrength(data);
   renderRecordId(data);
   renderEmptyResult(data);
+  // R46：循证对照、个体化调整、病历文书草稿。三块都各自判断该不该显示。
+  // `LAST_RESULT` 给病历文书用——它是"把这一次的结果排成一份文书"，
+  // 所以要拿得到这一次的结果。
+  LAST_RESULT = data;
+  renderGuideline(data.guideline);
+  renderIndividualization(data.individualization);
+  // R46 §7.4：医师模式下把病历文书草稿也生成出来。**这一趟不调模型**
+  // （把已经算好的结果排版而已），所以可以跟结果一起出来，不用让医师再点一次
+  // ——"生成病历"如果要额外一次点击，它就还是一件额外的事，而这一层的全部
+  // 意义正是"病历书写不该再是一件额外的事"。
+  if (getSelectedRole() === "doctor" && (data.results || []).length) {
+    buildEmrFromLastResult(data).then((out) => { if (out) renderEMR(out.emr); })
+      .catch(() => { /* 生成失败不影响结果页；按钮上还能再试一次 */ });
+  } else {
+    renderEMR(null);
+  }
   PHYSICIAN_COLORS = {};
   PHYSICIAN_NAMES = {};
   for (const r of data.results) {
@@ -3651,4 +3676,369 @@ function closeOnboarding() {
   }
   const g = document.getElementById("guide-open-btn");
   if (g) g.addEventListener("click", openOnboarding);
+}
+
+
+// ============================================================================
+// R46 临床工作流闭环：采集 → 诊断 → 方案 → 检索 → 管理
+// ============================================================================
+
+// ---------- §7.1 结构化四诊录入 ----------
+//
+// **字段表由后端下发**（`/api/intake/form`），前端不写死。写死的话
+// core/intake.py 加一个字段，表单上不会长出来——跟示例主诉、身份色、
+// 九层层名是同一条（"写死的常量也算一处实现"）。
+
+let INTAKE_FIELDS = null;
+
+const LIFE_STAGES = ["", "婴幼儿", "儿童", "青少年", "成人", "老年", "妊娠期", "哺乳期"];
+const CONSTITUTIONS = ["", "平和质", "气虚质", "阳虚质", "阴虚质", "痰湿质",
+                       "湿热质", "血瘀质", "气郁质", "特禀质"];
+
+function fillSelect(id, values) {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  sel.innerHTML = values.map((v) =>
+    `<option value="${escapeHtml(v)}">${escapeHtml(v || "—")}</option>`).join("");
+}
+
+function intakeFieldHtml(f) {
+  const picks = (f.quick_picks || []).map((p) =>
+    `<button type="button" class="qp" data-field="${escapeHtml(f.name)}"`
+    + ` data-value="${escapeHtml(p)}">${escapeHtml(p)}</button>`).join("");
+  return `<div class="intake-field">`
+    + `<label for="if-${escapeHtml(f.name)}">${escapeHtml(f.label)}</label>`
+    + `<input type="text" id="if-${escapeHtml(f.name)}" class="text-field" data-intake="${escapeHtml(f.name)}" />`
+    + (picks ? `<div class="qp-row">${picks}</div>` : "")
+    + `</div>`;
+}
+
+function renderIntakeForm(data) {
+  const box = document.getElementById("intake-fields");
+  if (!box) return;
+  INTAKE_FIELDS = data.parts || {};
+  box.innerHTML = Object.entries(INTAKE_FIELDS).map(([part, fields]) =>
+    `<fieldset class="intake-part"><legend>${escapeHtml(part)}</legend>`
+    + fields.map(intakeFieldHtml).join("") + `</fieldset>`).join("");
+  const note = document.getElementById("intake-note");
+  // §0.4 的输入侧边界**摆在表单上**，不只写在文档里：填表的人要在填之前
+  // 就知道这个系统不收照片和检验数值。
+  if (note) note.textContent = data.regulatory_note || "";
+  // 常用词一键选：点一下填进对应字段（已有内容就追加，不覆盖——
+  // 覆盖会把医师刚打的那句话吃掉）
+  box.addEventListener("click", (e) => {
+    const b = e.target.closest && e.target.closest(".qp");
+    if (!b) return;
+    const input = box.querySelector(`[data-intake="${b.dataset.field}"]`);
+    if (!input) return;
+    input.value = input.value ? `${input.value}；${b.dataset.value}` : b.dataset.value;
+  });
+}
+
+function collectIntake() {
+  const form = {};
+  // **页面上没有这张表单时返回空对象，不抛。** 跟 `getSelectedRole()` 的
+  // `sel ? sel.value : ...` 是同一条兜底：一个精简页面（或还没加载完的
+  // 页面）缺了这一块，不该让整个提交流程断在这里。
+  const all = document.querySelectorAll ? document.querySelectorAll("[data-intake]") : [];
+  Array.prototype.forEach.call(all, (el) => {
+    if (el.value && el.value.trim()) form[el.dataset.intake] = el.value.trim();
+  });
+  return form;
+}
+
+function splitList(v) {
+  return (v || "").split(/[、,，;；]/).map((x) => x.trim()).filter(Boolean);
+}
+
+function collectProfile() {
+  const val = (id) => (document.getElementById(id) || {}).value || "";
+  const age = val("pf-age");
+  const p = {
+    age_years: age === "" ? null : Number(age),
+    sex: val("pf-sex") || null,
+    life_stage: val("pf-stage") || null,
+    constitution: val("pf-const") || null,
+    comorbidities: splitList(val("pf-comorb")),
+    allergies: splitList(val("pf-allergy")),
+    current_medications: splitList(val("pf-meds")),
+    hepatic_impairment: val("pf-hep") || "不详",
+    renal_impairment: val("pf-ren") || "不详",
+  };
+  const empty = p.age_years === null && !p.sex && !p.life_stage && !p.constitution
+    && !p.comorbidities.length && !p.allergies.length && !p.current_medications.length
+    && p.hepatic_impairment === "不详" && p.renal_impairment === "不详";
+  // **一个字段都没填就不传**：传一份全空的 profile 会让后端把"没填"
+  // 当成"填了但都是不详"，两者在个体化那一层是不同的结论。
+  return empty ? null : p;
+}
+
+async function intakeToText() {
+  const resp = await fetch("/api/intake/parse", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ form: collectIntake() }),
+  });
+  if (!resp.ok) return;
+  const data = await resp.json();
+  const ta = document.getElementById("complaint");
+  if (ta) ta.value = data.text || "";
+}
+
+async function intakeFromText() {
+  const ta = document.getElementById("complaint");
+  const resp = await fetch("/api/intake/parse", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: (ta && ta.value) || "" }),
+  });
+  if (!resp.ok) return;
+  const data = await resp.json();
+  for (const [k, v] of Object.entries(data.form || {})) {
+    const el = document.querySelector(`[data-intake="${k}"]`);
+    if (el && typeof v === "string") el.value = v;
+  }
+}
+
+// ---------- §7.3 循证对照 ----------
+//
+// **这一层只呈现差异，不参与选择。** 没有分数、没有排序、不回答"哪个更好"
+// ——那会把它变成另一种投票。文案里的口径名（「教材推荐方案」）由后端下发，
+// 前端不写死"指南"两个字：底本是什么，说的就是什么。
+
+function guidelineHtml(g) {
+  if (!g) return "";
+  const label = g.basis_label || "";
+  if (!g.covered) {
+    return `<div class="gl-line gl-none">${escapeHtml(g.summary || "")}`
+      + `<div class="gl-why">${escapeHtml(g.not_covered || "")}</div></div>`;
+  }
+  const rows = [];
+  for (const a of g.aligned || []) {
+    rows.push(`<li class="gl-ok"><b>${escapeHtml(a.what)}</b>${escapeHtml(a.detail)}`
+      + `<span class="gl-src">出处：《${escapeHtml(a.source || "")}》${escapeHtml(a.span || "")}</span></li>`);
+  }
+  for (const d of g.deviations || []) {
+    rows.push(`<li class="gl-diff"><b>${escapeHtml(d.what)}</b>`
+      + `${escapeHtml(label)}为「${escapeHtml(d.recommended || "")}」，`
+      + `本次为「${escapeHtml(d.ours || "")}」`
+      + `<div class="gl-note">${escapeHtml(d.note || "")}</div>`
+      + `<span class="gl-src">出处：《${escapeHtml(d.source || "")}》${escapeHtml(d.span || "")}</span></li>`);
+  }
+  return `<details class="gl-box"><summary>${escapeHtml(g.summary || "")}（点击查看）</summary>`
+    + `<ul class="gl-list">${rows.join("")}</ul>`
+    + `<div class="gl-why">这一层只摆出异同供医师判断，不用于择优。</div></details>`;
+}
+
+function renderGuideline(g) {
+  const el = document.getElementById("guideline-box");
+  if (!el) return;
+  el.innerHTML = guidelineHtml(g);
+  el.classList.toggle("show", !!(g && (g.covered || g.summary)));
+}
+
+// ---------- §7.2 个体化调整 ----------
+
+function individualizationHtml(ind) {
+  if (!ind) return "";
+  const items = (ind.items || []).map((it) =>
+    `<li class="iv-item" data-kind="${escapeHtml(it.kind)}">`
+    + `<span class="iv-kind">${escapeHtml(it.kind)}</span>`
+    + `<b>${escapeHtml(it.target)}</b>${escapeHtml(it.adjustment)}`
+    + `<div class="iv-why">${escapeHtml(it.reason)}</div>`
+    + `<div class="iv-basis">依据：${escapeHtml(it.basis)}</div></li>`).join("");
+  const considered = (ind.considered || []).map((c) =>
+    `<li>${escapeHtml(c)}</li>`).join("");
+  // **空的 items 配非空的 considered** 才说得清"查过了，没有需要调的"，
+  // 而不是"没查"。所以两块都渲染，不因为 items 是空就整块不出现。
+  const head = items
+    ? `按患者情况需要注意 ${(ind.items || []).length} 处`
+    : "按患者情况核查完毕，没有需要调整的地方";
+  return `<details class="iv-box"${items ? " open" : ""}>`
+    + `<summary>${escapeHtml(head)}</summary>`
+    + (items ? `<ul class="iv-list">${items}</ul>` : "")
+    + (considered ? `<div class="iv-considered">已核查：<ul>${considered}</ul></div>` : "")
+    + `</details>`;
+}
+
+function renderIndividualization(ind) {
+  const el = document.getElementById("individualization-box");
+  if (!el) return;
+  el.innerHTML = individualizationHtml(ind);
+  el.classList.toggle("show", !!ind);
+}
+
+// ---------- §7.4 病历文书 ----------
+
+let LAST_EMR = null;
+
+function emrSectionHtml(s) {
+  const body = s.editable
+    ? `<textarea class="emr-input" data-emr="${escapeHtml(s.key)}"`
+      + ` rows="${Math.max(2, (s.body || "").split("\n").length)}">${escapeHtml(s.body || "")}</textarea>`
+    : `<div class="emr-ro">${escapeHtml(s.body || "＿＿＿＿＿＿")}</div>`;
+  return `<div class="emr-sec"><label>${escapeHtml(s.title)}</label>${body}</div>`;
+}
+
+function renderEMR(emr) {
+  const box = document.getElementById("emr-box");
+  if (!box) return;
+  LAST_EMR = emr;
+  const show = !!emr && getSelectedRole() === "doctor";
+  box.hidden = !show;
+  if (!show) return;
+  const notice = document.getElementById("emr-notice");
+  if (notice) notice.textContent = emr.draft_notice || "";
+  const secs = document.getElementById("emr-sections");
+  if (secs) secs.innerHTML = (emr.sections || []).map(emrSectionHtml).join("");
+}
+
+function collectEmrEdits() {
+  const edits = {};
+  document.querySelectorAll("[data-emr]").forEach((el) => {
+    const sec = (LAST_EMR && (LAST_EMR.sections || []).find((s) => s.key === el.dataset.emr));
+    if (sec && sec.body !== el.value) edits[el.dataset.emr] = el.value;
+  });
+  return edits;
+}
+
+async function buildEmrFromLastResult(data) {
+  const r = (data.results || [])[0] || {};
+  const st = r.s3_structured || r.s3 || {};
+  const formula = st.formula || (st.formula_candidates || [])[0] || null;
+  const resp = await fetch("/api/emr/draft", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      record_id: data.record_id || "",
+      complaint: LAST_COMPLAINT || "",
+      intake: collectIntake(),
+      patient_profile: collectProfile(),
+      s2: data.s2 || null,
+      s3: st,
+      formula,
+      triage: data.triage || null,
+      guideline: data.guideline || null,
+      doctor_id: (document.getElementById("doctor-id-input") || {}).value || "",
+      edits: collectEmrEdits(),
+    }),
+  });
+  if (!resp.ok) return null;
+  return resp.json();
+}
+
+function emrStatus(text) {
+  const el = document.getElementById("emr-status");
+  if (el) el.textContent = text;
+}
+
+async function copyText(text, okMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    emrStatus(okMsg);
+  } catch (e) {
+    // 剪贴板在非安全上下文里不可用（内网 http 就是这种情况）：
+    // **说出来并给出路**，不是静默失败
+    emrStatus("这个浏览器不允许自动复制，请手动选中下方文本复制。");
+  }
+}
+
+// ---------- §7.5 知识速查（Ctrl/⌘ + K） ----------
+
+let kpSeq = 0;
+
+function kpResultHtml(groups) {
+  return (groups || []).map((g) => {
+    if (!g.n) return "";
+    const items = g.items.map((it) =>
+      `<li><b>${escapeHtml(it.title)}</b><div class="kp-sum">${escapeHtml(it.summary || "")}</div>`
+      + (it.source ? `<div class="kp-src">出处：《${escapeHtml(it.source)}》${escapeHtml((it.span || "").slice(0, 60))}</div>` : "")
+      + `</li>`).join("");
+    return `<section class="kp-group"><h3>${escapeHtml(g.label)}（${g.n}）</h3><ul>${items}</ul></section>`;
+  }).join("");
+}
+
+async function kpSearch(q) {
+  const seq = ++kpSeq;
+  const status = document.getElementById("kp-status");
+  const out = document.getElementById("kp-results");
+  if (!q.trim()) { if (out) out.innerHTML = ""; if (status) status.textContent = ""; return; }
+  if (status) status.textContent = "查询中…";
+  const t0 = performance.now();
+  const resp = await fetch(`/api/knowledge/search?q=${encodeURIComponent(q)}`);
+  // 输入框打字快过网络时会有多个在飞：**只认最后一次**，否则前一次的结果
+  // 会盖住后一次的（R43 那条 `gbFetchSeq` 是同一个形状）
+  if (seq !== kpSeq) return;
+  if (!resp.ok) { if (status) status.textContent = "查询失败"; return; }
+  const data = await resp.json();
+  const ms = Math.round(performance.now() - t0);
+  if (out) out.innerHTML = kpResultHtml(data.groups) || `<div class="kp-none">${escapeHtml(data.note || "")}</div>`;
+  if (status) status.textContent = `${ms} ms`;
+}
+
+function kpOpen() {
+  const el = document.getElementById("kp-overlay");
+  if (!el) return;
+  el.hidden = false;
+  const input = document.getElementById("kp-input");
+  if (input) { input.focus(); input.select(); }
+}
+
+function kpClose() {
+  const el = document.getElementById("kp-overlay");
+  if (el) el.hidden = true;
+}
+
+// ---------- 接线 ----------
+
+{
+  const to = document.getElementById("intake-to-text");
+  if (to) to.addEventListener("click", intakeToText);
+  const from = document.getElementById("intake-from-text");
+  if (from) from.addEventListener("click", intakeFromText);
+  fillSelect("pf-stage", LIFE_STAGES);
+  fillSelect("pf-const", CONSTITUTIONS);
+  fetch("/api/intake/form").then((r) => (r.ok ? r.json() : null))
+    .then((d) => { if (d) renderIntakeForm(d); })
+    .catch(() => { /* 后端不在：表单空着，自由文本那条路照走 */ });
+
+  const kpIn = document.getElementById("kp-input");
+  if (kpIn) {
+    let timer = null;
+    kpIn.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => kpSearch(kpIn.value), 120);
+    });
+  }
+  const kpX = document.getElementById("kp-close");
+  if (kpX) kpX.addEventListener("click", kpClose);
+  const kpOv = document.getElementById("kp-overlay");
+  if (kpOv) kpOv.addEventListener("click", (e) => { if (e.target === kpOv) kpClose(); });
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) {
+      e.preventDefault();
+      kpOpen();
+      return;
+    }
+    if (e.key === "Escape" && kpOv && !kpOv.hidden) kpClose();
+  });
+
+  const copyBtn = document.getElementById("emr-copy-text");
+  if (copyBtn) copyBtn.addEventListener("click", async () => {
+    const out = await buildEmrFromLastResult(LAST_RESULT || {});
+    if (!out) { emrStatus("生成失败"); return; }
+    renderEMR(out.emr);
+    await copyText(out.text, "病历文本已复制，粘进病历编辑器后请逐段核对。");
+  });
+  const jsonBtn = document.getElementById("emr-copy-json");
+  if (jsonBtn) jsonBtn.addEventListener("click", async () => {
+    const out = await buildEmrFromLastResult(LAST_RESULT || {});
+    if (!out) { emrStatus("生成失败"); return; }
+    await copyText(JSON.stringify(out.emr, null, 2), "结构化 JSON 已复制。");
+  });
+  const printBtn = document.getElementById("emr-print");
+  if (printBtn) printBtn.addEventListener("click", async () => {
+    const out = await buildEmrFromLastResult(LAST_RESULT || {});
+    if (!out) { emrStatus("生成失败"); return; }
+    renderEMR(out.emr);
+    emrStatus("已生成处方笺，使用浏览器打印（A4 纵向）。");
+    window.print();
+  });
 }

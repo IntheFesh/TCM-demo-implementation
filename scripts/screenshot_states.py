@@ -75,6 +75,9 @@ PREFIX = {
     "chain_flow_1280": "r37", "chain_running": "r37", "node_explain": "r37",
     "cancel_button": "r37",
     "single_chain_graph": "r37",
+    # R46：临床闭环的四块新界面。
+    "intake_form": "r46", "guideline_compare": "r46",
+    "knowledge_panel": "r46", "emr_draft": "r46",
     # R47：首次引导与帮助气泡。**跑在内部模式下**（跟其余 33 张一样）——
     # 这两块不是 internal-only，两种模式下长得一样，没必要再占一档分辨率循环。
     "onboarding": "r47", "help_popover": "r47",
@@ -507,6 +510,57 @@ def _agent_trace():
 
 
 AGENT_TRACE = _agent_trace()
+
+
+# R46：循证对照 / 个体化 / 病历文书的 fixture。**用真模块算出来，不手捏 dict**
+# ——手捏的那份会在字段改名之后继续绿，而界面早就读不到了（这正是 R44
+# 「改一个显示名之前先确认它只写了一处」那条教训的同一个形状）。
+def _r46_guideline():
+    from core.guideline_compare import compare, load_guidelines
+
+    e = load_guidelines()[0]
+    # 主方给一个不同的，好让 aligned 与 deviations 都非空——截图要能同时
+    # 看到"一致"和"不一致"两种条目长什么样。
+    return compare(e.syndrome, e.recommended_principle, "一个不在教材里的方", [])
+
+
+def _r46_individualization():
+    from core.individualize import individualize
+    from core.schemas import PatientProfile
+
+    return individualize(
+        PatientProfile(age_years=68, sex="女", life_stage="老年",
+                       current_medications=["华法林"]),
+        ["细辛", "甘草"], "肝胃不和证").model_dump()
+
+
+def _r46_emr():
+    from core.emr_writer import build_emr
+    from core.intake import IntakeForm
+    from core.schemas import PatientProfile
+
+    return build_emr(
+        record_id="K7M3QX92",
+        form=IntakeForm(chief_complaint="胃脘胀痛三月，食后加重",
+                        present_illness="近三月加重，情志不畅时尤甚",
+                        tongue="舌淡红苔薄白", pulse="脉弦", sleep="多梦易醒"),
+        profile=PatientProfile(age_years=45, sex="女"),
+        s2={"elements": [{"element": "肝", "kind": "location"},
+                         {"element": "气滞", "kind": "nature"}]},
+        s3={"disease": "胃脘痛", "syndrome": "肝胃不和证", "method": "疏肝和胃",
+            "pathogenesis": "肝气犯胃，胃失和降",
+            "reasoning": "由两胁胀满、情志诱发与脉弦推得肝气犯胃"},
+        formula={"name": "柴胡疏肝散",
+                 "herb_items": [{"name": "柴胡", "dose": "6", "unit": "g"},
+                                {"name": "白芍", "dose": "9", "unit": "g"},
+                                {"name": "枳壳", "dose": "6", "unit": "g"}]},
+        doses=7,
+    ).model_dump()
+
+
+R46_GUIDELINE = _r46_guideline()
+R46_INDIVIDUALIZATION = _r46_individualization()
+R46_EMR = _r46_emr()
 
 # R24：建议层 + token 面板的 fixture。三档 severity 各一条（三档画成一样就等于
 # 没渲染），另带一条"没跑的规则"（那一行的存在本身就是 R23 的判据）。
@@ -1484,6 +1538,101 @@ STATES = {
           return null;
         }""",
     ),
+    # R46 §7.1：结构化四诊录入。字段由后端下发，所以要等那一趟 fetch 回来。
+    "intake_form": (
+        "document.getElementById('intake-box').open = true;"
+        " await new Promise(r => setTimeout(r, 400));",
+        """() => {
+          const box = document.getElementById('intake-fields');
+          if (!box) return '表单容器不在';
+          const parts = [...box.querySelectorAll('.intake-part legend')].map(l => l.textContent);
+          if (parts.join('') !== '望闻问切') return '四诊不全：' + parts.join('/');
+          const inputs = box.querySelectorAll('[data-intake]');
+          if (inputs.length < 10) return '字段太少：' + inputs.length;
+          // 常用词一键选：点一下要真的填进去
+          const qp = box.querySelector('.qp');
+          if (!qp) return '没有常用词';
+          qp.click();
+          const target = box.querySelector('[data-intake="' + qp.dataset.field + '"]');
+          if (!target || !target.value) return '点了常用词但没填进字段';
+          // §0.4 的输入侧边界要摆在表单上，不只写在文档里
+          const note = document.getElementById('intake-note');
+          if (!note || !note.textContent.includes('照片')) return '表单上没有输入边界说明';
+          // 人维那几个下拉要有选项
+          if (document.getElementById('pf-stage').options.length < 5) return '生理阶段下拉是空的';
+          if (document.getElementById('pf-const').options.length < 5) return '体质下拉是空的';
+          return null;
+        }"""),
+    # R46 §7.3：循证对照那一行。**措辞里不许出现"指南"**——底本是教材。
+    "guideline_compare": (
+        "renderComplaintBody(COMPLAINT);"
+        " renderConsultResult({...R37_DONE_PAYLOAD, guideline: R46_GUIDELINE,"
+        " individualization: R46_INDIVIDUALIZATION});"
+        # 两块默认折叠（对照是"点击查看"，个体化在没有条目时也折着）。
+        # **截图与判据都要展开的那一版**——判据读的是 innerText，而折叠起来的
+        # `<details>` 内容不参与渲染，innerText 里根本没有它。
+        " document.querySelector('.gl-box').open = true;"
+        " document.querySelector('.iv-box').open = true;",
+        """() => {
+          const gl = document.getElementById('guideline-box');
+          if (!gl || !gl.classList.contains('show')) return '对照那一行没出来';
+          const text = gl.innerText || '';
+          if (!text.includes('教材推荐方案')) return '没写清底本是什么：' + text.slice(0, 40);
+          if (text.includes('指南')) return '把教材说成了指南：' + text.slice(0, 60);
+          if (!text.includes('出处')) return '对照条目没有出处';
+          if (!text.includes('不用于择优')) return '少了"不用于择优"那句口径';
+          const iv = document.getElementById('individualization-box');
+          if (!iv || !iv.classList.contains('show')) return '个体化那一块没出来';
+          const ivText = iv.innerText || '';
+          if (!ivText.includes('依据：')) return '个体化条目没有依据';
+          if (!ivText.includes('已核查')) return '没有列出已核查的维度';
+          return null;
+        }"""),
+    # R46 §7.5：知识速查（Ctrl/⌘ + K）。
+    "knowledge_panel": (
+        "kpOpen(); document.getElementById('kp-input').value = '柴胡';"
+        " await kpSearch('柴胡');",
+        r"""() => {
+          const ov = document.getElementById('kp-overlay');
+          if (!ov || ov.hidden) return '速查面板没打开';
+          const groups = ov.querySelectorAll('.kp-group');
+          if (!groups.length) return '一条结果都没有';
+          const text = ov.innerText || '';
+          if (!text.includes('本草')) return '没有本草这一类';
+          if (!text.includes('出处')) return '结果没有出处';
+          const st = document.getElementById('kp-status').textContent || '';
+          if (!/\d+ ms/.test(st)) return '没有报响应耗时：' + st;
+          const ms = parseInt(st, 10);
+          if (ms > 200) return '速查超出 200 ms 预算：' + ms;
+          const card = document.getElementById('kp-card').getBoundingClientRect();
+          if (card.bottom > window.innerHeight + 1) return '面板超出屏幕';
+          return null;
+        }"""),
+    # R46 §7.4：病历文书草稿。**只在医师模式下出现**。
+    "emr_draft": (
+        "document.getElementById('role-select').value = 'doctor';"
+        " renderComplaintBody(COMPLAINT); renderConsultResult(R37_DONE_PAYLOAD);"
+        " renderEMR(R46_EMR); document.getElementById('emr-box').open = true;",
+        """() => {
+          const box = document.getElementById('emr-box');
+          if (!box || box.hidden) return '医师模式下病历文书没出现';
+          const notice = document.getElementById('emr-notice');
+          if (!notice || !notice.textContent.includes('草稿'))
+            return '没有"这是草稿"的声明';
+          const secs = box.querySelectorAll('.emr-sec');
+          if (secs.length < 8) return '文书段数太少：' + secs.length;
+          const editable = box.querySelectorAll('textarea[data-emr]');
+          if (!editable.length) return '一段都不能编辑';
+          // 签名栏不可编辑
+          const labels = [...secs].map(s => s.querySelector('label').textContent);
+          if (!labels.includes('医师签名')) return '没有医师签名栏';
+          const text = box.innerText || '';
+          for (const banned of ['建议患者服用', '推荐采用该方治疗']) {
+            if (text.includes(banned)) return '文书里出现了诊疗建议式措辞：' + banned;
+          }
+          if (!box.querySelector('#emr-print')) return '没有打印处方笺入口';
+          return null;
+        }"""),
     # R47 §8.4 第 34 条：首次引导。**截图里它是被显式打开的**——跑图前
     # `_seed_onboarding()` 把"已看过"预置进了 localStorage（否则每一张截图上
     # 都盖着这张卡），所以这里要自己开一次。
@@ -1991,6 +2140,10 @@ def run(only: str | None, wait_ms: int) -> int:
                                    ("R37_DONE_PAYLOAD", R37_DONE_PAYLOAD),
                                    # R44：代理决策
                                    ("AGENT_TRACE", AGENT_TRACE),
+                                   # R46：循证对照 / 个体化 / 病历文书
+                                   ("R46_GUIDELINE", R46_GUIDELINE),
+                                   ("R46_INDIVIDUALIZATION", R46_INDIVIDUALIZATION),
+                                   ("R46_EMR", R46_EMR),
                                    ("COMPLAINT", COMPLAINT)):
                     page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
                 # setup 里可能有 await（图谱浏览器要先把数据拉回来），

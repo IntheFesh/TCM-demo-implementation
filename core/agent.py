@@ -176,6 +176,17 @@ AGENT_RULES: tuple[AgentRule, ...] = (
         why="开完方自己按七条规则验一遍，有 veto/revise 级违规就把违规回灌给模型重开。",
         gate="core.formula_verifier:verify_formula",
     ),
+    # R46 §7.2 第 4 条：「人」这一维。**跟上面那条 verify 是两件事**——
+    # 那条验的是"这张方本身立不立得住"（配伍、剂量、归经），这条验的是
+    # "这张方对**这位患者**合不合适"（妊娠、小儿、老年、肝肾功能、过敏史）。
+    # 合成一条的话，"方是对的但人不对"会被说成方有问题。
+    AgentRule(
+        id="verify_patient_fit",
+        capability="verify",
+        why="按患者的年龄/生理阶段/肝肾功能/过敏史再核一遍这张方，"
+            "每条提示都指得出本草原文；取不到依据的维度不提示、但要说已经查过。",
+        gate="core.individualize:individualize",
+    ),
 )
 
 RULES_BY_ID: dict[str, AgentRule] = {r.id: r for r in AGENT_RULES}

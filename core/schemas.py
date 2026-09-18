@@ -1290,3 +1290,89 @@ class PrescribingPattern(BaseModel):
                 f'kind="herb_pair" 必须恰好两味药，实际 {len(self.herbs)} 味'
             )
         return self
+
+
+# ---------- R46 §7.2：「人」这一维 ----------
+#
+# 对标黄煌的「方—病—人」模式：同一个证，老人/小儿/孕妇/肝肾功能不全者的用药
+# 不是同一张方。此前这条链上完全没有"人"——只有症状、证素、证型、方。
+#
+# **新增 schema，不动既有的任何一个字段**（CLAUDE.md 那条铁律：防幻觉约束不
+# 许放松，某个新场景要不同的形状就新建一个 schema，不是把旧的改松）。
+
+#: 体质倾向。**不是自由文本**：九种体质是《中医体质分类与判定》的固定分类，
+#: 留成字符串的话模型会写出"偏寒"这种不在任何表里的词，而下游要拿它去查规则。
+Constitution = Literal[
+    "平和质", "气虚质", "阳虚质", "阴虚质", "痰湿质",
+    "湿热质", "血瘀质", "气郁质", "特禀质",
+]
+
+#: 生理阶段。剂量折算与禁忌规则按这个分派（儿童折算、妊娠禁忌、老年慎峻药）。
+LifeStage = Literal["婴幼儿", "儿童", "青少年", "成人", "老年", "妊娠期", "哺乳期"]
+
+
+class PatientProfile(BaseModel):
+    """患者的「人」维。**全部字段可空**——门诊现场未必问得全，
+    而一个"必须填满才能辨证"的表单在诊室里会被绕过去（写个假年龄），
+    那比留空更糟。
+
+    这里没有一个 `Field(min_length=1)`：**它不是模型的输出**，是人填的表单，
+    防幻觉约束管的是"模型说的话要有出处"，跟这张表无关。
+    """
+
+    age_years: int | None = Field(default=None, ge=0, le=130)
+    sex: Literal["男", "女"] | None = None
+    life_stage: LifeStage | None = None
+    constitution: Constitution | None = None
+    #: 基础病、过敏史、在服药物：自由文本列表，医师现场写什么就是什么。
+    comorbidities: list[str] = Field(default_factory=list)
+    allergies: list[str] = Field(default_factory=list)
+    current_medications: list[str] = Field(default_factory=list)
+    #: 肝肾功能不全：只收「有/无/不详」三态，不收检验数值。
+    #: **这是 §0.4 的输入侧边界**——一旦收 ALT/肌酐这类客观数据，
+    #: 产品性质从"对患者主诉与病历文本推理"变成"分析客观数据"，
+    #: 监管属性随之改变，要按医疗器械注册。
+    hepatic_impairment: Literal["有", "无", "不详"] = "不详"
+    renal_impairment: Literal["有", "无", "不详"] = "不详"
+
+    def is_empty(self) -> bool:
+        """一个字段都没填。调用方据此决定"这一次有没有人维可用"——
+        跟"填了但都是不详"是两件事。"""
+        return not any([
+            self.age_years is not None, self.sex, self.life_stage,
+            self.constitution, self.comorbidities, self.allergies,
+            self.current_medications,
+        ]) and self.hepatic_impairment == "不详" and self.renal_impairment == "不详"
+
+
+#: 个体化调整的类别。**`Literal` 而不是自由字符串**：下游要按类别分组显示，
+#: 也要按类别查"这一类调整有没有本体依据"。
+AdjustmentKind = Literal["剂量", "去药", "加药", "换药", "煎服法", "慎用提示"]
+
+
+class IndividualizationItem(BaseModel):
+    """一条针对这位患者的调整。
+
+    **`basis` 是 `Field(min_length=1)`**——跟 `cited_case_ids` 同一条防幻觉纪律：
+    一条"孕妇应当减量"的调整，说不出依据就是模型自己想的。取不到依据时正确的
+    做法是**不产出这一条**，不是产出一条依据为空的。
+    """
+
+    kind: AdjustmentKind
+    target: str = Field(min_length=1)          # 哪一味药 / 哪一项
+    adjustment: str = Field(min_length=1)      # 怎么调
+    reason: str = Field(min_length=1)          # 为什么（针对这位患者的哪一点）
+    basis: str = Field(min_length=1)           # 依据（本体条目、药典、教材原文）
+
+
+class Individualization(BaseModel):
+    """一次问诊的全部个体化调整。
+
+    `items` **可以为空**：这位患者没有需要调整的地方，是一个合法且常见的结论，
+    强制 `min_length=1` 会逼模型编一条出来。
+    `considered` 记的是"看了哪几个维度"——空的 `items` 配上非空的 `considered`
+    才说得清"查过了，没有需要调的"，而不是"没查"。
+    """
+
+    items: list[IndividualizationItem] = Field(default_factory=list)
+    considered: list[str] = Field(default_factory=list)

@@ -2121,6 +2121,7 @@ def consult(
     retriever_mode: str | None = None,
     refs_mode: str = "own",
     s3_mode_override: str | None = None,
+    patient_profile=None,
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
@@ -2232,6 +2233,12 @@ def consult(
             "insufficient_reason": None,
             "coverage": None,
             "agent_trace": trace.to_list(),
+            # R46：**中止的分支也要有这两个键。** 七个返回点守着同一套键这条
+            # 纪律不是形式——缺键在前端读到的是 undefined，会悄悄进渲染。
+            # 被拦下来的这一次没有方可比、也没有人维可核，所以是 None
+            # （"没有可算的"），不是 `{}`（"算了，结果是空的"）。
+            "individualization": None,
+            "guideline": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000), state.pop("_calls", 1), use_react,
                 retriever_mode=retriever_mode, s3_mode_used=mode),
@@ -2434,6 +2441,9 @@ def consult(
             ),
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
+            # R46：同上——检索跑不起来时没有结论可比对。
+            "individualization": None,
+            "guideline": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
                 s1s2_calls + extra_calls + (1 if residual else 0), use_react,
@@ -2589,6 +2599,18 @@ def consult(
         trace.record("verify_and_revise",
                      f"验了 {n_verified} 份处方" + (f"，重开 {reopened} 次" if reopened else "，一次通过"))
 
+    # R46 §7.2/§7.3：「人」维核查与循证对照。**两者都是确定性计算，零 LLM 调用**
+    # ——个体化的每一条要指得出本草原文（`basis` 是 `Field(min_length=1)`），
+    # 让模型生成的话那个字段只能是编的；循证对照比的是教材条目，更没有理由
+    # 去问模型。所以它们放在这里而不是进 prompt：**算得出来的东西不问模型。**
+    individualization, guideline = _patient_and_guideline(results, patient_profile)
+    if individualization is not None:
+        trace.record(
+            "verify_patient_fit",
+            (f"按「人」维核出 {len(individualization.items)} 条调整提示"
+             if individualization.items
+             else f"按「人」维查了 {len(individualization.considered)} 项，没有需要调整的"))
+
     return {
         "s1": s1,
         "results": results,
@@ -2603,6 +2625,11 @@ def consult(
         "insufficient_reason": None,
         "coverage": round(coverage, 3),
         "agent_trace": trace.to_list(),
+        # R46：个体化调整与循证对照。None = 这一次没有可算的（没填人维 /
+        # 没有证型），**跟"算了但是空的"是两件事**，前端据此显示不同的话。
+        "individualization": (individualization.model_dump()
+                              if individualization is not None else None),
+        "guideline": guideline,
         # S1/S2 这一段（合一 1 次、分开 2 次，见 s1s2_calls）+ 每位医家 S3 一次
         # + 残差一次 + 配伍禁忌重开若干次。重开必须计进来：漏算的话 manifest 报的
         # 调用数会低于实际花费，拿它算成本或比配置就都是错的。
@@ -2625,6 +2652,59 @@ def consult(
             synthesis=_synthesis_summary(results, mode),
         ),
     }
+
+
+def _step_name(step) -> str:
+    """五步链的一步 → 它的名字。裸字符串原样返回，对象取 `name`，
+    其余（None、数字）返回空串。**一处实现**：证型、治法、方名三处都走它。"""
+    if isinstance(step, str):
+        return step.strip()
+    if hasattr(step, "model_dump"):
+        step = step.model_dump()
+    if isinstance(step, dict):
+        return str(step.get("name") or step.get("principle") or "").strip()
+    return ""
+
+
+def _patient_and_guideline(results: list[dict], patient_profile):
+    """「人」维核查 + 循证对照。两者都从**第一条结论**取方与证型。
+
+    为什么只看第一条：structured 模式下 `results` 恰好一条（那是融合出的
+    结论）；legacy 三列模式下三条方各不相同，对每一条各算一份会在界面上摆出
+    三份对照——而 R44 刚把"几份并列"从产品面上消除。legacy 是研究面，
+    那里看的是三列本身，不需要这一层。
+    """
+    from core.guideline_compare import compare
+    from core.individualize import individualize
+
+    r = (results or [{}])[0]
+    st = r.get("s3_structured")
+    st = st.model_dump() if hasattr(st, "model_dump") else (st or {})
+    flat = r.get("s3")
+    flat = flat.model_dump() if hasattr(flat, "model_dump") else (flat or {})
+    # **五步链里每一步都是一个对象**（`{"name": ..., "from_...": ...}`），
+    # 扁平的那份 `s3` 才是裸字符串。两种形状都要认——只按其中一种写，
+    # 另一种走到这里是 `AttributeError: 'dict' object has no attribute 'strip'`，
+    # 而那会把一次本来跑成了的问诊整个打断。
+    syndrome = _step_name(st.get("syndrome")) or _step_name(flat.get("syndrome"))
+    method = _step_name(st.get("method")) or _step_name(flat.get("method"))
+    formula = st.get("formula") or {}
+    if not isinstance(formula, dict):
+        formula = formula.model_dump() if hasattr(formula, "model_dump") else {}
+    # 五步链的 `formula` 是 `{"candidate": {...}, "from_method": ...}`，
+    # 扁平那份是 `{"name": ..., "herb_items": [...]}`——同样两种形状都认。
+    cand = formula.get("candidate") if isinstance(formula.get("candidate"), dict) else formula
+    fname = (cand or {}).get("name") or formula.get("name") or ""
+    herbs = [it.get("name", "") for it in ((cand or {}).get("herb_items") or [])
+             if isinstance(it, dict)]
+    if not herbs:
+        herbs = [h for h in (flat.get("herbs") or []) if isinstance(h, str)]
+
+    individualization = None
+    if patient_profile is not None:
+        individualization = individualize(patient_profile, herbs, syndrome)
+    guideline = compare(syndrome, str(method), fname, herbs) if syndrome else None
+    return individualization, guideline
 
 
 def consult_many(queries: list[str], consult_fn=None) -> tuple[list[dict | None], list[dict]]:

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException, Header, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -50,6 +51,26 @@ from core.physicians import (
     resolve_physician_id,
 )
 from core.prescription import compute_herb_diffs, format_pharmacy_text
+from core.emr_writer import (
+    apply_edits,
+    build_emr,
+    record_edits,
+    render_emr_text,
+    render_prescription_sheet,
+)
+from core.guideline_compare import coverage_stats
+from core.individualize import individualize
+from core.intake import (
+    IntakeForm,
+    TextOnlyInput,
+    InputKindRejected,
+    check_input_kinds,
+    form_fields_by_part,
+    form_to_text,
+    text_to_form,
+)
+from core.integration_auth import IntegrationDenied, check as integration_check
+from core.knowledge_panel import search as knowledge_search
 from core.product_mode import (
     InternalOnly,
     product_flags,
@@ -62,7 +83,7 @@ from core.safety_output import (
     assess_formula_safety,
     check_incompatible,
 )
-from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, S1Normalize
+from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, PatientProfile, S1Normalize
 from core.tools import GRAPH_PATH, get_graph_store, search_cases
 from core.version import PRODUCT_NAME, VERSION
 from offline.graph_stats import compute_stats, lambda1_note
@@ -157,6 +178,26 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title=PRODUCT_NAME, version=VERSION, lifespan=_lifespan)
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """请求体校验失败。
+
+    **两种情况分开**：
+      - 命中 §0.4 的输入侧护栏（图像/信号/检验数值）→ **400**，正文是那句
+        监管属性的中文说明。它不是"请求写错了"，是"这类输入本系统不收"，
+        而且使用者需要读到原因。
+      - 其余 → 照旧 422，但正文换成中文摘要，不把 pydantic 的英文结构
+        原样吐出去（§8.2 第 12 条：英文技术词与报错原文不上产品面）。
+    """
+    msgs = [str(e.get("msg", "")) for e in exc.errors()]
+    hit = next((m for m in msgs if "不接受「" in m), "")
+    if hit:
+        return JSONResponse(status_code=400, content={"detail": hit.replace("Value error, ", "")})
+    fields = "、".join(".".join(str(x) for x in e.get("loc", ())[1:]) for e in exc.errors())
+    return JSONResponse(status_code=422,
+                        content={"detail": f"请求内容不合要求：{fields or '请检查填写的字段'}。"})
+
+
 @app.exception_handler(InternalOnly)
 async def _internal_only_handler(request: Request, exc: InternalOnly) -> JSONResponse:
     """内部功能在产品模式下被访问 → **404，不是 403**。
@@ -239,7 +280,7 @@ def _public_error_detail(exc: Exception) -> str:
     return f"服务端处理失败（{type(exc).__name__}，错误编号 {error_id}），详细原因见服务端日志。"
 
 
-class ConsultRequest(BaseModel):
+class ConsultRequest(TextOnlyInput):
     complaint: str = Field(min_length=1, max_length=MAX_COMPLAINT_CHARS)
     # 逐请求的检索模式。**刻意不做成服务端的全局设置**：RETRIEVER_MODE 那个
     # 环境变量是进程级的，一个请求设了它，同一进程里并发的另一个请求就跟着变了。
@@ -260,6 +301,11 @@ class ConsultRequest(BaseModel):
     # 下仍是研究者）——把默认写死在 schema 里等于让产品形态有第二个决定点。
     # 合法值仍由 Literal 卡，产品模式下研究者角色由 `resolve_role()` 拦。
     role: Role | None = None
+    # R46 §7.1/§7.2：结构化四诊表单与「人」这一维。
+    # **两者都可空**：自由文本那条路一个字没变（`complaint` 仍是唯一必填项），
+    # 表单只是另一种录入方式，二者可互转（见 core/intake.py）。
+    intake: IntakeForm | None = None
+    patient_profile: PatientProfile | None = None
 
 
 def demo_mode_info() -> dict | None:
@@ -1111,7 +1157,8 @@ def api_consult(
     outcome = None
     try:
         with use_llm(backend):
-            outcome = consult(req.complaint, retriever_mode=req.retriever_mode)
+            outcome = consult(_effective_complaint(req), retriever_mode=req.retriever_mode,
+                              patient_profile=req.patient_profile)
     except LLMAuthError as e:
         # 见 stream 里那条注释：这一类要说给访问者听。
         raise HTTPException(status_code=502, detail=str(e)) from e
@@ -1127,15 +1174,56 @@ def api_consult(
     # （test_researcher_role_response_matches_pre_m6_shape_byte_for_byte），
     # 而且额度是"站点计量"、不是"这次问诊的结果"，混进结果体会让两件事纠缠。
     # 完整看板在 GET /api/usage。
+    _record_history(out := _consult_response(outcome, role=role), req)
     snap = _usage_block(request, decision)
     response.headers["X-Usage-Mode"] = decision.mode
     response.headers["X-Usage-Remaining-Calls"] = str(snap["remaining_calls"])
-    return _consult_response(outcome, role=role)
+    return out
 
 
 #: 记录编号用的字母表：**去掉 0/O/1/I/L**。使用者要在电话里把它念给运维，
 #: 而这五个字符是电话里最容易听错的。
 _RECORD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _record_history(response: dict, req: "ConsultRequest") -> None:
+    """把这一次问诊记进本医师的历史。**失败不影响问诊**——历史是管理功能，
+    磁盘只读或目录不可写时不该让一次已经跑完的问诊反而报错。"""
+    try:
+        from core import history
+
+        r = (response.get("results") or [{}])[0]
+        st = r.get("s3_structured") or r.get("s3") or {}
+        formula = st.get("formula") or {}
+        history.record_consult(
+            doctor_id=getattr(req, "doctor_id", "") or "",
+            record_id=response.get("record_id") or "",
+            complaint=req.complaint or "",
+            syndrome=st.get("syndrome") or "",
+            disease=st.get("disease") or "",
+            formula=(formula.get("name") if isinstance(formula, dict) else "") or "",
+            advice_kinds=[a.get("kind", "") for a in (r.get("advice") or [])],
+        )
+    except OSError:
+        logging.getLogger("tcm.history").warning("问诊历史写入失败，这次问诊不受影响")
+
+
+def _effective_complaint(req: "ConsultRequest") -> str:
+    """这一次真正送进 S1 的那段文本。
+
+    表单与自由文本**不是二选一**：填了表单就把表单铺成文本（`form_to_text`），
+    自由文本里的内容由表单的 `free_text` 带着；两边都有时以表单为准并把
+    `complaint` 并进去——**不丢任何一边**，丢掉的那一边恰好可能是主诉。
+    """
+    if req.intake is None:
+        return req.complaint
+    form = req.intake
+    if req.complaint and not form.chief_complaint:
+        form = form.model_copy(update={"chief_complaint": req.complaint})
+    elif req.complaint and req.complaint not in form_to_text(form):
+        form = form.model_copy(
+            update={"free_text": (form.free_text + "。" + req.complaint).strip("。")})
+    return form_to_text(form) or req.complaint
 
 
 def _record_id() -> str:
@@ -1191,6 +1279,12 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         # 非 None = 这次结果是回放的录制推理。跟 manifest 分开放：manifest 只
         # 给 researcher，而这行提示要给所有角色看（见 demo_mode_info 的注释）。
         "demo_mode": demo_mode_info(),
+        # R46：个体化调整与循证对照。**都给（除患者外，见角色裁剪）**——
+        # 医师要的正是"这张方对这位患者合不合适、跟教材差在哪"。
+        # 问诊历史在 `_record_history()` 里落盘，不在这里——这个函数只负责
+        # "怎么序列化"，写文件混进来会让它在测试里产生副作用。
+        "individualization": outcome.get("individualization"),
+        "guideline": outcome.get("guideline"),
         # R47 §8.2 第 9 条：给所有角色一个**本次记录编号**，页脚一行小字，
         # 供报障时报给运维。刻意不叫 trace_id、不在产品面上出现这个词——
         # 使用者报障时要念得出来，所以是 8 位大写字母数字，不是 uuid。
@@ -1463,10 +1557,11 @@ def api_consult_stream(
             # BYOK 的 key 和超额降级都会静默失效。
             with use_llm(backend):
                 outcome = consult(
-                    req.complaint,
+                    _effective_complaint(req),
                     ask_fn=stream.ask,
                     on_step=stream.emit,
                     retriever_mode=req.retriever_mode,
+                    patient_profile=req.patient_profile,
                 )
             # R40 背压：丢过增量就**说出来**，紧挨在 done 之前。
             # 单独一个事件而不是塞进 done 的载荷：done 的形状跟 /api/consult
@@ -1474,7 +1569,9 @@ def api_consult_stream(
             # 往里加一个只有流式路径才有的键会让那份契约分叉。
             if stream.dropped_deltas:
                 stream.emit("deltas_dropped", {"n": stream.dropped_deltas})
-            stream.events_q.put(("done", _consult_response(outcome, role=_req_role)))
+            _done = _consult_response(outcome, role=_req_role)
+            _record_history(_done, req)
+            stream.events_q.put(("done", _done))
         except StreamClosed:
             pass  # 客户端已断开，没人读了，正常提前结束
         except LLMAuthError as e:
@@ -1797,6 +1894,12 @@ def _filter_response_by_role(response: dict, role: Role, results: list[dict]) ->
 
     # 走到这里说明 role 是 "patient" 或 "doctor"。
     response.pop("divergence", None)
+    if role == "patient":
+        # R46：个体化调整逐条点名药味（「附子：老年患者慎用」），跟
+        # `formula_candidates` 是同一条安全边界——患者角色下**键根本不存在**，
+        # 不是存在但为空。循证对照同理：它比的是方与治法。
+        response.pop("individualization", None)
+        response.pop("guideline", None)
 
     triage = _compute_triage(results)
     response["triage"] = triage
@@ -2360,3 +2463,233 @@ class _CachingStatic(StaticFiles):
 
 # 静态文件挂在 /app，不要挂在根路径——否则会遮蔽上面的 API 路由。
 app.mount("/app", _CachingStatic(directory=str(WEB_ROOT), html=True), name="web")
+
+
+# ============================================================================
+# R46 §7：临床工作流闭环（采集 → 诊断 → 方案 → 检索 → 管理）
+# ============================================================================
+#
+# 这一段的端点**都不调模型**：结构化录入是文本互转，知识速查是查内存里的
+# 本体，病历文书是把已经算好的结果排版，历史与统计是读 JSONL。
+# 所以它们没有额度闸门、没有并发位——那两样守的是"别把钱花光/别把线程占满"，
+# 而这一段一次调用的代价是几毫秒。
+
+
+@app.get("/api/intake/form")
+def api_intake_form() -> dict:
+    """结构化四诊表单的字段表 + 常用词。**前端不写死字段**——写死的话
+    `core/intake.py` 里加一个字段，表单上不会长出来。"""
+    return {
+        "parts": form_fields_by_part(),
+        "regulatory_note": (
+            "只接受文字描述。舌象照片、脉诊仪信号、检验数值等客观数据不在本系统"
+            "的输入范围内（引入它们会改变产品的监管属性）。"),
+    }
+
+
+class IntakeParseRequest(TextOnlyInput):
+    text: str = ""
+    form: IntakeForm | None = None
+
+
+@app.post("/api/intake/parse")
+def api_intake_parse(req: IntakeParseRequest, request: Request) -> dict:
+    """自由文本 ↔ 表单互转。给 `text` 就拆成表单，给 `form` 就铺成文本。
+
+    §0.4 的输入侧护栏在这里拦一次：请求体里出现图像/信号/检验数值字段就 400，
+    并回那句监管属性的说明。
+    """
+    try:
+        check_input_kinds(req.model_dump())
+    except InputKindRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if req.form is not None:
+        return {"text": form_to_text(req.form), "form": req.form.model_dump()}
+    form = text_to_form(req.text)
+    return {"text": form_to_text(form), "form": form.model_dump()}
+
+
+@app.get("/api/knowledge/search")
+def api_knowledge_search(q: str = "", kind: str = "", physician: str = "",
+                         limit: int = 8) -> dict:
+    """诊中知识速查：本草 / 方剂 / 教材推荐方案 / 名老中医用药规律。
+
+    响应预算 200 ms（§7.5 第 13 条）。本体是惰性加载的——**第一次查会把它
+    装进来**（实测约 2.4 秒），之后每次查在个位数毫秒。生产部署由
+    `api/warmup.py` 在起服务时就装好，所以医师遇不到那一次冷启动。
+    """
+    return knowledge_search(q, kind=kind, limit=max(1, min(limit, 50)),
+                            physician=physician)
+
+
+@app.get("/api/guideline/coverage")
+def api_guideline_coverage() -> dict:
+    """循证对照层覆盖到什么程度。**产品面显示「未覆盖」时要能给出这个数**
+    ——否则读的人会以为是自己这一次特殊。"""
+    return coverage_stats()
+
+
+class EMRRequest(BaseModel):
+    record_id: str = ""
+    complaint: str = ""
+    intake: IntakeForm | None = None
+    patient_profile: PatientProfile | None = None
+    s2: dict | None = None
+    s3: dict | None = None
+    formula: dict | None = None
+    triage: dict | None = None
+    guideline: dict | None = None
+    doses: int | None = None
+    decoction: str = ""
+    doctor_id: str = ""
+    edits: dict[str, str] = Field(default_factory=dict)
+
+
+def _emr_from_request(req: EMRRequest):
+    ind = individualize(req.patient_profile, [
+        it.get("name", "") for it in ((req.formula or {}).get("herb_items") or [])
+    ], (req.s3 or {}).get("syndrome") or "") if req.patient_profile else None
+    return build_emr(
+        record_id=req.record_id, complaint=req.complaint, form=req.intake,
+        profile=req.patient_profile, s2=req.s2, s3=req.s3, formula=req.formula,
+        individualization=ind, triage=req.triage, guideline=req.guideline,
+        doses=req.doses, decoction=req.decoction,
+    )
+
+
+@app.post("/api/emr/draft")
+def api_emr_draft(req: EMRRequest) -> dict:
+    """生成病历文书草稿，并按 `record_id` 存一版。
+
+    医师的修改走 `edits`：**改前改后都进审计链**（只写改后的话，"医师把哪
+    一句删了"就查不出来，而那正是质控要看的）。
+    """
+    emr = _emr_from_request(req)
+    changes: list[dict] = []
+    if req.edits:
+        emr, changes = apply_edits(emr, req.edits)
+        record_edits(emr, changes, doctor_id=req.doctor_id)
+    if emr.record_id:
+        from core import history
+
+        history.save_emr(emr.record_id, emr.model_dump(), doctor_id=req.doctor_id)
+    return {"emr": emr.model_dump(), "changes": changes,
+            "text": render_emr_text(emr),
+            "prescription_sheet": render_prescription_sheet(emr)}
+
+
+@app.get("/api/emr/{record_id}")
+def api_emr_get(record_id: str) -> dict:
+    from core import history
+
+    row = history.get_emr(record_id)
+    if not row:
+        # 404 而不是一份空文书——空文书会被当成"这次问诊什么都没生成"
+        raise HTTPException(status_code=404, detail="没有这个编号的病历草稿。")
+    return {"record_id": record_id, "emr": row.get("draft") or {},
+            "versions": len(history.emr_versions(record_id))}
+
+
+@app.get("/api/history")
+def api_history(doctor_id: str = "", syndrome: str = "", formula: str = "",
+                since: str = "", limit: int = 50) -> dict:
+    from core import history
+
+    rows = history.list_consults(doctor_id=doctor_id, syndrome=syndrome,
+                                 formula=formula, since=since,
+                                 limit=max(1, min(limit, 200)))
+    return {"items": rows, "n": len(rows)}
+
+
+class FavoriteRequest(BaseModel):
+    doctor_id: str = ""
+    name: str = ""
+    herbs: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
+@app.post("/api/history/favorite")
+def api_add_favorite(req: FavoriteRequest) -> dict:
+    from core import history
+
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="收藏要有名字。")
+    row = history.add_favorite(doctor_id=req.doctor_id, name=req.name,
+                               herbs=req.herbs, note=req.note)
+    return {"saved": row}
+
+
+@app.get("/api/history/favorites")
+def api_list_favorites(doctor_id: str = "") -> dict:
+    from core import history
+
+    rows = history.list_favorites(doctor_id=doctor_id)
+    return {"items": rows, "n": len(rows)}
+
+
+@app.get("/api/history/stats")
+def api_history_stats(doctor_id: str = "", recent: int = 50) -> dict:
+    """近 N 次的证型分布、常用方、核查提示分布。
+
+    **每个数都带 `of`（这批一共几次）**：「肝胃不和证 3 次」在 5 次里和在
+    50 次里是两件完全不同的事。
+    """
+    from core import history
+
+    return history.stats(doctor_id=doctor_id, recent=max(1, min(recent, 500)))
+
+
+# ---------- §7.5 第 15 条：HIS 集成接口 ----------
+#
+# 鉴权 = API Key + IP 白名单（等保 2.0 三级的身份鉴别与访问控制）。
+# **默认拒绝**：没配 `HIS_API_KEYS` 时这两个端点一律 401。
+
+
+def _integration_guard(request: Request, x_api_key: str | None) -> None:
+    try:
+        integration_check(x_api_key, _client_ip(request))
+    except IntegrationDenied as e:
+        logging.getLogger("tcm.integration").warning("集成接口拒绝：%s", e.reason)
+        # 回给调用方的原因**统一**：「key 不对」和「IP 不在白名单」的区别
+        # 会告诉试探者下一步该试什么。
+        raise HTTPException(status_code=401, detail="鉴权失败。") from e
+
+
+class IntegrationConsultRequest(TextOnlyInput):
+    """HIS 传来的患者基本信息与主诉。字段命名对齐常用 HIS 术语。"""
+
+    patient_id: str = ""          # HIS 的患者主索引
+    visit_id: str = ""            # 就诊流水号
+    chief_complaint: str = ""
+    present_illness: str = ""
+    patient_profile: PatientProfile | None = None
+    intake: IntakeForm | None = None
+
+
+@app.post("/api/integration/consult")
+def api_integration_consult(req: IntegrationConsultRequest, request: Request,
+                            x_api_key: str | None = Header(default=None)) -> dict:
+    """HIS 调用入口：接受患者基本信息与主诉，返回结构化结果。
+
+    **这一条真的会调模型**（它就是一次问诊），所以照走额度闸门与并发位。
+    """
+    _integration_guard(request, x_api_key)
+    form = req.intake or IntakeForm()
+    if req.chief_complaint and not form.chief_complaint:
+        form = form.model_copy(update={"chief_complaint": req.chief_complaint})
+    if req.present_illness and not form.present_illness:
+        form = form.model_copy(update={"present_illness": req.present_illness})
+    inner = ConsultRequest(complaint=form_to_text(form) or req.chief_complaint,
+                           intake=form, patient_profile=req.patient_profile,
+                           role="doctor")
+    response = Response()
+    out = api_consult(inner, request, response, None)
+    return {"patient_id": req.patient_id, "visit_id": req.visit_id, "result": out}
+
+
+@app.get("/api/integration/emr/{record_id}")
+def api_integration_emr(record_id: str, request: Request,
+                        x_api_key: str | None = Header(default=None)) -> dict:
+    """按记录编号返回病历文书的结构化 JSON，供 HIS 导入。"""
+    _integration_guard(request, x_api_key)
+    return api_emr_get(record_id)
