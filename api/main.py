@@ -43,7 +43,7 @@ from core.react import react_enabled
 from core import usage as usage_mod
 from core.physicians import (
     PHYSICIANS,
-    SYNTHESIS_DISPLAY,
+    synthesis_display,
     physicians_all,
     physicians_enabled,
     resolve_physician_id,
@@ -1102,6 +1102,10 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         "insufficient": False,
         "insufficient_reason": None,
         "coverage": outcome.get("coverage"),
+        # R44：这一次代理做过的决策（停/问/取证/验）。**给所有角色**——
+        # 患者最需要知道的正是"为什么让我去急诊"，而那句话就在这里。
+        # 规则表在 core/agent.py，这里只是原样下发。
+        "agent_trace": outcome.get("agent_trace") or [],
         "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
         "residual": _serialize_residual(outcome.get("residual")),
         # 拒绝也要带追问记录：被拦下来的原因可能正是追问问出来的，
@@ -1531,7 +1535,7 @@ def _serialize_result(r: dict) -> dict:
     # （见 core/physicians.py::SYNTHESIS_DISPLAY 的注释——它不是一位医家）。
     # 查不到就退到那份展示元数据，而不是退到灰色兜底：灰色在前端表示"未知医家"。
     info = physicians_all(PHYSICIANS).get(r["physician"]) or (
-        SYNTHESIS_DISPLAY if r["physician"] == SYNTHESIS_PHYSICIAN_ID else {})
+        synthesis_display() if r["physician"] == SYNTHESIS_PHYSICIAN_ID else {})
     return {
         "physician": r["physician"],
         "physician_name": r["physician_name"],

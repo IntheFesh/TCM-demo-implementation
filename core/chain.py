@@ -72,6 +72,7 @@ from core.retrieval_hybrid import (
     RETRIEVER_MODE_ENV,
     effective_mode,
 )
+from core.agent import AgentTrace, decide
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
 from core.formula_check import advice_dicts, check_formula
 from core.formula_verifier import (
@@ -1352,14 +1353,31 @@ class SymbolicVeto(Exception):
                 "请换用人工复核，或补充更多症状信息后重试。")
 
 
-#: 结构化模式下这份"综合诊断"在 `results` 里的身份。
+#: 结构化模式下这份结论在 `results` 里的身份。
 #:
 #: `results` 的元素结构是既有契约（前端、分歧度、eval 收集器都按它读），
 #: structured 模式只有**一个**元素，但它仍然需要一个 `physician` 值。
 #: 用一个**不在注册表里**的保留 id 而不是随便挑一位医家的 id：挑一位的话
 #: 「这份结论是叶天士给的」这句话就是假的，而前端会照着把它显示成叶天士的方。
 SYNTHESIS_PHYSICIAN_ID = "synthesis"
-SYNTHESIS_PHYSICIAN_NAME = "五家综合"
+
+#: **R44：显示名从「五家综合」改成「本次辨证」。**
+#:
+#: 「五家综合」把这份结论说成"几个人拼出来的"——那是**内部机制**，不是产品形态。
+#: 总纲 §12 的原话是「能力不删，产品面不露」：五家各出一份再融合这件事照旧
+#: 在跑（`run_synthesis` 一行没改），研究面（researcher 角色）照旧拿到三列与
+#: 分歧读数；变的是**结论顶上那句话**。
+#:
+#: 为什么是「本次辨证」而不是某个人名或者某个产品名：
+#:   - 人名是假的（这份结论不是哪一位医家给的）；
+#:   - 产品名会让这句话变成广告；
+#:   - 「本次辨证」如实说出这是什么——**这一次问诊的辨证结论**，
+#:     而名老中医经验是它引用的依据（`physician_influences` 逐条标着谁、哪一步）。
+#:
+#: 这不是把能力藏起来：谁贡献了哪一步仍然在 `physician_influences` 里逐条可查，
+#: 九段界面照样显示「叶天士·取象」这种归属。改的是**框架**——从"几个人投票"
+#: 改成"一位医师引用了几家的经验"。
+SYNTHESIS_PHYSICIAN_NAME = "本次辨证"
 
 
 def run_synthesis(
@@ -2185,6 +2203,41 @@ def consult(
     # demo 模式下这次请求会被拦截的原因（最早触发的那个）。EVAL_MODE 打开时
     # 链路继续往下走，但这个字段仍然如实记着"本来会被拦"，两种模式同一套语义。
     safety_flag: str | None = None
+    # R44：这一次代理做过的决策（停/问/取证/验）。规则表在 core/agent.py，
+    # 这里只记录——判断仍然在各自的模块里。
+    trace = AgentTrace()
+
+    def _stopped(decision, **state) -> dict:
+        """**一份**"停下来"的返回值。
+
+        R44 之前这个 dict 在 `consult()` 里有四份拷贝（危重主诉 / 追问命中 /
+        追问确认命中 / 证素为空），而且已经开始漂——其中一份带 `"coverage": None`、
+        另一份没有，键的顺序也各不相同。前端按同一份契约读，缺一个键就是 KeyError。
+
+        键集跟正常路径保持一致；`state` 里给什么就覆盖什么（被拦时 s2/residual
+        有没有值随触发点而定）。
+        """
+        base = {
+            "s1": s1,
+            "results": [],
+            "divergence": None,
+            "rejected": decision.stop_kind == "safety",
+            "reject_reason": decision.detail,
+            "safety_flag": safety_flag,
+            "retrieval_error": None,
+            "s2": None,
+            "residual": None,
+            "followup": None,
+            "insufficient": decision.stop_kind == "evidence",
+            "insufficient_reason": None,
+            "coverage": None,
+            "agent_trace": trace.to_list(),
+            "manifest": _build_manifest(
+                int((time.time() - _t0) * 1000), state.pop("_calls", 1), use_react,
+                retriever_mode=retriever_mode, s3_mode_used=mode),
+        }
+        base.update(state)
+        return base
     # R36：S1+S2 合不合**一次 consult 只判一次**（同 use_react / bypass / mode 那条
     # 纪律）：中途有人改环境变量时，同一个请求的调用数结算和实际发生的次数不会错位。
     merged_s1s2 = s1s2_merged()
@@ -2204,25 +2257,14 @@ def consult(
     # （s1_normalize.yaml 明确要求含糊的病史表述放 unmapped），只查 symptoms 会漏。
     reject_reason = check_safety([complaint] + s1.symptoms + s1.unmapped)
     safety_flag = safety_flag or reject_reason
-    if reject_reason is not None and not bypass:
-        # 键集跟正常路径保持一致：api/前端按同一份契约读，缺键就是 KeyError。
-        #
+    stop = decide("danger_in_complaint", reject_reason, bypass=bypass)
+    if stop is not None:
+        trace.decisions.append(stop)
         # **合一模式下 `s2_pending` 里已经有证素了，这里把它丢掉、照旧返回
         # `s2: None`。** 对外可见的行为跟分两次那条路逐字段一致（被拦截的请求
         # 不产出证素、不产出方药）。这也正是 `normalize_and_infer_merged` 默认
         # 关着的理由：丢掉是流程约定，没算过才是结构保证。
-        return {
-            "s1": s1,
-            "results": [],
-            "divergence": None,
-            "rejected": True,
-            "reject_reason": reject_reason,
-            "safety_flag": safety_flag, "retrieval_error": None,
-            "s2": None, "residual": None, "followup": None,
-            "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react,
-                                        retriever_mode=retriever_mode, s3_mode_used=mode),
-        }
+        return _stopped(stop, _calls=1)
 
     # 合一模式下这一步不再调模型（证素跟症状是同一次调用的产出）。
     s2 = s2_pending if s2_pending is not None else infer_elements(s1)
@@ -2243,43 +2285,31 @@ def consult(
     emit("followup_done", stopped_by=followup.stopped_by,
          stopped_by_label=stop_label(followup.stopped_by), rounds=followup.rounds,
          asserted=followup.asserted, denied=followup.denied)
+    # R44：**问过就记一笔**（问了 0 轮不记——那时这个能力没上场）。
+    if followup.rounds:
+        trace.record("ask_for_missing_symptoms",
+                     f"问了 {followup.rounds} 轮，确认 {len(followup.asserted)} 条、"
+                     f"否认 {len(followup.denied)} 条；停因：{stop_label(followup.stopped_by)}")
     extra_calls = 0
     if followup.stopped_by == "safety":
         # 追问问出危重症状 = 跟初始主诉命中同一道否决，同样不产出任何方药。
         # CLAUDE.md：追问是安全否决层的后门，这里堵上。
         safety_flag = safety_flag or followup.reject_reason
-    if followup.stopped_by == "safety" and not bypass:
-        return {
-            "s1": s1,
-            "results": [],
-            "divergence": None,
-            "rejected": True,
-            "reject_reason": followup.reject_reason,
-            "safety_flag": safety_flag, "retrieval_error": None,
-            "s2": s2,
-            "followup": followup,
-            "residual": None, "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000), s1s2_calls, use_react,
-                retriever_mode=retriever_mode, s3_mode_used=mode,
-            ),
-        }
+    stop = decide("danger_in_followup_answer",
+                  followup.reject_reason if followup.stopped_by == "safety" else None,
+                  bypass=bypass)
+    if stop is not None:
+        trace.decisions.append(stop)
+        return _stopped(stop, s2=s2, followup=followup, _calls=s1s2_calls)
     if followup.asserted:
         # 双保险：run_followup 已经把危重症状挡在 asserted 之外，这里再查一次是防
         # 将来有人改了 followup 的判据却没意识到这条症状会一路进 S2/S3。
         reject = check_safety(followup.asserted)
         safety_flag = safety_flag or reject
-        if reject is not None and not bypass:
-            return {
-                "s1": s1, "results": [], "divergence": None,
-                "rejected": True, "reject_reason": reject,
-                "safety_flag": safety_flag, "retrieval_error": None,
-                "s2": s2, "followup": followup, "residual": None,
-                "insufficient": False, "insufficient_reason": None, "coverage": None,
-                "manifest": _build_manifest(int((time.time() - _t0) * 1000), s1s2_calls,
-                                        use_react, retriever_mode=retriever_mode,
-                                        s3_mode_used=mode),
-            }
+        stop = decide("danger_in_asserted", reject, bypass=bypass)
+        if stop is not None:
+            trace.decisions.append(stop)
+            return _stopped(stop, s2=s2, followup=followup, _calls=s1s2_calls)
         # 追问确认的是国标症状名（来自图谱节点），本身已经是标准表述，不需要再过
         # S1——这不违反"S1 全局只跑一次"，S1 一次也没有多跑。
         s1 = S1Normalize(
@@ -2305,30 +2335,19 @@ def consult(
     # 而且输出的方药没有任何可追溯的依据。宁可如实说信息不足。
     coverage = len(explained_symptoms(s1, s2, residual)) / (len(s1.symptoms) or 1)
 
-    if not s2.elements and not (residual and residual["s2"].elements):
-        return {
-            "s1": s1,
-            "results": [],
-            "divergence": None,
-            "rejected": False,
-            "reject_reason": None,
-            "s2": s2,
-            "residual": residual,
-            "followup": followup,
-            "insufficient": True,
-            "insufficient_reason": (
+    stop = decide("no_elements", not s2.elements and not (residual and residual["s2"].elements))
+    if stop is not None:
+        trace.decisions.append(stop)
+        return _stopped(
+            stop, s2=s2, residual=residual, followup=followup,
+            insufficient_reason=(
                 "现有症状不足以推断证素，无法进行有依据的辨证。"
                 "请补充更多信息：起病与加重缓解的诱因、疼痛或不适的性质与部位、"
                 "饮食与二便情况、寒热喜恶、舌象与脉象。"
             ),
-            "coverage": round(coverage, 3),
-            "safety_flag": safety_flag, "retrieval_error": None,
-            "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000),
-                s1s2_calls + extra_calls + (1 if residual else 0), use_react,
-                retriever_mode=retriever_mode, s3_mode_used=mode,
-            ),
-        }
+            coverage=round(coverage, 3),
+            _calls=s1s2_calls + extra_calls + (1 if residual else 0),
+        )
     results = []
     try:
         _run_physicians_into(
@@ -2351,17 +2370,16 @@ def consult(
             + sum(len(r["candidates_scored"]) for r in results)
             + _reopen_calls(results)
         )
-        return {
-            "s1": s1, "results": [], "divergence": None,
-            "rejected": True, "reject_reason": veto.reason,
-            "safety_flag": safety_flag or veto.reason, "retrieval_error": None,
-            "s2": s2, "followup": followup, "residual": residual,
-            "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
-                                        retriever_mode=retriever_mode, s3_mode_used=mode,
-                                        knowledge=_aggregate_knowledge(results),
-                                        streaming=_aggregate_streaming(results)),
-        }
+        safety_flag = safety_flag or veto.reason
+        stop = trace.record("danger_in_react_answer", veto.reason)
+        return _stopped(
+            stop, s2=s2, followup=followup, residual=residual,
+            reject_reason=veto.reason, safety_flag=safety_flag,
+            manifest=_build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
+                                     retriever_mode=retriever_mode, s3_mode_used=mode,
+                                     knowledge=_aggregate_knowledge(results),
+                                     streaming=_aggregate_streaming(results)),
+        )
     except SymbolicVeto as veto:
         # R34：符号验证的 veto 级违规改了 MAX_REVISE_ROUNDS 轮还在——这张方不下发。
         # **跟 SafetyVeto 分两个分支而不是合成一个**：两者该对用户说的话不同
@@ -2373,24 +2391,26 @@ def consult(
             + veto.llm_calls
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
         )
-        return {
-            "s1": s1, "results": [], "divergence": None,
-            "rejected": True, "reject_reason": veto.reason,
-            # `safety_flag` 留给安全层，**不复用**：它的语义是"危重症状"，
-            # 而这里的原因是"方不合规"。前端按这两个字段走不同的提示文案。
-            "safety_flag": safety_flag,
-            "verification_veto": [
+        stop = trace.record("symbolic_veto", veto.reason)
+        return _stopped(
+            stop, s2=s2, followup=followup, residual=residual,
+            # **`rejected` 仍然是 True**：方不下发这件事对调用方来说跟安全拦截
+            # 一样是"这次没有方"。区别在 `safety_flag`（留给安全层，不复用——
+            # 它的语义是"危重症状"，而这里的原因是"方不合规"）与
+            # `verification_veto`（只有这一条路径有），前端按这两个字段走
+            # 不同的提示文案。
+            rejected=True,
+            reject_reason=veto.reason,
+            safety_flag=safety_flag,
+            verification_veto=[
                 {"rule": v.rule, "herbs": list(v.herbs), "reason": v.reason,
                  "counterexample": v.counterexample} for v in veto.violations
             ],
-            "retrieval_error": None,
-            "s2": s2, "followup": followup, "residual": residual,
-            "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
-                                        retriever_mode=retriever_mode, s3_mode_used=mode,
-                                        knowledge=_aggregate_knowledge(results),
-                                        streaming=_aggregate_streaming(results)),
-        }
+            manifest=_build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
+                                     retriever_mode=retriever_mode, s3_mode_used=mode,
+                                     knowledge=_aggregate_knowledge(results),
+                                     streaming=_aggregate_streaming(results)),
+        )
     except RetrievalUnavailable as e:
         # 选的检索模式这台机器上没有对应数据（graph 缺 element_index.json 之类）。
         # 已经跑完的医家结果也不返回：一半医家用了这个模式、另一半没有的话，
@@ -2401,6 +2421,9 @@ def consult(
             "s1": s1, "results": [], "divergence": None,
             "rejected": False, "reject_reason": None,
             "safety_flag": safety_flag,
+            # 键集跟其余返回点一致（这一条不是"代理的决策"，是环境缺数据，
+            # 所以 agent_trace 里照实是这一次已经发生过的那些决策，可能为空）。
+            "agent_trace": trace.to_list(),
             "retrieval_error": (
                 f"检索模式「{e.mode}」在这台机器上不可用：{e.detail} "
                 # 真实冒烟里踩到的：默认模式本身跑不了（没有 cases.json）时还建议
@@ -2554,6 +2577,18 @@ def consult(
         "epsilon_for_query": load_epsilon_for_query(complaint),
     }
 
+    # R44：**取证与自验这两条能力发生过就记一笔。** 从 results 里现算，
+    # 不在各处埋点——埋点必然漏一处，而漏掉的表现是"那一步好像没做"。
+    n_react = sum(1 for r in results if r.get("react_trace"))
+    if n_react:
+        steps = sum(len(r["react_trace"].steps) for r in results if r.get("react_trace"))
+        trace.record("gather_evidence", f"取证 {steps} 步（{n_react} 条推理链）")
+    n_verified = sum(1 for r in results if r.get("verification"))
+    if n_verified:
+        reopened = _reopen_calls(results)
+        trace.record("verify_and_revise",
+                     f"验了 {n_verified} 份处方" + (f"，重开 {reopened} 次" if reopened else "，一次通过"))
+
     return {
         "s1": s1,
         "results": results,
@@ -2567,6 +2602,7 @@ def consult(
         "insufficient": False,
         "insufficient_reason": None,
         "coverage": round(coverage, 3),
+        "agent_trace": trace.to_list(),
         # S1/S2 这一段（合一 1 次、分开 2 次，见 s1s2_calls）+ 每位医家 S3 一次
         # + 残差一次 + 配伍禁忌重开若干次。重开必须计进来：漏算的话 manifest 报的
         # 调用数会低于实际花费，拿它算成本或比配置就都是错的。

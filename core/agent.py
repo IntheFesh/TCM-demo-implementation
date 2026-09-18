@@ -46,6 +46,20 @@
 
 **三、这一层不碰数据，只回答"该做什么"。** `decide()` 是纯函数：喂一份状态，
 返回一个决策。所以它能被逐条断言，不用起模型、不用起服务。
+
+## 规则表**不是控制流**（这一点容易误解）
+
+`stop` 这一族是真的由规则表拦下来的：`consult()` 问 `decide()`，命中就返回。
+
+`ask` / `gather` / `verify` 这三族**不是**——它们仍然由 `consult()` 按流程直接调，
+规则表只在它们发生之后记一笔。这是有意的：那三件事的触发条件天然在各自模块
+内部（`run_followup` 自己算信息增益、`run_react` 自己决定要不要再走一步、
+验证器自己按七条规则判），把触发权挪到这张表，就会变成"表里放一个空壳条件、
+真条件还在模块里"——**那正是这一层要消灭的第二处实现**。
+
+所以规则表在这三条上的作用是**命名与解释**（这件事叫什么、为什么做），
+不是控制流。写在这里是为了让下一个想"把它们也改成 decide() 驱动"的人先看到
+这段话。
 """
 from __future__ import annotations
 
@@ -135,7 +149,7 @@ AGENT_RULES: tuple[AgentRule, ...] = (
         capability="stop", stop_kind="evidence",
         why="证素层为空，结构化推理没有落点。继续开方等于绕开证素看主诉猜证型，"
             "那样的方药没有可追溯的依据——宁可如实说信息不足。",
-        gate="core.elements:infer_elements",
+        gate="core.chain:infer_elements",
     ),
     AgentRule(
         id="symbolic_veto",

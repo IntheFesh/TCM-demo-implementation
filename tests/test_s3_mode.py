@@ -238,7 +238,8 @@ def test_structured_consult_returns_exactly_one_result(structured, monkeypatch):
     assert len(out["results"]) == 1, "五家融合只出一份答案"
     r = out["results"][0]
     assert r["physician"] == chain.SYNTHESIS_PHYSICIAN_ID == "synthesis"
-    assert r["physician_name"] == "五家综合"
+    from core.chain import SYNTHESIS_PHYSICIAN_NAME
+    assert r["physician_name"] == SYNTHESIS_PHYSICIAN_NAME
     assert r["s3"].syndrome == "脾胃气虚证"
     assert len(r["s3"].formula_candidates) == 1
 

@@ -1917,6 +1917,26 @@ function stripDose(name) {
 
 // 九段的填充。**每一段的数据来源写在对应分支的注释里**——一段填不出来时
 // 显示的是"这一步没有产出"而不是空白（空白看起来像坏了）。
+//: 代理决策的一行。**`why` 是制度、`detail` 是这一次的证据，两行分开**
+//: ——合成一句的话，读者分不清"系统一向这么做"和"这次是因为你说了这句话"。
+function agentTraceHtml(trace) {
+  const rows = (trace || []).filter((d) => d && d.capability);
+  if (!rows.length) return "";
+  const items = rows.map((d) => {
+    const kind = d.stop_kind_label
+      ? `<span class="agent-kind">${escapeHtml(d.stop_kind_label)}</span>` : "";
+    return `<li class="agent-step" data-capability="${escapeHtml(d.capability)}">
+      <span class="agent-cap">${escapeHtml(d.capability_label || d.capability)}</span>${kind}
+      <span class="agent-why">${escapeHtml(d.why || "")}</span>
+      ${d.detail ? `<span class="agent-detail">${escapeHtml(d.detail)}</span>` : ""}
+    </li>`;
+  }).join("");
+  return `<section class="agent-trace" aria-label="本次辨证的处理决策">
+      <div class="agent-trace-title">本次处理经过</div>
+      <ol class="agent-steps">${items}</ol>
+    </section>`;
+}
+
 function renderChainFlow(data) {
   const el = document.getElementById("chain-flow");
   if (!el) return;
@@ -1929,18 +1949,26 @@ function renderChainFlow(data) {
   const parts = [];
 
   // **这条链是谁的**：三列有列头，单链没有——名字要是不写在链顶上，页面上就只有
-  // §⑨ 的归因里能翻出来。而"五家综合"和"叶天士一家"是两种完全不同的结论
-  // （structured 给的是综合，legacy 单跑一家给的是那一家），读的人必须一眼看见
-  // 自己在看哪一种。引到几位医家的医案照实数（`physicians_cited`），
-  // 不拿"五家"这个名字当数——名字是配置，数是这次真跑出来的。
+  // §⑨ 的归因里能翻出来。而「本次辨证」（structured：融合出的一份结论）和
+  // 「叶天士一家」（legacy：单跑一家）是两种完全不同的结论，读的人必须一眼看见
+  // 自己在看哪一种。引用了几家的经验照实数（`physicians_cited`），
+  // 不拿配置里的家数当数——名字是配置，数是这次真跑出来的。
   const cited = new Set([...(r.physicians_cited || []),
                          ...(r.physician_influences || []).map((x) => x.physician)]);
   parts.push(`<header class="chain-head">`
     + `<span class="chain-who">${escapeHtml(r.physician_name || pid)}</span>`
     + (r.school ? `<span class="chain-school">${escapeHtml(r.school)}</span>` : "")
     + (cited.size
-        ? `<span class="chain-note">本次引到 ${cited.size} 位医家的医案</span>` : "")
+        // R44：措辞从「引到 N 位医家」改成「引用名老中医经验 N 家」。
+        // 前者读起来像"有 N 个人参与了这次判断"（投票），后者说的是
+        // "这一份判断引用了 N 家的经验"（依据）。同一个数、同一份数据，
+        // 改的是它在产品面上表达的关系。
+        ? `<span class="chain-note">引用名老中医经验 ${cited.size} 家</span>` : "")
     + `</header>`);
+  // R44：代理这一次做过的决策（停/问/取证/验）。**摆在链顶下面、九段上面**：
+  // 它回答的是"系统在这一步做了什么、凭什么"，而三甲的主治医师问的正是这个。
+  // 中文名由后端下发（`capability_label` / `stop_kind_label`），前端不写死。
+  parts.push(agentTraceHtml(data.agent_trace));
 
   for (const sec of CHAIN_SECTIONS) {
     let body = "";
@@ -2042,7 +2070,7 @@ function renderChainFlow(data) {
           + `<span class="chain-key">分母＝本方药味数</span>`);
       }
       if ((r.physicians_cited || []).length) {
-        body += chainLine("引到的医家", (r.physicians_cited || []).map((x) =>
+        body += chainLine("引用的名老中医经验", (r.physicians_cited || []).map((x) =>
           escapeHtml(physicianName(x))).join("、"));
       }
       for (const inf of (r.physician_influences || [])) {

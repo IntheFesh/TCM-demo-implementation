@@ -33,6 +33,7 @@ import sys
 import time
 from pathlib import Path
 
+from core.chain import SYNTHESIS_PHYSICIAN_NAME
 from scripts.screenshot_ui import _chromium_path, _free_port, _wait_ready
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -76,6 +77,7 @@ PREFIX = {
     # R42：九层图 + 层名列头 + tooltip 钉住 + 窄屏抽屉 + 图谱浏览器聚焦
     "graph_layer_bands": "r42", "graph_tooltip_pinned": "r42",
     "node_explain_drawer": "r42", "browser_focus": "r42",
+    "agent_trace": "r44",
     "advice_panel": "r24", "rings": "r24",
 }
 
@@ -312,7 +314,8 @@ DONE_PAYLOAD = {
 S33_RESULT = json.loads(json.dumps(RESULTS[0]))
 S33_RESULT.update({
     "physician": "synthesis",
-    "physician_name": "五家综合",
+    # R44：名字从后端常量取，不手抄——改名时手抄的那份会漏。
+    "physician_name": SYNTHESIS_PHYSICIAN_NAME,
     "color": "#3B4A6B",
     "school": None,
     "years": None,
@@ -431,7 +434,8 @@ def _r37_payload():
     flat = st.to_s3_syndrome()
     # **`s3_structured` 必须一起传**：`flat` 是扁平化之后的那一份，病机与治法
     # 两层的原件只在结构化那一份里（见 api.main.to_graph 里那段注释）。
-    graph = to_graph(s1, [{"physician": "synthesis", "physician_name": "五家综合",
+    graph = to_graph(s1, [{"physician": "synthesis",
+                           "physician_name": SYNTHESIS_PHYSICIAN_NAME,
                            "s3": flat, "s3_structured": st, "s2": s2}], s2=s2)
     result = {
         **json.loads(json.dumps(S33_RESULT)),
@@ -474,6 +478,23 @@ def _r37_payload():
 
 
 R37_DONE_PAYLOAD = _r37_payload()
+
+
+def _agent_trace():
+    """四条决策各一类。**用真的 `AgentTrace` 造，不手写 dict**——手写的那份
+    会漏掉后端随决策一起下发的中文名（`capability_label` / `stop_kind_label`），
+    而截图判据查的正是"界面上显示的是中文名不是 id"。"""
+    from core.agent import AgentTrace
+
+    tr = AgentTrace()
+    tr.record("ask_for_missing_symptoms", "问了 2 轮，确认 1 条、否认 1 条；停因：信息增益不足")
+    tr.record("gather_evidence", "取证 3 步（1 条推理链）")
+    tr.record("verify_and_revise", "验了 1 份处方，重开 1 次")
+    tr.record("symbolic_veto", "甘草 与 甘遂 属配伍禁忌")
+    return tr.to_list()
+
+
+AGENT_TRACE = _agent_trace()
 
 # R24：建议层 + token 面板的 fixture。三档 severity 各一条（三档画成一样就等于
 # 没渲染），另带一条"没跑的规则"（那一行的存在本身就是 R23 的判据）。
@@ -1325,6 +1346,48 @@ STATES = {
           return null;
         }""",
     ),
+    # ---------- R44：代理决策（本次处理经过） ----------
+    "agent_trace": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult({...R37_DONE_PAYLOAD, agent_trace: AGENT_TRACE});",
+        """() => {
+          const box = document.querySelector('.agent-trace');
+          if (!box) return '「本次处理经过」这一块没渲染';
+          if (box.offsetParent === null) return '有这一块但没在版面上';
+          const steps = [...box.querySelectorAll('.agent-step')];
+          if (steps.length !== 4) return '不是四条决策，是 ' + steps.length;
+          // 四能力的中文名由后端下发，前端不写死——这里验它们真的显示出来了
+          const caps = steps.map(s => s.querySelector('.agent-cap').textContent.trim());
+          for (const want of ['中止', '追问', '取证', '自验']) {
+            if (!caps.includes(want)) return '少了「' + want + '」这一类：' + caps.join('/');
+          }
+          // 中止那一条要看得出来跟别的不一样（左边竖线是朱砂）
+          const stop = box.querySelector('.agent-step[data-capability="stop"]');
+          if (!stop) return '中止那一条没有 data-capability 标记';
+          const cs = getComputedStyle(stop);
+          const other = getComputedStyle(
+            box.querySelector('.agent-step:not([data-capability="stop"])'));
+          if (cs.borderLeftColor === other.borderLeftColor)
+            return '中止那一条跟其余几条长得一样';
+          // `why`（制度）与 `detail`（这一次的证据）必须是两行
+          const withDetail = steps.find(s => s.querySelector('.agent-detail'));
+          if (!withDetail) return '没有一条显示了本次的证据（detail）';
+          if (getComputedStyle(withDetail.querySelector('.agent-detail')).display !== 'block')
+            return 'detail 没有单独一行，跟 why 混在一起了';
+          // 链顶要在这一块上面（先说「这是谁的结论」，再说「怎么得出来的」）
+          const head = document.querySelector('#chain-flow .chain-head');
+          if (!head) return '链顶不见了';
+          if (head.getBoundingClientRect().top > box.getBoundingClientRect().top)
+            return '决策块摆到链顶上面去了';
+          // R44：产品面不许出现投票措辞
+          const text = document.getElementById('chain-flow').innerText || '';
+          for (const bad of ['投票', '表决', '五家综合', '得票']) {
+            if (text.includes(bad)) return '产品面上出现了「' + bad + '」';
+          }
+          if (!text.includes('本次辨证')) return '链顶不是「本次辨证」';
+          return null;
+        }""",
+    ),
     # ---------- R42：窄屏（768px）释义抽屉 ----------
     "node_explain_drawer": (
         "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
@@ -1391,13 +1454,15 @@ STATES = {
           if (box.height < 100) return '单链几乎没有内容，高 ' + Math.round(box.height);
           const who = flow.querySelector('.chain-head .chain-who');
           if (!who) return '链顶没有"这是谁的结论"';
-          if (!(who.textContent || '').includes('五家综合'))
-            return '链顶写的不是「五家综合」，是 ' + who.textContent;
+          // R44：链顶写的是「本次辨证」，不是「五家综合」——后者把这份结论
+          // 说成"几个人拼出来的"，那是内部机制不是产品形态（消除投票痕迹）。
+          if (!(who.textContent || '').includes('本次辨证'))
+            return '链顶写的不是「本次辨证」，是 ' + who.textContent;
           // 引到几位照实数：这份 payload 的 physicians_cited 是 ye_tianshi/li_ke 两位,
           // **不许拿"五家"这个名字当数**（名字是配置，数是这次真跑出来的）
           const note = flow.querySelector('.chain-head .chain-note');
-          if (!note || !(note.textContent || '').includes('2 位'))
-            return '引到的医家数不对：' + (note ? note.textContent : '没这一行');
+          if (!note || !(note.textContent || '').includes('2 家'))
+            return '引用的名老中医经验家数不对：' + (note ? note.textContent : '没这一行');
           const text = flow.innerText || '';
           if (!text.includes('肝胃不和证')) return '证型没有渲染出来';
           // divergence 为 null 时处方对照区不该摆出一张空表
@@ -1672,6 +1737,8 @@ def run(only: str | None, wait_ms: int) -> int:
                                    ("S33_DONE_PAYLOAD", S33_DONE_PAYLOAD),
                                    # R37：单链九段 + 单链图（用真 schema 构造）
                                    ("R37_DONE_PAYLOAD", R37_DONE_PAYLOAD),
+                                   # R44：代理决策
+                                   ("AGENT_TRACE", AGENT_TRACE),
                                    ("COMPLAINT", COMPLAINT)):
                     page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
                 # setup 里可能有 await（图谱浏览器要先把数据拉回来），
