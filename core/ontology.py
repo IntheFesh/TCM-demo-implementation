@@ -304,6 +304,19 @@ class Ontology:
         canon = self._by_alias.get(n)
         return self.herbs.get(canon) if canon else None
 
+    def herbs_batch(self, names: list[str] | tuple[str, ...]) -> dict[str, Herb | None]:
+        """一次解析一批药名。**"这些药在本体里是什么"这个问题的唯一批量入口。**
+
+        R40：符号验证器七条规则各自逐味 `ont.herb()`，一张 12 味的方要查 7×12 = 84
+        次（每次都重跑一遍 `normalize_herb`）。这个方法让调用方只问一次，
+        重复的名字只归一一次。
+
+        查不到的名字**保留键、值为 None**，不从结果里省掉——省掉的话调用方
+        分不清"没查"和"查了没有"，而那正是这一层最要紧的区分
+        （`Unverifiable` 与 `Violation` 的分界）。
+        """
+        return {n: self.herb(n) for n in dict.fromkeys(names)}
+
     def herbs_by_meridian(self, meridian: str) -> list[Herb]:
         return [h for h in self.herbs.values() if meridian in h.meridians]
 

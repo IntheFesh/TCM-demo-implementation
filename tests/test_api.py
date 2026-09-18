@@ -26,7 +26,7 @@ def _fake_outcome() -> dict:
             "physician_name": "叶天士",
             "s2": s2,
             "s3": s3,
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         }
     ]

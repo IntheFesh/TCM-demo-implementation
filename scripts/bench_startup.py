@@ -47,6 +47,50 @@ BENCH_DIR = ROOT / "eval" / "bench"
 
 SEGMENTS = ("import", "construct", "model_load", "encode")
 
+#: R40：预热并行化的改前改后对照。**必须各起一个新进程**——本体层和检索器
+#: 都是进程级单例，同一个进程里量第二遍全是 0。
+_WARMUP_SNIPPET = """
+import json, sys, time
+sys.path.insert(0, {root!r})
+from api.warmup import WarmupTracker, run_warmup
+t0 = time.perf_counter()
+snap = run_warmup(WarmupTracker(), parallel={parallel})
+snap["wall_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+print("@@" + json.dumps(snap, ensure_ascii=False))
+"""
+
+
+def warmup_compare(*, repeat: int = 1) -> dict:
+    """串行预热 vs 并行预热，各跑 `repeat` 次新进程，取中位数。
+
+    为什么这个数值得单独量：两项预热（本体层 2.4s、检索器编码 5~9s）之间
+    **没有依赖**，串行跑纯粹是当初顺着写下来的。省下来的是两者中较小的那一段，
+    而"省了多少"只有真跑才说得准——GIL 下两个线程并不是完全并行，
+    本体层那 2.4 秒里有多少是纯 CPU（抢 GIL、省不掉）取决于 jsonl 解析本身。
+    """
+    import statistics
+    import subprocess
+
+    out: dict = {"repeat": repeat, "runs": {"serial": [], "parallel": []}}
+    for mode, parallel in (("serial", "False"), ("parallel", "True")):
+        for _ in range(max(1, repeat)):
+            code = _WARMUP_SNIPPET.format(root=str(ROOT), parallel=parallel)
+            proc = subprocess.run([sys.executable, "-c", code], check=False,
+                                  capture_output=True, text=True, timeout=900)
+            line = next((ln[2:] for ln in proc.stdout.splitlines()
+                         if ln.startswith("@@")), None)
+            if line is None:
+                out["runs"][mode].append({"error": (proc.stderr or proc.stdout)[-300:]})
+                continue
+            out["runs"][mode].append(json.loads(line))
+    for mode in ("serial", "parallel"):
+        walls = [r["wall_ms"] for r in out["runs"][mode] if "wall_ms" in r]
+        out[f"{mode}_wall_ms"] = round(statistics.median(walls), 1) if walls else None
+    a, b = out.get("serial_wall_ms"), out.get("parallel_wall_ms")
+    out["saved_ms"] = round(a - b, 1) if (a and b) else None
+    out["saved_pct"] = round((a - b) / a * 100, 1) if (a and b) else None
+    return out
+
 
 class _Stopwatch:
     """按段累计耗时。同一段被进入多次就累加（编码分批时会发生）。"""
@@ -178,7 +222,31 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--skip-import", action="store_true",
                     help="不量 import api.main（只想看检索层那三段时用）")
     ap.add_argument("--out", default=None, help="默认 eval/bench/startup_<时间戳>.json")
+    ap.add_argument("--warmup-compare", type=int, default=0, metavar="N",
+                    help="只跑预热并行化的改前改后对照：串行/并行各 N 个新进程，"
+                         "取中位数。不量 import、不量检索层三段")
     args = ap.parse_args(argv)
+
+    if args.warmup_compare:
+        cmp_report = warmup_compare(repeat=args.warmup_compare)
+        cmp_report.update({
+            "kind": "warmup_parallel_compare",
+            "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        out = Path(args.out) if args.out else \
+            BENCH_DIR / f"warmup_compare_{int(time.time())}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(cmp_report, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        print(f"  串行 {cmp_report['serial_wall_ms']} ms  →  "
+              f"并行 {cmp_report['parallel_wall_ms']} ms  "
+              f"（省 {cmp_report['saved_ms']} ms / {cmp_report['saved_pct']}%）")
+        for mode in ("serial", "parallel"):
+            for r in cmp_report["runs"][mode]:
+                if "error" in r:
+                    print(f"  ✗ {mode}: {r['error']}", file=sys.stderr)
+        print(f"→ {out}")
+        return 0
 
     watch = _Stopwatch()
     synthetic = args.self_test > 0

@@ -79,59 +79,67 @@ _consult_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONSULTS)
 MAX_COMPLAINT_CHARS = 2000
 MAX_ANSWER_CHARS = 500
 
+#: SSE 事件队列的上限。R40 背压。取 2000 的依据：一次问诊的增量事件实测在
+#: 千条量级（`S3DeltaEmitter` 每积累到一定字数发一条），2000 给了一倍余量，
+#: 而每条事件的字典很小（几十到几百字节），2000 条 ≈ 几百 KB/流。
+#: 上限太小会让正常的快客户端也开始丢增量；太大就退化成无上限。
+SSE_QUEUE_MAXSIZE = int(os.environ.get("SSE_QUEUE_MAXSIZE", "2000"))
+
+#: 非增量事件最多等多久。超过就按"客户端不读了"收尾。
+#: 生成器每 50ms 轮询一次队列，正常情况下这个等待是微秒级；30 秒还塞不进去
+#: 说明连接真的死了（TCP 窗口关死、对端不再 ack）。
+SSE_PUT_TIMEOUT_SECONDS = float(os.environ.get("SSE_PUT_TIMEOUT_SECONDS", "30"))
+
+#: 队列满时**可以丢**的事件名。只有"同一段文字的逐步生成"属于这一类：
+#: 它们的终值由 `s3_done` / `done` 兜底，丢掉不影响结果的正确性。
+#: **这张表只许收窄，不许扩张**——把 `need_input` 或 `done` 放进来就等于
+#: 允许静默丢结果。
+SSE_DROPPABLE_EVENTS = frozenset({"s3_delta"})
+
 
 def _warmup() -> None:
-    """启动时预热，把首请求那几十秒挪到启动阶段。**每一项失败都不阻塞启动**
-    ——数据不全时服务仍应能起来，预热不是前置条件。
+    """启动时预热，把首请求那几十秒挪到启动阶段。**两项并行**，每一项失败
+    都不阻塞启动——数据不全时服务仍应能起来，预热不是前置条件。
 
-    两项，各自 try：
-      1. 检索器（加载模型 + 编码医案）
-      2. **本体层**（R34 加）：药理层数据进版本控制之后，
-         `get_ontology()` 首次加载实测 **2057 ms**（1232 味 / 235 首），
-         而它是在**第一个问诊请求里**被惰性触发的——R32 的知识块、R34 的七条规则
-         都要它。不预热的话那 2 秒算在首个患者的等待时间里。
-         实测发现的方式很偶然：`test_chain_parallel` 那条并发计时测试
-         从 0.3s 级涨到 1.02s，而它测的是并发、不是本体。
+    实现整个在 `api/warmup.py`（状态机 + 并行 + 进度快照），这里只是一层壳：
+    `/health` 要报进度，进度就得有个地方存，而那份状态跟"跑预热"是同一件事的
+    两面，分在两个模块里会各存一份（R40 之前 `/health` 根本报不出进度，
+    因为预热没有状态，只有 stderr 上两行 print）。
+
+    两项为什么无依赖、为什么并行省得下来：见 `api/warmup.py` 的模块文档
+    （实测本体层 2417 ms、检索器 8757 ms，串行 11174 ms）。
     """
-    try:
-        from core.retrieval import get_retriever
+    from api.warmup import run_warmup
 
-        get_retriever()._ensure_encoded()
-    except Exception as e:  # noqa: BLE001 - 预热失败只是没有预热，服务照常起
-        print(f"[warmup] 检索器预热跳过：{e}", file=sys.stderr)
-    try:
-        from core.ontology import get_ontology
-
-        ont = get_ontology()
-        if ont.available:
-            print(f"[warmup] 本体层已就绪：{len(ont.herbs)} 味 / {len(ont.formulas)} 首",
-                  file=sys.stderr)
-    except Exception as e:  # noqa: BLE001 - 同上
-        print(f"[warmup] 本体层预热跳过：{e}", file=sys.stderr)
+    run_warmup()
 
 
-# 预热最多等这么久，超过就先开始服务。真实冒烟里踩到的：有 cases.json 但连不上
-# huggingface 的机器，预热卡在模型下载的重试上，服务一分多钟都不监听端口，存活探针
-# 一直连不上——编排器会把它当成起不来。预热线程超时后不杀（也杀不了），在后台
-# 继续；首个问诊会在 _encode_lock 上等它，而 /health 这时已经能答。
+# 预热最多等这么久——**现在这个数只用于"等预热完成"的工具（压测、冒烟脚本）**，
+# 不再是"服务什么时候开始监听"的闸门：R40 起 startup 阶段立刻 yield，服务先
+# 监听、预热在后台跑、`/health` 在就绪前回 503 带进度。
+#
+# 旧行为踩到的坑留在这里当反面教材：有 cases.json 但连不上 huggingface 的机器，
+# 预热卡在模型下载的重试上，ASGI startup 走不完，uvicorn **端口开着但一个请求
+# 都不答**，存活探针连得上却等不到响应——编排器会把一个其实正常的进程判死。
 WARMUP_TIMEOUT_SECONDS = float(os.environ.get("WARMUP_TIMEOUT_SECONDS", "120"))
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI 已把 on_event 标成 deprecated，改成 lifespan。预热是同步的
-    重 IO（加载模型、编码语料），放在自己的线程里而不是直接在事件循环上跑——
-    直接阻塞循环会让 uvicorn 的信号处理一起卡住，这段时间 Ctrl-C 都停不下来。
-    不走线程池：anyio 的 to_thread 默认等不到就取消不了，有超时也没法真的
-    "先开始服务"。"""
+    """**先监听，再预热。** startup 阶段不等预热——ASGI 的 startup 没走完
+    uvicorn 就不会开始处理请求，等在这里等于"端口开着但不答"。
+
+    预热是同步的重 IO（加载模型、编码语料），放在自己的线程里而不是直接在
+    事件循环上跑：直接阻塞循环会让 uvicorn 的信号处理一起卡住，那段时间
+    Ctrl-C 都停不下来。不走 anyio 的线程池——那里的线程等不到就取消不了。
+    """
+    from api.warmup import TRACKER
+
+    # **同步登记再起线程**：lifespan 起完线程立刻 yield，第一个 readiness 探针
+    # 可能比线程的第一行还早。见 `WarmupTracker.begin` 的文档字符串。
+    TRACKER.begin()
     t = threading.Thread(target=_warmup, name="warmup", daemon=True)
     t.start()
-    deadline = time.monotonic() + WARMUP_TIMEOUT_SECONDS
-    while t.is_alive() and time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
-    if t.is_alive():
-        print(f"[warmup] 预热 {WARMUP_TIMEOUT_SECONDS:.0f} 秒还没完成，先开始服务；"
-              "预热在后台继续，首个问诊会等它", file=sys.stderr)
     yield
 
 
@@ -209,11 +217,32 @@ def _lambda1_note_or_none() -> str | None:
     return lambda1_note(compute_stats(store))
 
 
+@app.get("/health/live")
+async def health_live() -> dict:
+    """**存活**探针：只要进程在跑就 200，预热到哪一步都不影响它。
+
+    跟 `/health`（就绪）分开，因为两个探针问的不是同一个问题——
+    存活答"要不要重启我"，就绪答"能不能把流量放进来"。合成一个的代价是
+    真实的：R40 之前只有一个端点，预热期间编排器分不清"还在热"和"已经死"，
+    只能靠调长探针超时来将就。
+    """
+    from api.warmup import TRACKER
+
+    return {"status": "alive", "warmup": TRACKER.snapshot()}
+
+
 @app.get("/health")
-async def health() -> dict:
-    """async def 而不是 def：同步端点跑在 anyio 的线程池里（默认 40 个槽），
+async def health(response: Response) -> dict:
+    """**就绪**探针 + 前端启动所需的那几份配置。
+
+    async def 而不是 def：同步端点跑在 anyio 的线程池里（默认 40 个槽），
     几十条并发问诊把槽占满时，存活探针也跟着排队、超时，编排器会把一个其实
-    还活着的进程重启掉。这个端点不做任何 IO，直接在事件循环上答。"""
+    还活着的进程重启掉。这个端点不做任何 IO，直接在事件循环上答。
+
+    **预热没完成时回 503**，响应体照样完整（外加 `warmup` 进度块）：
+    编排器看状态码，前端读响应体。只回一个空 503 的话前端在预热那几秒里
+    连医家身份色都拿不到，页面是一片没有颜色的骨架——比"晚几秒着色"更糟。
+    """
     # demo_mode 非 None = 这台服务在回放录制好的推理（LLM_MODE=replay）。
     # **放在 /health 而不是只放在问诊响应里**：前端一加载就该看到那行小字，
     # 不该等到跑完一次问诊才告诉访问者"刚才那个不是现场跑的"。
@@ -225,8 +254,15 @@ async def health() -> dict:
     # CSS 里不写死——写死的话注册表加第四位医家时那份副本不会跟着长出来，新医家在
     # 界面上就没有颜色（这个坑已经踩过一次）。
     # 放 /health 而不是等第一次问诊：三列的顶边和姓名行在**还没有结果时**就要着色。
+    from api.warmup import TRACKER
+
+    warmup_block = TRACKER.snapshot()
+    if not warmup_block["ready"]:
+        # 503 而不是 200+标记：编排器只看状态码，一个 200 会让流量在知识库
+        # 还没加载完时就被放进来，首个患者等的是那 11 秒。
+        response.status_code = 503
     return {
-        "status": "ok",
+        "status": "ok" if warmup_block["ready"] else "warming",
         "demo_mode": demo_mode_info(),
         "physicians": [
             {"id": pid, "name": info["name"], "years": info["years"],
@@ -265,6 +301,9 @@ async def health() -> dict:
         # 默认值是准确的。每次问诊结束仍然以 `manifest.s3_mode` 为准（那一份
         # 记的是真的跑了哪一条），两处不一致时前端信 manifest。
         "s3_mode": s3_mode(),
+        # R40：预热进度。`ready=false` 时上面那个 503 才有可读的原因，
+        # 前端据此显示"正在加载知识库（1/2）"而不是干等。
+        "warmup": warmup_block,
     }
 
 
@@ -1118,7 +1157,14 @@ class _ConsultStream:
 
     def __init__(self, stream_id: str, slots: threading.BoundedSemaphore) -> None:
         self.stream_id = stream_id
-        self.events_q: queue.Queue = queue.Queue()
+        # R40 **背压**：有上限的队列。之前是 `queue.Queue()`（无上限）——
+        # 客户端读得慢或者卡住时，后台线程照样按 token 频率往里塞 `s3_delta`，
+        # 队列只涨不降。一条流的增量事件是**几千条**（每 N 个 token 一条），
+        # 几十条慢连接就能把进程的内存吃掉，而这中间没有任何一处会报错。
+        self.events_q: queue.Queue = queue.Queue(maxsize=SSE_QUEUE_MAXSIZE)
+        # 被丢掉的增量条数。**丢了必须数出来**，不能静默——前端据此显示
+        # "网络较慢，已跳过 N 条增量"，而不是让用户看到一段缺字的推理过程。
+        self.dropped_deltas = 0
         self.cancel = threading.Event()
         self._slots = slots
         self._pending: queue.Queue | None = None
@@ -1127,9 +1173,33 @@ class _ConsultStream:
     # ---- 后台线程侧（consult 的回调）----
 
     def emit(self, name: str, data: dict) -> None:
+        """往流里塞一个事件。**两类事件两种背压策略**，不能合并成一种：
+
+        · 增量事件（`SSE_DROPPABLE_EVENTS`）：队列满就**丢**，并计数。它们是
+          "同一段文字的逐步生成"，丢掉几条只是打字机效果卡一下，终值由
+          `s3_done` / `done` 兜底——而为它们阻塞后台线程，等于让一条慢连接
+          把这次问诊整体拖慢。
+        · 其余事件（阶段完成、需要追问、终值、错误）：**阻塞等**，让生产端
+          慢到消费端的速度上。这才是真正的背压。丢掉任何一条都会让前端
+          缺一段状态（`need_input` 丢了 = 追问永远等不到回答）。
+
+        阻塞不是无限等：`SSE_PUT_TIMEOUT_SECONDS` 之后按"客户端已经不读了"
+        处理，抛 `StreamClosed`——跟客户端断开走同一条收尾路径。
+        """
         if self.cancel.is_set():
             raise StreamClosed()
-        self.events_q.put((name, data))
+        if name in SSE_DROPPABLE_EVENTS:
+            try:
+                self.events_q.put_nowait((name, data))
+            except queue.Full:
+                self.dropped_deltas += 1
+            return
+        try:
+            self.events_q.put((name, data), timeout=SSE_PUT_TIMEOUT_SECONDS)
+        except queue.Full as e:
+            # 队列满了这么久 = 没人在读。跟客户端断开是同一件事，走同一条路。
+            self.cancel.set()
+            raise StreamClosed() from e
 
     def ask(self, question: str) -> str | None:
         answer_q: queue.Queue = queue.Queue(maxsize=1)
@@ -1185,7 +1255,16 @@ class _ConsultStream:
             return True
 
     def finish(self) -> None:
-        self.events_q.put((None, None))  # 哨兵：告诉生成器可以收工了
+        """收尾。哨兵告诉生成器可以退出了。
+
+        **有超时**：队列有上限之后，一个没人读的满队列会让这里永远阻塞，
+        后台线程于是永远不退出（daemon=True 只保证进程能退，不保证线程能回收
+        它占的内存和那个信号量槽）。塞不进去就说明没人读，哨兵本身也没意义。
+        """
+        try:
+            self.events_q.put((None, None), timeout=SSE_PUT_TIMEOUT_SECONDS)
+        except queue.Full:
+            pass
         self._slots.release()
         with _streams_lock:
             _streams.pop(self.stream_id, None)
@@ -1235,6 +1314,12 @@ def api_consult_stream(
                     on_step=stream.emit,
                     retriever_mode=req.retriever_mode,
                 )
+            # R40 背压：丢过增量就**说出来**，紧挨在 done 之前。
+            # 单独一个事件而不是塞进 done 的载荷：done 的形状跟 /api/consult
+            # 的响应体是同一份契约（`_consult_response` 是唯一实现），
+            # 往里加一个只有流式路径才有的键会让那份契约分叉。
+            if stream.dropped_deltas:
+                stream.emit("deltas_dropped", {"n": stream.dropped_deltas})
             stream.events_q.put(("done", _consult_response(outcome, role=req.role)))
         except StreamClosed:
             pass  # 客户端已断开，没人读了，正常提前结束
@@ -1316,12 +1401,63 @@ def _serialize_followup(followup) -> dict | None:
     return out
 
 
+def _refs_block(r: dict) -> dict:
+    """`refs` + 三个对照数。抽成函数因为 `_serialize_result` 里那个字典字面量
+    已经很长，而这几个键必须**一起**出现——只有 refs 没有 refs_total 时，
+    前端会把"下发的条数"当成"语料的条数"，那是个假数。"""
+    cited = (r.get("s3").cited_case_ids if r.get("s3") is not None
+             and hasattr(r.get("s3"), "cited_case_ids") else ())
+    sent, counts = _cap_refs(list(r.get("refs") or []), cited)
+    return {"refs": sent, **counts}
+
+
 def _serialize_residual(residual: dict | None) -> dict | None:
     if not residual:
         return None
     out = dict(residual)
     out["s2"] = residual["s2"].model_dump()
     return out
+
+
+#: 一次响应里最多下发多少条参考医案。R40 实测：`full_context` 模式下
+#: `refs` 是**整个语料**——一条问诊的响应体 2,848,127 字节，其中
+#: `results[0].refs` 占 1,252,722 字节 / 1060 条（98.9%）。
+#:
+#: 为什么这是个真问题而不是"多传一点没关系"：
+#:   · 前端要 JSON.parse 这 2.8 MB（主线程上一次长任务，R41 量到的 TBT 来源之一）
+#:   · 1060 条参考医案没有任何界面能有意义地展示
+#:   · 三甲内网的带宽不是本机回环
+#:
+#: 为什么**不是**在 `core/chain.py` 那一层砍：`refs` 在链内部还有别的用途
+#: （幻觉检查要拿全集比 `cited_case_ids`）。砍在序列化边界上，链的语义一个字不动。
+REFS_IN_RESPONSE = int(os.environ.get("REFS_IN_RESPONSE", "20"))
+
+
+def _cap_refs(refs: list[dict], cited_ids, cap: int = REFS_IN_RESPONSE) -> tuple[list[dict], dict]:
+    """下发的参考医案裁到 `cap` 条，**被引用的一条都不许丢**。
+
+    顺序上的取舍：先放这次真的被引用的（`cited_case_ids`），再按分数补满。
+    被引用的条目丢了的话前端的"点结论跳到依据"就会指向一条不存在的医案
+    ——那比传得多严重得多（可追溯是这个项目的卖点）。
+
+    `cap <= 0` 表示不裁（给需要全量的评测脚本留口）。
+
+    返回的第二项是**对照数**（CLAUDE.md「任何数字都必须带对照」）：
+    下发几条、这次引用了几条、语料里一共几条。前端显示"下发 20 / 共 1060"，
+    不显示成"共 20"——后者是个假数。
+    """
+    total = len(refs)
+    cited = set(cited_ids or ())
+    if cap <= 0 or total <= cap:
+        return refs, {"refs_total": total, "refs_sent": total,
+                      "refs_cited": sum(1 for x in refs if x.get("case_id") in cited),
+                      "refs_truncated": False}
+    must = [x for x in refs if x.get("case_id") in cited]
+    rest = [x for x in refs if x.get("case_id") not in cited]
+    rest.sort(key=lambda x: -(x.get("score") or 0))
+    sent = must + rest[:max(0, cap - len(must))]
+    return sent, {"refs_total": total, "refs_sent": len(sent),
+                  "refs_cited": len(must), "refs_truncated": True}
 
 
 def _serialize_result(r: dict) -> dict:
@@ -1349,7 +1485,10 @@ def _serialize_result(r: dict) -> dict:
         # 规则倾向 Y"这种交叉校验，不是要替代模型的判断。
         "disease_candidates": r.get("disease_candidates", []),
         "no_reference_cases": r.get("no_reference_cases", False),
-        "refs": r["refs"],
+        # R40：下发的 refs 裁到 REFS_IN_RESPONSE 条，被引用的全留。
+        # `hallucinated` 是**服务端**用全集算完的结论，不受这里裁剪影响——
+        # 裁剪只改"下发多少"，不改"验了什么"。
+        **_refs_block(r),
         "hallucinated": r["hallucinated"],
         # X2 输出侧安全校验结果，前端据此挂红/黄标签
         "safety_output": r.get("safety_output"),

@@ -61,7 +61,7 @@ def _make_results() -> list[dict]:
             "physician_name": "叶天士",
             "s2": s2_ye,
             "s3": s3_ye,
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         },
         {
@@ -69,7 +69,7 @@ def _make_results() -> list[dict]:
             "physician_name": "吴鞠通",
             "s2": s2_wu,
             "s3": s3_wu,
-            "refs": [("wu_jutong-001", 0.8)],
+            "refs": [{"case_id": "wu_jutong-001", "score": 0.8}],
             "hallucinated": [],
         },
     ]
@@ -118,7 +118,7 @@ def test_element_nodes_deduplicated_across_physicians():
                 syndrome="脾虚", reasoning="...", treatment_principle="健脾",
                 herbs=["党参"], cited_case_ids=["ye_tianshi-001"],
             ),
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         },
         {
@@ -133,7 +133,7 @@ def test_element_nodes_deduplicated_across_physicians():
                 syndrome="脾虚", reasoning="...", treatment_principle="健脾",
                 herbs=["白术"], cited_case_ids=["wu_jutong-001"],
             ),
-            "refs": [("wu_jutong-001", 0.9)],
+            "refs": [{"case_id": "wu_jutong-001", "score": 0.9}],
             "hallucinated": [],
         },
     ]
@@ -163,7 +163,7 @@ def test_m5_no_longer_truncates_herbs_per_physician():
                 )],
                 cited_case_ids=["ye_tianshi-001"],
             ),
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         }
     ]
@@ -189,7 +189,7 @@ def _single_physician_result(herbs: list[str], formula: str = "调补方") -> li
                 )],
                 cited_case_ids=["ye_tianshi-001"],
             ),
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         }
     ]
@@ -375,7 +375,7 @@ def _multi_candidate_result(physician: str = "ye_tianshi", physician_name: str =
             ],
             cited_case_ids=["ye_tianshi-001"],
         ),
-        "refs": [("ye_tianshi-001", 0.9)],
+        "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
         "hallucinated": [],
     }
 

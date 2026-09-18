@@ -1,0 +1,119 @@
+{
+  "repeat": 2,
+  "runs": {
+    "serial": [
+      {
+        "ready": true,
+        "all_ready": false,
+        "progress": "2/2",
+        "n_done": 2,
+        "n_steps": 2,
+        "elapsed_ms": 7624.2,
+        "parallel": false,
+        "steps": [
+          {
+            "step": "retriever",
+            "label": "检索器（加载编码模型 + 编码医案）",
+            "status": "skipped",
+            "ms": 5354.0,
+            "note": "ProxyError: 403 Forbidden"
+          },
+          {
+            "step": "ontology",
+            "label": "本体层（本草 + 方剂 + 证型）",
+            "status": "ready",
+            "ms": 2270.0,
+            "note": "1232 味 / 235 首"
+          }
+        ],
+        "wall_ms": 7624.3
+      },
+      {
+        "ready": true,
+        "all_ready": false,
+        "progress": "2/2",
+        "n_done": 2,
+        "n_steps": 2,
+        "elapsed_ms": 7580.1,
+        "parallel": false,
+        "steps": [
+          {
+            "step": "retriever",
+            "label": "检索器（加载编码模型 + 编码医案）",
+            "status": "skipped",
+            "ms": 5296.7,
+            "note": "ProxyError: 403 Forbidden"
+          },
+          {
+            "step": "ontology",
+            "label": "本体层（本草 + 方剂 + 证型）",
+            "status": "ready",
+            "ms": 2283.2,
+            "note": "1232 味 / 235 首"
+          }
+        ],
+        "wall_ms": 7580.1
+      }
+    ],
+    "parallel": [
+      {
+        "ready": true,
+        "all_ready": false,
+        "progress": "2/2",
+        "n_done": 2,
+        "n_steps": 2,
+        "elapsed_ms": 7812.3,
+        "parallel": true,
+        "steps": [
+          {
+            "step": "retriever",
+            "label": "检索器（加载编码模型 + 编码医案）",
+            "status": "skipped",
+            "ms": 7811.6,
+            "note": "ProxyError: 403 Forbidden"
+          },
+          {
+            "step": "ontology",
+            "label": "本体层（本草 + 方剂 + 证型）",
+            "status": "ready",
+            "ms": 2705.1,
+            "note": "1232 味 / 235 首"
+          }
+        ],
+        "wall_ms": 7812.4
+      },
+      {
+        "ready": true,
+        "all_ready": false,
+        "progress": "2/2",
+        "n_done": 2,
+        "n_steps": 2,
+        "elapsed_ms": 7707.4,
+        "parallel": true,
+        "steps": [
+          {
+            "step": "retriever",
+            "label": "检索器（加载编码模型 + 编码医案）",
+            "status": "skipped",
+            "ms": 7706.7,
+            "note": "ProxyError: 403 Forbidden"
+          },
+          {
+            "step": "ontology",
+            "label": "本体层（本草 + 方剂 + 证型）",
+            "status": "ready",
+            "ms": 2663.5,
+            "note": "1232 味 / 235 首"
+          }
+        ],
+        "wall_ms": 7707.4
+      }
+    ]
+  },
+  "serial_wall_ms": 7602.2,
+  "parallel_wall_ms": 7759.9,
+  "saved_ms": -157.7,
+  "saved_pct": -2.1,
+  "kind": "warmup_parallel_compare",
+  "generated_at": "2026-09-18T03:34:50Z"
+}

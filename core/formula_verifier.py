@@ -578,6 +578,54 @@ def check_role_structure(s3, ont) -> tuple[list[Violation], list[Unverifiable], 
     )], [], ["role_structure"]
 
 
+class BatchedOntology:
+    """把一张方里的药名**一次全解析完**，七条规则共用这一份。
+
+    R40 实测的动机：七条规则各自逐味 `ont.herb()`，而 `herb()` 每次都要跑一遍
+    `normalize_herb`（去炮制前缀、去剂量、查别名）。一张 12 味的方 = 7×12 = 84 次
+    归一 + 84 次查表，其中 72 次是重复劳动。改成一次 `herbs_batch()` 之后是
+    12 次。`_span_of()` 也走 `herb()`，所以它一起受益。
+
+    **委托而不是继承**：`Ontology` 的其余方法（`is_incompatible`、
+    `formulas_for_syndrome`、`herbs`、`available`…）原样透出去，这个类只拦
+    `herb()` 一个方法。继承会把"本体是什么"和"这一次验证怎么查得快"两件事
+    绑在一个类型上，而换本体实现时前者要能替换、后者不该跟着改。
+
+    缓存范围是**一次 `verify_formula` 调用**——不是进程级缓存：本体可以被
+    `reset_ontology_for_tests()` 换掉，跨调用缓存会让换本体之后的验证读到旧值。
+    """
+
+    def __init__(self, ont: Ontology, names: list[str] | tuple[str, ...]) -> None:
+        self._ont = ont
+        self._resolved = ont.herbs_batch(names)
+        #: 批量表命中/未命中的次数。**报出来**：如果 misses 远大于 hits，说明
+        #: 预解析的名字集合取错了（规则在查方子以外的药名），批量化就没生效。
+        self.hits = 0
+        self.misses = 0
+
+    def herb(self, name: str):
+        if name in self._resolved:
+            self.hits += 1
+            return self._resolved[name]
+        self.misses += 1
+        return self._ont.herb(name)
+
+    def __getattr__(self, attr):
+        return getattr(self._ont, attr)
+
+
+def _all_names(s3: _S3StructuredBase) -> list[str]:
+    """预解析要覆盖的全部药名：方中药 + `herb_choices` 里的药。
+
+    **两处都要**：`check_herb_grounded` 遍历的是 `herb_choices`，它跟
+    `formula.candidate.herb_items` 通常一致但 schema 上是两个字段，
+    只取前者会让 grounded 那一条全部落到 `misses` 上。
+    """
+    names = [i.name for i in _items(s3)]
+    names += [c.item.name for c in getattr(s3, "herb_choices", ())]
+    return names
+
+
 #: 规则名 → 实现。`verify_formula` 按 `ALL_RULES` 的顺序跑，**不按字典顺序**。
 RULE_FUNCS = {
     "incompatible_pair": check_incompatible_pair,
@@ -609,11 +657,16 @@ def verify_formula(s3: _S3StructuredBase, *, ontology: Ontology | None = None
                 for r in ALL_RULES),
             ontology_available=False, checked_rules=(),
         )
+    # R40：**7N → 1**。七条规则原先各自逐味查本体，这里一次解析完再共用。
+    # 包一层而不是改七个规则的签名：规则的入参形状是这一层的公开契约
+    # （`(s3, ont) -> (violations, unverifiable, checked)`，医院要增补规则就照它写），
+    # 为了查得快去改那个契约，等于让每一条将来新增的规则都背上批量表这个细节。
+    batched = BatchedOntology(ont, _all_names(s3))
     violations: list[Violation] = []
     unver: list[Unverifiable] = []
     checked: list[str] = []
     for rule in ALL_RULES:
-        v, u, c = RULE_FUNCS[rule](s3, ont)
+        v, u, c = RULE_FUNCS[rule](s3, batched)
         violations.extend(v)
         unver.extend(u)
         checked.extend(c)
@@ -621,6 +674,77 @@ def verify_formula(s3: _S3StructuredBase, *, ontology: Ontology | None = None
         violations=tuple(violations), unverifiable=tuple(unver),
         ontology_available=True, checked_rules=tuple(checked),
     )
+
+
+# ---------- R40：投机执行（流式期间先跑"只看药名"的那两条规则） ----------
+
+#: 只需要**药名（+剂量）**就能判的规则。这两条不依赖证型/治法/君臣佐使，
+#: 所以 S3 还在流式输出、药名刚出来时就能先跑。
+#:
+#: 为什么只有这两条：`herb_grounded` 要 `ontology_refs`（模型写在后面），
+#: `meridian_coverage` 要 `organs`，`nature_conflict` 要证型名，
+#: `effect_matches_method` 要治法，`role_structure` 要 role——都在药名之后才有。
+#: **表里多放一条就是在不完整的输入上下结论**，那比晚一点知道糟得多。
+INCREMENTAL_RULES: tuple[str, ...] = ("incompatible_pair", "dose_exceeds")
+
+
+def verify_incremental(items: list[HerbItem] | tuple[HerbItem, ...], *,
+                       ontology: Ontology | None = None) -> VerificationResult:
+    """只用药名+剂量能判的那两条规则，**流式期间就能跑**。
+
+    ## 这一项省的不是吞吐，是"知道得早"
+
+    R40 实测：完整七条规则在一张 12 味的方上是 **0.137 ms**（批量查表之后），
+    所以"提前把一部分活干掉"在耗时上省不出任何东西——这一点必须先说清楚，
+    否则这个函数看起来像一个没有收益的优化。
+
+    它真正的价值是**临床反馈的时机**：配伍禁忌（十八反十九畏）和超药典上限
+    是 veto 级的，一旦命中这张方根本不会下发。等整段 S3 输出完（真实后端上
+    几十秒到几分钟）再告诉医生"这张方作废了"，那几十秒是白等的。药名一出来
+    就能判，就能当场发一个警示事件。
+
+    ## 结果不复用进最终验证
+
+    最终的 `verify_formula` 照样把七条全跑一遍，**不跳过这两条**。理由：
+    流式期间拿到的药名是**可能不完整的**（解析中途的 JSON），在不完整输入上
+    得出的"通过"不能算通过。投机执行的定义就是"结果可能作废"，把它当成
+    已经验过的部分会让"符号验证通过"这句话失去意义。
+    """
+    ont = ontology if ontology is not None else get_ontology()
+    if not ont.available:
+        return VerificationResult(
+            violations=(),
+            unverifiable=tuple(
+                Unverifiable(rule=r, herbs=(), missing_predicate="药理层数据",
+                             reason="本体不可用，这条规则一次都没跑")
+                for r in INCREMENTAL_RULES),
+            ontology_available=False, checked_rules=())
+    shim = _ItemsOnlyS3(tuple(items))
+    batched = BatchedOntology(ont, [i.name for i in items])
+    violations: list[Violation] = []
+    unver: list[Unverifiable] = []
+    checked: list[str] = []
+    for rule in INCREMENTAL_RULES:
+        v, u, c = RULE_FUNCS[rule](shim, batched)
+        violations.extend(v)
+        unver.extend(u)
+        checked.extend(c)
+    return VerificationResult(violations=tuple(violations), unverifiable=tuple(unver),
+                              ontology_available=True, checked_rules=tuple(checked))
+
+
+class _ItemsOnlyS3:
+    """喂给那两条规则的最小壳：它们只读 `formula.candidate.herb_items`。
+
+    为什么不构造一个真的 `S3Structured`：那个 schema 的每个字段都有
+    `Field(min_length=1)` 防幻觉约束（CLAUDE.md 那条铁律），流式中途根本
+    填不出合法值。**正确做法是新建一个不含那些字段的形状，不是放松原来的约束**
+    ——铁律原文就是这么写的。这个壳不是 pydantic 模型、不参与任何对外契约，
+    只在本模块内部活一瞬间。
+    """
+
+    def __init__(self, items: tuple[HerbItem, ...]) -> None:
+        self.formula = type("_F", (), {"candidate": type("_C", (), {"herb_items": items})()})()
 
 
 # ---------- 回灌：把违规写成模型能照着改的一段话 ----------

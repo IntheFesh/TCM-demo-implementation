@@ -105,7 +105,13 @@ X3 那轮把 `CaseTripleItem.p`/`CaseTripleRecord.p` 的 `str = Field(min_length
 之后，总纲阶段二的药理层加了 14 处：`MateriaMedicaItem`/`MateriaMedicaRecord`/
 `FormularyItem`/`FormularyRecord` 四个 schema 的 `s`/`o`/`source_span`（+`book`）
 全部 `Field(min_length=1)`，谓词是 `Literal`——跟 X3 医案三元组同一套防幻觉
-约束，纯新增，没有动任何既有字段。**当前基线：31 处。**
+约束，纯新增，没有动任何既有字段。**31 处（截至 `2f0d174` 之后的药理层那一轮）。**
+再之后 M 系列与 R33/R34 的新 schema 继续纯新增：`S3Structured` 的五步链
+（`organs`/`syndrome`/`method`/`formula`/`herb_choices` 各自的必填字段）、
+符号验证器的 `Violation`/`Unverifiable`（`rule` 是 `Literal`、`reason`/
+`counterexample` 是 `Field(min_length=1)`）、R35 的 `PrescribingPattern`、
+R36 的 `S1S2Merged`——**当前基线：72 处（截至 `931cdc7`）。**
+R36~R39 四轮一处未动，每一轮的报告自查里都报了这个数。
 
 这条铁律里的数字**允许合法下降**——用更强约束（`Literal`、枚举、更具体的
 子类型）替换 `Field(min_length=1)` 属于收紧，不违反"不许放松"；只有改成

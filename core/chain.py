@@ -21,6 +21,7 @@ import sys
 import threading
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
@@ -84,6 +85,7 @@ from core.schemas import (
     S3_CHAIN_STEPS,
     CaseRecord,
     FollowupResult,
+    HerbItem,
     ReActTrace,
     S1Normalize,
     S1S2Merged,
@@ -693,6 +695,50 @@ def _streaming_note(n_samples: int) -> str | None:
     return f"后端 {who} 没有实现 streaming_note()，这次有没有流式无从判断"
 
 
+#: 流式中途从半截 JSON 里扒药名用的。**只扫 `herb_items` 之后那一段**：
+#: `"name"` 这个键在方名（`candidate.name`）上也有，整段扫会把方名当药名。
+_PARTIAL_ITEMS_ANCHOR = '"herb_items"'
+_PARTIAL_NAME_RE = re.compile(r'"name"\s*:\s*"([^"\\]{1,16})"')
+_PARTIAL_DOSE_RE = re.compile(r'"dose"\s*:\s*(null|[0-9]+(?:\.[0-9]+)?)')
+
+
+def scan_partial_herb_items(text: str) -> list[HerbItem]:
+    """从**还没输出完**的 S3 JSON 里扒出已经成型的药名与剂量。
+
+    R40 投机执行用。**这是个尽力而为的扫描，不是解析器**：
+      · 只取 `"herb_items"` 之后的部分（方名也叫 `name`，见上面那条注释）
+      · 每个 `"name"` 往后找到下一个 `"name"` 之前的 `"dose"` 配对，
+        找不到就 dose=None（`dose_exceeds` 会把"有上限可比但没写剂量"
+        记成 unverifiable，这正是想要的语义）
+      · 最后一条可能是半截的（引号还没闭合）→ 正则匹配不上，自然被跳过
+
+    扒错的后果由调用方兜：只有**veto 级**结论才发提示，且措辞写明"初步"，
+    最终以完整验证为准。宁可晚报，不可错报——这是临床产品，不是日志。
+    """
+    if not text:
+        return []
+    pos = text.find(_PARTIAL_ITEMS_ANCHOR)
+    if pos < 0:
+        return []
+    seg = text[pos + len(_PARTIAL_ITEMS_ANCHOR):]
+    out: list[HerbItem] = []
+    names = list(_PARTIAL_NAME_RE.finditer(seg))
+    for i, m in enumerate(names):
+        end = names[i + 1].start() if i + 1 < len(names) else len(seg)
+        dm = _PARTIAL_DOSE_RE.search(seg, m.end(), end)
+        dose: float | None = None
+        if dm and dm.group(1) != "null":
+            try:
+                dose = float(dm.group(1))
+            except ValueError:
+                dose = None
+        try:
+            out.append(HerbItem(name=m.group(1), dose=dose))
+        except Exception:  # noqa: BLE001 - 半截的名字过不了 schema 校验，跳过就是
+            continue
+    return out
+
+
 class S3DeltaEmitter:
     """R36：把 S3 的流式增量合并成 `s3_delta` 事件。
 
@@ -710,7 +756,13 @@ class S3DeltaEmitter:
     FLUSH_CHARS = 80
     FLUSH_SECONDS = 0.12
 
-    def __init__(self, on_step: StepFn | None, physician: str, physician_name: str) -> None:
+    #: R40 投机执行：正式输出每多这么多字，就拿半截 JSON 里已成型的药名
+    #: 跑一次"只看药名"的两条 veto 规则。不是每帧都跑——`verify_incremental`
+    #: 本身只要 0.1 ms 级，但正则扫的是**累积全文**，每帧扫一遍是 O(n²)。
+    SPECULATIVE_EVERY_CHARS = 400
+
+    def __init__(self, on_step: StepFn | None, physician: str, physician_name: str,
+                 *, speculative: bool = True) -> None:
         self._on_step = on_step
         self._physician = physician
         self._physician_name = physician_name
@@ -720,6 +772,14 @@ class S3DeltaEmitter:
         self.chars: dict[str, int] = {"content": 0, "reasoning": 0}
         self.events = 0
         self.first_delta_s: float | None = None
+        # 投机执行的状态。`_full` 留累积的正式输出（扫描要全文，增量帧不够）。
+        self._speculative = speculative
+        self._full = ""
+        self._next_scan_at = self.SPECULATIVE_EVERY_CHARS
+        #: 已经报过的（规则, 药名元组）——**同一条 veto 只报一次**，
+        #: 后面每次扫描都会再看见它，重复报会把提示区刷满。
+        self._early_reported: set[tuple] = set()
+        self.early_vetoes: list[dict] = []
 
     def __call__(self, text: str, kind: str) -> None:
         if not text:
@@ -732,6 +792,11 @@ class S3DeltaEmitter:
             self.first_delta_s = round(time.monotonic() - self._t0, 4)
         self.chars[kind] += len(text)
         self._buf[kind] += text
+        if self._speculative and kind == "content":
+            self._full += text
+            if self.chars["content"] >= self._next_scan_at:
+                self._next_scan_at = self.chars["content"] + self.SPECULATIVE_EVERY_CHARS
+                self._speculate()
         now = time.monotonic()
         if (len(self._buf[kind]) >= self.FLUSH_CHARS
                 or now - self._last_flush[kind] >= self.FLUSH_SECONDS):
@@ -760,6 +825,43 @@ class S3DeltaEmitter:
                 "seq": self.events,
             })
 
+    def _speculate(self) -> None:
+        """拿半截输出里已成型的药名跑两条 veto 规则，**命中就当场报一条提示**。
+
+        为什么值得：配伍禁忌和超药典上限是 veto 级——命中这张方根本不会下发。
+        真实后端上 S3 要几十秒到几分钟，等输出完再说"这张方作废了"，
+        那几十秒白等。药名一出来就能判。
+
+        **一次扫描失败不能影响这次问诊**：这是个尽力而为的旁路，扒错、
+        本体不在、schema 拒了半截的名字——任何异常都只意味着"这一次没提示"。
+        """
+        try:
+            items = scan_partial_herb_items(self._full)
+            if len(items) < 2:      # 一味药谈不上配伍；剂量那条也要有名字才查得到
+                return
+            from core.formula_verifier import rule_label, verify_incremental
+
+            result = verify_incremental(items)
+            for v in result.vetoes:
+                key = (v.rule, v.herbs)
+                if key in self._early_reported:
+                    return
+                self._early_reported.add(key)
+                row = {"rule": v.rule, "rule_label": rule_label(v.rule),
+                       "herbs": list(v.herbs), "reason": v.reason,
+                       "n_herbs_scanned": len(items),
+                       # **措辞是这条提示的一半**：半截输出上的结论可能作废，
+                       # 说成定论就是在临床界面上撒谎。
+                       "note": "初步提示：基于尚未输出完的药味清单，"
+                               "最终以完整符号验证为准"}
+                self.early_vetoes.append(row)
+                if self._on_step is not None:
+                    self._on_step("early_veto", {
+                        "physician": self._physician,
+                        "physician_name": self._physician_name, **row})
+        except Exception:  # noqa: BLE001 - 旁路，见文档字符串
+            return
+
     def summary(self) -> dict:
         """写进 `s3_done` 与 manifest 的那几个数。"""
         return {
@@ -767,6 +869,10 @@ class S3DeltaEmitter:
             "chars_content": self.chars["content"],
             "chars_reasoning": self.chars["reasoning"],
             "first_delta_s": self.first_delta_s,
+            # 投机执行提前报了几条。**0 和"没开"要分得开**：`speculative`
+            # 一起下发，否则读数的人分不清"没命中"和"没跑"。
+            "speculative": self._speculative,
+            "n_early_vetoes": len(self.early_vetoes),
         }
 
 
@@ -2494,23 +2600,39 @@ def consult_many(queries: list[str], consult_fn=None) -> tuple[list[dict | None]
     run_batch 的文档记过同一个坑（insufficient 分支 AttributeError 整批挂掉），
     教训没有传到后来的两个批处理入口——所以抽成一处，两边都调它。
     """
+    from core.parallel import run_indexed, worker_count
     from core.progress import Progress
 
     fn = consult_fn or consult
-    results: list[dict | None] = []
     failures: list[dict] = []
-    # 一条主诉十几次 LLM 调用、几十秒；这个循环是 E1/E2 和 MES 导出的主干，
-    # 原来从头到尾只在失败时才出声（R9：静默和卡死不能长得一样）。
-    bar = Progress(total=len(queries), label="consult 批量", unit="条")
-    for i, complaint in enumerate(queries, 1):
-        try:
-            results.append(fn(complaint))
-            bar.advance(note=f"第 {i} 条「{complaint[:12]}」")
-        except Exception as e:  # noqa: BLE001 - 一条主诉的失败不能把整批已完成的结果一起丢掉
-            print(f"[consult_many] 第 {i} 条失败：{type(e).__name__}: {e}", file=sys.stderr)
-            bar.note(f"第 {i} 条失败：{type(e).__name__}")
-            results.append(None)
-            failures.append({"index": i, "query": complaint, "error": f"{type(e).__name__}: {e}"})
+    # R40：**并发跑**。一条主诉十几次 LLM 调用、几十秒到几分钟，其中绝大部分
+    # 时间在等 socket——串行跑 10 条 = 10 倍的等待。E1/E2 与 MES 导出是这个
+    # 函数的主干，它们批量跑几十条，省下的是小时级的墙钟。
+    #
+    # 默认并发度 `CONSULT_MANY_WORKERS`（默认 4）而不是"能开多少开多少"：
+    #   · 上游 API 有速率限制，一次把 50 条打出去会整批 429；
+    #   · 本地 vLLM 后端的显存是硬上限，并发过高直接 OOM；
+    #   · 4 是"明显比 1 快、又不至于触发限流"的保守值，现场可调。
+    # 串行（=1）时的顺序、异常路径与并发路径完全一致（见 `run_indexed`）。
+    workers = worker_count("CONSULT_MANY_WORKERS", 4)
+    bar = Progress(total=len(queries), label=f"consult 批量（并发 {workers}）", unit="条")
+
+    def _done(i: int, _result) -> None:
+        bar.advance(note=f"第 {i + 1} 条「{queries[i][:12]}」")
+
+    def _failed(i: int, e: BaseException) -> None:
+        # 一条主诉的失败不能把整批已完成的结果一起丢掉。
+        print(f"[consult_many] 第 {i + 1} 条失败：{type(e).__name__}: {e}", file=sys.stderr)
+        bar.note(f"第 {i + 1} 条失败：{type(e).__name__}")
+        failures.append({"index": i + 1, "query": queries[i],
+                         "error": f"{type(e).__name__}: {e}"})
+
+    results = run_indexed(list(queries), fn, workers=workers,
+                          on_done=_done, on_error=_failed,
+                          thread_name_prefix="consult")
+    # 失败记录按 index 排序：并发下回调的到达顺序不确定，而 failures 是要写进
+    # 报告的——同一批输入必须给出同一份报告，不能因为线程调度而变。
+    failures.sort(key=lambda f: f["index"])
     bar.close(f"{len(queries) - len(failures)} 条成功，{len(failures)} 条失败")
     return results, failures
 

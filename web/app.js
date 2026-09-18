@@ -687,11 +687,59 @@ function injectPhysicianColors(physicians) {
   }
 }
 
+// R40：预热进度条。后端改成「先监听再预热」之后，`/health` 在知识库加载完
+// 之前回 **503 带进度**——503 不是"后端不在"，响应体是完整的。
+//
+// 这块横幅是动态建的、不写进 index.html：它是**瞬时状态**，不是页面结构，
+// 而 index.html 那份契约（≤250 行）守的是结构文件不该越长。
+function renderWarmupBanner(warmup) {
+  let el = document.getElementById("warmup-banner");
+  if (!warmup || warmup.ready) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "warmup-banner";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.className = "show";
+    const anchor = document.getElementById("offline-banner");
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(el, anchor);
+    else document.body.prepend(el);
+  }
+  // 逐项列出来而不是只给一个百分比：哪一项还没好决定了现在能做什么
+  // （本体层没好 → 符号验证判不了；检索器没好 → 医案检索是空的）。
+  const pending = (warmup.steps || [])
+    .filter((s) => s.status === "pending" || s.status === "running")
+    .map((s) => s.label || s.step);
+  el.textContent = `正在加载知识库（${warmup.progress}）：${pending.join("、")}` +
+    "——现在可以浏览页面，点「辨证」会等它加载完。";
+}
+
+// 预热还没完就隔一会儿再问一次。**不轮询到永远**：到了上限就停下并如实说
+// 「预热没能在 N 秒内完成」，而不是让一个转圈的横幅永远挂着。
+const WARMUP_POLL_MS = 1000;
+const WARMUP_POLL_MAX = 180;
+let warmupPolls = 0;
+
+function scheduleWarmupRecheck() {
+  if (warmupPolls >= WARMUP_POLL_MAX) {
+    const el = document.getElementById("warmup-banner");
+    if (el) el.textContent = `知识库预热超过 ${WARMUP_POLL_MAX} 秒还没完成，` +
+      "服务仍可用但首次辨证会更慢；请查看服务端日志。";
+    return;
+  }
+  warmupPolls += 1;
+  setTimeout(() => { initDemoModeBanner(); }, WARMUP_POLL_MS);
+}
+
 async function initDemoModeBanner() {
   try {
     const resp = await fetch("/health");
-    if (!resp.ok) { renderOfflineBanner(false); return; }
+    // **503 要放过**：那是"预热中"，响应体完整。当成 !ok 处理的话预热那十几秒
+    // 里页面会说"服务未连接"，而服务其实在正常应答——比晚几秒着色糟得多。
+    if (!resp.ok && resp.status !== 503) { renderOfflineBanner(false); return; }
     const health = await resp.json();
+    renderWarmupBanner(health.warmup);
+    if (health.warmup && !health.warmup.ready) scheduleWarmupRecheck();
     renderDemoMode(health.demo_mode);
     injectPhysicianColors(health.physicians);
     // 示例主诉和身份色同一趟拿：两者都要在"点第一次辨证之前"就到位。
@@ -812,12 +860,22 @@ function refListHtml(refs) {
 
 // R14 §3.1 第九条：引用收成一行「引自 N 条医案 ▾」，展开后才是原文块。
 // N 从 refs.length 现算，不另存一个计数——两处各存一份必然有一处忘了更新。
-function refFoldHtml(refs) {
+//
+// R40：后端只下发前 REFS_IN_RESPONSE 条（实测 1060 条 = 1.25 MB / 响应体的
+// 98.9%）。这时 `refs.length` 是**下发的条数**，不是语料里检索到的条数——
+// 光显示它就是个假数。所以有 `refs_total` 时两个数一起显示：
+// 「引自 20 条医案（本次检索到 1060 条，下发前 20 条）」。
+// 项目规则「任何数字都必须带对照」在界面上的落点。
+function refFoldHtml(refs, counts) {
   const n = (refs || []).length;
   if (!n) {
     return '<div class="col-refs col-refs-empty">无相关医案（相似度均低于阈值）</div>';
   }
-  return `<details class="col-refs"><summary>引自 ${n} 条医案</summary>
+  const total = counts && counts.refs_total;
+  const note = (counts && counts.refs_truncated && total > n)
+    ? `（本次检索到 ${total} 条，按相似度下发前 ${n} 条；被结论引用的一条不漏）`
+    : "";
+  return `<details class="col-refs"><summary>引自 ${n} 条医案${escapeHtml(note)}</summary>
     <div class="detail-block">${refListHtml(refs)}</div>
   </details>`;
 }
@@ -2218,7 +2276,7 @@ function columnHtml(result, mode = "researcher") {
       ${hallucinationHtml}
       ${adviceBlockHtml(result)}
       ${doctorSectionHtml(result.physician, mode)}
-      ${refFoldHtml(result.refs)}
+      ${refFoldHtml(result.refs, result)}
       <details class="col-reasoning" ${openAttr}>
         <summary>推理过程</summary>
         <div class="detail-block">
@@ -2921,6 +2979,11 @@ async function submitConsult() {
       } else if (name === "s3_delta") {
         // R36：增量**不进日志**（几十帧会把日志顶得看不见），只刷流式区。
         onS3Delta(data);
+      } else if (name === "deltas_dropped") {
+        // R40 背压：后端因为 SSE 队列满丢了 N 条逐字增量。**要说出来**——
+        // 打字机效果中间缺一段而界面一声不响，会被读成"模型就是这么写的"。
+        // 终值不受影响（s3_done / done 兜底），所以这是一条说明，不是错误。
+        appendProgress(`网络较慢，已跳过 ${data.n} 条逐字增量（最终结果不受影响）`);
       } else if (name === "heartbeat") {
         // 心跳的全部作用是"别把这条连接当空闲连接掐掉"（见 api/main.py
         // _HEARTBEAT_SECONDS）。armWatchdog() 上面已经调过了，这里什么都不做

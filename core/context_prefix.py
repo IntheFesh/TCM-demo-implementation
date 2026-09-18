@@ -546,25 +546,42 @@ def build_focused_knowledge(s1, s2, hits, physicians, *,
     syndromes = syndromes or []
     per_physician = int(os.environ.get("FOCUSED_MAX_PATTERNS_PER_PHYSICIAN",
                                        FOCUSED_MAX_PATTERNS_PER_PHYSICIAN))
-    patterns: list[dict] = []
-    n_patterns_available = 0
-    seen_pat: set[str] = set()
-    for pid in (physicians or []):
-        got: list[dict] = []
-        for syn in (syndromes or [""]):
-            for pat in ont.patterns_for(syn, physician=pid):
-                key = str(pat.get("pattern_id") or "")
-                if key in seen_pat:
-                    continue
-                seen_pat.add(key)
-                got.append(pat)
-        # 多个证型的结果拼在一起之后顺序乱了，要按同一套规则重排（单一实现）。
-        got = sort_patterns(got)
-        n_patterns_available += len(got)
-        patterns.extend(got[:per_physician] if per_physician > 0 else got)
 
+    def _pick_patterns() -> tuple[list[dict], int]:
+        picked: list[dict] = []
+        n_avail = 0
+        seen_pat: set[str] = set()
+        for pid in (physicians or []):
+            got: list[dict] = []
+            for syn in (syndromes or [""]):
+                for pat in ont.patterns_for(syn, physician=pid):
+                    key = str(pat.get("pattern_id") or "")
+                    if key in seen_pat:
+                        continue
+                    seen_pat.add(key)
+                    got.append(pat)
+            # 多个证型的结果拼在一起之后顺序乱了，要按同一套规则重排（单一实现）。
+            got = sort_patterns(got)
+            n_avail += len(got)
+            picked.extend(got[:per_physician] if per_physician > 0 else got)
+        return picked, n_avail
+
+    # R40：这三段里**只有两段能并行**，第三段不能——如实说清楚，不说成"三段并行"：
+    #   · 规律段（patterns）：读 `ont.patterns_for`，独立
+    #   · 方剂段（formulas）：读本体的方剂表，独立
+    #   · 药材段（herbs）：**要用规律段选出来的 patterns 当输入**，只能等它
+    # 所以并行度是 2，然后串一段。`_pick_patterns` 里的 `seen_pat` 是局部的，
+    # 两路之间不共享可变状态——这是能并行的前提，不是巧合。
+    from core.parallel import run_routes
+
+    _picked = run_routes(
+        [("patterns", _pick_patterns),
+         ("formulas", lambda: _focused_candidate_formulas(ont, s2, hits, syndromes))],
+        thread_name_prefix="knowledge",
+    )
+    patterns, n_patterns_available = _picked["patterns"]
+    formulas = _picked["formulas"]
     herbs = _focused_candidate_herbs(ont, s1, s2, hits, patterns)
-    formulas = _focused_candidate_formulas(ont, s2, hits, syndromes)
 
     detail = True
     trimmed: list[str] = []

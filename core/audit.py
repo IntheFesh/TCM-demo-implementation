@@ -15,6 +15,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -178,3 +179,70 @@ def verify_audit_chain(path: Path | None = None) -> tuple[bool, list[str]]:
             expected_seq = (seq + 1) if isinstance(seq, int) else expected_seq + 1
 
     return (len(problems) == 0), problems
+
+
+# ---------- R40：异步写入（给"不在关键路径上"的审计点用） ----------
+#
+# ## 为什么这里有两条路，而不是把所有审计都改成异步
+#
+# 实测（R40 profiler，本沙盒）：`append_audit()` 一次 **0.3 ms**（读尾行取
+# prev_hash + flock + 追加写）。异步化能省的就是这 0.3 ms。
+#
+# 而处方导出那个端点**必须同步**：医生点了"导出"之后拿到 200，意味着这张方
+# 已经进了审计链。改成异步的话，进程在那 0.3 ms 内被 kill（重启、OOM、
+# 编排器滚动更新）就会出现"药房拿到了方、审计链里没有这条记录"——
+# 三甲的审计要求下这是个合规缺陷，而换来的是 0.3 ms。
+# **不为性能牺牲正确性**（R40 §12 第 4 条）：这一项的正确做法是量出来、
+# 指出代价不对等、把同步保留，而不是把它异步掉再在报告里写"已优化"。
+#
+# 那为什么还要有异步路：R45 要把哈希链扩展到**完整推理轨迹**（每次问诊都写，
+# 不只是导出）。那条路上的记录不是"发给药房的凭据"，丢一条的后果是
+# "少一条可回放的轨迹"，跟合规凭据不是一个量级；而它在问诊的关键路径上，
+# 每次问诊都同步写一次磁盘会累加。所以机制先建好并验清楚语义边界。
+
+_async_pool = None
+_async_lock = threading.Lock()
+
+
+def _pool():
+    """单线程的写入池。**必须是单线程**：哈希链要求"读尾行取 prev_hash、算 hash、
+    追加写"整段串行。两个写线程会各自读到同一个 prev_hash，链在那里分叉——
+    `flock` 挡得住跨进程，挡不住同一进程里两个线程之间的逻辑竞态（它们各自
+    拿锁、各自看到的"最后一条"可能相同，取决于谁先拿到）。
+    单线程池把并发压成队列，这是这条路唯一安全的形状。"""
+    global _async_pool
+    if _async_pool is None:
+        with _async_lock:
+            if _async_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                _async_pool = ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="audit")
+    return _async_pool
+
+
+def append_audit_async(record_data: dict):
+    """排队写一条审计记录，立刻返回 `Future`。
+
+    **调用方必须自己决定要不要等**：不等就是接受"这条记录可能没落盘"。
+    合规凭据类的审计**不许**走这条路（见上面那段）。
+    """
+    return _pool().submit(append_audit, record_data)
+
+
+def flush_audit(timeout: float = 5.0) -> bool:
+    """等队列里的异步写全部落盘。返回是否在 `timeout` 内等完。
+
+    进程退出前、以及测试里断言审计内容之前必须调它——否则断言的是一个
+    还没写完的文件，而那种测试会随机红，比没有测试更糟。
+    """
+    pool = _async_pool
+    if pool is None:
+        return True
+    # 往单线程池里再排一个空活：它跑完就意味着前面排的全跑完了（FIFO 单线程）。
+    fut = pool.submit(lambda: None)
+    try:
+        fut.result(timeout=timeout)
+    except Exception:  # noqa: BLE001 - 等不到就如实回 False，不抛
+        return False
+    return True
