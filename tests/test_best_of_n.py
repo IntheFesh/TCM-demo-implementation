@@ -108,12 +108,24 @@ def test_n_equals_one_takes_the_single_sample_path(monkeypatch):
 
 
 def test_it_picks_the_highest_scoring_sample(monkeypatch):
-    """三次采样分别是 0.0（十八反）/ 0.5（超剂量）/ 1.0（干净方）→ 选第三个。"""
+    """三次采样：十八反（0 分）/ 超剂量（中间）/ 干净方（满分）→ 选第三个。
+
+    **中间那个分数不钉具体值。** 它原来写死 0.5（只扣超剂量那一条），但
+    2026-09-17 药理层入库、本草表从 0 条变成 9776 条之后，「缺引经药」规则
+    第一次能取到归经依据、开始生效，同一张超量方变成 0.35（0.5 − 0.15）。
+    那是规则按设计工作，不是缺陷；而这条测试要验的是**选最高分那个**，
+    不是某张方恰好扣多少分。钉死中间值等于每次药理层数据变动就误报一次。
+    扣分权重的正确性由 tests/test_formula_check.py 负责。
+    """
     scripted = [_s3("禁忌方", FORBIDDEN), _s3("超量方", OVERDOSE), _s3("四君子汤", CLEAN)]
     out, _ = _run(monkeypatch, scripted, n="3")
     for r in out["results"]:
         rows = r["candidates_scored"]
-        assert sorted(row["score"] for row in rows) == [0.0, 0.5, 1.0]
+        scores = sorted(row["score"] for row in rows)
+        assert len(scores) == 3
+        assert scores[0] == 0.0, f"十八反那张必须 0 分，实际 {scores[0]}"
+        assert scores[2] == 1.0, f"干净方必须满分，实际 {scores[2]}"
+        assert 0.0 < scores[1] < 1.0, f"超量方应落在两者之间，实际 {scores[1]}"
         assert r["s3"].formula_candidates[r["s3"].selected].name == "四君子汤"
         chosen = [c for c in rows if c["chosen"]]
         assert len(chosen) == 1 and chosen[0]["score"] == 1.0

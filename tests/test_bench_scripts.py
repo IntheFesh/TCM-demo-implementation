@@ -378,6 +378,7 @@ def test_fake_backend_installs_synthetic_cases_when_the_repo_has_none(tmp_path, 
     from core.retrieval_hybrid import HybridRetriever
 
     missing = tmp_path / "没有这个文件.json"
+    monkeypatch.setattr(retrieval, "CASES_PATH", missing)  # bench_consult 判的是这个常量
     monkeypatch.setattr(retrieval, "_retriever_singleton", None)
     monkeypatch.setattr(retrieval.DenseRetriever.__init__, "__defaults__", (missing,))
     monkeypatch.setattr(HybridRetriever.__init__, "__defaults__", (missing,))

@@ -155,9 +155,21 @@ def _materia_medica_path() -> Path | None:
       - 文件可能在 import 之后才生成（run_onsite.sh 段 5 落盘、服务先起来）。
         只用 import 时算好的常量会永远读不到新文件。
     回退顺序本身仍然只有一处实现（core.data_paths），这里只加"覆盖优先"。
+
+    **回退只在没人覆盖过的时候发生。** 早先的写法是"覆盖的文件存在就用它、
+    否则回退"，于是覆盖指向一个**还不存在**的文件时会被静默忽略——正是这段
+    docstring 自己警告的那种失效。2026-09-17 药理层入版本控制后立刻暴露：
+    测试把路径指到 tmp_path/nope.jsonl，函数回退去读了仓库里真实的 9776 条，
+    "文件缺失时报 unavailable" 那条判据于是从来没有被真正验证过（沙盒里
+    文件本来就不存在，它一直绿，但绿的原因不是覆盖生效）。
     """
+    default = pharmacology_read_path_or_canonical("materia_medica")
+    if MATERIA_MEDICA_PATH != default:
+        # 有人显式覆盖过：以覆盖为准，文件不存在就是"没有数据"，不偷偷回退。
+        return MATERIA_MEDICA_PATH if MATERIA_MEDICA_PATH.exists() else None
     if MATERIA_MEDICA_PATH.exists():
         return MATERIA_MEDICA_PATH
+    # 没覆盖过：文件可能在 import 之后才生成，重新按回退顺序找一次。
     return pharmacology_read_path("materia_medica")
 
 
