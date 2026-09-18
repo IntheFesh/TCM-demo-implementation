@@ -71,6 +71,9 @@ data/local_corpora/李可医案.txt
 # 假跑（--backend fake / --self-test）的秒数纯属本地合成，混进仓库之后没人能从文件名
 # 看出它不是真的。脚本按后端给文件名前缀，这两条就是按前缀分的。
 eval/bench/consult_fake_*.json
+# profiler 的临时跑（--out 不给名字时的默认文件名）。R40 的基线/改后那几份
+# 是**带名字**落盘的（R40_*.json），要进版本控制；这些是随手跑出来的，不进。
+eval/profile/consult_*.json
 eval/bench/startup_synthetic_*.json
 # R38 消融：同一条规则的第三次应用。**假后端跑的那份不进**——它的内容指标
 # 本来就不出数（`content_metrics_valid: false`），留在仓库里只会让人以为
