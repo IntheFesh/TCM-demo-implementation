@@ -1048,7 +1048,7 @@ def test_max_ask_rounds_none_keeps_the_module_default(monkeypatch):
     `core.followup.MAX_ASK_ROUNDS`，不是 0。"""
     from core.followup import MAX_ASK_ROUNDS
 
-    fake_llm = _followup_setup(monkeypatch)
+    _followup_setup(monkeypatch)
     monkeypatch.setenv("S3_BEST_OF_N", "1")
     asked = []
     chain.consult("纳差乏力", ask_fn=lambda q: (asked.append(q), "没有")[1])

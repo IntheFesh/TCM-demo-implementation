@@ -33,7 +33,7 @@ def test_differentiation_points_are_the_symmetric_difference_of_cardinal_symptom
     other = _row("饮食伤胃证", "胃痛")
     rows = _load_standard() or []
     sec = _differentiation_section(row, rows)
-    line = next(l for l in sec["lines"] if l.startswith("饮食伤胃证"))
+    line = next(ln for ln in sec["lines"] if ln.startswith("饮食伤胃证"))
     mine = set(row["cardinal_symptoms"])
     theirs = set(other["cardinal_symptoms"])
     for sym in sorted(mine - theirs):
