@@ -1030,6 +1030,32 @@ def test_fast_mode_skips_followup_in_consult(monkeypatch):
     assert fake_llm.calls.count("S2Elements") == 1
 
 
+def test_max_ask_rounds_zero_reaches_run_followup_and_asks_nothing(monkeypatch):
+    """R55：`consult(max_ask_rounds=0)` 必须真的传到 `run_followup`，不是
+    只在 `consult()` 自己的签名里加了个没人读的参数——医师角色（算出来是 0）
+    传进来之后，一个追问问题都不该发出去。"""
+    _followup_setup(monkeypatch)
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
+    asked = []
+    outcome = chain.consult("纳差乏力", ask_fn=lambda q: asked.append(q) or "有",
+                            max_ask_rounds=0)
+    assert asked == []
+    assert outcome["followup"].rounds == 0
+
+
+def test_max_ask_rounds_none_keeps_the_module_default(monkeypatch):
+    """不传（CLI/eval/批跑现状）行为跟改造前逐字节一致——落回
+    `core.followup.MAX_ASK_ROUNDS`，不是 0。"""
+    from core.followup import MAX_ASK_ROUNDS
+
+    fake_llm = _followup_setup(monkeypatch)
+    monkeypatch.setenv("S3_BEST_OF_N", "1")
+    asked = []
+    chain.consult("纳差乏力", ask_fn=lambda q: (asked.append(q), "没有")[1])
+    # 没传 max_ask_rounds：问几轮就该跟模块默认的上限一致（不多问）。
+    assert len(asked) <= MAX_ASK_ROUNDS
+
+
 # ---------- 审查修复 ----------
 
 

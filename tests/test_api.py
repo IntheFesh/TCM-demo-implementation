@@ -304,6 +304,35 @@ def test_consult_endpoint_defaults_retriever_mode_to_none(monkeypatch):
     assert seen["retriever_mode"] is None
 
 
+# ---------- R55：角色决定追问轮数上限，在 API 层算，consult() 只认整数 ----------
+
+
+def test_doctor_role_makes_the_api_pass_zero_ask_rounds(monkeypatch):
+    seen = {}
+
+    def fake_consult(complaint, **kwargs):
+        seen.update(kwargs)
+        return _fake_outcome()
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+    client.post("/api/consult", json={"complaint": "纳差乏力", "role": "doctor"})
+    assert seen["max_ask_rounds"] == 0
+
+
+def test_patient_role_makes_the_api_pass_one_ask_round(monkeypatch):
+    seen = {}
+
+    def fake_consult(complaint, **kwargs):
+        seen.update(kwargs)
+        return _fake_outcome()
+
+    monkeypatch.setattr(api_main, "consult", fake_consult)
+    client = TestClient(api_main.app)
+    client.post("/api/consult", json={"complaint": "纳差乏力", "role": "patient"})
+    assert seen["max_ask_rounds"] == 1
+
+
 def test_unknown_retriever_mode_is_400_not_500(monkeypatch):
     """模式名写错是请求的问题，要回 400 并带上人能看懂的原因，不是 500。"""
     def fake_consult(complaint, **kwargs):

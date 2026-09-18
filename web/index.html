@@ -223,12 +223,15 @@
         <div id="followup-note"></div>
         <div id="graph-panel">
           <div id="graph-toolbar">
-            <button class="ghost-btn" id="skip-btn" title="立即显示终态">⏭ 跳过动画</button>
-            <button class="ghost-btn" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
+            <!-- R55：跳过动画/重播是演示用的，产品模式（internal-only，见 app.css）下不出现；导出 PNG 任何模式都留着。 -->
+            <button class="ghost-btn internal-only" id="skip-btn" title="立即显示终态">⏭ 跳过动画</button>
+            <button class="ghost-btn internal-only" id="replay-btn" title="重新播放生长过程">↻ 重播</button>
             <!-- R42：导出整图 PNG（2 倍、白底）。三甲的实际用法是贴进病历讨论
                  或教学幻灯，截屏只能拿到视口里的半条链。 -->
             <button class="ghost-btn" id="png-btn" title="导出整图 PNG（2 倍、白底）">⤓ 导出 PNG</button>
           </div>
+          <!-- R55：没有 `.has-graph`（还没有图）时显示这段说明，画布/层名列头 display:none，见 app.css。 -->
+          <p id="graph-empty-note">还没有可显示的图谱——完成一次问诊后，这里会画出从证素到方药的推理链。</p>
           <!-- R42：九层的层名列头。缺的那一层照样出一个列头、标成「本次没有」
                ——后端刻意不把缺层的链条悄悄接过去，前端也不能悄悄藏掉。 -->
           <div id="graph-layers"></div>

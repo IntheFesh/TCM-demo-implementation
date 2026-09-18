@@ -239,6 +239,23 @@
     border-radius: var(--r-md);
     background: var(--surface-2);
   }
+  /* R55：`#graph-panel` 没有 `.has-graph` 类（还没有图）时，画布和层名列头
+     不占地方，改显示 `#graph-empty-note` 那段说明——修复前这里在问诊开始
+     之前就已经是一个 540px 高的空画布加一整条工具栏，展开详情区看到的是
+     "空白大框加三个按钮"，会被当成页面坏了（见本轮报告 §5.2）。
+     `.has-graph` 由 `updateGraphToolbar()` 按 `lastGraph` 切，跟"要不要
+     禁用工具栏按钮"同一处判据，不是另一套独立逻辑。 */
+  #graph-empty-note {
+    display: block;
+    padding: 24px 12px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+    text-align: center;
+  }
+  #graph-panel.has-graph #graph-empty-note { display: none; }
+  #cy, #graph-layers { display: none; }
+  #graph-panel.has-graph #cy, #graph-panel.has-graph #graph-layers { display: block; }
   /* 图谱容器右下角的两条角标。R14 第 0 项之前它们是 index.html 里的 `style="..."`
      内联属性，色值各写各的（一个偏橙一个偏褐）——扫描只看 app.css，所以两个都躲过了
      "规则里不许出现十六进制"那条断言。搬到这里之后两条角标都走 --caution：它们

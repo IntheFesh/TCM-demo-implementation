@@ -56,8 +56,8 @@ from core.llm import (
     thinking_for,
 )
 from core.followup import (
-    AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
-    stop_label,
+    MAX_ASK_ROUNDS, AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer,
+    run_followup, stop_label,
 )
 from core.physicians import (
     PHYSICIANS,
@@ -2403,6 +2403,7 @@ def consult(
     refs_mode: str = "own",
     s3_mode_override: str | None = None,
     patient_profile=None,
+    max_ask_rounds: int | None = None,
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
@@ -2429,6 +2430,14 @@ def consult(
     ReAct 追问需要用户回答"这件事**——那仍然是 ask_fn 的职责：SSE 端点想在
     追问时推 need_input 事件、暂停等回答，只需要传一个自己包了一层的 ask_fn，
     不需要 consult() 或 core/followup.py 知道"上面接的是不是 SSE"。
+
+    max_ask_rounds 是**逐请求**的追问轮数上限（R55：按角色分——医师 0、患者 1，
+    学生/研究者不限）。不传（None）就走 `run_followup` 自己的默认
+    `MAX_ASK_ROUNDS`，行为跟改造前逐字节一致（CLI/eval/批跑现状）。**刻意不接
+    收 role 本身**：api/main.py 的 `_filter_response_by_role` 那段注释已经
+    说明"role 传得太深只会让 consult() 也去关心跟辨证无关的展示逻辑"
+    ——这里只认一个已经从 role 解出来的整数，role→整数的映射
+    （`core.followup.max_ask_rounds_for_role`）留在 API 层做。
 
     retriever_mode 是**逐请求**的检索模式（dense/bm25/graph/hybrid），不传就走
     检索层自己的默认。**这里刻意不去设 RETRIEVER_MODE 环境变量**：那个变量是
@@ -2487,7 +2496,7 @@ def consult(
     safety_flag: str | None = None
     # R44：这一次代理做过的决策（停/问/取证/验）。规则表在 core/agent.py，
     # 这里只记录——判断仍然在各自的模块里。
-    trace = AgentTrace()
+    trace = AgentTrace(on_step=on_step)
 
     def _stopped(decision, **state) -> dict:
         """**一份**"停下来"的返回值。
@@ -2547,7 +2556,7 @@ def consult(
     safety_flag = safety_flag or reject_reason
     stop = decide("danger_in_complaint", reject_reason, bypass=bypass)
     if stop is not None:
-        trace.decisions.append(stop)
+        trace.append(stop)
         # **合一模式下 `s2_pending` 里已经有证素了，这里把它丢掉、照旧返回
         # `s2: None`。** 对外可见的行为跟分两次那条路逐字段一致（被拦截的请求
         # 不产出证素、不产出方药）。这也正是 `normalize_and_infer_merged` 默认
@@ -2566,7 +2575,8 @@ def consult(
     # 想要 need_input 事件，自己包一层传进来的 ask_fn，不需要 run_followup 或
     # 这里知道调用方是不是 SSE）。这里只上报"追问这一整段结束了"。
     followup = run_followup(
-        s1.symptoms, [h.element for h in s2.elements], ask_fn
+        s1.symptoms, [h.element for h in s2.elements], ask_fn,
+        max_rounds=(max_ask_rounds if max_ask_rounds is not None else MAX_ASK_ROUNDS),
     )
     # 中文名跟事件一起发：进度日志是给人读的，`max_rounds` 这种 id 印在那里
     # 跟印在结论里一样不可读（`stop_label` 是停因的唯一一张表）。
@@ -2587,7 +2597,7 @@ def consult(
                   followup.reject_reason if followup.stopped_by == "safety" else None,
                   bypass=bypass)
     if stop is not None:
-        trace.decisions.append(stop)
+        trace.append(stop)
         return _stopped(stop, s2=s2, followup=followup, _calls=s1s2_calls)
     if followup.asserted:
         # 双保险：run_followup 已经把危重症状挡在 asserted 之外，这里再查一次是防
@@ -2596,7 +2606,7 @@ def consult(
         safety_flag = safety_flag or reject
         stop = decide("danger_in_asserted", reject, bypass=bypass)
         if stop is not None:
-            trace.decisions.append(stop)
+            trace.append(stop)
             return _stopped(stop, s2=s2, followup=followup, _calls=s1s2_calls)
         # 追问确认的是国标症状名（来自图谱节点），本身已经是标准表述，不需要再过
         # S1——这不违反"S1 全局只跑一次"，S1 一次也没有多跑。
@@ -2625,7 +2635,7 @@ def consult(
 
     stop = decide("no_elements", not s2.elements and not (residual and residual["s2"].elements))
     if stop is not None:
-        trace.decisions.append(stop)
+        trace.append(stop)
         return _stopped(
             stop, s2=s2, residual=residual, followup=followup,
             insufficient_reason=(

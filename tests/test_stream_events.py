@@ -69,8 +69,20 @@ def _prefix_and_per_physician(events):
     physician_events = {"physician_start", "react_step", "s3_start",
                         "s3_delta", "s3_done", "physician_done"}
     first = next(i for i, n in enumerate(names) if n in physician_events)
+    last = max(i for i, n in enumerate(names) if n in physician_events)
+    # R55：`agent_step` 是 `consult()` 收尾时（取证/自验/个体化这几笔小结，
+    # core/chain.py 里 `trace.record("gather_evidence"/"verify_and_revise"/
+    # "verify_patient_fit", ...)`）广播的**全局**事件，不属于任何一位医家——
+    # 它只会在全部医家都跑完之后成段出现，不会夹在医家事件中间。单独校验这一
+    # 段，不然会被下面那条"医家事件之间混进了 xxx"的守卫误判成一种没人认的
+    # 医家事件（这份测试本身就是当年在真机上发现"新事件没人接"这类 bug 之后
+    # 加的守卫，agent_step 是这一轮新增的合法信号，不是需要拦下的噪音）。
+    tail = names[last + 1:]
+    assert all(n == "agent_step" for n in tail), (
+        f"医家事件结束之后只该跟着 agent_step 收尾事件，混进了 {tail}"
+    )
     per_physician: dict[str, list[str]] = {}
-    for name, data in events[first:]:
+    for name, data in events[first:last + 1]:
         assert name in physician_events, f"医家事件之间混进了 {name}"
         pid = data.get("physician")
         assert pid, f"{name} 事件没带 physician 字段——并发之后前端没法路由"

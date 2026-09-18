@@ -5939,3 +5939,40 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     "这条测试曾经是哪一轮的占位符"这条历史线索。判据：写 canary 测试时，
     如果能预见到未来实现可能选择"嵌套"而不是"拍平"这类形状上的分支，
     应该两种形状都覆盖，而不是只赌一种。
+
+152. **一个"缺了才 return"的早退判据，容易在不知不觉中变成一条它管不着的
+    总闸门（R55）。**
+
+    `core/llm.py::record_usage` 原来的实现：`if hit is None and miss is None:
+    return`——这句话的原意是"DeepSeek 专属的两个缓存字段都没报，这次 usage
+    就不算命中过缓存统计"。但因为它写在函数最前面、后面 `completion_tokens`/
+    `reasoning_tokens` 的记账代码全部排在这个 `return` 之后，效果变成了
+    "只要没报缓存字段，这条 usage 整个不算数"——任何不报 DeepSeek 缓存字段
+    但报了 `completion_tokens_details.reasoning_tokens` 的后端（比如走扩展
+    思考的非 DeepSeek 后端），`reasoning_tokens` 会被永远记成 0，manifest
+    上恒显示 None。这正是 R55 spec 点名的"reasoning_tokens 恒 None"那条投诉
+    ——查了两轮才定位到：`s3_reasoning_effort()`/`thinking_by_step()` 本身
+    完全正确（默认值、按检索模式选档的逻辑都没问题），问题出在从来没人怀疑
+    过的记账函数最前面那一行"看起来无害"的早退。
+
+    判据：**一个函数里"提前 return"的条件，要问它守的是"这条数据整体没东西
+    可记"还是"这条数据里某一类字段没报"——两者混在一起写的表现是"看起来在
+    正确地跳过没用的数据"，实际是"跳过的范围比想跳过的范围大"。** 修法是把
+    三类信号（缓存 / completion_tokens / reasoning_tokens）拆成三个独立的
+    `if xxx is not None: ...; reported = True`，只在**任意一类**报了才计
+    `n_reported += 1`。同时把 `tests/test_cache_observability.py` 里那条
+    原来断言"没报缓存字段就等于 current_usage_stats() 返回 None"的测试
+    （`test_a_backend_that_does_not_report_cache_fields_counts_as_not_
+    reported`）改了名字、改了断言方向——它原来钉的就是这条 bug 本身，不是
+    什么需要保护的正确行为；新增了一条专门覆盖"三类都不认才是真的没报"的
+    测试，把原来那条被误钉住的场景腾出来。
+
+    R55 还有一处同一类判据的例子：`web/app.js` 的九段渲染骨架里，「校验与
+    出处」（⑨）原来跟④-⑧共用 `sec.step === "s3"` 这一个粗粒度状态桶——
+    `s3_done` 之后进入验证/佐证/个体化调整这几步的等待期间，⑨看起来跟④-⑧
+    流式输出中一模一样，用户读到的是"这一段还在跑"，实际是"这一段压根没有
+    事件为它更新过状态"。真机上表现为「已用 286 秒仍在转，底部日志却已经
+    写着输出完成」——这是同一条判据的前端版本：一个复用别处状态的字段，
+    要问它复用的粒度是不是真的对得上这个场景要回答的问题。修法是给⑨一个
+    独立跟踪的状态机（`chainChecksState`），只认 `verify_revise`/`done`
+    两个事件，不再从 `reached` 反推。

@@ -361,11 +361,24 @@ S3_THINKING_DEFAULT = "enabled"
 # "这次悄悄用了别的设置"，跟没设一样看不出来（同 thinking_for 未知 step 那条）。
 REASONING_EFFORTS = ("low", "medium", "high", "max")
 S3_REASONING_EFFORT_ENV = "S3_REASONING_EFFORT"
-# top3 系沿用 high（R1~R21 所有数字都是在 high 下跑出来的，换档 = 不可比）。
-S3_REASONING_EFFORT_TOP3 = "high"
-# full_context 下默认 max：一次问诊的输入已经是几十万 token 的全量医案，
-# 这时候省推理 token 是本末倒置——贵的那部分（输入）已经靠缓存降到 1/30 了。
-S3_REASONING_EFFORT_FULL_CONTEXT = "max"
+# R55：2026-09-17 真机三档墙钟实测 264.6/276.3/208.9 秒，**档位顺序跟耗时顺序
+# 对不上**（顺序应该是 low<medium<high，实测里 medium 反而最慢）——三档差异
+# 落在测量噪声以内，"档位越高越慢"这个假设在真机上不成立，继续按 high/max 收费
+# 换不来可验证的质量收益。真正确定的成本是思考：同一次真机跑出了 16350 字思考，
+# 这部分不受档位名字影响，只受"关不关思考"影响（`S3_THINKING_DEFAULT` 仍是
+# "enabled"，不能因为它慢就关掉——关思考会让输出质量坍缩，是两回事）。
+# top3 系原沿用 high（R1~R21 数字在 high 下跑出）；换到 low 之后那批历史数字
+# 不再可比，真机三档质量对照（证型/主方/验证器一次通过率/rule_refs 完整率）
+# 需要在真机上补跑——本仓库没有真实 LLM 后端，跑不出这份数字，工具在
+# scripts/compare_reasoning_tiers.py，由用户在 AutoDL 上执行（详见 R55 报告
+# 的"无法完成项"一节）。低档质量掉（一次通过率降 > 10 个百分点）就回 medium。
+S3_REASONING_EFFORT_TOP3 = "low"
+# full_context 下原来是 max：一次问诊的输入已经是几十万 token 的全量医案，
+# 省推理 token 曾被认为本末倒置。**同样被上面那组真机数字推翻**——档位差异
+# 落在噪声内，选 max 换不来可验证的收益，改成 medium 作为省成本与保质量之间
+# 更保守的折中（不像 top3 那样直接落到最低档：full_context 模式本来输入就大，
+# 这一步是这条链上唯一会思考的一步，留一档缓冲）。
+S3_REASONING_EFFORT_FULL_CONTEXT = "medium"
 
 
 # R33：S3 这一步产出哪种形状。
@@ -662,8 +675,18 @@ def current_usage_stats() -> dict | None:
 def record_usage(usage) -> None:
     """把一次响应的 usage 累加进当前统计。usage 可以是 SDK 对象或 dict。
 
-    只在**真的取到**缓存字段时才算一次 `n_reported`——非 DeepSeek 后端的 usage
-    里没有这两个键，不能因为它有 completion_tokens 就把它算成"报了缓存数"。
+    R55 修复：三类信号**互相独立**，谁报了就记谁，不能拿"有没有缓存字段"
+    当作"这条 usage 到底有没有东西可记"的总闸门——修复前的实现是
+    `if hit is None and miss is None: return`，只要响应里没有 DeepSeek 专属
+    的那两个缓存字段就整条提前返回，连 `completion_tokens` / `reasoning_tokens`
+    也一起被跳过。后果是任何一个"报 completion_tokens_details.reasoning_tokens
+    但不报 DeepSeek 缓存字段"的后端（比如走扩展思考的非 DeepSeek 后端），
+    `reasoning_tokens` 会被永远记成 0、manifest 上恒显示 None——这正是
+    R55 spec 里"reasoning_tokens 恒 None"那条投诉的根因。
+    `n_reported` 现在只要**这三类里有任意一类真的取到值**就算一次；三类
+    都没取到（比如 usage 是个空对象）才不计——这是"这次响应有没有报任何
+    usage 信息"，不是"报没报 DeepSeek 缓存字段"，两个问题在这里被之前的
+    实现悄悄合成了一个。
     """
     stats = _usage_stats.get()
     if stats is None or usage is None:
@@ -674,18 +697,29 @@ def record_usage(usage) -> None:
             return usage.get(name)
         return getattr(usage, name, None)
 
+    reported = False
+
     hit, miss = _get(CACHE_HIT_FIELD), _get(CACHE_MISS_FIELD)
-    if hit is None and miss is None:
-        return
-    stats["prompt_cache_hit_tokens"] += int(hit or 0)
-    stats["prompt_cache_miss_tokens"] += int(miss or 0)
-    stats["completion_tokens"] += int(_get("completion_tokens") or 0)
+    if hit is not None or miss is not None:
+        stats["prompt_cache_hit_tokens"] += int(hit or 0)
+        stats["prompt_cache_miss_tokens"] += int(miss or 0)
+        reported = True
+
+    completion = _get("completion_tokens")
+    if completion is not None:
+        stats["completion_tokens"] += int(completion or 0)
+        reported = True
+
     details = _get("completion_tokens_details")
     if details is not None:
         reasoning = (details.get("reasoning_tokens") if isinstance(details, dict)
                      else getattr(details, "reasoning_tokens", None))
-        stats["reasoning_tokens"] += int(reasoning or 0)
-    stats["n_reported"] += 1
+        if reasoning is not None:
+            stats["reasoning_tokens"] += int(reasoning or 0)
+            reported = True
+
+    if reported:
+        stats["n_reported"] += 1
 
 
 def _record_retry(error: BaseException) -> None:

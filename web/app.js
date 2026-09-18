@@ -1879,9 +1879,38 @@ function chainSectionHtml(sec, state, body) {
   </section>`;
 }
 
+// R55：第九段「校验与出处」原来跟④-⑧共用 sec.step === "s3" 这一个粗桶，
+// 于是 s3_done 之后进入验证/佐证/个体化这几步的等待期间，⑨看起来跟④-⑧
+// 流式输出中一模一样——都是 state="active" + 固定文案「推理中…」。用户在
+// 这段时间里唯一能看到变化的地方是底部一行行滚动的进度日志，主状态区完全
+// 不动，286 秒卡在「推理中」正是这个空档（见本轮报告 §5.2 的真机实证）。
+// 独立跟踪⑨自己的状态，不再从 reached 推：pending（还没到）→ active
+// （S3 已完，正在验证/佐证，还没有 verify_revise）→ verifying（正在回灌
+// 重开，带轮次）。"done" 不需要在这里出现——终值由 renderChainFlow() 整体
+// 替换掉骨架，不经过这个函数。
+let chainChecksState = { phase: "pending" };
+
+function resetChainChecksState() {
+  chainChecksState = { phase: "pending" };
+}
+
+function chainChecksBodyHtml() {
+  if (chainChecksState.phase === "verifying") {
+    return `<span class="chain-key">核对中（第 ${chainChecksState.round} 轮）</span>`;
+  }
+  if (chainChecksState.phase === "active") {
+    return "<span class=\"chain-key\">推理中…</span>";
+  }
+  return "";
+}
+
 // 跑到哪一步了 → 九段各自的状态。step 的取值跟 COLUMN_STEPS 同一套
 // （s1/s2/s3），**复用那套而不是另编一套**：两套的话进度会各走各的。
+// ⑨是例外（见上面 chainChecksState 的注释）：它不跟着 reached 走。
 function chainStateFor(sec, reached) {
+  if (sec.key === "checks") {
+    return chainChecksState.phase === "pending" ? "todo" : "active";
+  }
   const order = COLUMN_STEPS.map((x) => x.key);
   const at = order.indexOf(reached);
   const mine = order.indexOf(sec.step);
@@ -1893,9 +1922,16 @@ function chainStateFor(sec, reached) {
 function renderChainSkeleton(reached) {
   const el = document.getElementById("chain-flow");
   if (!el) return;
+  // S3 这一步一旦被触达（s3_start/s3_delta/s3_done 都传 "s3"），⑨从
+  // pending 变成 active——不用等 s3_done：S3 一开始验证器就已经"在排队"了，
+  // 摆一个「推理中…」比让它继续显示"还没轮到"更诚实。
+  if (reached === "s3" && chainChecksState.phase === "pending") {
+    chainChecksState = { phase: "active" };
+  }
   el.innerHTML = CHAIN_SECTIONS.map((sec) => chainSectionHtml(
     sec, chainStateFor(sec, reached),
-    chainStateFor(sec, reached) === "todo" ? "" : "<span class=\"chain-key\">推理中…</span>",
+    sec.key === "checks" ? chainChecksBodyHtml()
+      : (chainStateFor(sec, reached) === "todo" ? "" : "<span class=\"chain-key\">推理中…</span>"),
   )).join("");
   showChainFlow();
 }
@@ -3045,8 +3081,17 @@ function describeProgressEvent(name, data) {
       return `✓ ${data.physician_name} 完成：${data.syndrome}`;
     case "followup_answered":
       return `　已回答「${data.question}」：${data.answer}`;
+    // R55：这三个事件之前后端发了、这里一个 case 都没有——不是"少一行日志"
+    // 这么轻，是⑨（校验与出处）那一段在这段时间里完全没有任何可见变化，
+    // 用户会把"S3 早就输出完了、还在走验证/佐证"读成"卡住了"（见本轮报告）。
+    case "verify_revise":
+      return `　⑨ 校验：第 ${data.round} 轮核对未通过（${data.rules.join("、")}），正在按反例重开…`;
+    case "early_veto":
+      return `　⚠ 初步提示：${data.reason || data.rule_label}（基于尚未输出完的药味清单，最终以完整校验为准）`;
+    case "agent_step":
+      return `　${data.capability_label}：${data.why}${data.detail ? "——" + data.detail : ""}`;
     default:
-      return null; // stream_id / need_input / done / error 各自单独处理，不进日志
+      return null; // stream_id / need_input / done / error / heartbeat 各自单独处理，不进日志
   }
 }
 
@@ -3105,6 +3150,47 @@ let currentAbort = null;
 let cancelledByUser = false;
 const SSE_IDLE_TIMEOUT_MS = 300000;
 
+// R55：s3_done 之后 120 秒还没等到 done 的兜底。**不是整体看门狗
+// （SSE_IDLE_TIMEOUT_MS=300s）的替代**——那个按"距上一条事件多久"算，
+// heartbeat 每 15 秒一条，只要连接还活着它就不会触发；这个专门针对
+// "s3_done 已经发生、后面的验证/佐证/收尾阶段这条连接却再也没有任何一帧
+// 新事件"这一种更窄的失败模式（真机上更常见：nginx/CDN 截断了 done 那一帧，
+// 或者后端 worker 早就跑完但那一帧在网络上丢了），不用干等到 300 秒才有
+// 反应。
+const S3_DONE_FALLBACK_MS = 120000;
+let s3DoneFallbackTimer = null;
+let resolvedByFallback = false;
+
+function clearS3DoneFallback() {
+  if (s3DoneFallbackTimer) {
+    clearTimeout(s3DoneFallbackTimer);
+    s3DoneFallbackTimer = null;
+  }
+}
+
+function armS3DoneFallback(streamId) {
+  clearS3DoneFallback();
+  if (!streamId) return; // 理论上到不了：stream_id 事件总在 s3_done 之前到
+  s3DoneFallbackTimer = setTimeout(() => fetchDoneFallback(streamId), S3_DONE_FALLBACK_MS);
+}
+
+async function fetchDoneFallback(streamId) {
+  // 只是一次尝试，不是主流程——失败（还没跑完 / stream_id 已过期 / 网络
+  // 也不通）就什么都不做，继续按原计划让主看门狗（300 秒）兜底，不额外报错。
+  try {
+    const resp = await fetch(`/api/consult/stream/${streamId}/result`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (currentStreamId !== streamId) return; // 这期间用户已经开始了下一次问诊
+    resolvedByFallback = true;
+    appendProgress("　长时间没有收到最终结果，已通过兜底接口直接取回（本次结果不受影响）");
+    if (currentAbort) currentAbort.abort();
+    renderConsultResult(data);
+  } catch {
+    // 静默：见上面的注释。
+  }
+}
+
 async function submitConsult() {
   const complaint = document.getElementById("complaint").value.trim();
   if (!complaint) {
@@ -3129,6 +3215,7 @@ async function submitConsult() {
   renderComplaintBody(complaint);
   setConsultState("running");
   resetColumnProgress();
+  resetChainChecksState();
   if (isSingleChain(null)) {
     // R37：structured 下**问诊一开始就摆九段骨架**。/health 已经告诉了前端
     // 这台服务的形状，所以不必先摆三列再当场换掉——那一下闪烁正是"界面在猜"。
@@ -3141,6 +3228,7 @@ async function submitConsult() {
 
   currentAbort = new AbortController();
   cancelledByUser = false;
+  resolvedByFallback = false;
   let idleTimedOut = false;
   if (cancelBtn) cancelBtn.classList.remove("is-hidden");
 
@@ -3178,6 +3266,11 @@ async function submitConsult() {
     let errorDetail = null;
     await readSSE(resp, (name, data) => {
       armWatchdog(); // 每收到一条事件就把空闲计时归零
+      // R55：s3_done 后 120 秒还没等到 done 的兜底（见 armS3DoneFallback 的
+      // 文档）。放在这里、路由逻辑之前——不管下面按哪个分支处理这条事件，
+      // 计时器的起止都不该漏。
+      if (name === "s3_done") armS3DoneFallback(currentStreamId);
+      if (name === "done" || name === "error") clearS3DoneFallback();
       if (name === "usage") { renderUsage(data); return; }
       if (name === "stream_id") {
         // 额度状态搭在第一帧里：降级到回放要在推理开始之前让人知道。
@@ -3189,6 +3282,14 @@ async function submitConsult() {
         errorDetail = data.detail;
       } else if (name === "done") {
         doneData = data;
+      } else if (name === "verify_revise") {
+        // R55：⑨（校验与出处）的状态**只**由这个事件（进行中）和 done（定稿）
+        // 推进，不再跟④-⑧共用 reached==="s3" 这个粗桶——那正是"S3 早输出完、
+        // 界面还显示推理中"这条真机 bug 的根因。
+        chainChecksState = { phase: "verifying", round: data.round };
+        if (isSingleChain(null)) renderChainSkeleton("s3");
+        const line = describeProgressEvent(name, data);
+        if (line) appendProgress(line);
       } else if (name === "s3_delta") {
         // R36：增量**不进日志**（几十帧会把日志顶得看不见），只刷流式区。
         onS3Delta(data);
@@ -3221,24 +3322,33 @@ async function submitConsult() {
     if (!doneData) throw new Error("事件流意外中断，没有收到最终结果");
     renderConsultResult(doneData);
   } catch (err) {
-    console.error("consult failed:", err);
-    if (cancelledByUser) {
-      showError("已取消本次辨证。服务端可能还在跑完当前这一步，费用已经发生的部分不会退回。");
-    } else if (idleTimedOut || (err && err.name === "AbortError")) {
-      showError(
-        `等待服务端新进度超过 ${Math.round(SSE_IDLE_TIMEOUT_MS / 1000)} 秒，已中断。`
-        + "服务端可能仍在重试（API 后端墙钟 180 秒 × 3 次）——先看服务端日志，"
-        + "不要先怀疑网络。"
-      );
+    if (resolvedByFallback) {
+      // R55：120 秒兜底已经拿到结果并渲染过了（fetchDoneFallback 里主动
+      // abort 了这次 fetch 换来的就是这里的 AbortError）——这不是失败，
+      // 不该再走下面任何一条错误提示。
+      console.warn("consult stream 被兜底接口接管:", err);
     } else {
-      showError(`请求失败：${err.message || err}\n${(err.stack || "").split("\n").slice(0, 3).join("\n")}`);
+      console.error("consult failed:", err);
+      if (cancelledByUser) {
+        showError("已取消本次辨证。服务端可能还在跑完当前这一步，费用已经发生的部分不会退回。");
+      } else if (idleTimedOut || (err && err.name === "AbortError")) {
+        showError(
+          `等待服务端新进度超过 ${Math.round(SSE_IDLE_TIMEOUT_MS / 1000)} 秒，已中断。`
+          + "服务端可能仍在重试（API 后端墙钟 180 秒 × 3 次）——先看服务端日志，"
+          + "不要先怀疑网络。"
+        );
+      } else {
+        showError(`请求失败：${err.message || err}\n${(err.stack || "").split("\n").slice(0, 3).join("\n")}`);
+      }
     }
   } finally {
     clearInterval(ticker);
     clearTimeout(idleTimer);
+    clearS3DoneFallback();
     if (cancelBtn) cancelBtn.classList.add("is-hidden");
     currentAbort = null;
     cancelledByUser = false;
+    resolvedByFallback = false;
     btn.disabled = false;
     btn.textContent = "辨证";
     status.textContent = "";
@@ -3307,7 +3417,15 @@ document.getElementById("need-input-answer").addEventListener("keydown", (e) => 
 });
 // 没有图时这三个按钮点了什么都不会发生（lastGraph 为 null），原来仍然是
 // 可点的实心按钮，看起来像坏了。
+// R55：`#graph-panel` 原来在没有图的时候也照常显示 540px 高的空画布 + 一整条
+// 工具栏——展开「推理链·图谱·取证过程」那个 details 之后，问诊开始之前看到
+// 的就是一个空白大框加三个按钮，会被当成"坏了"（见本轮报告 §5.2）。
+// `.has-graph` 这个类才是真正的开关：CSS 那边（app.css）用它决定画布/图层
+// 列头显示还是一段"还没有图"的说明，这里只负责按 `lastGraph` 切它——跟
+// 下面禁用三个按钮同一处判据，不再另写一份"有没有图"的逻辑。
 function updateGraphToolbar() {
+  const panel = document.getElementById("graph-panel");
+  if (panel) panel.classList.toggle("has-graph", !!lastGraph);
   for (const id of ["skip-btn", "replay-btn", "png-btn"]) {
     const b = document.getElementById(id);
     if (b) b.disabled = !lastGraph;

@@ -26,6 +26,29 @@ from core.tools import question_candidates
 
 MAX_ASK_ROUNDS = 3
 
+#: R55：追问轮数上限的产品默认**按角色分**，不再是一个全局常量。
+#: 医师已经完成了望闻问切四诊，系统再追问三轮是把医师当患者审——所以医师
+#: 角色下限 0（拒绝追问，直接按现有信息辨证或如实说证素不足）；患者角色限 1
+#: 轮（多轮像被审问）。`student`（教学，追问过程本身是演示的一部分）与
+#: `researcher`（内部角色，要看完整行为）不在这张表里，落到下面
+#: `max_ask_rounds_for_role()` 的默认分支，沿用 `MAX_ASK_ROUNDS`——「可开」
+#: 不是"给它另一个数"，是"不限制它"。
+ROLE_MAX_ASK_ROUNDS: dict[str, int] = {
+    "doctor": 0,
+    "patient": 1,
+}
+
+
+def max_ask_rounds_for_role(role: str | None) -> int:
+    """role → 追问轮数上限的**唯一映射**（R55）。这是全项目唯一一处按角色
+    决定追问轮数的地方，不要在调用方各写一份 if role == "doctor" ...。
+
+    不认识的 role（`None`、`"student"`、`"researcher"`、或任何将来加的新角色）
+    一律落回 `MAX_ASK_ROUNDS`——没写进 `ROLE_MAX_ASK_ROUNDS` 就是"这个角色
+    不受限制"，不是"忘了配置"。
+    """
+    return ROLE_MAX_ASK_ROUNDS.get(role or "", MAX_ASK_ROUNDS)
+
 # 低于这个信息增益就认为"再问一句也问不出什么了"，收敛退出。0.05 bit 大约相当于
 # 把一个 17 选 1 的问题削掉 3% 的不确定性——继续问的收益已经低于多问一句的代价。
 # 这是策略阈值不是物理常数，改它只影响"什么时候停"，不影响问题的排序。

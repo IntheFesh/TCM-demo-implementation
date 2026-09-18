@@ -61,10 +61,46 @@ def test_usage_accumulates_across_calls():
     assert stats["n_reported"] == 2
 
 
-def test_a_backend_that_does_not_report_cache_fields_counts_as_not_reported():
-    """非 DeepSeek 后端的 usage 里没有这两个键。不能因为它有 completion_tokens
-    就把它算成"报了缓存数"。"""
+def test_a_backend_that_only_reports_completion_tokens_still_counts_as_reported():
+    """R55 修复：非 DeepSeek 后端的 usage 里没有缓存那两个键，**但这不等于
+    "这次 usage 什么都没报"**——completion_tokens/reasoning_tokens 是跟缓存
+    字段互相独立的信号，报了就该被记下来，缓存那两格保持 0（真的没报）就够了。
+
+    这条测试原来断言的是相反的结果（`current_usage_stats() is None`），
+    是修复前 `record_usage` 的 bug 本身：那个实现里 `if hit is None and
+    miss is None: return` 拿"有没有报缓存字段"当整条 usage 记不记的总闸门，
+    completion_tokens 跟着被一起跳过——manifest 上 `reasoning_tokens` 恒
+    None 的根因就是这条判断（R55 spec 明确点名的那个症状）。旧测试名字里的
+    "not_reported" 精确对应的是那个 bug，这里改名 + 改断言，反映修复后的
+    正确语义：缓存字段独立于其它两类信号，不是它们的总闸门。
+    """
     record_usage({"completion_tokens": 42, "prompt_tokens": 100})
+    stats = current_usage_stats()
+    assert stats is not None
+    assert stats["completion_tokens"] == 42
+    assert stats[CACHE_HIT_FIELD] == 0
+    assert stats[CACHE_MISS_FIELD] == 0
+
+
+def test_reasoning_tokens_is_recorded_even_without_cache_fields():
+    """R55 spec 原话点名的症状：manifest 的 `reasoning_tokens` 恒 None。
+    根因是同一个总闸门 bug——一个只报 `completion_tokens_details.
+    reasoning_tokens`、不报 DeepSeek 缓存字段的后端（比如走扩展思考的
+    非 DeepSeek 后端），reasoning_tokens 会被永远记成 0。"""
+    class _NonDeepSeekUsage:
+        completion_tokens_details = {"reasoning_tokens": 777}
+
+    record_usage(_NonDeepSeekUsage())
+    stats = current_usage_stats()
+    assert stats is not None
+    assert stats["reasoning_tokens"] == 777
+    assert stats[CACHE_HIT_FIELD] == 0
+
+
+def test_a_usage_payload_with_nothing_recognized_still_counts_as_not_reported():
+    """三类信号（缓存 / completion_tokens / reasoning_tokens）**一个都没有**
+    才是真正的"这次 usage 没东西可记"——不是"没报缓存字段"这么窄。"""
+    record_usage({"prompt_tokens": 100})  # 三类都不认的字段
     assert current_usage_stats() is None
 
 

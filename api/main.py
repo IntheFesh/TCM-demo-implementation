@@ -30,7 +30,7 @@ from core.chain import (
 )
 from core.diseases import get_disease, triage_advice
 from core.examples import EXAMPLE_COMPLAINTS
-from core.followup import stop_label
+from core.followup import max_ask_rounds_for_role, stop_label
 from core.herbs import is_western_drug, strip_dose_and_parens
 from core.llm import (
     ByokBackend,
@@ -1157,8 +1157,12 @@ def api_consult(
     outcome = None
     try:
         with use_llm(backend):
+            # R55：追问轮数上限按角色算，在这里算（role 已经解出来了），
+            # consult() 本身只认一个整数，不认 role——见 core.chain.consult
+            # 的文档字符串那段"刻意不接收 role 本身"。
             outcome = consult(_effective_complaint(req), retriever_mode=req.retriever_mode,
-                              patient_profile=req.patient_profile)
+                              patient_profile=req.patient_profile,
+                              max_ask_rounds=max_ask_rounds_for_role(role))
     except LLMAuthError as e:
         # 见 stream 里那条注释：这一类要说给访问者听。
         raise HTTPException(status_code=502, detail=str(e)) from e
@@ -1517,6 +1521,40 @@ class _ConsultStream:
 _streams: dict[str, _ConsultStream] = {}
 _streams_lock = threading.Lock()
 
+#: R55 渲染断链兜底：`s3_done` 之后 120 秒还没等到 `done`，前端会主动查一次
+#: `/api/consult/stream/{stream_id}/result`。**跟 `_streams` 是两张分开的表**
+#: ——`_streams` 只在流还活着的时候有条目，`_ConsultStream.finish()` 一收尾
+#: 就把 stream_id 从里面 pop 掉（见上面），而兜底恰恰是在流大概率**已经**
+#: 跑完之后才触发：这时候 `_streams` 里已经没有它了，查不到不代表结果不存在。
+#: 值是 `(写入时刻, 结果 dict)`；只留 `_FINISHED_RESULT_TTL_SECONDS`，不是
+#: 一个通用的"历史问诊结果"存档——超时之后自然被下一次写入顺带清掉。
+_finished_results: dict[str, tuple[float, dict]] = {}
+_finished_results_lock = threading.Lock()
+_FINISHED_RESULT_TTL_SECONDS = 600.0
+
+
+def _cache_finished_result(stream_id: str, done: dict) -> None:
+    now = time.monotonic()
+    with _finished_results_lock:
+        _finished_results[stream_id] = (now, done)
+        # 顺手清掉过期的——问诊频率不高，不值得为这张表单开一个定时任务，
+        # 搭在下一次写入时扫一遍就够了。
+        expired = [k for k, (t, _) in _finished_results.items()
+                   if now - t > _FINISHED_RESULT_TTL_SECONDS]
+        for k in expired:
+            _finished_results.pop(k, None)
+
+
+def _get_finished_result(stream_id: str) -> dict | None:
+    with _finished_results_lock:
+        entry = _finished_results.get(stream_id)
+    if entry is None:
+        return None
+    written_at, done = entry
+    if time.monotonic() - written_at > _FINISHED_RESULT_TTL_SECONDS:
+        return None
+    return done
+
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -1562,6 +1600,7 @@ def api_consult_stream(
                     on_step=stream.emit,
                     retriever_mode=req.retriever_mode,
                     patient_profile=req.patient_profile,
+                    max_ask_rounds=max_ask_rounds_for_role(_req_role),
                 )
             # R40 背压：丢过增量就**说出来**，紧挨在 done 之前。
             # 单独一个事件而不是塞进 done 的载荷：done 的形状跟 /api/consult
@@ -1571,6 +1610,12 @@ def api_consult_stream(
                 stream.emit("deltas_dropped", {"n": stream.dropped_deltas})
             _done = _consult_response(outcome, role=_req_role)
             _record_history(_done, req)
+            # R55 渲染断链兜底：结果**先**进这张短期缓存再发 `done` 事件——
+            # 顺序反过来的话，`done` 发出去和缓存写入之间有一个窗口，前端的
+            # 120 秒兜底 GET 如果恰好落在这个窗口里会扑空，得到一个不必要的
+            # 404（`done` 明明已经在路上）。缓存写入是本地字典操作，先做不会
+            # 让 `done` 事件晚发。
+            _cache_finished_result(stream.stream_id, _done)
             stream.events_q.put(("done", _done))
         except StreamClosed:
             pass  # 客户端已断开，没人读了，正常提前结束
@@ -1640,6 +1685,25 @@ def api_consult_stream_answer(stream_id: str, req: ConsultStreamAnswer) -> dict:
         # 忽略：前端要知道这次回答没地方接。
         raise HTTPException(status_code=404, detail="stream 不存在，或当前没有待回答的问题")
     return {"ok": True}
+
+
+@app.get("/api/consult/stream/{stream_id}/result")
+def api_consult_stream_result(stream_id: str) -> dict:
+    """R55 渲染断链兜底：`s3_done` 后 120 秒仍未收到 `done` 时，前端主动查一次。
+
+    **不是**一个通用的"按 id 查历史问诊结果"接口——它只回答"这条 stream_id
+    有没有一份缓存下来的完成结果"，缓存只留 `_FINISHED_RESULT_TTL_SECONDS`。
+    查不到（id 写错、还没跑完、或者已经过期）一律 404，不区分这三种原因：
+    前端拿到 404 之后的动作只有一种——继续按原计划等主看门狗（300 秒）超时，
+    分不分对这个动作没有任何影响，没必要在响应里多编一层理由。
+    """
+    done = _get_finished_result(stream_id)
+    if done is None:
+        raise HTTPException(
+            status_code=404,
+            detail="没有这个 stream_id 的已完成结果（可能还没跑完，或者已经过期）",
+        )
+    return done
 
 
 def _serialize_followup(followup) -> dict | None:

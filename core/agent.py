@@ -64,7 +64,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal
 
 #: 四能力。**顺序就是它们在一次问诊里出现的先后**（停 > 问 > 取证 > 验），
 #: 不是字母序。
@@ -226,6 +226,27 @@ class AgentTrace:
     """
 
     decisions: list[AgentDecision] = field(default_factory=list)
+    #: R55：每记一条决策就同步往 SSE 发一个 `agent_step` 事件，(事件名, 数据) -> None。
+    #: 不参与 `__eq__`/`__repr__`——它是一次性的回调对象，不是这份 trace 的数据。
+    #: 不传（CLI、eval/、批跑现状）就完全不影响原来的行为，跟 `consult()` 的
+    #: `on_step` 同一条纪律。**改造前 `agent_trace` 只在整次问诊结束时随最终
+    #: 结果一起下发**——四能力（停/问/取证/验）做过什么，前端只能等到最后
+    #: 才知道；这里把同一份数据在发生的当下也发一遍，不是新造一层机制。
+    on_step: Callable[[str, dict], None] | None = field(default=None, repr=False, compare=False)
+
+    def append(self, d: AgentDecision) -> AgentDecision:
+        """加一条已经构造好的决策（`decide()` 的返回值）并广播。
+
+        `record()` 和直接 `trace.decisions.append(...)` 曾经是两条并行的写入
+        路径——前者走 `record()`、后者在 `core/chain.py` 里散落四处直接操作
+        `.decisions` 这个列表，`on_step` 广播只接在其中一条上就会有一半的决策
+        不广播。CLAUDE.md「同一概念的匹配逻辑只能有一处实现」：写入 + 广播现在
+        只有这一处实现，`record()` 和调用方都改成走它。
+        """
+        self.decisions.append(d)
+        if self.on_step is not None:
+            self.on_step("agent_step", d.to_dict())
+        return d
 
     def record(self, rule_id: str, detail: str | None = None) -> AgentDecision:
         rule = RULES_BY_ID.get(rule_id)
@@ -233,8 +254,7 @@ class AgentTrace:
             raise KeyError(f"没有这条规则：{rule_id}（规则表在 core/agent.py）")
         d = AgentDecision(rule_id=rule.id, capability=rule.capability, why=rule.why,
                           stop_kind=rule.stop_kind, detail=detail)
-        self.decisions.append(d)
-        return d
+        return self.append(d)
 
     def stopped(self) -> AgentDecision | None:
         """有没有停过。**取第一条**：一次问诊最多停一次，后面的都不会发生。"""

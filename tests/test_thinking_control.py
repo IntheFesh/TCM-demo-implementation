@@ -45,13 +45,15 @@ def test_extraction_steps_have_thinking_disabled():
 
 
 def test_s3_keeps_thinking_on_by_default():
-    """S3 是这条链上唯一真正需要推理的一步——默认开。
+    """S3 是这条链上唯一真正需要推理的一步——默认开，**不能因为它慢就关掉**
+    （关思考会让输出质量坍缩，见 core/llm.py 里这几个常量旁边的注释）。
 
-    **有意的契约变更（R22）**：原来断言 `reasoning_effort == "high"` 是写死的。
-    R22 起 effort 的默认值**跟检索方式绑**：full_context（默认）下 `max`、
-    top3 系下 `high`。理由见 `core/llm.py::s3_reasoning_effort` 的文档字符串——
-    full_context 下输入已经是十几万 token 且靠缓存便宜 30 倍，这时限制推理深度
-    是省小钱费大钱；top3 保持 high 是为了跟 R1~R21 的数字可比。
+    **两次有意的契约变更**：R22 把 effort 默认值改成跟检索方式绑
+    （full_context 下 `max`、top3 系下 `high`，为了跟 R1~R21 的数字可比）；
+    R55 用 2026-09-17 的真机三档墙钟数字（264.6/276.3/208.9 秒，顺序落在
+    测量噪声内）推翻了"档位越高质量越好"这个假设，把两档都往下调
+    （full_context: max→medium，top3: high→low）——这里只断言"S3 默认开思考"
+    这件事本身没变，具体档位去读常量，不在这里重复写字面量。
     """
     assert s3_thinking() == S3_THINKING_DEFAULT == "enabled"
     assert thinking_for("s3") == {"thinking": "enabled",
@@ -60,12 +62,14 @@ def test_s3_keeps_thinking_on_by_default():
 
 def test_s3_effort_default_follows_the_retriever_mode(monkeypatch):
     """两系各自的默认档。写成两条断言而不是一条参数化：这两个值的**理由不同**
-    （一个是"输入已经很贵了"，一个是"要跟历史数字可比"），合成一条会把理由抹掉。"""
+    （一个是"输入已经很贵了"，一个是"要跟历史数字可比"——R55 之后两个理由都被
+    真机数字推翻了，见上一条测试的文档字符串），合成一条会把理由抹掉。
+    字面量断言只用来钉住"这俩常量不能悄悄变成别的值"，不重复文档。"""
     monkeypatch.delenv("S3_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("RETRIEVER_MODE", raising=False)
-    assert s3_reasoning_effort() == S3_REASONING_EFFORT_FULL_CONTEXT == "max"
+    assert s3_reasoning_effort() == S3_REASONING_EFFORT_FULL_CONTEXT == "medium"
     monkeypatch.setenv("RETRIEVER_MODE", "hybrid")
-    assert s3_reasoning_effort() == S3_REASONING_EFFORT_TOP3 == "high"
+    assert s3_reasoning_effort() == S3_REASONING_EFFORT_TOP3 == "low"
 
 
 def test_s3_effort_env_var_wins_over_the_mode_default(monkeypatch):

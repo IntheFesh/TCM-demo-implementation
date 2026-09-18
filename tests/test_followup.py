@@ -8,8 +8,10 @@ from core import followup as fu
 from core.followup import (
     MAX_ASK_ROUNDS,
     MIN_USEFUL_IG,
+    ROLE_MAX_ASK_ROUNDS,
     fast_mode_enabled,
     format_followup_for_s3,
+    max_ask_rounds_for_role,
     parse_answer,
     run_followup,
 )
@@ -324,3 +326,39 @@ def test_shiwen_fallback_answer_mentioning_danger_is_caught(monkeypatch):
     }])
     r = run_followup(SYMPTOMS, ELEMENTS, lambda q: "解的是黑的，像柏油一样")
     assert r.stopped_by == "safety"
+
+
+# ---------- R55：追问轮数上限按角色分 ----------
+
+def test_doctor_role_gets_zero_ask_rounds():
+    """医师已经完成了望闻问切四诊——系统再追问是把医师当患者审。"""
+    assert max_ask_rounds_for_role("doctor") == 0
+
+
+def test_patient_role_gets_one_ask_round():
+    assert max_ask_rounds_for_role("patient") == 1
+
+
+@pytest.mark.parametrize("role", ["student", "researcher", None, "", "some_future_role"])
+def test_unmapped_roles_fall_back_to_the_module_default_not_zero(role):
+    """「学生可开（教学）」的意思是"不限制"，不是"给它另一个具体的数"——
+    没写进 `ROLE_MAX_ASK_ROUNDS` 的角色（含还没出现过的新角色）落回
+    `MAX_ASK_ROUNDS`，不是落回 0（那会把 student/researcher 也一起限制住，
+    是完全不同的产品行为）。"""
+    assert max_ask_rounds_for_role(role) == MAX_ASK_ROUNDS
+
+
+def test_role_max_ask_rounds_table_only_has_the_two_restricted_roles():
+    """这张表只列"要限制"的角色——多列一个就是给某个不该被限制的角色
+    意外加了上限，这条测试把表的大小钉住，表变了要显式改这里。"""
+    assert set(ROLE_MAX_ASK_ROUNDS) == {"doctor", "patient"}
+
+
+def test_doctor_role_zero_rounds_means_run_followup_asks_nothing():
+    """`max_ask_rounds_for_role("doctor")` 算出来的 0 传进 `run_followup` 之后，
+    真的一个问题都不问——不是"上限设成 0 但循环还是问了一轮才检查"。"""
+    called = []
+    r = run_followup(SYMPTOMS, ELEMENTS, lambda q: (called.append(q), "有")[1],
+                     max_rounds=max_ask_rounds_for_role("doctor"))
+    assert called == []
+    assert r.rounds == 0
