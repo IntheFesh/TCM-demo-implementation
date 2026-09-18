@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from eval.ablation import (
+from eval.ablation.r38 import (
     GROUPS,
     KNOBS,
     aggregate,

@@ -11,11 +11,32 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 TCM_THEORY_PATH = Path(__file__).resolve().parent.parent / "data" / "standard" / "tcm_theory.jsonl"
+
+#: R57 消融实验 B 组的开关：derived 模式（不检索医案）本身不受这个旋钮影响，
+#: 它只决定 `core/chain.py::run_derivation` 要不要把 `_format_theory_rules`
+#: 的产出摆进 s3_derived 的 prompt。关掉之后模型只剩症状本身可用，没有医理
+#: 规则可引——B 组回答的问题是"去掉医案模仿之后，如果连医理规则都不给，
+#: 模型能推到什么程度"，作为 A→C 提升量里"医理规则层净贡献"（R51 存在的
+#: 理由）的另一端对照。跟 `core.corroboration.corroboration_enabled()`
+#: 同一条纪律：拼错就抛，不静默按默认处理；默认 on——医理规则是产品要交付
+#: 的真实能力，off 只是消融实验专用的降级路径，不是产品默认。
+THEORY_LAYER_ENV = "THEORY_LAYER"
+THEORY_LAYER_DEFAULT = "on"
+
+
+def theory_layer_enabled() -> bool:
+    raw = (os.environ.get(THEORY_LAYER_ENV) or THEORY_LAYER_DEFAULT).strip().lower()
+    if raw in ("on", "1", "true"):
+        return True
+    if raw in ("off", "0", "false"):
+        return False
+    raise ValueError(f"{THEORY_LAYER_ENV}={raw!r} 不认识，只能是 on/off。")
 
 RuleKind = str  # "organ_relation" | "pathomechanism" | "treatment_principle" | "compatibility"
 

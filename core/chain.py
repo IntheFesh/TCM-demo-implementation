@@ -103,6 +103,7 @@ from core.theory import (
     organ_relations as theory_organ_relations,
     principles_for as theory_principles_for,
     role_construction_rules as theory_role_construction_rules,
+    theory_layer_enabled,
     transitions as theory_transitions,
 )
 
@@ -1723,7 +1724,21 @@ def run_derivation(
 
     symptoms_text = "；".join(s1.symptoms)
 
-    theory_text, theory_stats = _format_theory_rules(s2)
+    # R57 消融实验 B 组（`THEORY_LAYER=off`）：不把 `_format_theory_rules` 的
+    # 产出摆进 prompt——模型只剩症状本身，没有医理规则可引。**不在
+    # `_format_theory_rules` 内部判断这个开关**：那个函数回答的是"这次症状
+    # 对应哪些规则"，跟"这次要不要把规则给模型看"是两个不同的问题（CLAUDE.md
+    # 「同一概念的匹配逻辑只能有一处实现」那条的例外情形：两处回答的不是
+    # 同一个问题），合并判断会让"规则库缺文件"（`available: False`）跟
+    # "消融实验故意关掉"（这里）在 `theory_stats` 里长成同一种形状，读报告的
+    # 人分不清哪一种。
+    if theory_layer_enabled():
+        theory_text, theory_stats = _format_theory_rules(s2)
+    else:
+        theory_text, theory_stats = "", {
+            "available": True, "n_rules": 0, "by_kind": {}, "trimmed_sections": [],
+            "theory_layer_disabled": True,
+        }
     knowledge_text, knowledge_stats = build_focused_knowledge(s1, s2, [], [], syndromes=[])
 
     s3_prompt = load_prompt("s3_derived")

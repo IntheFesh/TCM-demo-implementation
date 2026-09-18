@@ -37,7 +37,9 @@ from core.physicians import PHYSICIANS
 from core.schemas import S1Normalize, S2Elements
 from core.setstats import jaccard_distance
 
-#: R57 消融实验的开关：A/B 组（无佐证）关掉这一相，C/D 组开着。默认 on——
+#: R57 消融实验的开关：A/B/C 三组关掉这一相，只有 D 组（最终形态）开着——
+#: 分组定义唯一出处见 `eval/ablation/spec.py`（这里曾经写过一条相反的注释，
+#: 跟那份定义矛盾，已改对；不要在这两处分别维护同一件事）。默认 on——
 #: 佐证是产品要交付的真实能力，不是一个需要显式开启的实验特性；off 是消融
 #: 实验专用的降级路径，不是产品默认。
 CORROBORATION_ENV = "CORROBORATION"
@@ -115,7 +117,7 @@ def corroborate(s3, s1: S1Normalize, s2: S2Elements, *,
     if not corroboration_enabled():
         return CorroborationResult(
             enabled=False,
-            note="CORROBORATION=off，这一相没有跑（R57 消融实验的 A/B 组用）。")
+            note="CORROBORATION=off，这一相没有跑（R57 消融实验的 A/B/C 组用）。")
 
     from core.chain import _search_cases  # 延迟 import 破循环：chain 也要 import 这个模块
 

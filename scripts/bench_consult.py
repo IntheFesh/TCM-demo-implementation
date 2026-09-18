@@ -101,7 +101,33 @@ def _minimal(node: dict, defs: dict) -> Any:
     if node_type == "object":
         props = node.get("properties", {})
         required = node.get("required", list(props))
-        return {k: _minimal(v, defs) for k, v in props.items() if k in required}
+        out = {k: _minimal(v, defs) for k, v in props.items() if k in required}
+        # R57：`S3Derived` 的五个步骤类（`SyndromeStepDerived` 等）用一条
+        # model_validator 要求 `rule_refs` 非空或 `insufficient` 非空——这条
+        # 约束是跨字段的 Python 校验，不出现在 JSON Schema 里（`rule_refs`
+        # 本身是 `Field(default_factory=list)`，不在 `required` 里），所以上面
+        # 那行"只填必填字段"的通用逻辑天然看不到它，生成的假数据永远是空列表、
+        # 永远校验失败。**按字段名特判，不是按 schema 类型特判**：这个字段名
+        # 在这五个类里语义一致（这一步依据哪条医理规则），特判一次覆盖全部，
+        # 不用在每个 schema 里分别加 `min_length=1`（那会连累真实模型输出——
+        # 允许 `insufficient` 兜底正是不想逼模型硬编一条不存在的规则）。
+        if "rule_refs" in props and "rule_refs" not in out:
+            # `_minimal` 的 array 分支本来就在没有 minItems 时也生成 1 条
+            # （给"至少有内容可看"让下游耗时有意义），这里借用同一条逻辑，
+            # 不用再自己拼一条兜底。
+            out["rule_refs"] = _minimal(props["rule_refs"], defs)
+        if node.get("title") == "TheoryRef" and "rule_id" in props:
+            # `TheoryRef.rule_id` 有一条模型校验器回查 `core.theory.rule()`，
+            # 假字符串（"基准测试假数据"）不是任何真实规则 id，会在构造时就被
+            # 拒绝——这跟上面 `rule_refs` 的问题是同一类（约束是 Python 校验器，
+            # JSON Schema 看不见），但这里连"填个非空字符串"都不够，得是一个
+            # 真实存在的 id。惰性取第一条规则的 id 就够用：这里要的只是"存在"，
+            # 不是"跟这次症状相关"（假后端的产出本来就不代表任何真实推理）。
+            from core.theory import load_theory
+
+            rules = load_theory()
+            out["rule_id"] = rules[0].id if rules else FAKE_TEXT
+        return out
     if node_type == "array":
         count = max(1, int(node.get("minItems", 1)))
         return [_minimal(node.get("items") or {"type": "string"}, defs)] * count
@@ -453,12 +479,22 @@ def invalid_reason(result: dict | None) -> str | None:
     # 配置下从未跑通过一次（实测 `--backend fake` 0/1 成功）。
     # 判据来源只能有一处：`core.physicians.physicians_for_mode(mode)` 回答
     # "这个模式下应该有几条结果"，跟 `core.usage.calls_per_consult` 问的是同一处。
-    from core.physicians import physicians_for_mode
-
+    #
+    # **`derived`（R52）单独一档，不能落进医家数那条分支**：
+    # `physicians_for_mode("derived")` 故意恒返回空字典——那个函数回答的是
+    # "这次结论检索用了哪几位医家的医案"，演绎推导不检索医案，0 是诚实答案。
+    # 但这里要问的是另一件事："`results` 该有几个元素"——演绎推导跟 structured
+    # 一样，产出**一份**融合结论（`run_derivation` 一次调用、`results` 一个
+    # 元素），不是"0 位医家 = 0 条结果"。R57 的消融第一次真的用
+    # `--backend fake` 跑 `S3_MODE=derived` 才把这处混淆暴露出来——`derived`
+    # 模式下 `got=1`（真的跑出了一份结论）却被拿去跟 `physicians_for_mode`
+    # 给的 `n=0` 比，永远判成"只有 1/0 份结果"，即使这次问诊完全正常。
     mode = (result.get("manifest") or {}).get("s3_mode")
-    if mode == "structured":
-        n, unit = 1, "份融合结论"
+    if mode in ("structured", "derived"):
+        n, unit = 1, "份融合结论" if mode == "structured" else "份演绎推导结论"
     else:
+        from core.physicians import physicians_for_mode
+
         n, unit = len(physicians_for_mode(mode or "legacy")), "位医家"
     got = len(result.get("results") or [])
     if got != n:

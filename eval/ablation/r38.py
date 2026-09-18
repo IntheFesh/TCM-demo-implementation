@@ -57,7 +57,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+#: R57 把这个文件从 `eval/ablation.py` 挪进了 `eval/ablation/r38.py`——
+#: 多了一层目录，`.parent` 要多跳一次才能回到仓库根，不然 DEFAULT_OUT
+#: 会算成 `eval/eval/report_ablation.json`（这个 bug 挪文件那次真的踩过）。
+ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_OUT = ROOT / "eval" / "report_ablation.json"
 
 #: 这一轮要摆平的三个开关。**产品默认值不写在这里**——它们是 `core/llm.py`
