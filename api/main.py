@@ -59,7 +59,28 @@ from core.emr_writer import (
     render_emr_text,
     render_prescription_sheet,
 )
-from core.guideline_compare import coverage_stats
+from core.assist import (
+    ADVICE_BUDGET_S,
+    COMPOSE_BUDGET_S,
+    HINTS_BUDGET_S,
+    compose_verify,
+    edit_advice,
+    intake_hints,
+)
+from core.explanations import build_explanations
+from core.export_render import ExportContext, build_render_model, render_plain_text
+from core.export_render import render_print_html, render_record_text
+from core import history
+from core.guideline_compare import coverage_stats, textbook_formula_for
+from core.preferences import (
+    DOSAGE_FORMS,
+    DOSES_CHOICES,
+    HERB_COUNT_BANDS,
+    USAGE_CHOICES,
+    get_preferences,
+    preferences_prompt_text,
+    set_preferences,
+)
 from core.individualize import individualize
 from core.intake import (
     IntakeForm,
@@ -74,6 +95,7 @@ from core.integration_auth import IntegrationDenied, check as integration_check
 from core.knowledge_panel import search as knowledge_search
 from core.product_mode import (
     InternalOnly,
+    is_product_mode,
     product_flags,
     require_internal,
     resolve_role,
@@ -168,9 +190,32 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # **同步登记再起线程**：lifespan 起完线程立刻 yield，第一个 readiness 探针
     # 可能比线程的第一行还早。见 `WarmupTracker.begin` 的文档字符串。
     TRACKER.begin()
+    _log_product_mode()
     t = threading.Thread(target=_warmup, name="warmup", daemon=True)
     t.start()
     yield
+
+
+def _log_product_mode() -> None:
+    """R62 §12 第 11 项：启动日志打印 `S3_MODE / PRODUCT_MODE / THEORY_LAYER`。
+
+    **为什么值得占一行启动日志**：这三个开关决定产品形态（单链还是对照、
+    走哪份 schema、有没有医理规则层），而它们全是环境变量——现场排查
+    "怎么跟昨天不一样"时，第一件要确认的就是这一行。此前它们只能靠打
+    `/health` 反查，而服务起不来的时候恰恰打不了。
+
+    用 `logging` 不是 `print`：这一行要跟其余服务日志一起被收集。
+    """
+    from core.corroboration import corroboration_enabled
+    from core.llm import s3_mode
+    from core.theory import theory_layer_enabled
+
+    logging.getLogger("tcm.startup").info(
+        "启动配置 PRODUCT_MODE=%s S3_MODE=%s THEORY_LAYER=%s CORROBORATION=%s",
+        "1" if is_product_mode() else "0", s3_mode(),
+        "on" if theory_layer_enabled() else "off",
+        "on" if corroboration_enabled() else "off",
+    )
 
 
 # R47：标题从「名医辨证对照 demo」改成产品名 + 版本。**这不是措辞洁癖**：
@@ -1201,7 +1246,6 @@ def _record_history(response: dict, req: "ConsultRequest") -> None:
     """把这一次问诊记进本医师的历史。**失败不影响问诊**——历史是管理功能，
     磁盘只读或目录不可写时不该让一次已经跑完的问诊反而报错。"""
     try:
-        from core import history
 
         r = (response.get("results") or [{}])[0]
         st = r.get("s3_structured") or r.get("s3") or {}
@@ -1305,6 +1349,11 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         # 的 base32），产品面这一行的形状不变。现在先把产品面这一处补上，
         # 不等 R45——录制视频时页脚不能是空的。
         "record_id": _record_id(),
+        # 四个分支返回**同一套键**（见上面那条注释）。被拦截/信息不足的那几个
+        # 分支没有结论、也就没有可点的术语，但键要在——缺键会让前端读到
+        # undefined 悄悄进渲染。
+        "explanations": {"terms": [], "by_id": {}, "n": 0, "n_total": 0,
+                         "n_available": 0, "truncated": False, "note": ""},
     }
 
     if outcome["rejected"]:
@@ -1328,6 +1377,35 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         )
 
     results = outcome["results"]
+    # R62 §12 第 11 项：产品模式强制单链。
+    #
+    # **为什么是报错而不是取第一条**：`results` 长度 >1 只可能来自
+    # `S3_MODE=legacy`（多位医家各自出一份），而那正是 §1.3 明确取消的形态
+    # （"不是多位名医各自给方案让人挑"）。静默取第一条会让一次配错的部署
+    # 看起来正常运行——而它产出的每一份结果都少了两家的内容，没有任何
+    # 地方会显出异常。
+    if is_product_mode() and len(results) > 1:
+        logging.getLogger("tcm.product").error(
+            "产品模式下得到 %d 条结论（单链形态应当恰好 1 条）；"
+            "检查 S3_MODE（当前的多家并列形态只在 PRODUCT_MODE=0 下提供）",
+            len(results))
+        raise HTTPException(
+            status_code=500,
+            detail="服务端配置异常：本次得到了多条并列结论，而产品形态是单链。")
+    # R62 §12 第 1 项：把这次结果里会被点到的术语的释义**跟结果一起发下去**。
+    # §11 给"点术语到释义出现"的预算是 100 毫秒，一次 HTTP 往返在院内网络上
+    # 就吃掉大半。零 LLM，实测几十毫秒（见 core/explanations.py）。
+    #
+    # **取第一份结果**：产品模式是单链（`PRODUCT_MODE=1` 下 results 恒为 1 条），
+    # 内部对照模式下多条时也只给第一条的释义——那个模式的用途是比较几家的
+    # 结论，不是点开每一家的每一个词。
+    first = results[0] if results else {}
+    _s3s = first.get("s3_structured")
+    explanations = build_explanations(
+        _s3s.model_dump() if hasattr(_s3s, "model_dump") else _s3s,
+        {**first["s3"].model_dump(), } if first.get("s3") is not None else None,
+    ) if results else {"terms": [], "by_id": {}, "n": 0, "n_total": 0,
+                       "n_available": 0, "truncated": False, "note": ""}
     # role 传进 to_graph()：patient 角色从图构造这一步起就不生成方剂/药材层
     # （layer 3/4），不是先生成完整图再事后过滤掉那两层——图节点本身就带着
     # 药名，事后过滤等于先把处方发出去一半再藏起来，跟"裁剪必须在后端做"
@@ -1339,6 +1417,7 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         "results": [_serialize_result(r) for r in results],
         "divergence": outcome["divergence"],
         "graph": graph,
+        "explanations": explanations,
     }
     return _filter_response_by_role(full, role, results)
 
@@ -1671,7 +1750,7 @@ def api_consult_stream(
                 if name is None:
                     return
                 last_sent = time.monotonic()
-                yield _sse(name, data)
+                yield _sse(name, _filter_stream_event_for_role(name, data, _req_role))
         finally:
             # 正常收尾时后台线程早已结束，置位无害；客户端断开时 Starlette 取消
             # 这个生成器、走到这里，后台线程下一次回调就会看到并退出。
@@ -1713,6 +1792,24 @@ def api_consult_stream_result(stream_id: str) -> dict:
             detail="没有这个 stream_id 的已完成结果（可能还没跑完，或者已经过期）",
         )
     return done
+
+
+def _filter_stream_event_for_role(name: str, data: dict, role: Role) -> dict:
+    """进度事件的角色裁剪。
+
+    **为什么必须有这一处**：`s3_draft`（R62 §11.3，S3 一解析出来就把五步链
+    整件发出去，好让界面不必等到 `done`）载荷里带着完整的 `herb_items`。
+    终值那条路上有 `_filter_response_by_role`，而这条流式的路上此前**没有
+    任何裁剪**——加一个带内容的进度事件，等于给患者角色开了一条绕过角色
+    裁剪的后门。
+
+    只裁带内容的事件，不动纯遥测事件（帧数、耗时、规则名）——那些里面
+    没有药名。"""
+    if name != "s3_draft":
+        return data
+    out = dict(data)
+    out["s3_structured"] = _filter_s3_structured_for_role(out.get("s3_structured"), role)
+    return out
 
 
 def _serialize_followup(followup) -> dict | None:
@@ -1945,6 +2042,52 @@ def _filter_s3_for_role(s3: dict, role: Role) -> dict:
     return s3
 
 
+#: R62 §8 那张表里"患者不显示"的两项。**加减建议与自评不给患者**：
+#: 加减是给医师操作的（"若见口苦加黄连 3g"是一个用药决定），自评是给专业
+#: 读者判断这次推导可信度的。
+_S3_STRUCTURED_PATIENT_DROP = ("modifications", "self_assessment", "herb_choices")
+
+
+def _filter_s3_structured_for_role(s3s: dict | None, role: Role) -> dict | None:
+    """五步链原件按角色裁剪。
+
+    **这个函数此前不存在，而 `s3_structured` 一直原样下发给所有角色**——
+    `_filter_s3_for_role` 只裁了 `s3`（扁平那一份）。患者角色因此虽然拿不到
+    `s3.formula_candidates`，却从 `s3_structured.formula.candidate.herb_items`
+    把同一张方原样拿到了。这是 R62 补上的一个真实漏洞，不是新加的功能。
+
+    R62 §8.1 同时改了患者该看到什么：**教材代表方及其组成**（教材上的公开
+    知识），而不是模型为他拟的那一张（那属于"推荐治疗方案"）。所以这里把
+    模型的方整块摘掉，教材方由 `_textbook_block` 另外补上。
+    """
+    if s3s is None or role != "patient":
+        return s3s
+    out = {k: v for k, v in s3s.items() if k not in _S3_STRUCTURED_PATIENT_DROP}
+    # 模型拟的那张方整块摘掉：`formula.candidate.herb_items` 是具体药名剂量。
+    fml = dict(out.get("formula") or {})
+    fml.pop("candidate", None)
+    out["formula"] = fml
+    return out
+
+
+def _textbook_block(results: list[dict]) -> dict | None:
+    """§8.1：患者角色看到的那张方——**教材记载的该证型代表方及其组成**。
+
+    它跟模型拟的方是不同性质的东西（见
+    `core/guideline_compare.py::textbook_formula_for` 的文档字符串）：
+    前者是教材上的公开知识，后者是"针对这位患者的推荐治疗方案"。
+    """
+    for r in results:
+        syn = getattr(r.get("s3"), "syndrome", "") or ""
+        if syn:
+            out = textbook_formula_for(syn)
+            if out:
+                return out
+            return {"available": False, "syndrome": syn,
+                    "note": f"教材推荐方案与方剂本体里都没有查到「{syn}」对应的代表方。"}
+    return None
+
+
 def _filter_response_by_role(response: dict, role: Role, results: list[dict]) -> dict:
     """把 _consult_response() 拼好的完整响应按角色裁剪。**全项目角色裁剪
     唯一的实现**——前端不做任何字段过滤，过滤在这里一次性做完，服务端
@@ -1976,6 +2119,10 @@ def _filter_response_by_role(response: dict, role: Role, results: list[dict]) ->
         # 不是存在但为空。循证对照同理：它比的是方与治法。
         response.pop("individualization", None)
         response.pop("guideline", None)
+        # R62 §8.1：换成教材代表方。**这不是把上面摘掉的东西换个名字发回去**
+        # ——教材方是按证型查表得到的，跟这位患者的年龄体质无关，也不带
+        # 个体化加减。它的性质是"教材上写这个证的代表方是什么"。
+        response["textbook_formula"] = _textbook_block(results)
 
     triage = _compute_triage(results)
     response["triage"] = triage
@@ -1992,6 +2139,7 @@ def _filter_response_by_role(response: dict, role: Role, results: list[dict]) ->
         r.pop("react_trace", None)  # patient/doctor 都拿不到取证轨迹
         if role == "patient":
             r["s3"] = _filter_s3_for_role(r["s3"], role)
+            r["s3_structured"] = _filter_s3_structured_for_role(r.get("s3_structured"), role)
             r["refs"] = []
             r["safety_output"] = _simplify_safety_output(r.get("safety_output"))
         if not _role_gets_advice(role):
@@ -2650,7 +2798,6 @@ def api_emr_draft(req: EMRRequest) -> dict:
         emr, changes = apply_edits(emr, req.edits)
         record_edits(emr, changes, doctor_id=req.doctor_id)
     if emr.record_id:
-        from core import history
 
         history.save_emr(emr.record_id, emr.model_dump(), doctor_id=req.doctor_id)
     return {"emr": emr.model_dump(), "changes": changes,
@@ -2773,3 +2920,404 @@ def api_integration_emr(record_id: str, request: Request,
     """按记录编号返回病历文书的结构化 JSON，供 HIS 导入。"""
     _integration_guard(request, x_api_key)
     return api_emr_get(record_id)
+
+
+# ============================================================================
+# R62 §12：产品面要补齐的端点
+# ============================================================================
+#
+# 这一段里只有三条会调模型（编辑助手、组方检验，以及问诊本身），其余全部是
+# 读内存里的本体、读 JSONL、拼模板。**三条调模型的都关思考、低努力、带预算**
+# ——它们是界面上的小面板，超时了主界面必须照常能用（见 `core/assist.py`
+# 模块文档那张表的最后一行）。
+
+
+class FormulaCheckRequest(TextOnlyInput):
+    """§12 第 2 项。跟 `PrescriptionValidateRequest` 的区别是它收患者概况
+    ——§5.2 的判据「填了妊娠而方中有妊娠禁忌药必须报警」靠的就是这个字段。
+
+    **没有把那个既有请求体改宽**：那条路（`/api/prescription/validate`）是
+    R23 起的既有契约，它的调用方按现在的形状传参；加一个可选字段看着无害，
+    但会让"这条路要不要跑个体化检查"变成一个隐式的运行期分支。
+    """
+
+    herb_items: list[HerbItem] = []
+    syndrome: str = ""
+    patient_profile: PatientProfile | None = None
+    role: Role | None = None
+
+
+def _rule_check_payload(items: list[HerbItem], syndrome: str,
+                        profile: PatientProfile | None, role: Role) -> dict:
+    """§7.3 第一层：纯规则、零 LLM。
+
+    **问诊页与组方实验室走的是同一个函数**（§9.4 原话：核查规则复用同一套
+    实现，不另起一份）。三部分各自已有实现，这里只是把它们摆在一起：
+      · `assess_formula_safety` —— 十八反十九畏、药典上限、煎法、毒性
+      · `check_formula` —— 上面三条 + 归经覆盖 + 性味功效重复
+      · `individualize` —— 妊娠/哺乳、老年慎峻药、儿童折算、肝肾功能
+    """
+    safety = assess_formula_safety(syndrome, items)
+    check = check_formula(syndrome, items)
+    ind = individualize(profile or PatientProfile(), [i.name for i in items], syndrome)
+    out = {
+        **_safety_dict(safety),
+        "blocking": safety.blocking,
+        "syndrome": syndrome,
+        "n_herbs": len(items),
+    }
+    if _role_gets_advice(role):
+        out["advice"] = advice_dicts(check)
+        out["advice_skipped"] = list(check.skipped)
+    # 个体化提示逐条点名药味，跟 `formula_candidates` 是同一条安全边界——
+    # 患者角色下**这个键根本不存在**，不是存在但为空（跟
+    # `_filter_response_by_role` 里对它的处理保持一致）。
+    if role != "patient":
+        out["individualization"] = ind.model_dump()
+    return out
+
+
+@app.post("/api/formula/check")
+def api_formula_check(req: FormulaCheckRequest, request: Request) -> dict:
+    """§12 第 2 项：方剂 + 患者概况 → 规则核查。**纯规则、≤200ms、零 LLM。**
+
+    预算写在这里不是一句愿望：这条路径上没有任何一次 I/O 或模型调用，
+    本体是进程内的。真要超 200ms，只可能是本体那一次冷启动——那由
+    `api/warmup.py` 在起服务时吃掉。
+    """
+    try:
+        check_input_kinds(req.model_dump())
+    except InputKindRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    role = resolve_role(req.role)
+    return _rule_check_payload(list(req.herb_items), req.syndrome or "",
+                               req.patient_profile, role)
+
+
+class FormulaAdviseRequest(TextOnlyInput):
+    """§12 第 3 项：编辑助手。`before`/`after` 两张方，diff 由服务端算。
+
+    **不让前端传 diff**：`core/prescription.py::compute_herb_diffs` 已经处理
+    了"按药名配对而不是按下标配对"这个坑（医师在中间插一味药会让按下标比
+    的实现把后面每一味都报成变了）。前端自己算一份就是第二处实现。
+    """
+
+    before: list[HerbItem] = []
+    after: list[HerbItem] = []
+    syndrome: str = ""
+    principle: str = ""
+    patient_profile: PatientProfile | None = None
+    role: Role | None = None
+    user: str = ""
+
+
+@app.post("/api/formula/advise")
+def api_formula_advise(req: FormulaAdviseRequest, request: Request) -> dict:
+    """§12 第 3 项：≤5 秒，**超时返回空不报错**。
+
+    先跑一遍第一层规则核查，把结论当既定事实喂给模型（§7.3 规格最后一句：
+    有红色违规时优先解释那条并给替代药），而不是让模型重新发现一遍——
+    界面上那两块是上下挨着的，两份说法不一致时医师没有依据判断信哪一份。
+    """
+    try:
+        check_input_kinds(req.model_dump())
+    except InputKindRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    role = resolve_role(req.role)
+    if role == "patient":
+        # §8 那张表：患者角色没有「AI 编辑提示」这一行，因为方本来就不可编辑。
+        raise HTTPException(status_code=404, detail="当前角色没有这一项功能。")
+    after = list(req.after)
+    before = FormulaCandidate(name="改动前", source="composed", confidence="medium",
+                              rationale="diff 用", herb_items=list(req.before) or [HerbItem(name="（空方）")])
+    now = FormulaCandidate(name="改动后", source="composed", confidence="medium",
+                           rationale="diff 用", herb_items=after or [HerbItem(name="（空方）")])
+    diff = compute_herb_diffs(before, now)
+    rule = _rule_check_payload(after, req.syndrome or "", req.patient_profile, role)
+    out = edit_advice(
+        herb_items=after, diff=diff,
+        syndrome=req.syndrome or "", principle=req.principle or "",
+        profile=(req.patient_profile.model_dump() if req.patient_profile else None),
+        preferences_text=preferences_prompt_text(get_preferences(req.user)),
+        violations=rule.get("advice") or [],
+        budget_s=ADVICE_BUDGET_S,
+    )
+    # 规则层的结论无论模型这一路成不成功都带出去：模型超时了，右栏空着，
+    # 但处方表下面那条红字照样要显示。
+    return {**out.to_dict(), "diff": diff, "rule_check": rule,
+            "budget_s": ADVICE_BUDGET_S}
+
+
+class IntakeHintsRequest(TextOnlyInput):
+    text: str = ""
+    asked: list[str] = []
+
+
+@app.post("/api/intake/hints")
+def api_intake_hints(req: IntakeHintsRequest, request: Request) -> dict:
+    """§12 第 4 项：主诉 → 还该问什么（≤5 条，每条说明为什么问）。
+
+    **零 LLM**：判据走 `core/tools.py::question_candidates`（信息增益 + 危重
+    症状保底），理由见 `core/assist.py` 的模块文档。预算 3 秒，实测 0.18 秒。
+    """
+    try:
+        check_input_kinds(req.model_dump())
+    except InputKindRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    out = intake_hints(req.text or "", asked=list(req.asked or []))
+    return {**out.to_dict(), "budget_s": HINTS_BUDGET_S}
+
+
+class ComposeVerifyRequest(TextOnlyInput):
+    """§12 第 5 项：组方实验室的 `[检验组方]`。"""
+
+    herb_items: list[HerbItem] = []
+    syndrome: str = ""
+    principle: str = ""
+    patient_profile: PatientProfile | None = None
+    role: Role | None = None
+    user: str = ""
+
+
+@app.post("/api/compose/verify")
+def api_compose_verify(req: ComposeVerifyRequest, request: Request) -> dict:
+    """§12 第 5 项：≤8 秒。君臣佐使 + 治法覆盖 + 缺什么由模型给；
+    配伍禁忌/超量/寒热/归经/重复由规则层给，**不问模型**（见
+    `core/assist.py::compose_verify` 的文档字符串）。"""
+    try:
+        check_input_kinds(req.model_dump())
+    except InputKindRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    role = resolve_role(req.role)
+    if role == "patient":
+        # §8 那张表：组方实验室对患者角色不开放。
+        raise HTTPException(status_code=404, detail="当前角色没有这一项功能。")
+    out = compose_verify(
+        herb_items=[i.model_dump() for i in req.herb_items],
+        syndrome=req.syndrome or "", principle=req.principle or "",
+        profile=(req.patient_profile.model_dump() if req.patient_profile else None),
+        preferences_text=preferences_prompt_text(get_preferences(req.user)),
+        budget_s=COMPOSE_BUDGET_S,
+    )
+    return {**out.to_dict(), "budget_s": COMPOSE_BUDGET_S}
+
+
+class ExportFormulaRequest(TextOnlyInput):
+    """§12 第 6 项。`format` 三选：print / text / png。"""
+
+    formula: FormulaCandidate
+    format: Literal["print", "text", "png"] = "print"
+    role: Role | None = None
+    signature: str = ""
+    visit_date: str = ""
+    dosage_form: str = "饮片"
+    usage: str = ""
+    record_id: str = ""
+    syndrome: str = ""
+    disease: str = ""
+    method: str = ""
+
+
+@app.post("/api/export/formula")
+def api_export_formula(req: ExportFormulaRequest, request: Request) -> dict:
+    """三种格式**出自同一份 render_model**。
+
+    `png` 这一档返回的是 render_model 本身，由前端 canvas 光栅化——
+    仓库里没有 Pillow，`web/vendor/fonts/` 只有 woff2（Pillow 喂不进去），
+    为一个导出档引入新依赖加一套中文 TTF 属于过度设计。**内容仍由服务端
+    一处生成**，前端画的是这同一份模型，不是另编一份（理由写在
+    `core/export_render.py` 的模块文档里）。
+    """
+    role = resolve_role(req.role)
+    ctx = ExportContext(
+        role=role, signature=req.signature, visit_date=req.visit_date,
+        dosage_form=req.dosage_form, usage=req.usage, record_id=req.record_id,
+        syndrome=req.syndrome, disease=req.disease, method=req.method,
+    )
+    model = build_render_model(req.formula, ctx)
+    base = {"format": req.format, "render_model": model,
+            "filename": f"{model.get('title') or '处方'}"}
+    if req.format == "text":
+        return {**base, "mime": "text/plain; charset=utf-8",
+                "content": render_plain_text(model)}
+    if req.format == "png":
+        # 没有 content：这一档的"内容"就是 render_model。
+        return {**base, "mime": "image/png",
+                "note": "PNG 由浏览器按这份 render_model 光栅化（服务端没有字体光栅化能力）。"}
+    return {**base, "mime": "text/html; charset=utf-8",
+            "content": render_print_html(model)}
+
+
+class ExportRecordRequest(TextOnlyInput):
+    """§12 第 6 项后半：「生成记录」。**纯模板、零 LLM、≤1 秒。**"""
+
+    record_id: str = ""
+    complaint: str = ""
+    intake: IntakeForm | None = None
+    patient_profile: PatientProfile | None = None
+    s2: dict | None = None
+    s3: dict | None = None
+    formula: dict | None = None
+    triage: dict | None = None
+    guideline: dict | None = None
+    doses: int | None = None
+    decoction: str = ""
+    safety_flag: str | None = None
+    role: Role | None = None
+
+
+@app.post("/api/export/record")
+def api_export_record(req: ExportRecordRequest, request: Request) -> dict:
+    """§8 那张表：「生成记录」只有医师有。学生与患者 404——
+    **不是返回一份空文书**：一个点了给出空白的按钮比一个明确说没有这项功能
+    的 404 更难查（跟 `core/product_mode.py` 那条纪律同一个理由）。"""
+    role = resolve_role(req.role)
+    if role != "doctor":
+        raise HTTPException(status_code=404, detail="当前角色没有这一项功能。")
+    text = render_record_text(
+        record_id=req.record_id, complaint=req.complaint, form=req.intake,
+        profile=req.patient_profile, s2=req.s2, s3=req.s3, formula=req.formula,
+        triage=req.triage, guideline=req.guideline, doses=req.doses,
+        decoction=req.decoction, safety_flag=req.safety_flag,
+    )
+    return {"text": text, "record_id": req.record_id}
+
+
+class RecordSaveRequest(TextOnlyInput):
+    """§12 第 7 项：本地记录。**不对接任何外部系统**（§6.2 原话）。"""
+
+    record_id: str = ""
+    doctor_id: str = ""
+    patient_ref: str = ""
+    complaint: str = ""
+    syndrome: str = ""
+    disease: str = ""
+    method: str = ""
+    formula: str = ""
+    herb_items: list[HerbItem] = []
+    doses_count: int | None = None
+    usage: str = ""
+    dosage_form: str = ""
+
+
+@app.post("/api/records")
+def api_records_save(req: RecordSaveRequest, request: Request) -> dict:
+    row = history.record_consult(
+        doctor_id=req.doctor_id, record_id=req.record_id or _record_id(),
+        complaint=req.complaint, syndrome=req.syndrome, disease=req.disease,
+        formula=req.formula, patient_ref=req.patient_ref, method=req.method,
+        herb_items=[i.model_dump() for i in req.herb_items],
+        doses_count=req.doses_count, usage=req.usage, dosage_form=req.dosage_form,
+    )
+    return {"saved": row,
+            "next_visit_index": history.next_visit_index(req.patient_ref,
+                                                         doctor_id=req.doctor_id)}
+
+
+@app.get("/api/records")
+def api_records_list(doctor_id: str = "", patient_ref: str = "",
+                     limit: int = 50) -> dict:
+    """§6.2 左栏那一块。不传 `patient_ref` 时按备注分组返回——界面上
+    这一栏本来就是分组显示的，让前端拿一个平列表自己分组等于把
+    "怎么算一组"这件事又实现一遍。"""
+    if patient_ref:
+        items = history.list_consults(doctor_id=doctor_id, patient_ref=patient_ref,
+                                      limit=max(1, min(limit, 200)))
+        return {"items": items, "n": len(items), "patient_ref": patient_ref}
+    groups = history.consults_by_patient(doctor_id=doctor_id,
+                                         limit_per=max(1, min(limit, 200)))
+    return {"groups": groups, "n": sum(g["n"] for g in groups)}
+
+
+@app.delete("/api/records/{record_id}")
+def api_records_delete(record_id: str) -> dict:
+    """§6.2「可导出可删除」。删除写墓碑行，原始行留在盘上——删除本身也留痕。"""
+    return {"deleted": history.delete_consult(record_id)}
+
+
+class TemplateSaveRequest(TextOnlyInput):
+    """§12 第 8 项：个人模板。§6.5 明确**不做科室方/院内验方**
+    （那是医院内部管理，不在本产品范围 §1.1），所以没有"作用域"这一维。"""
+
+    doctor_id: str = ""
+    name: str = ""
+    syndrome: str = ""
+    herb_items: list[HerbItem] = []
+    doses_count: int | None = None
+    usage: str = ""
+    note: str = ""
+
+
+@app.post("/api/templates")
+def api_templates_save(req: TemplateSaveRequest, request: Request) -> dict:
+    if not (req.name or "").strip():
+        raise HTTPException(status_code=400, detail="模板要有名字，否则调用时认不出它。")
+    row = history.add_favorite(
+        doctor_id=req.doctor_id, name=req.name, herbs=[], syndrome=req.syndrome,
+        herb_items=[i.model_dump() for i in req.herb_items],
+        doses_count=req.doses_count, usage=req.usage, note=req.note,
+    )
+    return {"saved": row}
+
+
+@app.get("/api/templates")
+def api_templates_list(doctor_id: str = "") -> dict:
+    """个人模板 + 经典方两级（§6.5）。经典方来自方剂本体，**不落盘**
+    ——它不是这位医师存的东西，是知识。"""
+    mine = history.list_favorites(doctor_id=doctor_id)
+    return {"personal": mine, "n_personal": len(mine)}
+
+
+@app.delete("/api/templates/{name}")
+def api_templates_delete(name: str, doctor_id: str = "") -> dict:
+    return {"deleted": history.delete_favorite(name, doctor_id=doctor_id)}
+
+
+class PreferencesRequest(TextOnlyInput):
+    """§12 第 9 项。**只收 `core/preferences.py::DEFAULTS` 里的键**——
+    拼错的键当场 400，不静默存进去（那会让"我明明设了 14 剂"永远查不出原因）。"""
+
+    user: str = ""
+    changes: dict = {}
+
+
+@app.get("/api/preferences")
+def api_preferences_get(user: str = "") -> dict:
+    """当前设置 + 每一项的可选值。**可选值由服务端给**：前端写死一份的话，
+    这里加一种剂型，界面上的下拉不会跟着长出来。"""
+    return {
+        "preferences": get_preferences(user),
+        "choices": {
+            "dosage_form": list(DOSAGE_FORMS),
+            "doses_count": list(DOSES_CHOICES),
+            "usage": {k: list(v) for k, v in USAGE_CHOICES.items()},
+            "herb_count_band": list(HERB_COUNT_BANDS),
+            "role": [r["id"] for r in product_flags()["roles"]],
+        },
+    }
+
+
+@app.put("/api/preferences")
+def api_preferences_put(req: PreferencesRequest, request: Request) -> dict:
+    try:
+        prefs = set_preferences(req.user, **(req.changes or {}))
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e.args[0] if e.args else e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"preferences": prefs}
+
+
+@app.get("/api/textbook_formula")
+def api_textbook_formula(syndrome: str = "") -> dict:
+    """§8.1：某个证型的**教材代表方及其组成**。患者角色看到的方是这一个。
+
+    取不到时 `available: false` 并说清楚是哪一种取不到——"教材推荐方案表里
+    没有这个证型"和"有这个证型但本体里没有那张方的组成"是两件事，而它们在
+    界面上会长成同一个空白。
+    """
+    out = textbook_formula_for(syndrome or "")
+    if out is None:
+        return {"available": False, "syndrome": syndrome,
+                "note": f"教材推荐方案与方剂本体里都没有查到「{syndrome}」对应的代表方。"}
+    return {"available": True, **out}

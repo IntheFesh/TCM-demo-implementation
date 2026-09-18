@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-role="doctor" data-fontsize="standard" data-page="consult">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>中医辨证推理工具</title>
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../vendor/fonts/noto-serif-sc-400-subset.woff2">
+<link rel="preload" as="font" type="font/woff2" crossorigin href="../vendor/fonts/noto-sans-sc-400-subset.woff2">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ══════════ 顶栏 ══════════ -->
+<header id="topbar">
+  <div class="tb-brand">中医辨证推理工具</div>
+  <nav id="tab-bar" role="tablist" aria-label="主入口">
+    <button id="tab-consult" class="tab is-on" role="tab" aria-selected="true">问诊</button>
+    <button id="tab-lab" class="tab" role="tab" aria-selected="false">组方实验室</button>
+  </nav>
+  <div class="tb-right">
+    <label class="tb-role">角色
+      <select id="role-select">
+        <option value="doctor">医师</option>
+        <option value="student">学生</option>
+        <option value="patient">患者</option>
+      </select>
+    </label>
+    <button id="btn-knowledge" class="tb-btn">知识查询</button>
+    <button id="btn-settings" class="tb-btn" aria-haspopup="dialog" aria-expanded="false">设置</button>
+    <button id="btn-help" class="tb-btn" aria-haspopup="dialog" aria-expanded="false">帮助</button>
+  </div>
+</header>
+
+<!-- ══════════ 设置面板（§4.3：每一项点了都必须有效果） ══════════ -->
+<div id="settings-panel" class="panel-pop" role="dialog" aria-label="设置" hidden>
+  <div class="pp-row"><span class="pp-k">使用角色</span>
+    <select id="set-role">
+      <option value="doctor">医师</option><option value="student">学生</option><option value="patient">患者</option>
+    </select></div>
+  <div class="pp-row"><span class="pp-k">界面字号</span>
+    <select id="set-fontsize"><option value="standard">标准</option><option value="large">大（+2px）</option></select></div>
+  <div class="pp-row"><span class="pp-k">默认剂型</span><select id="set-form"></select></div>
+  <div class="pp-row"><span class="pp-k">默认剂数</span><select id="set-doses"></select></div>
+  <div class="pp-row"><span class="pp-k">默认煎服法</span><select id="set-usage"></select></div>
+  <div class="pp-row pro-only"><span class="pp-k">常用药味数</span><select id="set-herbcount"></select></div>
+  <div class="pp-row pro-only"><span class="pp-k">忌用药</span>
+    <input id="set-avoid" type="text" placeholder="以顿号分隔，如：附子、细辛"></div>
+  <div class="pp-row"><span class="pp-k">署名</span>
+    <input id="set-signature" type="text" placeholder="用于导出药方的落款，可留空"></div>
+  <div class="pp-about">
+    <div>版本 <span id="about-version">—</span></div>
+    <div>本次记录编号 <span id="about-record">—</span></div>
+    <p id="about-disclaimer"></p>
+  </div>
+  <div class="pp-foot"><span id="set-status" class="pp-status"></span><button id="set-close" class="btn-min">关闭</button></div>
+</div>
+
+<!-- ══════════ 帮助 ══════════ -->
+<div id="help-panel" class="panel-pop" role="dialog" aria-label="帮助" hidden>
+  <h3 class="pp-h">怎么用</h3>
+  <ol class="help-list">
+    <li>左栏填年龄与性别（必填），其余按问到的填。</li>
+    <li>中栏写下患者说的症状与舌象脉象，停一下右栏会提示还可以问什么。</li>
+    <li>点「开始辨证」。证型出来之后，每一个术语都可以点，右栏给出它的释义与出处。</li>
+    <li>处方表可以直接改。改完立刻给出规则核查，几秒后右栏给出提示。</li>
+    <li>「组方实验室」是另一条路：从治法出发组方，再检验它站不站得住。</li>
+  </ol>
+  <div class="pp-foot"><button id="help-close" class="btn-min">关闭</button></div>
+</div>
+
+<!-- ══════════ 问诊：三栏 ══════════ -->
+<main id="shell">
+  <aside id="col-left" aria-label="患者信息">
+    <section class="lc-block">
+      <h2 class="lc-h">患者</h2>
+      <div class="pf-grid">
+        <label class="pf-f">年龄<span class="req">*</span>
+          <input id="pf-age" type="number" min="0" max="130" inputmode="numeric" placeholder="岁"></label>
+        <label class="pf-f">性别<span class="req">*</span>
+          <select id="pf-sex"><option value="">—</option><option value="男">男</option><option value="女">女</option></select></label>
+        <label class="pf-f pf-wide">生理阶段
+          <select id="pf-stage">
+            <option value="">无</option><option value="妊娠期">妊娠</option><option value="哺乳期">哺乳</option>
+            <option value="儿童">小儿</option><option value="老年">老年</option>
+          </select></label>
+        <label class="pf-f pf-wide">中医体质<select id="pf-const"></select></label>
+        <label class="pf-f pf-wide">基础病<input id="pf-comorb" type="text" placeholder="顿号分隔"></label>
+        <label class="pf-f pf-wide">过敏史<input id="pf-allergy" type="text" placeholder="顿号分隔"></label>
+        <label class="pf-f pf-wide">在服西药<input id="pf-meds" type="text" placeholder="顿号分隔"></label>
+        <label class="pf-f pf-wide">备注<input id="pf-ref" type="text" placeholder="患者称呼或编号，随便填"></label>
+      </div>
+      <p id="pf-hint" class="lc-hint"></p>
+    </section>
+    <section class="lc-block" id="records-block">
+      <h2 class="lc-h">既往记录</h2>
+      <div id="records-list" class="rec-list"><p class="lc-empty">还没有保存过记录。</p></div>
+    </section>
+  </aside>
+
+  <section id="col-mid" aria-label="问诊与结果">
+    <section id="sec-input" class="card">
+      <h2 class="card-h">① 主诉与四诊</h2>
+      <p id="lede" class="lede">输入症状与四诊所见，看清楚一个证是怎么推出来的。系统按中医医理逐步推导病位、证型、治则治法与方药，每一步注明所依据的医理规则与教材原文。</p>
+      <dl id="io-spec" class="io-spec">
+        <dt>输入</dt><dd>症状、舌象脉象的文字描述、现病史</dd>
+        <dt>输出</dt><dd>证型与辨证要点、病机、治则治法、教材代表方与加减、每一步的依据出处</dd>
+        <dt>边界</dt><dd>不接受舌象照片、脉诊仪信号、检验数值；所生成内容须由执业医师审核后方可用于临床</dd>
+      </dl>
+      <textarea id="complaint" rows="8" placeholder="胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。"></textarea>
+      <div id="four-exams" class="fx-row">
+        <button class="fx-btn" data-part="望">望</button>
+        <button class="fx-btn" data-part="闻">闻</button>
+        <button class="fx-btn" data-part="问">问</button>
+        <button class="fx-btn" data-part="切">切</button>
+      </div>
+      <div id="fx-pop" class="pop" hidden></div>
+      <div id="examples" class="ex-block">
+        <h3 class="ex-h">示例</h3>
+        <ul id="ex-list" class="ex-list"></ul>
+      </div>
+      <div class="go-row">
+        <button id="btn-go" class="btn-primary">开始辨证</button>
+        <button id="btn-cancel" class="btn-min" hidden>停止</button>
+        <span id="go-status" class="go-status"></span>
+      </div>
+    </section>
+
+    <div id="redflag-bar" class="redflag" role="alert" hidden></div>
+    <section id="triage-page" class="card triage" role="alert" hidden></section>
+
+    <div id="result-zone" hidden>
+      <section id="sec-conclusion" class="card">
+        <h2 class="card-h">② 结论</h2>
+        <div class="cc-grid">
+          <span class="cc-k">证型</span>
+          <span class="cc-v" id="cc-syndrome"></span>
+          <span class="cc-act"><button id="btn-differential" class="chip">鉴别</button></span>
+          <span class="cc-k">病名</span><span class="cc-v" id="cc-disease"></span><span></span>
+        </div>
+        <div class="kp-block">
+          <h3 class="sub-h">辨证要点</h3>
+          <ul id="kp-list" class="kp-list"></ul>
+        </div>
+        <div id="diff-block" class="diff-block" hidden>
+          <h3 class="sub-h">鉴别——排除了哪些证</h3>
+          <ul id="diff-list" class="diff-list"></ul>
+        </div>
+      </section>
+
+      <section id="sec-mechanism" class="card">
+        <h2 class="card-h">③ 病机 · ④ 治则治法</h2>
+        <div class="mm-grid">
+          <span class="mm-k">病机</span><span class="mm-v" id="mm-patho"></span>
+          <span class="mm-k">治则</span><span class="mm-v" id="mm-principle"></span>
+          <span class="mm-k">治法</span><span class="mm-v" id="mm-method"></span>
+        </div>
+      </section>
+
+      <section id="sec-formula" class="card">
+        <h2 class="card-h">⑤ 方剂</h2>
+        <div class="fm-head">
+          <b id="fm-name" class="term"></b>
+          <span class="fm-meta">
+            剂型<select id="fm-form"></select>
+            剂数<input id="fm-doses" type="number" min="1" max="60" value="7">
+            用法<input id="fm-usage" type="text">
+          </span>
+        </div>
+        <div id="fm-textbook" class="fm-textbook" hidden></div>
+        <table id="rx-table" class="rx"><tbody id="rx-body"></tbody></table>
+        <div class="rx-actions">
+          <button id="rx-add" class="btn-min">+ 加味</button>
+          <button id="rx-tpl" class="btn-min">调用模板</button>
+          <button id="rx-save-tpl" class="btn-min">存为模板</button>
+          <button id="rx-to-lab" class="btn-min">送入组方实验室</button>
+        </div>
+        <div id="tpl-pop" class="pop" hidden></div>
+        <div id="rx-check" class="rx-check" aria-live="polite"></div>
+      </section>
+
+      <section id="sec-mods" class="card">
+        <h2 class="card-h">⑥ 加减建议</h2>
+        <ul id="mods-list" class="mods-list"></ul>
+      </section>
+
+      <details id="sec-guideline" class="fold"><summary>教材对照</summary><div id="guideline-body"></div></details>
+
+      <div id="op-bar" class="op-bar">
+        <button id="op-export" class="btn-primary">导出药方</button>
+        <button id="op-record" class="btn-min">生成记录</button>
+        <button id="op-save" class="btn-min">保存</button>
+        <span id="op-status" class="go-status"></span>
+      </div>
+      <div id="export-pop" class="pop" hidden></div>
+
+      <details id="sec-basis" class="fold"><summary>⑨ 推导依据</summary><div id="basis-body"></div></details>
+      <details id="sec-cases" class="fold"><summary>⑩ 历史医案对照</summary>
+        <p class="fold-note">以下为推导完成后检索到的相似处理，仅作对照，不参与上面的推导。</p>
+        <div id="cases-body"></div></details>
+      <details id="sec-self" class="fold"><summary>⑪ 系统自评</summary><div id="self-body"></div></details>
+    </div>
+  </section>
+
+  <aside id="col-right" aria-label="助手">
+    <div class="rc-head">
+      <span id="rc-title">问诊要点提示</span>
+      <label class="rc-pin"><input id="rc-pin" type="checkbox"> 钉住</label>
+      <button id="rc-collapse" class="btn-min" title="收起助手">›</button>
+    </div>
+    <div id="rc-body" class="rc-body" aria-live="polite"></div>
+  </aside>
+  <button id="rc-expand" class="rc-expand" hidden title="展开助手">‹</button>
+</main>
+
+<!-- ══════════ 组方实验室（§9） ══════════ -->
+<main id="lab" hidden>
+  <aside id="lab-left" aria-label="组方目标">
+    <h2 class="lc-h">目标</h2>
+    <label class="pf-f pf-wide">证型<select id="lab-syndrome"></select></label>
+    <p class="lc-or">或</p>
+    <label class="pf-f pf-wide">治法<input id="lab-method" type="text" placeholder="如：疏肝理气，和胃止痛"></label>
+    <div class="mm-grid">
+      <span class="mm-k">病位</span><span class="mm-v" id="lab-locus">—</span>
+      <span class="mm-k">病性</span><span class="mm-v" id="lab-nature">—</span>
+    </div>
+    <h2 class="lc-h">患者概况（可选）</h2>
+    <div class="pf-grid">
+      <label class="pf-f">年龄<input id="lab-age" type="number" min="0" max="130"></label>
+      <label class="pf-f">性别<select id="lab-sex">
+        <option value="">—</option><option value="男">男</option><option value="女">女</option></select></label>
+      <label class="pf-f pf-wide">生理阶段<select id="lab-stage">
+        <option value="">无</option><option value="妊娠期">妊娠</option><option value="哺乳期">哺乳</option>
+        <option value="儿童">小儿</option><option value="老年">老年</option></select></label>
+    </div>
+    <button id="lab-to-consult" class="btn-min">送回问诊</button>
+  </aside>
+
+  <section id="lab-mid" aria-label="组方">
+    <h2 class="card-h">组方</h2>
+    <table id="lab-table" class="rx"><tbody id="lab-body"></tbody></table>
+    <div class="rx-actions">
+      <button id="lab-add" class="btn-min">+ 加味</button>
+      <button id="lab-classic" class="btn-min">从经典方开始</button>
+      <button id="lab-verify" class="btn-primary">检验组方</button>
+    </div>
+    <div id="lab-classic-pop" class="pop" hidden></div>
+    <div id="lab-check" class="rx-check" aria-live="polite"></div>
+  </section>
+
+  <aside id="lab-right" aria-label="检验与释义">
+    <div class="rc-head"><span id="lab-rc-title">检验结果</span></div>
+    <div id="lab-rc-body" class="rc-body" aria-live="polite">
+      <p class="rc-empty">选一个证型或写下治法，加几味药，然后点「检验组方」。</p>
+    </div>
+  </aside>
+</main>
+
+<!-- ══════════ 知识查询覆盖层（§10） ══════════ -->
+<div id="kb-overlay" class="overlay" role="dialog" aria-label="知识查询" hidden>
+  <div class="kb-box">
+    <div class="kb-head">
+      <input id="kb-input" type="search" placeholder="查药名、方名、证型或医理规则">
+      <span id="kb-status" class="go-status"></span>
+      <button id="kb-close" class="btn-min">关闭（Esc）</button>
+    </div>
+    <div class="kb-main">
+      <nav id="kb-locus" class="kb-locus" aria-label="病位"></nav>
+      <div class="kb-center">
+        <nav id="kb-crumb" class="kb-crumb" aria-label="路径"></nav>
+        <div id="kb-graph" class="kb-graph"></div>
+        <div id="kb-results" class="kb-results" hidden></div>
+        <p id="kb-graph-note" class="fold-note"></p>
+      </div>
+      <aside id="kb-side" class="kb-side"><p class="rc-empty">点左边的病位展开证候，或在上面搜索。</p></aside>
+    </div>
+  </div>
+</div>
+
+<footer id="footer">
+  <span class="ft-claim">不替代医生，只帮医生省时间</span>
+  <span class="ft-sep">·</span>
+  <span id="ft-disclaimer"></span>
+</footer>
+
+<script defer src="knowledge.js"></script>
+<script defer src="lab.js"></script>
+<script defer src="app.js"></script>
+</body>
+</html>

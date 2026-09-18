@@ -344,7 +344,8 @@ def _rule_layer(herb_items, syndrome: str, profile: dict | None) -> dict:
     ind = None
     if profile:
         try:
-            ind = individualize(items, PatientProfile(**profile)).model_dump()
+            ind = individualize(PatientProfile(**profile),
+                                [i.name for i in items], syndrome).model_dump()
         except Exception as e:                  # noqa: BLE001
             # 患者概况里有认不出的值（前端传了一个不在 Literal 里的体质名）
             # 不该让整个检验失败——如实记一句，其余照常。

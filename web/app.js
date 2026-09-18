@@ -2400,6 +2400,11 @@ const NODE_KIND_LABEL = {
   symptom: "症状", element: "证素", syndrome: "证型",
   pathogenesis: "病机", principle: "治则", method: "治法",
   formula: "方剂", herb: "药材", case: "医案",
+  // R62 §7.2：医理规则也能点开（内容 / 出处 / 用在哪一步）。这一行是
+  // `tests/test_chain_flow_frontend.py` 那条"前后端种类清单必须一致"的
+  // 测试逼出来的——后端 NodeKind 加一种，这里不加就会在面板标题后面
+  // 印出一个英文单词。
+  rule: "医理规则",
 };
 
 function closeNodeExplain() {
@@ -3296,6 +3301,12 @@ function describeProgressEvent(name, data) {
     // 这里补上的是**边界**（开始/每轮结论/结束），不是把 verify_revise 说第二遍：
     // verify_revise 只在"要回炉重开"时发，而第一轮就通过的那条路径此前
     // 在界面上完全看不见，恰恰是最常见的那条。
+    case "s3_draft":
+      // 内容事件，不是进度事件：五步链已经推出来了，但**还没过符号验证**。
+      // 这一版旧界面按 `done` 一次性渲染（R62 的三栏新界面才用它提前渲染
+      // ②–⑥），所以这里只记一行——但必须有这一行：它标出"推导结束、核查
+      // 开始"这个时刻，没有它，s3_done 到 verify_start 之间看起来像空白。
+      return "　推导完成，方已拟出（尚未通过符号核查）";
     case "verify_start":
       return "　⑨ 校验：开始逐条核对方药与医理…";
     case "verify_round":

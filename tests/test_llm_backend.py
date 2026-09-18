@@ -473,6 +473,14 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         # 区别只在 `$extra` 里塞不塞证素分析——所以它只有这一个占位符，
         # 多一个就说明有人给某个 solver 开了小灶（那量到的就不是链的贡献了）。
         "mtcmb_prescribe": {"extra"},
+        # R62 §3.3：两个轻量能力的 prompt。它们**不是问诊链的一环**
+        # （见 core/assist.py 的模块文档那张表），所以占位符里没有
+        # $elements_summary / $theory_rules ——它们拿到的是已经定下来的
+        # 证型治法，不重新辨一次证。
+        "assist_edit": {"syndrome", "principle", "profile", "preferences",
+                        "herbs", "diff", "violations", "n_min", "n_max"},
+        "assist_compose": {"syndrome", "principle", "profile", "preferences",
+                           "herbs", "rule_findings"},
     }
     for path in (PROMPTS_ROOT / "v1").glob("*.yaml"):
         found = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?", load_prompt(path.stem)["system"]))

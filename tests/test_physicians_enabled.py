@@ -53,11 +53,21 @@ def test_no_module_filters_the_registry_by_itself():
         if path.name == "physicians.py":
             continue
         text = path.read_text(encoding="utf-8")
-        if 'get("enabled"' in text or '["enabled"]' in text:
-            # api/main.py 把 enabled 原样下发给前端，那是**传递**不是筛选
-            if path.name == "main.py" and 'info.get("enabled", True)}' in text:
+        # api/main.py 把 enabled 原样下发给前端，那是**传递**不是筛选
+        if path.name == "main.py" and 'info.get("enabled", True)}' in text:
+            continue
+        # **"enabled"这个键名不是医家注册表独占的，所以要逐行看。**
+        # R62 给 `corroborate_done` 事件加了一个 `enabled` 字段（这一相
+        # 跑没跑），而 core/chain.py 又恰好 import 了 PHYSICIANS，于是整份
+        # 文件被这条扫描误报成"自己筛了注册表"——它碰的根本不是注册表。
+        # 判据改成：**读 enabled 的那一行上要同时出现医家的影子**
+        # （`info` / `physician` / `PHYSICIANS`）。真去筛注册表的代码
+        # 一定是在遍历它，那一行上必然有这几个词之一。
+        for line in text.splitlines():
+            if 'get("enabled"' not in line and '["enabled"]' not in line:
                 continue
-            hits.append(str(path.relative_to(ROOT)))
+            if any(w in line for w in ("info", "physician", "PHYSICIANS")):
+                hits.append(f"{path.relative_to(ROOT)}: {line.strip()}")
     assert not hits, f"这些模块自己筛了注册表：{hits}"
 
 

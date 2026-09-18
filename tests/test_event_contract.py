@@ -49,7 +49,13 @@ def _backend_emitted_events() -> set[str]:
         # 永远会被这份测试自己误判成"后端没发"。
         _read("core/agent.py"),
     )
-    pattern = re.compile(r'(?:on_step|_on_step|emit|_sse)\(\s*"([a-z_]+)"')
+    # **`[a-z0-9_]` 而不是 `[a-z_]`。** 这个字符类原来不含数字，于是这个
+    # 扫描器**静默漏掉了链上最要紧的五个事件**——`s1_done` / `s2_done` /
+    # `s3_start` / `s3_delta` / `s3_done` 全都带数字，十九个事件里有五个
+    # 从来没被这份契约检查过。一份"守着前后端事件名对得上"的测试，
+    # 盲区恰好盖住了推理链的主干。R62 加 `s3_draft` 时撞出来的：那个事件
+    # 后端发了、前端零处理，而这份测试照样全绿。
+    pattern = re.compile(r'(?:on_step|_on_step|emit|_sse)\(\s*"([a-z0-9_]+)"')
     names: set[str] = set()
     for src in sources:
         names |= set(pattern.findall(src))
@@ -64,8 +70,8 @@ def _frontend_handled_events() -> set[str]:
     合并统计因为二者都算"这个事件名被认出来了"。"""
     src = _read("web/app.js")
     names: set[str] = set()
-    names |= set(re.findall(r'case\s+"([a-z_]+)"\s*:', src))
-    names |= set(re.findall(r'name\s*===\s*"([a-z_]+)"', src))
+    names |= set(re.findall(r'case\s+"([a-z0-9_]+)"\s*:', src))
+    names |= set(re.findall(r'name\s*===\s*"([a-z0-9_]+)"', src))
     return names
 
 
@@ -146,3 +152,18 @@ def test_agent_step_is_actually_emitted_by_agent_trace_not_just_documented():
     assert 'self.on_step("agent_step"' in agent_src
     chain_src = _read("core/chain.py")
     assert "AgentTrace(on_step=on_step)" in chain_src
+
+
+def test_the_scanner_itself_sees_the_events_with_digits_in_their_names():
+    """这份测试的**自检**：`s1_done`/`s2_done`/`s3_start`/`s3_delta`/`s3_done`
+    这五个带数字的事件必须真的出现在扫描结果里。
+
+    加这一条是因为它们曾经整整五个都在扫描器的盲区里（字符类写成了
+    `[a-z_]`，不含数字），而那期间这份测试一直是绿的——一个永远放行的
+    守卫比没有守卫更糟，它看起来像守着。
+    """
+    backend = _backend_emitted_events()
+    frontend = _frontend_handled_events()
+    for name in ("s1_done", "s2_done", "s3_start", "s3_delta", "s3_done"):
+        assert name in backend, f"{name} 应该被扫描器认出来，它在 core/chain.py 里确实发了"
+        assert name in frontend, f"{name} 前端确实有处理，扫描器却没认出来"
