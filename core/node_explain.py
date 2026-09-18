@@ -63,7 +63,7 @@ from typing import Literal
 
 NodeKind = Literal[
     "symptom", "element", "syndrome", "pathogenesis", "principle", "method",
-    "formula", "herb", "case", "unknown",
+    "formula", "herb", "rule", "case", "unknown",
 ]
 
 #: 节点 id 前缀 → 种类。
@@ -93,6 +93,10 @@ _PREFIX_KIND: dict[str, NodeKind] = {
     # R42 之前问诊图用的合并证素层。**留着**：审计日志与已导出的 SFT 样本里
     # 有这个前缀，去掉之后回看旧记录会变成 unknown。
     "elem": "element",
+    # R62 §7.2：医理规则也要能点开（内容 / 出处 / 用在哪一步）。**加在这里而
+    # 不是在前端另写一个规则弹窗**：界面上它跟药名、方名、证型是同一种交互
+    # （点一下，右栏出释义），同一种交互只能有一处实现（CLAUDE.md 第 31 条）。
+    "rule": "rule",
 }
 
 #: 节的顺序与标题。**顺序是链条，不是排版偏好**（见模块文档）。「相似证型与
@@ -882,6 +886,57 @@ def _pathogenesis_sections(text: str) -> list[dict]:
     return [s for s in out if s]
 
 
+def _rule_sections(rule_id: str) -> list[dict]:
+    """一条医理规则的释义（R62 §7.2）。数据来自 `core/theory.py` 的 171 条。
+
+    只有三节，不是八节：一条规则没有药理、没有名老中医经验、也没有"注意"。
+    **缺的节整块不出现**，不摆一个空壳（模块文档第二条纪律）。
+
+    「用在哪一步」这一节说的是规则的类别能支持推导的哪一步——`applies_to`
+    与四类 kind 的对应关系。它回答的是"我在结论里看到这条 id，它凭什么出现
+    在这一步"，而不是"这一次它具体怎么用的"（那句话在结论里的 `note` 字段上，
+    由模型写、随每一次问诊不同，不属于规则本身的释义）。
+    """
+    from core.theory import rule as _theory_rule
+
+    r = _theory_rule(rule_id)
+    if r is None:
+        return []
+    d = r.to_dict()
+    kind_label = {
+        "organ_relation": "藏象关系——支持「病变脏腑」这一步",
+        "pathomechanism": "病机传变——支持「证型」这一步",
+        "treatment_principle": "治则推导——支持「治法」这一步",
+        "compatibility": "配伍理论——支持「方剂」与「用药」两步",
+    }.get(d.get("kind", ""), d.get("kind", ""))
+
+    # 规则本身的内容。键名走 `core.theory.PAYLOAD_LABELS` 翻成中文——
+    # **没有标签的键整条不显示**：R62 §7.2 把"字段名"列进了产品面绝不允许
+    # 出现的东西里，印一个 `trigger_elements` 出来比少一行糟得多。
+    from core.theory import PAYLOAD_LABELS
+
+    body = [f"{PAYLOAD_LABELS[k]}：{_fmt_rule_value(v)}" for k, v in d.items()
+            if k in PAYLOAD_LABELS and _fmt_rule_value(v)]
+    out: list[dict] = []
+    if body:
+        out.append(_section("是什么", body, source=None))
+    if d.get("span"):
+        out.append(_section("出处原文", [d["span"]], source=_display_source(d.get("source"))))
+    tail = [x for x in (kind_label,
+                        f"适用范围：{d['applies_to']}" if d.get("applies_to") else "",
+                        f"这条规则的把握程度：{d['confidence']}" if d.get("confidence") else "")
+            if x]
+    if tail:
+        out.append(_section("病机", tail, source=None))
+    return out
+
+
+def _fmt_rule_value(v) -> str:
+    if isinstance(v, (list, tuple)):
+        return "、".join(str(x) for x in v if str(x).strip())
+    return str(v or "").strip()
+
+
 def explain_node(node_id: str, *, name: str | None = None, ontology=None) -> dict:
     """一个节点的八节释义。**零 LLM**。
 
@@ -917,6 +972,7 @@ def explain_node(node_id: str, *, name: str | None = None, ontology=None) -> dic
         "pathogenesis": lambda: _pathogenesis_sections(name),
         "principle": lambda: _method_like_sections("principle", name, ontology=ontology),
         "method": lambda: _method_like_sections("method", name, ontology=ontology),
+        "rule": lambda: _rule_sections(name),
     }
     sections = builders[kind]()
     # 固定顺序（见 SECTION_ORDER）：各 builder 自己的顺序已经是它，这里再排一次

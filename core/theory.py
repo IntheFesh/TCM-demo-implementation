@@ -79,6 +79,26 @@ _PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
+#: payload 字段的中文标签。**跟 `_PAYLOAD_KEYS` 并排放在这里**，不放在
+#: `core/node_explain.py`：那边有一份的话，这边加一个字段、那边不知道，
+#: 界面上就会冒出一个英文键名——而 R62 §7.2 明确把"字段名"列进了产品面
+#: 绝不允许出现的东西里。没有标签的键**整条不显示**（不是显示原键名）：
+#: 一个还没起中文名的字段，摆出来只会让人以为界面坏了。
+PAYLOAD_LABELS: dict[str, str] = {
+    # organ_relation
+    "subject": "主脏", "relation": "关系", "object": "客脏",
+    "mechanism": "机理", "direction": "方向",
+    "trigger_elements": "触发证素", "implied_elements": "可推出的证素",
+    # pathomechanism
+    "from": "自", "to": "至", "condition": "条件", "markers": "辨认要点",
+    # treatment_principle
+    "when_nature": "病性为", "when_location": "病位在", "principle": "治则",
+    "method_keywords": "治法关键词", "contraindicated_methods": "忌用治法",
+    # compatibility
+    "definition": "定义", "example_pairs": "例",
+}
+
+
 def _to_rule(row: dict) -> TheoryRule:
     kind = row["kind"]
     keys = _PAYLOAD_KEYS.get(kind, ())
