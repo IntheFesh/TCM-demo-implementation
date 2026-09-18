@@ -52,9 +52,13 @@ def test_every_segment_declares_both_a_number_and_an_execution_order():
         assert row["num"] is not None and row["order"] is not None, row
 
 
-def test_segment_numbers_are_unchanged_zero_to_ten():
-    """**段号不动**：`--only` / `--from` / `--resume` 和状态文件都按段号寻址。"""
-    assert [r["num"] for r in _segments()] == [str(i) for i in range(11)]
+def test_segment_numbers_are_unchanged_and_in_order():
+    """**段号不动**：`--only` / `--from` / `--resume` 和状态文件都按段号寻址。
+    新增的段只能往后加（R38 加了段 11），**不许重排、不许插空**——重排会让
+    正在跑的机器上的状态文件指向另一段。"""
+    nums = [r["num"] for r in _segments()]
+    assert nums == [str(i) for i in range(len(nums))]
+    assert len(nums) >= 12, "段 11（R38 消融 + 外部基准）不见了"
 
 
 def test_the_execution_order_is_a_permutation_not_a_free_for_all():
@@ -120,9 +124,14 @@ def test_the_segments_with_top3_history_are_pinned_to_top3():
 
 
 def test_segment_nine_is_the_only_full_context_segment():
+    """full_context 单价是 top3 的 29 倍，所以**只有那一段该按它算钱**：
+    段 9 自己验的就是"full_context 还能不能当默认"。别的段要么是 top3 系
+    （历史值可比），要么不走检索层。R38 的段 11 也钉 top3——R32 之后
+    知识块进所有检索模式，三指标不需要 full_context 才量得到。"""
     mode = {r["num"]: r["mode"] for r in _segments()}
     assert mode["9"] == "full_context"
     assert [n for n, m in mode.items() if m == "full_context"] == ["9"]
+    assert mode["11"] == "top3"
 
 
 def test_the_offline_segments_are_marked_not_applicable():

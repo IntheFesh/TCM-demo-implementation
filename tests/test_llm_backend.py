@@ -462,6 +462,10 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         # 总纲 2.2/2.3：药理层的两份抽取 prompt（offline/extract_reference_triples.py 调用）
         "s6_extract_materia_medica": {"raw_text"},
         "s7_extract_formulary": {"raw_text"},
+        # R38：MTCMB TCM-PR 的开方提示词。**两个 solver 共用这一份**，
+        # 区别只在 `$extra` 里塞不塞证素分析——所以它只有这一个占位符，
+        # 多一个就说明有人给某个 solver 开了小灶（那量到的就不是链的贡献了）。
+        "mtcmb_prescribe": {"extra"},
     }
     for path in (PROMPTS_ROOT / "v1").glob("*.yaml"):
         found = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?", load_prompt(path.stem)["system"]))

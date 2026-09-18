@@ -113,8 +113,11 @@ def test_segments_are_ordered_cheapest_first_and_dependencies_before_dependents(
     # 那一段必须是最后一段」。段 10 排在它后面有两条硬依据：它要 cases.json、
     # 要真实 API（跟段 9 同样的前提），而且**整段可以不做**——可选的段排在必做的
     # 段后面，中途停下来不会漏掉任何必做项。
-    i_last = next(i for i, n in enumerate(names) if "蒸馏" in n)
-    assert i_last == len(rows) - 1, "蒸馏必须是最后一段"
+    # **R38 起按执行序断言，不按表里的行号**：段表按段号排（段号是身份，
+    # 动它等于让状态文件作废），而"谁最后跑"写在执行序那一格里。R38 的段 11
+    # 段号最大但必做，所以它排在蒸馏之前——可选的段仍然是最后一个执行的。
+    in_order = _segments_in_execution_order()
+    assert "蒸馏" in in_order[-1][1], f"最后一个执行的段是 {in_order[-1][1]}，不是蒸馏"
     # **R28：段 9 从最后挪到了最前面（执行序 3）**，理由不是成本是依赖——
     # 它验的是「full_context 还能不能当默认」，闸门不过后面每一段的成本口径都变。
     # 所以这条断言翻了个方向：以前是 i_r21 < i_last（它在蒸馏之前），

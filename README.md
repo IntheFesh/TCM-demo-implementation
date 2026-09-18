@@ -85,6 +85,48 @@ Validation 做中间验证（满分上限 **48.9998/50**，官方金标准带 BO
 [`eval/sdt/README.md`](eval/sdt/README.md)。数据怎么拿、提交文件什么格式见下面
 「TCMEval-SDT 的数据获取与接法（细节）」一节。
 
+## 外部基准二：MTCMB · TCM-PR（方剂推荐，R38 接入）
+
+给一段患者描述，输出一张方，按**药味集合**打分（P/R/F1 + 完全命中）。
+接法跟 SDT 同一个形状：两个 solver（`baseline` 裸模型 / `chain` 注入 S1+S2 的
+证素分析）、**同一份提示词**、差值才是这条链的贡献。
+
+```bash
+python -m eval.mtcmb.run --dir <MTCMB>/TCM-PR --probe        # 上机第一步，零调用
+python -m eval.mtcmb.run --dir <MTCMB>/TCM-PR --solver baseline --out out/pr_baseline.json
+python -m eval.mtcmb.run --dir <MTCMB>/TCM-PR --solver chain    --out out/pr_chain.json
+python -m eval.mtcmb.run --compare out/pr_baseline.json out/pr_chain.json
+```
+
+⚠ **字段映射没有在这台机器上核过**（写这一轮的沙盒连不上数据源），所以
+`--probe` 不是可选步骤：跳过它的代价不是报错，是一份"所有人都得 0 分"的漂亮
+报告。探针会打印真实字段名并报三类"多半映射错了"的形状。细节与跟开源中医模型
+（BianCang / ShizhenGPT）比较的三条可比性前提，见
+[`eval/mtcmb/README.md`](eval/mtcmb/README.md)。
+
+## 四组消融（R38）
+
+每一组**只动一个开关**，其余全是产品默认——同时动两个就没法归因：
+
+| 组 | 开关 | 回答什么 | 沙盒实测调用数 |
+|---|---|---|---|
+| A | （默认） | 基线 | **3** |
+| B | `S3_MODE=legacy` | 五家融合 vs 三家并置 | **5** |
+| C | `S3_BEST_OF_N=3` | 采三次挑最好的，值不值三倍的钱 | **5** |
+| D | `S1S2_MERGED=1` | 省一次往返的代价（产品里默认关，见 SOURCES 第 93 条） | **2** |
+
+三指标沿用 R34 定的那三个（带本体出处的药味占比 / 验证器一次过率 / 本体对语料的
+覆盖率），**legacy 组的验证器一格是「不适用」不是 0**——把不适用写成 0，
+等于拿一个不存在的失败去抹黑对照组。
+
+```bash
+python -m eval.ablation --backend fake --limit 2   # 只验管道，内容指标不出数
+python -m eval.ablation --backend real --queries-path tests/queries.txt
+```
+
+**假后端的内容指标一律不出数**（`content_metrics_valid: false`，Markdown 里印 ⏳）：
+它的产出是固定假文本，算出来的"带本体出处占比"只反映假数据长什么样。
+
 ## 三种后端
 
 | 后端 | 用途 | 启用 | 怎么验证接上了 | 数字可不可比 |

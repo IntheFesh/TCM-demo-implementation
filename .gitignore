@@ -72,6 +72,10 @@ data/local_corpora/李可医案.txt
 # 看出它不是真的。脚本按后端给文件名前缀，这两条就是按前缀分的。
 eval/bench/consult_fake_*.json
 eval/bench/startup_synthetic_*.json
+# R38 消融：同一条规则的第三次应用。**假后端跑的那份不进**——它的内容指标
+# 本来就不出数（`content_metrics_valid: false`），留在仓库里只会让人以为
+# 那四组真跑过。真跑的 `eval/report_ablation.json` 进（花了 API 钱、复现不了）。
+eval/bench/ablation_fake.*
 
 # R12 语料向量的磁盘缓存。**不进版本控制**：它从版本控制里的输入（cases.json +
 # 模型名）能完全重算，而且文件名里带了输入的 sha——重算一定得到同一份。

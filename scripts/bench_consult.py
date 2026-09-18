@@ -467,7 +467,7 @@ def invalid_reason(result: dict | None) -> str | None:
 
 
 def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
-             backend) -> dict:
+             backend, *, keep_result: bool = False) -> dict:
     from core.chain import consult
     from core.llm import use_llm
 
@@ -489,6 +489,11 @@ def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
         error = invalid_reason(result)
     manifest = (result or {}).get("manifest") or {}
     return {
+        # R38：消融要按同一次问诊算三指标（带本体出处的药味占比、验证器一次过、
+        # 幻觉），而那几项的原料在 `results` 里。**默认不带**：这份 dict 会被
+        # 原样写进 bench 的 json，塞进整份 consult 结果会让文件涨几十倍，
+        # 而 bench 自己一个字段都用不上。
+        **({"result": result} if keep_result else {}),
         "ok": error is None,
         "error": error,
         "elapsed_s": round(elapsed, 4),
