@@ -29,13 +29,16 @@ R51 补规则，不许把医案放回推导相凑数（那是回退，不是修�
 跟 R38 同一条诚实约束：这个沙盒没有真实 LLM 后端，`--backend fake` 只能验
 管道（四组分别设对了环境变量、跑通了四条路径、报告格式对不对），**不能**
 产出可信的内容指标——假后端的产出是固定假文本，"验证器一次过率" 算出来的
-只是假数据长什么样。真机 20 条主诉 × 4 组 = 80 次问诊，按 R55 报告记录的
-单次问诊墙钟量级（top3 档约 45 秒、full_context 档约 75 秒，derived 模式
-经验上接近 top3 档），**80 次约 1~1.5 小时机器时间**；按当前主流 API 价格
-（`docs/reports/R37-R39_acceptance.md` 记录的同类调用成本量级）预估**约
-¥5 左右**——这两个数字需要用户在自己的 AutoDL 机器上实测确认，此处只给
-量级、不假装精确。跑法见本文件顶部两行命令，`--sdt-dir` 指向用户自己的
-TCMEval-SDT 本地checkout（数据集不随本仓库分发，见 `eval/sdt/data.py`）。
+只是假数据长什么样。真机 20 条主诉 × 4 组 = 80 次问诊——**单次墙钟没有
+一个可信数字**：R55 commit 留下两处互相矛盾的记录（"top3 档约 45 秒、
+full_context 档约 75 秒" vs 另一处"三档墙钟实测 264.6/276.3/208.9 秒"，
+量级差 3~4 倍），量出后者的工具 `scripts/compare_reasoning_tiers.py`
+在仓库里不存在，两处谁准核实不到。**不要用这两个数字估算时间/费用**，
+先跑 `--limit 2`（2 条 × 4 组 = 8 次问诊）拿到本机真实的 `elapsed_s_mean`，
+按比例估算 80 次的时长，具体方法见 `docs/ONSITE_R57_R58.md`。跑法见本
+文件顶部两行命令，`--sdt-dir` 指向用户自己的 TCMEval-SDT 本地 checkout
+（数据集不随本仓库分发，见 `eval/sdt/data.py`）。断点续跑、结果判读、
+C 组不达标时的诊断命令同样见 `docs/ONSITE_R57_R58.md`，不在这里重复。
 """
 from __future__ import annotations
 
@@ -184,8 +187,16 @@ def _rate(hits: int, total: int) -> dict:
             "n": hits, "denominator": total}
 
 
-def run_group(group: R57Group, complaints: list[dict], backend, *, progress=None) -> list[dict]:
-    """跑一组。每条主诉一次问诊，一次失败不丢整组（同 R9/R38 的失败容忍）。"""
+def run_group(group: R57Group, complaints: list[dict], backend, *, progress=None,
+             keep_raw_results: bool = False) -> list[dict]:
+    """跑一组。每条主诉一次问诊，一次失败不丢整组（同 R9/R38 的失败容忍）。
+
+    `keep_raw_results=True` 时每行多带一个 `result` 键（完整 `consult()`
+    返回值，含 `insufficient_notes`/`rule_refs` 明细）——**默认不带**，理由
+    跟 `run_once(keep_result=...)` 一样：正式报告只用得上 `metrics`
+    算出来的汇总比率，带上完整结果会让 `eval/report_ablation_r57.json`
+    涨几十倍。`scripts/diagnose_r57_group.py` 要看"缺的是哪一类规则"这种
+    明细，才需要打开它。"""
     from scripts.bench_consult import run_once
 
     rows: list[dict] = []
@@ -198,6 +209,7 @@ def run_group(group: R57Group, complaints: list[dict], backend, *, progress=None
             rows.append({
                 "record_id": c["record_id"], "complaint": c["complaint"],
                 "ok": run["ok"], "error": run["error"], "elapsed_s": run["elapsed_s"],
+                **({"result": run.get("result")} if keep_raw_results else {}),
                 "llm_calls": run["llm_calls"],
                 "metrics": metrics_from_result(run.get("result")),
             })
@@ -385,6 +397,37 @@ def to_markdown(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def load_complaints(sdt_dir: Path | None, queries_path: str | None, limit: int,
+                    *, n: int = 20) -> list[dict]:
+    """`--sdt-dir`/`--queries-path` 二选一挑主诉——**唯一实现**，`main()` 与
+    `scripts/diagnose_r57_group.py`（诊断某一组用同一批主诉重跑）共用，不各自
+    抄一份。失败或一条都没挑到时 `raise SystemExit(2)`，不返回空列表让调用方
+    自己判断——CLAUDE.md「同一概念只有一处实现」在 CLI 参数解析这一层的应用。
+    """
+    if sdt_dir is None and queries_path is None:
+        raise SystemExit("需要 --sdt-dir（自动挑脾胃门 20 条）或 --queries-path"
+                         "（自备主诉文件）之一")
+
+    if sdt_dir is not None:
+        try:
+            complaints = select_pi_wei_men_complaints(sdt_dir, n=n)
+        except Exception as e:  # noqa: BLE001 - 数据集缺失/格式不对都要说清楚，不崩栈
+            raise SystemExit(f"从 --sdt-dir 挑主诉失败：{type(e).__name__}: {e}") from e
+    else:
+        qpath = Path(queries_path)
+        if not qpath.exists():
+            raise SystemExit(f"主诉文件不在：{qpath}")
+        lines = [ln.strip() for ln in qpath.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.startswith("#")]
+        complaints = [{"record_id": f"q{i}", "syndrome": None, "complaint": c}
+                     for i, c in enumerate(lines, 1)]
+    if limit > 0:
+        complaints = complaints[:limit]
+    if not complaints:
+        raise SystemExit("一条主诉都没读到")
+    return complaints
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -401,30 +444,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.set_defaults(warmup=True)
     args = ap.parse_args(argv)
 
-    if args.sdt_dir is None and args.queries_path is None:
-        print("需要 --sdt-dir（自动挑脾胃门 20 条）或 --queries-path（自备主诉文件）之一",
-             file=sys.stderr)
-        return 2
-
-    if args.sdt_dir is not None:
-        try:
-            complaints = select_pi_wei_men_complaints(args.sdt_dir, n=20)
-        except Exception as e:  # noqa: BLE001 - 数据集缺失/格式不对都要说清楚，不崩栈
-            print(f"从 --sdt-dir 挑主诉失败：{type(e).__name__}: {e}", file=sys.stderr)
-            return 2
-    else:
-        qpath = Path(args.queries_path)
-        if not qpath.exists():
-            print(f"主诉文件不在：{qpath}", file=sys.stderr)
-            return 2
-        lines = [ln.strip() for ln in qpath.read_text(encoding="utf-8").splitlines()
-                if ln.strip() and not ln.startswith("#")]
-        complaints = [{"record_id": f"q{i}", "syndrome": None, "complaint": c}
-                     for i, c in enumerate(lines, 1)]
-    if args.limit > 0:
-        complaints = complaints[:args.limit]
-    if not complaints:
-        print("一条主诉都没读到", file=sys.stderr)
+    try:
+        complaints = load_complaints(args.sdt_dir, args.queries_path, args.limit)
+    except SystemExit as e:
+        print(e.code, file=sys.stderr)
         return 2
 
     from scripts.bench_consult import (
