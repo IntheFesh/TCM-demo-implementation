@@ -123,8 +123,8 @@ def test_the_loop_stops_at_max_revise_rounds(run):
     ——`llm_calls` 要可预测（manifest 里那个数是额度结算的依据）。"""
     out, llm = run([dict(herbs=("党参", "白术"), roles=["臣", "臣"])])
     m = out["results"][0]["verifier_metrics"]
-    assert m["revise_rounds"] == MAX_REVISE_ROUNDS == 3
-    assert m["n_rounds"] == 4, "1 次首验 + 3 次重开后各验一次"
+    assert m["revise_rounds"] == MAX_REVISE_ROUNDS == 1
+    assert m["n_rounds"] == 1 + MAX_REVISE_ROUNDS, "1 次首验 + MAX_REVISE_ROUNDS 次重开后各验一次"
     assert len(llm.s3_systems_full) == 1 + MAX_REVISE_ROUNDS
 
 
@@ -277,7 +277,7 @@ def test_each_reopen_emits_a_progress_event(monkeypatch, ont):
                   on_step=lambda n, d: seen.append((n, d)))
     events = [d for n, d in seen if n == "verify_revise"]
     assert len(events) == MAX_REVISE_ROUNDS
-    assert [e["round"] for e in events] == [1, 2, 3]
+    assert [e["round"] for e in events] == list(range(1, MAX_REVISE_ROUNDS + 1))
     assert events[0]["status"] == "revise_needed"
     assert "role_structure" in events[0]["rules"]
 

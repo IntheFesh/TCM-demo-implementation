@@ -1739,8 +1739,9 @@ def run_derivation(
                             "physician_name": SYNTHESIS_PHYSICIAN_NAME,
                             **emitter.summary(),
                             "streaming_note": _streaming_note(len(candidates_scored))})
-    # R34（延伸到 R52）：同一套验证闭环，S3Derived 靠字段名跟 S3Structured 保持
-    # 一致这件事直接免费获得（core/formula_verifier.py 的七条规则全是鸭子类型）。
+    # R34（延伸到 R52/R53）：同一套验证闭环，S3Derived 靠字段名跟 S3Structured
+    # 保持一致这件事直接免费获得（core/formula_verifier.py 的十一条规则全是
+    # 鸭子类型，含 R53 新增的四条医理一致性规则）。
     raw, s3, verify_rounds, revise_calls = _verify_and_revise(
         raw, s3_system, S3Derived, on_step=on_step,
     )

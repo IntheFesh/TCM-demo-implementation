@@ -205,7 +205,10 @@ _VERIFICATION_POINTER = (
 
 
 def _herb_verifiability(herb, norm: str) -> list[str]:
-    """七条规则对**这一味药**能不能求值。缺什么就说缺什么。"""
+    """本体那七条规则对**这一味药**能不能求值，缺什么就说缺什么；R53 加的
+    四条医理一致性规则不按单味药判（跟证型/治法/脏腑相关，不跟某一味药相关），
+    所以只报"按什么判"，不重复本体那七条的"可验证/不可验证"判法——
+    每条规则的中文名都出自 `RULE_LABELS`（唯一一张表），不在这里另抄一份。"""
     from core.formula_verifier import rule_label
     from core.safety_output import INCOMPATIBLE_PAIRS, dose_limit_entry, normalize_for_incompat
 
@@ -235,6 +238,14 @@ def _herb_verifiability(herb, norm: str) -> list[str]:
                    if herb.effects
                    else f"{rule_label('effect_matches_method')}：不可验证——缺「功效」谓词")
     out.append(f"{rule_label('role_structure')}：按整张方判，跟单味药无关")
+    # R53：医理一致性四条按脏腑/证型/治法判，不按单味药判——这里只报判据
+    # 落在哪，不重复本体那七条"可验证/不可验证"的判法（这四条的数据源是
+    # 医理规则层，不是本草本体，"这味药有没有被本体收录"这件事对它们不适用）。
+    out.append(f"{rule_label('principle_matches_syndrome')}：按治法与辨出的脏腑判，跟单味药无关")
+    out.append(f"{rule_label('method_not_contraindicated')}：按治法与辨出的脏腑判，跟单味药无关")
+    out.append(f"{rule_label('pathomechanism_consistent')}：按辨出的多个脏腑判，跟单味药无关")
+    out.append(f"{rule_label('role_structure_by_rule')}：按这味药的角色（君/臣/佐/使）"
+              "与辨出的脏腑一起判，这里看不到本次问诊的脏腑，见问诊结果的「验证」段")
     out.append(_VERIFICATION_POINTER)
     return out
 

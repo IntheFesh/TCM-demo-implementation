@@ -13,18 +13,37 @@
 一条可以指着原文说出来的错，而"指着原文"正是 LLM-Modulo 那条实证
 （幻觉 63% → 1.7%）的机制所在。
 
-## 七条规则，两种级别
+## 十一条规则，两种级别，两个数据源（R53 起）
+
+前七条（R34）都从 `core/ontology.py`（本草/方剂本体）取证；R53 加的四条从
+`core/theory.py`（R51 的医理规则层）取证——**两个数据源各自独立可用/不可用**，
+`ont.available` 是 0/1、`load_theory()` 是另一个 0/1，一个数据源缺了不该把
+另一个数据源能判的规则也一起打成 unverifiable（`ONTOLOGY_RULES`/`THEORY_RULES`
+两张表分别管各自的开关，见 `verify_formula`）。
 
 revise（可改，回灌重开）：
-  `meridian_coverage`     方中药的归经覆盖不了辨出来的病变脏腑
-  `nature_conflict`       证型寒热方向与主方药性相悖
-  `effect_matches_method` 药的功效跟治法对不上
-  `role_structure`        君臣佐使结构不成立
+  `meridian_coverage`          方中药的归经覆盖不了辨出来的病变脏腑（本体）
+  `nature_conflict`            证型寒热方向与主方药性相悖（本体）
+  `effect_matches_method`      药的功效跟治法对不上（本体）
+  `role_structure`             君臣佐使结构不成立（本体，看 role 计数）
+  `principle_matches_syndrome` 治法跟辨出的脏腑对应的治则规则没有交集（医理）
+  `method_not_contraindicated` 治法用了对应治则规则明确列为禁忌的方法（医理）
+  `pathomechanism_consistent`  多个病变脏腑之间查不到医理规则能联系起来（医理）
+  `role_structure_by_rule`     君药没有针对主病机（医理，看 for_element 对不对得上）
 
 veto（不可下发，残余不发）：
-  `incompatible_pair`     十八反十九畏
-  `dose_exceeds`          超药典常用上限
-  `herb_grounded`         **引用了本体里不存在的原文**（编造出处）
+  `incompatible_pair`     十八反十九畏（本体）
+  `dose_exceeds`          超药典常用上限（本体）
+  `herb_grounded`         **引用了本体里不存在的原文**（编造出处，本体）
+
+## 为什么 R53 那四条都是 revise，不是 veto
+
+veto 级现有三条判的是**具体、可核实的危险或欺骗**（配伍相反、超量、编造出处）
+——查不到反驳空间。R53 那四条判的是"这条推理链跟医理规则库对不对得上"，而
+医理规则库（171 条，`curated`/`classic` 两档置信度）不是穷尽的：查不到匹配
+规则更可能是规则库还没收录这种组合，不是这条链错了。定成 veto 会让"规则库
+不全"直接变成"这张方不能发"，那是拿数据覆盖率的锅让患者背——所以是"拟得
+不够好，回灌重开"，不是"不可下发"。
 
 ## `herb_grounded` 为什么判的是"编造出处"而不是"这味药不在本体里"
 
@@ -66,13 +85,36 @@ from core.safety_output import (
     dose_limit_entry,
 )
 from core.schemas import HerbItem, OntologyRef, _S3StructuredBase
+from core.theory import (
+    load_theory,
+    organ_relations as theory_organ_relations,
+    principles_for as theory_principles_for,
+    role_construction_rules as theory_role_construction_rules,
+    transitions as theory_transitions,
+)
 
 #: 规则名。**顺序即报告顺序**，veto 在前（先看能不能发，再看拟得对不对）。
 VETO_RULES: tuple[str, ...] = ("incompatible_pair", "dose_exceeds", "herb_grounded")
 REVISE_RULES: tuple[str, ...] = (
     "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
+    # R53：医理一致性四条，接在本体那四条 revise 规则后面。
+    "principle_matches_syndrome", "method_not_contraindicated",
+    "pathomechanism_consistent", "role_structure_by_rule",
 )
 ALL_RULES: tuple[str, ...] = VETO_RULES + REVISE_RULES
+
+#: R34 起的七条，数据源是 `core/ontology.py`（本草/方剂本体）。
+ONTOLOGY_RULES: tuple[str, ...] = (
+    "incompatible_pair", "dose_exceeds", "herb_grounded",
+    "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
+)
+#: R53 新增的四条，数据源是 `core/theory.py`（R51 医理规则层）。**两张表互斥、
+#: 并集等于 `ALL_RULES`**——`verify_formula` 按各自的数据源独立判断可用性，
+#: 一张表缺数据不该连累另一张表能判的规则（见模块文档字符串）。
+THEORY_RULES: tuple[str, ...] = (
+    "principle_matches_syndrome", "method_not_contraindicated",
+    "pathomechanism_consistent", "role_structure_by_rule",
+)
 
 #: 规则名 / 结论名 → 中文名。**展示层只认中文名，id 只在数据层出现**
 #: （CLAUDE.md「标识符只有一种规范形式」的显示层版本）。
@@ -89,6 +131,10 @@ RULE_LABELS: dict[str, str] = {
     "nature_conflict": "寒热方向",
     "effect_matches_method": "功效对得上治法",
     "role_structure": "君臣佐使结构",
+    "principle_matches_syndrome": "治法对得上治则",
+    "method_not_contraindicated": "治法未犯治则禁忌",
+    "pathomechanism_consistent": "病位间医理关联",
+    "role_structure_by_rule": "君药针对主病机",
 }
 
 #: 四种结论的中文名。次序即严重性，见 `VerificationResult.status`。
@@ -113,9 +159,13 @@ def status_label(status: str) -> str:
 Severity = Literal["veto", "revise"]
 
 #: 闭环最多重开几轮。**不是无限循环**：`llm_calls` 要可预测（manifest 里那个数
-#: 是额度结算与成本比较的依据），而且模型改三轮还改不好时，再改一轮的期望收益
-#: 已经低于又花一次调用的代价。环境变量 `MAX_REVISE_ROUNDS` 可覆盖（做消融用）。
-MAX_REVISE_ROUNDS = 3
+#: 是额度结算与成本比较的依据）。**R53 产品默认从 3 降到 1**：规则从七条扩到
+#: 十一条之后一次重开要同时改对更多条判据，多留的第二三轮改的是"同一次没改对
+#: 的地方再试一次"，每一轮都是一次完整的 S3 重开调用——这个默认值是按调用成本
+#: 定的权衡，不是靠真机实测的收益曲线定的（真机数字要等 R57/R58），沙盒里
+#: 拿不出那条曲线就不装作有。环境变量 `MAX_REVISE_ROUNDS` 可覆盖
+#: （R38/R57 的消融要拿更大的值当对照组）。
+MAX_REVISE_ROUNDS = 1
 MAX_REVISE_ROUNDS_ENV = "MAX_REVISE_ROUNDS"
 
 
@@ -201,8 +251,12 @@ class VerificationResult:
 
     violations: tuple[Violation, ...] = ()
     unverifiable: tuple[Unverifiable, ...] = ()
-    #: 本体可用吗。False 时 `checked_rules` 为空、`unverifiable` 覆盖全部七条。
+    #: 本体可用吗。False 时 `ONTOLOGY_RULES` 那七条全部落进 `unverifiable`。
     ontology_available: bool = True
+    #: 医理规则层（R51/R53）可用吗。False 时 `THEORY_RULES` 那四条全部落进
+    #: `unverifiable`——跟 `ontology_available` 是两个独立的开关（两个数据源，
+    #: 一个缺了不该连累另一个能判的规则，见模块文档字符串）。
+    theory_available: bool = True
     #: 这一次真的跑过判定的规则（跑了但判不了的不算）。
     checked_rules: tuple[str, ...] = ()
 
@@ -239,6 +293,7 @@ class VerificationResult:
             "status_label": status_label(self.status),
             "passed": self.passed,
             "ontology_available": self.ontology_available,
+            "theory_available": self.theory_available,
             "checked_rules": list(self.checked_rules),
             "n_veto": len(self.vetoes),
             "n_revise": len(self.revisables),
@@ -578,6 +633,165 @@ def check_role_structure(s3, ont) -> tuple[list[Violation], list[Unverifiable], 
     )], [], ["role_structure"]
 
 
+# ---------- R53：医理一致性四条（数据源是 core/theory.py，不是本体） ----------
+#
+# 这四条**只读 `s3.organs`/`s3.syndrome`/`s3.method`/`s3.herb_choices`
+# 这几个通用字段**，不碰 `rule_refs`/`cited_case_ids` 这类只在某一种 schema
+# 上才有的字段——`S3Structured` 与 `S3Derived` 字段名相同（R52 的设计），
+# 这四条规则因此对两种 schema 都直接生效，不用为哪种模式各写一份。
+
+
+def _theory_unavailable(rule: str) -> Unverifiable:
+    return Unverifiable(
+        rule=rule, herbs=(), missing_predicate="医理规则层数据",
+        reason="data/standard/tcm_theory.jsonl 不在（或未生成），这条规则一次都没跑",
+    )
+
+
+def check_principle_matches_syndrome(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
+    """治法（第 3 步）跟辨出的脏腑（第 1 步）对应的治则推导规则有没有交集。
+
+    按 `s3.organs` 的脏腑名查 `core.theory.principles_for`（不给病性，只按
+    病位查——两种 schema 都保证有 organs，不保证有干净的病性标注）。查到的
+    每条规则带 `method_keywords`（如「疏肝」「理气」），`method.principle`
+    只要覆盖到其中一条关键词就算对得上——治法允许比规则更具体，但不能
+    完全脱节。
+
+    查不到任何对应规则时**判不了，不是通过**：医理规则层目前 171 条，
+    覆盖不到的脏腑组合不代表这条治法就有问题。
+    """
+    organ_names = [o.organ for o in s3.organs]
+    if not load_theory():
+        return [], [_theory_unavailable("principle_matches_syndrome")], []
+    candidates = theory_principles_for([], organ_names)
+    if not candidates:
+        return [], [Unverifiable(
+            rule="principle_matches_syndrome", herbs=(), missing_predicate="治则规则",
+            reason=f"脏腑 {organ_names} 在医理规则层查不到对应的治则推导规则，"
+                   "这条无法判定",
+        )], []
+    principle_text = s3.method.principle
+    matched = [r for r in candidates
+              if any(kw in principle_text for kw in r.payload["method_keywords"])]
+    if matched:
+        return [], [], ["principle_matches_syndrome"]
+    kw_all = sorted({kw for r in candidates for kw in r.payload["method_keywords"]})
+    return [Violation(
+        rule="principle_matches_syndrome", severity="revise",
+        herbs=tuple(_herb_names(s3)),
+        reason=f"治法「{principle_text}」跟脏腑 {organ_names} 对应的治则推导规则"
+               f"（关键词：{'、'.join(kw_all) or '（该规则未标关键词）'}）没有任何交集",
+        counterexample=f"[{candidates[0].id}] {candidates[0].span}",
+    )], [], ["principle_matches_syndrome"]
+
+
+def check_method_not_contraindicated(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
+    """治法（含 targets）有没有用到脏腑对应治则规则里明确列为禁忌的方法。
+
+    `core/theory.py` 的 `TREATMENT_PRINCIPLES` 里相当一部分规则同时带
+    `method_keywords`（该怎么治）与 `contraindicated_methods`（不该怎么治）
+    ——这条规则直接查后者，`principle_matches_syndrome` 查前者，两条互补
+    但不是同一件事：治法可以既不在推荐关键词里、也没踩中禁忌（判两条都不违规，
+    只是这一步"依据不算强"，那是 `S3Derived.insufficient` 该报的事，不是这里）。
+    """
+    organ_names = [o.organ for o in s3.organs]
+    if not load_theory():
+        return [], [_theory_unavailable("method_not_contraindicated")], []
+    candidates = theory_principles_for([], organ_names)
+    if not candidates:
+        return [], [Unverifiable(
+            rule="method_not_contraindicated", herbs=(), missing_predicate="治则规则",
+            reason=f"脏腑 {organ_names} 在医理规则层查不到对应的治则推导规则，"
+                   "这条无法判定",
+        )], []
+    principle_text = s3.method.principle
+    targets_text = "；".join(s3.method.targets)
+    hit: tuple = ()
+    for r in candidates:
+        for bad in r.payload["contraindicated_methods"]:
+            if bad and (bad in principle_text or bad in targets_text):
+                hit = (r, bad)
+                break
+        if hit:
+            break
+    if not hit:
+        return [], [], ["method_not_contraindicated"]
+    rule, bad = hit
+    return [Violation(
+        rule="method_not_contraindicated", severity="revise",
+        herbs=tuple(_herb_names(s3)),
+        reason=f"治法「{principle_text}」（targets：{targets_text}）用到了「{bad}」，"
+               f"而脏腑 {organ_names} 对应的治则规则明确把它列为禁忌方法",
+        counterexample=f"[{rule.id}] {rule.span}",
+    )], [], ["method_not_contraindicated"]
+
+
+def check_pathomechanism_consistent(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
+    """辨出的多个病变脏腑之间，医理规则层查不查得到关联。
+
+    只有一个脏腑时没什么可核对的关系，直接算过。两个及以上时，要求
+    脏腑两两之间至少有一条真实的藏象关系（`organ_relations`，如"肝木克脾土"）
+    或病机传变（`transitions`）能把它们联系起来——不是随便把几个脏腑摆在一起
+    就算"辨证"，脏腑之间总该有个说得清的理由。
+    """
+    organ_names = [o.organ for o in s3.organs]
+    if not load_theory():
+        return [], [_theory_unavailable("pathomechanism_consistent")], []
+    if len(organ_names) < 2:
+        return [], [], ["pathomechanism_consistent"]
+    for a in organ_names:
+        for rule in theory_organ_relations(a):
+            if rule.payload["object"] in organ_names:
+                return [], [], ["pathomechanism_consistent"]
+    if theory_transitions(organ_names):
+        return [], [], ["pathomechanism_consistent"]
+    return [Violation(
+        rule="pathomechanism_consistent", severity="revise",
+        herbs=tuple(_herb_names(s3)),
+        reason=f"病变脏腑 {organ_names} 两两之间，医理规则层查不到任何藏象关系或"
+               "病机传变能把它们联系起来",
+        counterexample=f"已查 {len(organ_names)} 个脏腑两两间的藏象关系与病机传变，均无匹配"
+                       "——如果这几个脏腑确实相关，应当在 organs 的 pathogenesis 里"
+                       "写清楚是通过哪条医理关联起来的",
+    )], [], ["pathomechanism_consistent"]
+
+
+def check_role_structure_by_rule(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
+    """君药有没有针对主病机。
+
+    跟既有 `role_structure` 不是一回事：那条数的是君臣佐使的**数量**关系，
+    这条查的是君药的**去向**对不对——配伍理论里"君药"的定义是"针对主病或
+    主证起主要治疗作用的药物"（`core.theory.role_construction_rules` 里那条
+    `relation="君药"` 的规则），所以君药的 `for_element` 该落在辨出来的脏腑
+    （`s3.organs`）上，不能只针对治法 `targets` 里派生出来的某条兼夹症状
+    ——那样这味药更像佐使，不该标君。
+    """
+    if not load_theory():
+        return [], [_theory_unavailable("role_structure_by_rule")], []
+    chief_rule = next(
+        (r for r in theory_role_construction_rules() if r.payload["relation"] == "君药"), None)
+    if chief_rule is None:
+        return [], [Unverifiable(
+            rule="role_structure_by_rule", herbs=(), missing_predicate="君药定义规则",
+            reason="配伍理论里没有「君药」这条定义规则，这条无法判定",
+        )], []
+    primary = {o.organ for o in s3.organs}
+    chiefs = [c for c in s3.herb_choices if c.item.role == "君"]
+    if not chiefs:
+        # 一味君药都没标：`role_structure` 已经把"role 全空"这件事报过了
+        # （unverifiable 或"没有君药"违规），这里不重复报，算过就是。
+        return [], [], ["role_structure_by_rule"]
+    stray = sorted({c.item.name for c in chiefs if c.for_element not in primary})
+    if not stray:
+        return [], [], ["role_structure_by_rule"]
+    return [Violation(
+        rule="role_structure_by_rule", severity="revise", herbs=tuple(stray),
+        reason=f"君药 {stray} 的 for_element 不在辨出的病变脏腑 {sorted(primary)} 里，"
+               "只针对了治法 targets 里的某条派生目标——君药理应针对主病机",
+        counterexample=f"[{chief_rule.id}] {chief_rule.span}",
+    )], [], ["role_structure_by_rule"]
+
+
 class BatchedOntology:
     """把一张方里的药名**一次全解析完**，七条规则共用这一份。
 
@@ -635,44 +849,61 @@ RULE_FUNCS = {
     "nature_conflict": check_nature_conflict,
     "effect_matches_method": check_effect_matches_method,
     "role_structure": check_role_structure,
+    "principle_matches_syndrome": check_principle_matches_syndrome,
+    "method_not_contraindicated": check_method_not_contraindicated,
+    "pathomechanism_consistent": check_pathomechanism_consistent,
+    "role_structure_by_rule": check_role_structure_by_rule,
 }
 
 
 def verify_formula(s3: _S3StructuredBase, *, ontology: Ontology | None = None
                    ) -> VerificationResult:
-    """跑七条规则。本体不可用时**七条全部进 unverifiable**，不是全部通过。
+    """跑十一条规则（R34 七条 + R53 四条）。**两个数据源分别判断可用性**：
+    本体不可用时 `ONTOLOGY_RULES` 那七条全部进 unverifiable，医理规则层
+    不可用时 `THEORY_RULES` 那四条全部进 unverifiable——两件事独立发生，
+    一个数据源缺了不该连累另一个数据源能判的规则（模块文档字符串那条）。
 
-    这是这一层最要紧的一条语义：药理层数据不在的机器上，"符号验证通过"必须
-    报成"一条都没验"（`status="partially_verified"`、`passed=False`），
-    否则那句话在没有本体的环境里恒真，而它恒真时毫无意义。
+    这是这一层最要紧的一条语义：某个数据源不在的机器上，那个数据源能管的
+    规则必须报成"一条都没验"（`status="partially_verified"`、`passed=False`），
+    否则那句话在没有那份数据的环境里恒真，而它恒真时毫无意义。
     """
     ont = ontology if ontology is not None else get_ontology()
-    if not ont.available:
-        return VerificationResult(
-            violations=(),
-            unverifiable=tuple(
-                Unverifiable(rule=r, herbs=(), missing_predicate="药理层数据",
-                             reason="本体不可用（data/standard/materia_medica.jsonl 与 "
-                                    "formulary.jsonl 不在），这条规则一次都没跑")
-                for r in ALL_RULES),
-            ontology_available=False, checked_rules=(),
-        )
-    # R40：**7N → 1**。七条规则原先各自逐味查本体，这里一次解析完再共用。
-    # 包一层而不是改七个规则的签名：规则的入参形状是这一层的公开契约
-    # （`(s3, ont) -> (violations, unverifiable, checked)`，医院要增补规则就照它写），
-    # 为了查得快去改那个契约，等于让每一条将来新增的规则都背上批量表这个细节。
-    batched = BatchedOntology(ont, _all_names(s3))
     violations: list[Violation] = []
     unver: list[Unverifiable] = []
     checked: list[str] = []
-    for rule in ALL_RULES:
-        v, u, c = RULE_FUNCS[rule](s3, batched)
-        violations.extend(v)
-        unver.extend(u)
-        checked.extend(c)
+
+    if not ont.available:
+        unver.extend(
+            Unverifiable(rule=r, herbs=(), missing_predicate="药理层数据",
+                         reason="本体不可用（data/standard/materia_medica.jsonl 与 "
+                                "formulary.jsonl 不在），这条规则一次都没跑")
+            for r in ONTOLOGY_RULES)
+    else:
+        # R40：**7N → 1**。七条规则原先各自逐味查本体，这里一次解析完再共用。
+        # 包一层而不是改规则的签名：规则的入参形状是这一层的公开契约
+        # （`(s3, ont) -> (violations, unverifiable, checked)`，医院要增补规则就照它写），
+        # 为了查得快去改那个契约，等于让每一条将来新增的规则都背上批量表这个细节。
+        batched = BatchedOntology(ont, _all_names(s3))
+        for rule in ONTOLOGY_RULES:
+            v, u, c = RULE_FUNCS[rule](s3, batched)
+            violations.extend(v)
+            unver.extend(u)
+            checked.extend(c)
+
+    theory_available = bool(load_theory())
+    if not theory_available:
+        unver.extend(_theory_unavailable(r) for r in THEORY_RULES)
+    else:
+        for rule in THEORY_RULES:
+            v, u, c = RULE_FUNCS[rule](s3, ont)  # 这四条不用 ont，签名对齐只为一致
+            violations.extend(v)
+            unver.extend(u)
+            checked.extend(c)
+
     return VerificationResult(
         violations=tuple(violations), unverifiable=tuple(unver),
-        ontology_available=True, checked_rules=tuple(checked),
+        ontology_available=ont.available, theory_available=theory_available,
+        checked_rules=tuple(checked),
     )
 
 

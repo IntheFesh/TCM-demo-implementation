@@ -18,6 +18,7 @@ from core.formula_verifier import (
     ALL_RULES,
     MAX_REVISE_ROUNDS,
     REVISE_RULES,
+    THEORY_RULES,
     VETO_RULES,
     RULE_FUNCS,
     Unverifiable,
@@ -85,12 +86,16 @@ def _rules(result, severity=None):
 
 # ---------- 规则表本身 ----------
 
-def test_seven_rules_split_into_three_veto_and_four_revise():
-    assert len(ALL_RULES) == 7
-    assert len(VETO_RULES) == 3 and len(REVISE_RULES) == 4
+def test_eleven_rules_split_into_three_veto_and_eight_revise():
+    """R53：七条（R34，本体）扩到十一条（+ 四条 R53 医理一致性规则）。"""
+    assert len(ALL_RULES) == 11
+    assert len(VETO_RULES) == 3 and len(REVISE_RULES) == 8
     assert set(VETO_RULES) == {"incompatible_pair", "dose_exceeds", "herb_grounded"}
-    assert set(REVISE_RULES) == {"meridian_coverage", "nature_conflict",
-                                 "effect_matches_method", "role_structure"}
+    assert set(REVISE_RULES) == {
+        "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
+        "principle_matches_syndrome", "method_not_contraindicated",
+        "pathomechanism_consistent", "role_structure_by_rule",
+    }
     assert set(VETO_RULES) & set(REVISE_RULES) == set(), "一条规则不能又是 veto 又是 revise"
 
 
@@ -411,16 +416,36 @@ def test_status_orders_by_severity():
     assert VerificationResult().status == "verified"
 
 
-def test_an_unavailable_ontology_puts_all_seven_rules_in_unverifiable():
-    """药理层数据不在的机器上，「符号验证通过」必须报成「一条都没验」
-    ——否则那句话在没有本体的环境里恒真，而它恒真时毫无意义。"""
+def test_an_unavailable_ontology_puts_only_the_ontology_rules_in_unverifiable():
+    """药理层数据不在的机器上，本体那七条规则「符号验证通过」必须报成
+    「一条都没验」——否则那句话在没有本体的环境里恒真，而它恒真时毫无意义。
+
+    R53：本体不可用**不该连累医理规则层那四条**（数据源不是一回事，见
+    `verify_formula` 的文档字符串）——`ONTOLOGY_RULES` 全部进 unverifiable，
+    `THEORY_RULES` 该跑还跑（这里没有毒化 `load_theory`，用的是仓库里真实的
+    `data/standard/tcm_theory.jsonl`，跟真实部署一致）。
+    """
+    from core.formula_verifier import ONTOLOGY_RULES
+
     empty = Ontology(materia_rows=[], formulary_rows=[], patterns=[])
     r = verify_formula(mk(["党参"]), ontology=empty)
     assert r.ontology_available is False
-    assert r.checked_rules == ()
-    assert {u.rule for u in r.unverifiable} == set(ALL_RULES)
-    assert r.passed is False and r.status == "partially_verified"
-    assert r.violations == ()
+    assert set(r.checked_rules) == set(THEORY_RULES)
+    assert {u.rule for u in r.unverifiable} == set(ONTOLOGY_RULES)
+    assert r.passed is False and r.status in ("partially_verified", "revise_needed")
+
+
+def test_an_unavailable_theory_layer_puts_only_the_theory_rules_in_unverifiable(
+    monkeypatch, ont):
+    """跟上一条对称：医理规则层不在时，只有 `THEORY_RULES` 那四条进
+    unverifiable，本体那七条该跑还跑。"""
+    import core.formula_verifier as fv
+
+    monkeypatch.setattr(fv, "load_theory", lambda: ())
+    r = verify_formula(mk(["党参"]), ontology=ont)
+    assert r.theory_available is False
+    assert set(r.checked_rules) & set(THEORY_RULES) == set()
+    assert {u.rule for u in r.unverifiable} >= set(THEORY_RULES)
 
 
 def test_to_dict_is_json_serialisable_and_keeps_the_counts(ont):
@@ -510,8 +535,10 @@ def test_verifier_metrics_on_an_empty_round_list_says_none():
 # ---------- 轮数上限 ----------
 
 def test_max_revise_rounds_default_and_override(monkeypatch):
+    """R53：产品默认从 3 降到 1——规则从七条扩到十一条之后，第二三轮改的多半
+    是同一类没改对的地方，见 `MAX_REVISE_ROUNDS` 的文档字符串。"""
     monkeypatch.delenv("MAX_REVISE_ROUNDS", raising=False)
-    assert max_revise_rounds() == MAX_REVISE_ROUNDS == 3
+    assert max_revise_rounds() == MAX_REVISE_ROUNDS == 1
     monkeypatch.setenv("MAX_REVISE_ROUNDS", "0")
     assert max_revise_rounds() == 0, "0 = 关掉闭环（做消融用）"
     monkeypatch.setenv("MAX_REVISE_ROUNDS", "5")
