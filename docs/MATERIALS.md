@@ -82,13 +82,44 @@
 
 ---
 
+### 8. 四行对比：同一个问题，四条路线（R39）
+
+答辩上被问得最多的一句「跟直接问大模型有什么区别」，答案在
+[`docs/DESIGN.md` §10.1](DESIGN.md) 那张四行表里：通用大模型 / 检索增强 /
+开源中医模型 / 本项目，**每一行的"它给不了什么"都对应本项目里一个具体机制，
+而那个机制有它自己的数**。没有数的机制不写进那张表。
+
+配套的两节：§10.2「现在量到了什么」（六行，⏳ 的那几行带上机命令）、
+§10.3「明确做不到的三件事」（不是诊断工具 / 本体有长尾缺口 / 五位医家里
+用药规律只覆盖三位）。
+
+### 9. 申报书怎么补：只增不改，且**可机器校验**（R39）
+
+用户手里那份申报书的黑色正文一个字都不许变。"我小心地没动它"是一句无法核实的话，
+所以这一轮把它变成了一条能跑的命令：
+
+```bash
+python -m scripts.annotate_docx fingerprint 申报书.docx --out fp.json   # 改之前
+python -m scripts.annotate_docx annotate  申报书.docx --additions add.json \
+    --fingerprint fp.json --out 申报书.已补充.docx                       # 补充（红色 E54C5E）
+python -m scripts.annotate_docx verify    申报书.已补充.docx --fingerprint fp.json
+```
+
+校验的口径在**文本层、按顺序比**：把补充色滤掉之后，剩下那串文字的 sha 序列
+必须一字不差、一序不乱。不按 `(段落号, run 号)` 比——插一段会让后面所有下标后移，
+那种会误报的校验第二次就会被人加白名单绕过去。
+故意改坏一处黑字、校验必须报红，这一条有测试钉着（`tests/test_annotate_docx.py`）。
+
+⏳ **申报书原件不在这个仓库里**，所以这套工具还没在真文件上跑过；
+上机第一步是 `fingerprint`，那一步的输出就是"改之前长什么样"的凭据。
+
 ## 三、工程规模（可核）
 
 | 项 | 数 | 凭据 |
 |---|---|---|
-| 全量测试 | **3593** passed / **7** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=3593` `bench/sandbox.json:bench.pytest_skipped=7` `bench/sandbox.json:bench.pytest_failed=0` |
+| 全量测试 | **3607** passed / **7** skipped / **0** failed | `bench/sandbox.json:bench.pytest_passed=3607` `bench/sandbox.json:bench.pytest_skipped=7` `bench/sandbox.json:bench.pytest_failed=0` |
 | 前端状态验收 | **29** 种 | `bench/sandbox.json:bench.playwright_states_passed=29` |
-| 凭据核对 | **23** 份文档，退出码 **0** | `bench/sandbox.json:bench.n_checked_docs=23` `bench/sandbox.json:bench.check_exit_code=0` |
+| 凭据核对 | **24** 份文档，退出码 **0** | `bench/sandbox.json:bench.n_checked_docs=24` `bench/sandbox.json:bench.check_exit_code=0` |
 | 知识图谱节点 | **2356** | `../data/graph.json:graph.n_nodes=2356` |
 | 知识图谱边 | **3682** | `../data/graph.json:graph.n_edges=3682` |
 | 证候 | **174** | `../data/graph.json:graph.n_syndromes=174` |
