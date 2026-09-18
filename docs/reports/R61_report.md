@@ -249,9 +249,10 @@ A 组 prompt 同步）之前已经各自用一条真机 A 组问诊、和 §1 �
 
 ## §6 全量测试与静态检查
 
-`python -m pytest tests/ -q` → 4748 passed / 7 skipped（含本轮新增测试，
-`tests/test_ablation_r57.py`/`tests/test_merge_r57.py` 单独跑绿）。
-`ruff check` 全部通过。
+`python -m pytest tests/ -q` → **4752 passed / 7 skipped**（含本轮新增测试：
+`tests/test_ablation_r57.py`/`tests/test_merge_r57.py` 单独跑绿，
+`tests/test_formula_verifier.py` 66 passed）。`ruff check .`（全仓库）
+全部通过。
 
 ## §7 给用户的验收命令
 
@@ -262,7 +263,14 @@ python -m eval.ablation.r57 --backend real --limit 2 --queries-path tests/querie
 **判据**：
 - A 组 `n_ok ≥ 1`，且失败原因（如果还有）不再是 `herb_source_fabricated`
 - 五组 `n_ok` 全部 ≥ 1（新增 E 组，配置跟 C 组相同）
+- 六条方（B/C/D 各两条）里，第一轮不再必然挂在 `effect_matches_method`
+  上——单条真机样本已经确认这条规则修好了，但 `--limit 2` 样本太小，
+  看不出"频率降了多少"，只能看"这次触发的规则集合里还有没有它"
+  （`rows[*].metrics.verifier_first_pass`/`verification_veto` 字段）
 - C-D 一致率的三项（证型/主方/治法）分开看，且报告里能看到跟 C-E 噪声
   地板的对照——`--limit 2` 样本量小于 `GATE_MIN_SAMPLE_SIZE`（5），三条
   相对一致率闸门会判「⏳ 样本不足」，这是预期行为，不是没修好；要看到
   这三条门真的判出 ✅/❌，需要不带 `--limit` 的全量 100 次跑
+
+**通过就直接进全量 100 次**（`--groups ABCDE`，或按 `docs/ONSITE_R57_R58.md`
+「一、1.3」分五组分别跑）。
