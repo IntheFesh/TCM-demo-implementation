@@ -122,6 +122,14 @@
     <!-- 三列集注：等宽等高、细线分隔、无卡片。 -->
     <div id="columns"></div>
 
+    <!-- R37 单链九段 + 节点释义。**跟 #columns 真的并列**：一度写在折叠的
+         #detail-zone 里，而 structured 下这条链就是结论本身，折起来等于跑完
+         什么都看不见。**开关只有 `.show`**——不写 `is-hidden`（它带
+         `!important`，两者同时在就永远 display:none，而"类名对、就是看不见"
+         查 class 的判据查不出来：R37 四张单链截图全空白、判据全绿）。 -->
+    <div id="chain-flow" aria-live="polite"></div>
+    <div id="node-explain" role="dialog" aria-label="节点释义"></div>
+
     <!-- R18-I「参考医家」：注册表里 enabled=false 的那几位（李可、王云启）。
          他们不参加集注（三列里没有他们），但语料在库里——学生/研究者模式下
          应该能看到"同一条主诉，他们的医案里最像的是哪三条"。

@@ -42,7 +42,15 @@ VIEWPORT = {"width": 1440, "height": 900}
 # 个别状态要在**更小的屏**上验。rings 那条"标签可读"的承诺是对最小的那块屏
 # 讲的（1280×800 的投影仪），在 1440×900 上验等于放过一批在投影仪上糊掉的布局。
 # 只覆盖需要的那几个，其余仍用统一视口——截图之间的可比性靠这一点。
-VIEWPORT_OVERRIDES = {"rings": {"width": 1280, "height": 800}}
+# R37：单链九段要在**三种分辨率**上验（任务书原文）。1920×1080 是评审大屏、
+# 1366×768 是会议室笔记本（竖向最紧的那个）、1280×800 是投影仪。
+# 只验一种等于放过另外两种上的折行与压字。
+VIEWPORT_OVERRIDES = {
+    "rings": {"width": 1280, "height": 800},
+    "chain_flow_1920": {"width": 1920, "height": 1080},
+    "chain_flow_1366": {"width": 1366, "height": 768},
+    "chain_flow_1280": {"width": 1280, "height": 800},
+}
 
 COMPLAINT = "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。"
 
@@ -58,6 +66,10 @@ PREFIX = {
     "reference_physicians": "r18",
     "epigraph": "r24", "select_open": "r24",
     "structured_single": "r33",
+    "chain_flow": "r37", "chain_flow_1920": "r37", "chain_flow_1366": "r37",
+    "chain_flow_1280": "r37", "chain_running": "r37", "node_explain": "r37",
+    "cancel_button": "r37",
+    "single_chain_graph": "r37",
     "advice_panel": "r24", "rings": "r24",
 }
 
@@ -286,6 +298,138 @@ S33_DONE_PAYLOAD = {
                                                "formula", "herbs"]}},
 }
 
+# ---------- R37：单链九段 + 单链图 的 fixture ----------
+#
+# **用真的 schema 类构造，不手写 JSON。** 手写的那份会跟 `core/schemas.py` 漂
+# ——而这一轮要验的恰恰是"九段界面读得懂五步链的每一个字段"。跨步引用
+# （from_organs / from_syndrome / from_method / herb_choices 的双向药名集合）
+# 由 schema 自己校验，构造得出来就说明这份 fixture 是合法的五步链；
+# 单链图同样由真的 `api.main.to_graph` 生成，不手摆节点。
+
+
+def _r37_structured():
+    from core.schemas import (
+        ElementHit,
+        FormulaCandidate,
+        FormulaStep,
+        HerbChoice,
+        HerbItem,
+        MethodStep,
+        OntologyRef,
+        OrganLocus,
+        PhysicianInfluence,
+        S1Normalize,
+        S2Elements,
+        S3Structured,
+        SyndromeStep,
+    )
+
+    def it(n, role, dose):
+        return HerbItem(name=n, role=role, dose=dose, dose_unit="g")
+
+    items = [it("柴胡", "君", 12), it("白芍", "臣", 12), it("枳壳", "佐", 9),
+             it("甘草", "使", 6)]
+    st = S3Structured(
+        organs=[
+            OrganLocus(organ="肝", supporting_symptoms=["胃脘胀痛"],
+                       pathogenesis="肝气郁结，横逆犯胃"),
+            OrganLocus(organ="胃", supporting_symptoms=["嗳气泛酸"],
+                       pathogenesis="胃失和降"),
+        ],
+        syndrome=SyndromeStep(name="肝胃不和证", disease="胃痛", from_organs=["肝", "胃"],
+                              reasoning="脘痛随情志而发，肝气犯胃，胃失和降。",
+                              reasoning_plain="情绪一紧张就胃痛胀气，是肝气不顺连累了胃。"),
+        method=MethodStep(principle="疏肝理气，和胃止痛", from_syndrome="肝胃不和证",
+                          targets=["肝", "胃"]),
+        formula=FormulaStep(
+            candidate=FormulaCandidate(
+                name="柴胡疏肝散加减", source="modified", base_formula="柴胡疏肝散",
+                rationale="与肝胃不和、气机郁滞相合", confidence="high", herb_items=items),
+            from_method="疏肝理气，和胃止痛",
+            ontology_refs=[OntologyRef(kind="formula", name="柴胡疏肝散", predicate="主治",
+                                       span="肝气郁滞，胸胁胀痛", book="方剂学")]),
+        herb_choices=[
+            HerbChoice(item=items[0], for_element="肝", effect_cited="疏肝解郁",
+                       ontology_refs=[OntologyRef(kind="herb", name="柴胡", predicate="功效",
+                                                  span="疏肝解郁、和解表里", book="中药学")],
+                       physician_source="ye_tianshi"),
+            HerbChoice(item=items[1], for_element="肝", effect_cited="柔肝止痛"),
+            HerbChoice(item=items[2], for_element="胃", effect_cited="理气和胃"),
+            HerbChoice(item=items[3], for_element="胃", effect_cited="调和诸药"),
+        ],
+        physician_influences=[
+            PhysicianInfluence(physician="ye_tianshi", step="formula",
+                               contribution="用药轻灵，剂量偏小",
+                               cited_case_ids=["ye_tianshi-0001-p0-0"]),
+            PhysicianInfluence(physician="li_ke", step="herbs",
+                               contribution="温阳一路敢用重剂",
+                               cited_case_ids=["ye_tianshi-0001-p0-0"]),
+        ],
+        cited_case_ids=["ye_tianshi-0001-p0-0"])
+    s1 = S1Normalize(symptoms=["胃脘胀痛", "嗳气泛酸", "纳差"],
+                     tongue="淡红苔薄白", pulse="弦", unmapped=["三年前有胃病史"])
+    s2 = S2Elements(elements=[
+        ElementHit(element="肝", kind="location", supporting_symptoms=["胃脘胀痛"],
+                   confidence="high"),
+        ElementHit(element="胃", kind="location", supporting_symptoms=["嗳气泛酸"],
+                   confidence="high"),
+        ElementHit(element="气滞", kind="nature", supporting_symptoms=["胃脘胀痛"],
+                   confidence="medium"),
+    ], unexplained_symptoms=["纳差"])
+    return st, s1, s2
+
+
+def _r37_payload():
+    from api.main import _serialize_followup, to_graph
+    from core.formula_verifier import Unverifiable, VerificationResult
+    from core.schemas import FollowupResult
+
+    st, s1, s2 = _r37_structured()
+    flat = st.to_s3_syndrome()
+    graph = to_graph(s1, [{"physician": "synthesis", "physician_name": "五家综合",
+                           "s3": flat, "s2": s2}], s2=s2)
+    result = {
+        **json.loads(json.dumps(S33_RESULT)),
+        "s3": json.loads(flat.model_dump_json()),
+        "s3_structured": json.loads(st.model_dump_json()),
+        "physician_influences": [json.loads(i.model_dump_json())
+                                 for i in st.physician_influences],
+        "physicians_cited": ["ye_tianshi", "li_ke"],
+        "herbs_grounded_ratio": st.herbs_grounded_ratio(),
+        # R34 的验证结果。**`unverifiable` 非空**：九段界面必须把"判不了"显示出来
+        # （查不到依据 ≠ 查到了且通过），这条 fixture 就是为了钉住那一行。
+        # **用真的 VerificationResult 序列化，不手写这个 dict**：手写的那一版
+        # 漏掉了 `rule_label` / `status_label`（后端随结论下发的中文名），
+        # 而截图判据查的正是"页面上不许出现 id"——fixture 自己先跟真接口漂了，
+        # 判据就在验一个不存在的形状。
+        "verification": VerificationResult(
+            unverifiable=(
+                Unverifiable(rule="meridian_coverage", herbs=("枳壳",),
+                             missing_predicate="归经", reason="枳壳 在本体里没有归经条目"),
+                Unverifiable(rule="nature_conflict", herbs=("甘草",),
+                             missing_predicate="性味", reason="甘草 在本体里没有性味条目"),
+            ),
+            ontology_available=True,
+            checked_rules=("incompatible_pair", "dose_exceeds", "herb_grounded"),
+        ).to_dict(),
+        "verifier_metrics": {"revise_rounds": 1, "first_pass_status": "revise_needed"},
+    }
+    return {
+        **json.loads(json.dumps(S33_DONE_PAYLOAD)),
+        "results": [result],
+        "graph": graph,
+        "s1": json.loads(s1.model_dump_json()),
+        "s2": json.loads(s2.model_dump_json()),
+        # 同 `verification` 那条：**用真的序列化函数造**，不手写 dict——
+        # 手写的那份缺 `stopped_by_label`（后端随结果下发的中文名），
+        # 而截图判据查的正是"页面上不许出现 id"。
+        "followup": _serialize_followup(FollowupResult(
+            rounds=1, stopped_by="max_rounds", asserted=["善叹息"], denied=["口苦"])),
+    }
+
+
+R37_DONE_PAYLOAD = _r37_payload()
+
 # R24：建议层 + token 面板的 fixture。三档 severity 各一条（三档画成一样就等于
 # 没渲染），另带一条"没跑的规则"（那一行的存在本身就是 R23 的判据）。
 R24_ADVICE = [
@@ -367,6 +511,62 @@ REFERENCE_FIXTURE = [
     ["wang_yunqi", {"available": True, "physician": {"id": "wang_yunqi", "name": "王云启"},
                     "cases": [], "note": "该医家（wang_yunqi）医案中没有相似度达标的匹配项，已查 77 条医案"}],
 ]
+
+
+# R37：九段界面的判据。四个分辨率共用同一份——**判据只有一处**，
+# 不然三种分辨率会各自跑偏（同 CLAUDE.md 第 31 条）。
+CHAIN_FLOW_CHECK = r"""() => {
+          const flow = document.getElementById('chain-flow');
+          if (!flow || !flow.classList.contains('show')) return '单链区没显示出来';
+          // **类名对不等于看得见**：`.is-hidden` 带 `!important`，跟 `.show`
+          // 同时挂着就永远 display:none；祖先要是折叠的 <details>，自己也量不出高。
+          // R37 实测：只查 `.show` 的那一版判据全绿，而四张截图全是空白。
+          if (flow.offsetParent === null) return '单链区有 .show 但根本没在版面上';
+          const flowBox = flow.getBoundingClientRect();
+          if (flowBox.height < 100)
+            return '单链区高 ' + Math.round(flowBox.height) + 'px——它没真的铺开';
+          if (flow.closest('details'))
+            return '单链是这次问诊的结论，不许藏在折叠区里（祖先有 <details>）';
+          const secs = [...flow.querySelectorAll('.chain-sec')];
+          if (secs.length !== 9) return '不是九段，是 ' + secs.length;
+          const keys = secs.map(x => x.dataset.key).join(',');
+          const want = 'complaint,elements,followup,organs,syndrome,method,formula,herbs,checks';
+          if (keys !== want) return '九段顺序不对：' + keys;
+          if (document.querySelectorAll('#columns .col').length)
+            return '三列没清掉——两种形态不许同时在 DOM 里';
+          const txt = flow.textContent;
+          // 五步链每一步的关键内容都要真的渲染出来（不是只有标题）
+          for (const need of ['肝气郁结', '肝胃不和证', '疏肝理气，和胃止痛',
+                              '柴胡疏肝散加减', '柴胡', '判不了'])
+            if (!txt.includes(need)) return '九段里缺内容：' + need;
+          // R34a：判不了那一行必须带具体缺了什么
+          if (!txt.includes('归经')) return '「判不了」没说清缺哪一项';
+          // **展示层不许出现 id**（CLAUDE.md 的标识符规范）。R37 的第一版截图上
+          // 同时印出了 `ye_tianshi`、`modified`、`high`、`meridian_coverage` 四种。
+          // 医案号是例外：它本来就是要显示的凭据（`ye_tianshi-0001-p0-0`），
+          // 所以先把"医家 id + 连字符 + 数字"这种写法摘掉再查。
+          const bare = txt.replace(/[a-z_]+-\d[\w-]*/g, '');
+          for (const bad of ['ye_tianshi', 'wu_jutong', 'li_ke', 'partially_verified',
+                             'meridian_coverage', 'nature_conflict', 'modified',
+                             'classic', 'composed', 'high', 'medium',
+                             'max_rounds', 'converged', 'no_candidate', 'fast_mode',
+                             'organ', 'syndrome', 'method', 'formula', 'herbs'])
+            if (bare.includes(bad)) return '页面上印出了 id：' + bad;
+          // 分母口径必须跟着那个百分比一起显示（R34b）
+          if (txt.includes('%') && !txt.includes('分母')) return '百分比没带分母口径';
+          // 字号下限：投影仪上 12px 以下就糊了
+          for (const el of secs) {
+            const fs = parseFloat(getComputedStyle(el.querySelector('.chain-body')).fontSize);
+            if (fs < 12) return '正文字号 ' + fs + 'px < 12px';
+            if (el.getBoundingClientRect().height < 20)
+              return '第' + el.dataset.key + '段塌成了 '
+                + Math.round(el.getBoundingClientRect().height) + 'px';
+          }
+          // 横向不许溢出（三种分辨率都验）
+          if (document.documentElement.scrollWidth > window.innerWidth + 1)
+            return '横向溢出：' + document.documentElement.scrollWidth + ' > ' + window.innerWidth;
+          return null;
+        }"""
 
 
 STATES = {
@@ -727,23 +927,172 @@ STATES = {
     ),
     # 第六张：终态。不在 §3.1 的五种状态表里（那张表列的是"非终态怎么办"），
     # 但三列集注 + 用药对照带这两个 R14 的主要交付物只有在这张图上看得见。
+    # ---------- R37：单链九段（三种分辨率各验一次） ----------
+    #
+    # **为什么三种**：1920×1080 评审大屏、1366×768 会议室笔记本（竖向最紧）、
+    # 1280×800 投影仪。九段是纵向长版面，竖向空间最紧的那块屏最容易出折行与压字，
+    # 而"在 1440×900 上看着挺好"正是 rings 那条教训要防的事。
+    "chain_flow": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult(R37_DONE_PAYLOAD);",
+        CHAIN_FLOW_CHECK,
+    ),
+    "chain_flow_1920": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult(R37_DONE_PAYLOAD);",
+        CHAIN_FLOW_CHECK,
+    ),
+    "chain_flow_1366": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult(R37_DONE_PAYLOAD);",
+        CHAIN_FLOW_CHECK,
+    ),
+    "chain_flow_1280": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult(R37_DONE_PAYLOAD);",
+        CHAIN_FLOW_CHECK,
+    ),
+    # 跑到一半的样子：九段骨架 + 当前那一段高亮。**问诊一开始就摆九段**，
+    # 不先摆三列再换掉（那一下闪烁正是"界面在猜"的表现）。
+    "chain_running": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " setConsultState('running'); renderChainSkeleton('s2');",
+        """() => {
+          const flow = document.getElementById('chain-flow');
+          if (!flow || flow.offsetParent === null) return '跑起来了但九段骨架没在版面上';
+          const secs = [...document.querySelectorAll('#chain-flow .chain-sec')];
+          if (secs.length !== 9) return '骨架不是九段，是 ' + secs.length;
+          const states = secs.map(x => x.dataset.state);
+          if (states[0] !== 'done') return '第①段（S1 已完成）状态不是 done：' + states[0];
+          if (states[1] !== 'active') return '第②段（正在跑 S2）不是 active：' + states[1];
+          if (states[8] !== 'todo') return '第⑨段不该已经亮：' + states[8];
+          if (document.querySelectorAll('#columns .col').length)
+            return '三列不该在 structured 下摆出来';
+          return null;
+        }""",
+    ),
+    # R37：**跑起来之后取消按钮必须是可见的、可点的**，而且那条 300 秒的空闲
+    # 兜底要跟界面上说的一致。一次问诊要等几十秒，没有出口的等待是这一轮
+    # 点名要修的弊端之一（"转圈转到底"）。
+    "cancel_button": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " setConsultState('running'); renderChainSkeleton('s2');"
+        " document.getElementById('cancel-btn').classList.remove('is-hidden');",
+        """() => {
+          const btn = document.getElementById('cancel-btn');
+          if (!btn) return '没有取消按钮';
+          if (btn.classList.contains('is-hidden')) return '跑起来了但取消按钮还藏着';
+          const box = btn.getBoundingClientRect();
+          if (box.width < 40 || box.height < 20)
+            return '取消按钮太小：' + Math.round(box.width) + '×' + Math.round(box.height);
+          if (btn.disabled) return '取消按钮是禁用的';
+          // 300 秒那个兜底值必须跟界面上说的一致（两处各写一个数就会漂）
+          if (typeof SSE_IDLE_TIMEOUT_MS === 'undefined' || SSE_IDLE_TIMEOUT_MS !== 300000)
+            return '空闲兜底不是 300 秒：' + SSE_IDLE_TIMEOUT_MS;
+          return null;
+        }""",
+    ),
+    # 节点释义：点一个药名，面板弹出四节里真有内容的那几节。
+    # **走真的 /api/node_explain**（这个脚本起的是真 uvicorn），不是塞一份假数据。
+    "node_explain": (
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult(R37_DONE_PAYLOAD);"
+        " const hit = [...document.querySelectorAll('#chain-flow .explainable')]"
+        "   .find(x => x.dataset.node.startsWith('herb::'));"
+        " await openNodeExplain(hit.dataset.node, hit.dataset.name);",
+        """() => {
+          const box = document.getElementById('node-explain');
+          if (!box || !box.classList.contains('show')) return '释义面板没弹出来';
+          // 同 CHAIN_FLOW_CHECK 那条：类名对 ≠ 看得见
+          if (box.offsetParent === null) return '释义面板有 .show 但没在版面上';
+          if (box.getBoundingClientRect().height < 40)
+            return '释义面板高 ' + Math.round(box.getBoundingClientRect().height) + 'px';
+          const heads = [...box.querySelectorAll('.ne-head')].map(x => x.textContent);
+          if (!heads.length) return '面板里一节都没有';
+          const ORDER = ['是什么', '出处原文', '名医怎么用', '注意'];
+          const idx = heads.map(h => ORDER.indexOf(h));
+          if (idx.some(i => i < 0)) return '出现了四节之外的节：' + heads.join('/');
+          for (let i = 1; i < idx.length; i++)
+            if (idx[i] < idx[i - 1]) return '四节顺序乱了：' + heads.join('/');
+          if (!box.textContent.includes('出处')) return '没有出处那一行——释义必须能回指';
+          return null;
+        }""",
+    ),
+    # 单链图：一条链（一个证型、一个方剂、药材是方剂的 compound 子节点）。
+    # **CLAUDE.md 点名的那条**：改了图的层结构/含义就必须真的喂给浏览器跑一遍。
+    "single_chain_graph": (
+        # 图区默认折叠、生长动画是分批 add 的——**要展开 + 跳过动画 + 等一会儿**，
+        # 跟 consult_graph 那条同一套（那条也是这么等的）。
+        "renderComplaintBody(COMPLAINT); SERVER_S3_MODE = 'structured';"
+        " renderConsultResult(R37_DONE_PAYLOAD);"
+        " document.getElementById('detail-zone').open = true;"
+        " skipAnimation();",
+        """async () => {
+          await new Promise(r => setTimeout(r, 1200));
+          if (typeof cy === 'undefined' || !cy) return 'cytoscape 画布没建起来';
+          const byLayer = {};
+          cy.nodes().forEach(n => {
+            const L = String(n.data('layer'));
+            byLayer[L] = (byLayer[L] || 0) + 1;
+          });
+          if (byLayer['2'] !== 1) return '证型层不是一个节点，是 ' + byLayer['2'];
+          if (byLayer['3'] !== 1) return '方剂层不是一个节点，是 ' + byLayer['3'];
+          if (!byLayer['4']) return '药材层（compound 子节点）没画出来';
+          // 药材必须挂在方剂下面（compound），不是另画一条边
+          const herbs = cy.nodes().filter(n => String(n.data('layer')) === '4');
+          const bad = herbs.filter(n => !n.parent().length);
+          if (bad.length) return bad.length + ' 味药没有 parent——compound 关系断了';
+          // **方名必须看得见**：方剂是 compound 父节点，label 画在框的上沿
+          // （`text-valign: top`），而 `fit` 只保证节点本体在视口里——父节点的
+          // label 是"框外"的东西，很容易被切掉。这条量它的 label 包围盒在不在
+          // 画布里（"这条链开的是哪张方"是这张图的主语，切掉就白画了）。
+          const parent = cy.nodes().filter(n => n.isParent())[0];
+          if (!parent) return '没有 compound 父节点（方剂层不见了）';
+          if (!(parent.data('label') || '').trim()) return '方剂节点没有 label';
+          const pb = parent.renderedBoundingBox({includeLabels: true});
+          if (pb.y1 < 0 || pb.x1 < 0 || pb.x2 > cy.width() || pb.y2 > cy.height())
+            return '方名被切掉了：label 框 ' + JSON.stringify({
+              x1: Math.round(pb.x1), y1: Math.round(pb.y1),
+              x2: Math.round(pb.x2), y2: Math.round(pb.y2)})
+              + ' 超出画布 ' + Math.round(cy.width()) + '×' + Math.round(cy.height());
+          // 节点两两不许重叠（单链下更不该有）
+          const boxes = cy.nodes().filter(n => !n.isParent()).map(n => n.renderedBoundingBox());
+          for (let i = 0; i < boxes.length; i++)
+            for (let j = i + 1; j < boxes.length; j++) {
+              const a = boxes[i], b = boxes[j];
+              if (a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2)
+                return '有两个节点压在一起';
+            }
+          return null;
+        }""",
+    ),
+    # R33 那一版的判据是"结构化模式只有一列"；**R37 把终态换成了九段单链**，
+    # 所以这条状态跟着换形状。它留着不是为了再验一遍九段（chain_flow 那四条在验
+    # 那个），而是因为它喂的是 R33 那份 payload：五家归因、`divergence` 为 null、
+    # `herbs_grounded_ratio` 为 0——问的还是同一件事：只有一份结论时页面不许摆出
+    # 一张空的处方对照表，也不许留下三列的壳，而"这是谁的结论"必须写在链顶上。
     "structured_single": (
         "renderComplaintBody(COMPLAINT); renderConsultResult(S33_DONE_PAYLOAD);",
         """() => {
           const cols = document.querySelectorAll('#columns .col');
-          if (cols.length !== 1) return '结构化模式应该只有一列，实际 ' + cols.length;
-          const col = cols[0];
-          if (col.dataset.physician !== 'synthesis')
-            return '那一列的 data-physician 不是 synthesis，是 ' + col.dataset.physician;
-          if (col.dataset.state !== 'done') return '那一列没进终态';
-          const box = col.getBoundingClientRect();
-          const grid = document.getElementById('columns').getBoundingClientRect();
-          if (box.width < grid.width * 0.5)
-            return '一列没有铺开（宽 ' + Math.round(box.width) + ' / 容器 '
-                   + Math.round(grid.width) + '），auto-fit 塌了';
-          if (box.height < 100) return '那一列几乎没有内容，高 ' + Math.round(box.height);
-          const text = col.innerText || '';
-          if (!text.includes('五家综合')) return '列头没有显示「五家综合」';
+          if (cols.length) return '结构化模式下还留着三列的壳：' + cols.length;
+          const flow = document.getElementById('chain-flow');
+          if (!flow || !flow.classList.contains('show')) return '单链没画出来';
+          if (flow.offsetParent === null) return '单链有 .show 但没在版面上';
+          const secs = [...flow.querySelectorAll('.chain-sec')];
+          if (secs.length !== 9) return '不是九段，是 ' + secs.length;
+          const box = flow.getBoundingClientRect();
+          if (box.height < 100) return '单链几乎没有内容，高 ' + Math.round(box.height);
+          const who = flow.querySelector('.chain-head .chain-who');
+          if (!who) return '链顶没有"这是谁的结论"';
+          if (!(who.textContent || '').includes('五家综合'))
+            return '链顶写的不是「五家综合」，是 ' + who.textContent;
+          // 引到几位照实数：这份 payload 的 physicians_cited 是 ye_tianshi/li_ke 两位,
+          // **不许拿"五家"这个名字当数**（名字是配置，数是这次真跑出来的）
+          const note = flow.querySelector('.chain-head .chain-note');
+          if (!note || !(note.textContent || '').includes('2 位'))
+            return '引到的医家数不对：' + (note ? note.textContent : '没这一行');
+          const text = flow.innerText || '';
           if (!text.includes('肝胃不和证')) return '证型没有渲染出来';
           // divergence 为 null 时处方对照区不该摆出一张空表
           const cmp = document.getElementById('rx-compare');
@@ -1014,6 +1363,8 @@ def run(only: str | None, wait_ms: int) -> int:
                                    ("R24_USAGE", R24_USAGE),
                                    # R33：结构化模式的单列终态
                                    ("S33_DONE_PAYLOAD", S33_DONE_PAYLOAD),
+                                   # R37：单链九段 + 单链图（用真 schema 构造）
+                                   ("R37_DONE_PAYLOAD", R37_DONE_PAYLOAD),
                                    ("COMPLAINT", COMPLAINT)):
                     page.evaluate(f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
                 # setup 里可能有 await（图谱浏览器要先把数据拉回来），

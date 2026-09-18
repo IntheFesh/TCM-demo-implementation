@@ -4996,3 +4996,105 @@ R1 判据：叶天士、吴鞠通各自 `follow_hint>0` 的采用案 ≥25。实
     判据：**合并两个步骤之前，先看它们之间有没有一道只能在那个位置生效的检查。**
     有的话，合并就不只是性能改动；"丢掉算出来的东西"是流程约定，"根本没算过"
     才是结构保证，两者在代码审查里看起来一样，在出事时不一样。
+
+94. **两个"隐藏"开关叠在同一个元素上，带 `!important` 的那个永远赢——而查类名的
+    判据看不出这个元素根本没显示。**
+
+    R37 的单链九段：`index.html` 里写的是 `<div id="chain-flow" class="is-hidden">`，
+    而 `app.css` 里另有一套 `#chain-flow { display:none } / #chain-flow.show { display:block }`。
+    `showChainFlow()` 加上 `.show`，`is-hidden`（`display:none !important`）从来没被摘掉。
+    结果：**四张分辨率截图全是空白，而 Playwright 判据全绿**——它查的是
+    `classList.contains('show')`、`.chain-sec` 有几个、`getComputedStyle(...).fontSize`，
+    这些在 `display:none` 的元素上一样返回正确的值。
+
+    同一轮还踩到同一症状的第二种形状：这条链一开始写在页面下方那个**默认折叠**的
+    `<details id="detail-zone">` 里。structured 模式下三列是空的、这条链就是结论
+    本身，折起来等于"问诊跑完，页面上什么都没有"。
+
+    改法两条，一条治因一条治判据：
+      · 一个块只留一个开关（`.show`），markup 里不写 `is-hidden`；结论区移出折叠区；
+      · 判据从"类名对不对"改成**量得出来的东西**：`offsetParent !== null`、
+        整块高 ≥100px、每一段高 ≥20px、祖先里不许有 `<details>`。
+
+    判据：**"它显示出来了"这句话只能用几何量来断言**——高度、offsetParent、
+    包围盒。类名、`getComputedStyle`、`innerHTML.length` 在一个隐藏元素上全都正常，
+    它们能证明"渲染代码跑过了"，证明不了"人能看见"。
+
+95. **模式是可能回落猜出来的，结论条数是事实——两者冲突时按事实画。**
+
+    前端判断"这次画单链还是三列"的函数 `isSingleChain(manifest)`：manifest 里带
+    `s3_mode` 就按它，没带就回落到 `/health` 报的服务端默认模式。而
+    `renderChainFlow()` 只读 `results[0]`。于是一份**三位医家**的响应（回放的老
+    manifest、截图 fixture 都不带 `s3_mode`）在一台 structured 的服务上会被画成
+    单链——另外两位的证型、治法、方药**静默消失**，页面上看不出少了东西。
+
+    发现它的方式值得记：**不是想出来的，是全量截图跑崩的**。29 种状态跑到第 14 种
+    `doctor_conflict` 时 `Page.evaluate` 抛 `Cannot read properties of null`——
+    那条判据在找 `.col[data-physician="ye_tianshi"]`，而三列已经被清空了。
+
+    判据：**当"按什么形状画"能从数据本身读出来时，不要让一个可能回落的配置去
+    决定它。** 形状判断（`isSingleChainResult(data)`：条数 >1 就一定不是单链）与
+    模式判断（`isSingleChain(manifest)`）分成两个函数，各自回答自己的问题。
+
+96. **CSS 的 `text-max-width` 断不了中文——而我拿"标签变窄了"这个没量过的前提，
+    把一次展开的上限从 14 改回了 20。**
+
+    R37 给两张图的标签宽度拆了槽位令牌（`--label-max-consult: 120px` /
+    `--label-max-browser: 84px`），然后据此把图谱浏览器一次展开的节点数上限从 14
+    调回 20（R28 因为标签变宽才砍到 14 的）。真浏览器逐对量包围盒当场打回：
+
+        20 个 → 2 对压字　19 个 → 1 对　18 个 → 4 对　17 个 → 7 对
+        16 个 → 6 对　　　14 个 → 0 对
+
+    根因有两层。**第一层**：cytoscape 的 `text-wrap: wrap` 只在**空白和换行**处断行，
+    而「疫毒炽盛（急黄）证」里没有断行机会——令牌从 124px 收到 84px 之后，
+    量出来的最宽标签**仍然是 125px**。那个令牌真正收窄的只是重名时补的
+    `（病名 编码）` 那一行（它里面有空格）。**第二层**：14 个以上会让扇面从两排变
+    三排，而三排的径向间距放不下 125×41 的标签——所以"少画几个"反而更差
+    （16、17 比 20 压得更多）。面积也对得上：那个扇面约 11.2 万 px²，一个位置要
+    124×62≈7,700 px²，理想排布也就 14 个上下。
+
+    判据：**"这个设置会让 X 变小"是一个需要量的断言，不是一个可以推的结论。**
+    尤其是排版参数——CJK 没有词边界，一大半西文排版假设在它上面不成立。
+
+97. **手写的 fixture 跟真序列化漂了，于是判据在验一个不存在的形状。**
+
+    截图判据这一轮新加了一条"页面上不许出现英文 id"。它红了，报的是
+    `partially_verified`——而后端那一轮已经把中文名随结论下发了
+    （`VerificationResult.to_dict()` 里的 `status_label` / `rule_label`）。
+    问题在 fixture：那份 `verification` 是**手写的 dict**，没有这两个键。
+    判据没有验到"前端会不会显示中文名"，它验的是"这份手写数据长什么样"。
+
+    改法：fixture 用真的 `VerificationResult(...).to_dict()` 构造。
+    同一份文件里 `S3Structured`、`to_graph()` 本来就是这么做的——手写的那一处是
+    补丁时图快留下的。
+
+    判据：**fixture 里凡是"接口产出的形状"，一律用产出它的那段代码现造**；
+    手写只用于"输入"。一份手写的输出型 fixture 会让判据在它自己造的世界里绿。
+
+98. **展示层第二次漏 id：这次不是模型看不懂，是评审看不懂。**
+
+    第 31 条记的是 ReAct 的 physician 参数——模型只看得到中文名、填中文名，
+    而过滤用 id，工具恒返回空。这一轮是同一件事的显示层版本：单链九段的截图上
+    同时印着 `ye_tianshi`、`modified`、`high`、`meridian_coverage`。
+
+    根因四处不同，但形状一样——**中文名的来源跟用它的地方之间隔着一次会落空的
+    查表**：
+      · 医家名：`renderConsultResult()` 每次把 `PHYSICIAN_NAMES` 清空、只用这次的
+        `results` 重填，而 structured 模式下 `results` 只有「五家综合」一条，
+        §⑧ 的用药归属、§⑨ 的「引到的医家」全都落空回落到 id；
+      · 方剂来源（classic/modified/composed）：中文名只存在于图谱 tooltip 里的一个
+        内联字面量，新写的九段没有；
+      · 置信度（high/medium/low）：两处都直接把英文值印出来；
+      · 验证规则名与结论名：规则清单在后端，前端根本没有对应的中文名。
+
+    改法一律是"每种 id 在边界上解析一次"：`physicianName()` 两级回落（本次结果 →
+    `/health` 注册表 → id 本身）、`formulaSourceLabel()` 放在被依赖的那一侧
+    （graph.js，因为依赖方向只能 app→graph）、`confidenceLabel()` 一处、
+    规则名与结论名由后端随结论下发（`RULE_LABELS` / `STATUS_LABELS`，跟
+    `ALL_RULES` 放在一起，加规则时漏配中文名会被一条测试当场抓住）。
+
+    判据：**id 出现在界面上，等价于一次查表落空，而不是"少写了一个翻译"。**
+    所以修法是补那条解析路径（并让它有兜底），不是在出事的那一行贴一个 map。
+    这一轮同时把它变成机器判据：截图判据里列出禁止出现的 id，
+    前端测试断言"查表只有一处"。

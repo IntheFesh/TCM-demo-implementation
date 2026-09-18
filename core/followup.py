@@ -202,6 +202,25 @@ def run_followup(
     return _result(history, asserted, denied, "max_rounds")
 
 
+#: 六种停因的中文名。**跟 `FollowupResult.stopped_by` 的 Literal 一一对应**，
+#: 由 `_serialize_followup` 随结果下发给前端——展示层只认中文名，id 只在数据层
+#: （跟 `core/formula_verifier.RULE_LABELS` 同一条理由：枚举在哪，它的中文名就在哪，
+#: 前端另建一张表意味着以后加一种停因要改两处，而漏改的表现是界面上冒出英文 id）。
+STOP_LABELS: dict[str, str] = {
+    "max_rounds": "问满轮次",
+    "converged": "再问也问不出新信息",
+    "no_candidate": "没有可问的问题",
+    "safety": "回答触发安全否决",
+    "fast_mode": "被 FAST_MODE 跳过",
+    "no_answer": "提问方没给回答",
+}
+
+
+def stop_label(stopped_by: str) -> str:
+    """停因 id → 中文名。查不到回落到 id 本身（少一条比显示空白好找）。"""
+    return STOP_LABELS.get(stopped_by, stopped_by)
+
+
 def _result(history, asserted, denied, stopped_by, reject_reason=None) -> FollowupResult:
     return FollowupResult(
         history=history, asserted=asserted, denied=denied,

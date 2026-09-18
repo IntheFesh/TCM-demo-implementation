@@ -28,8 +28,17 @@ from core.chain import (
 )
 from core.diseases import get_disease, triage_advice
 from core.examples import EXAMPLE_COMPLAINTS
+from core.followup import stop_label
 from core.herbs import is_western_drug, strip_dose_and_parens
-from core.llm import ByokBackend, LLMAuthError, check_api_key, get_llm, use_llm
+from core.llm import (
+    ByokBackend,
+    LLMAuthError,
+    check_api_key,
+    get_llm,
+    s3_mode,
+    use_llm,
+)
+from core.node_explain import syndrome_row
 from core.react import react_enabled
 from core import usage as usage_mod
 from core.physicians import (
@@ -246,6 +255,16 @@ async def health() -> dict:
         # 图谱本身，而且页面一加载就该能显示。图谱没建过时是 None，前端不显示
         # 这一行——不是显示一句"未知"。
         "lambda1_note": _lambda1_note_or_none(),
+        # R37：这台服务的 S3 形状（structured / legacy）。**前端要在问诊开始之前
+        # 就知道它**：structured 是单链九段、legacy 是三列集注，两种形态的骨架
+        # 完全不同。等到 done 事件里的 manifest 才知道的话，跑的那几十秒里只能
+        # 先摆一个可能是错的骨架，然后当场换掉——那一下闪烁正是"界面在猜"的表现。
+        #
+        # 这是**服务端配置的默认值**，不是某一次问诊的结果：`consult()` 支持
+        # 逐请求覆盖（`s3_mode_override`），但界面上没有这个开关，所以这里报
+        # 默认值是准确的。每次问诊结束仍然以 `manifest.s3_mode` 为准（那一份
+        # 记的是真的跑了哪一条），两处不一致时前端信 manifest。
+        "s3_mode": s3_mode(),
     }
 
 
@@ -309,6 +328,30 @@ def _node_payload(node_id: str, data: dict,
     return {"data": node_data}
 
 
+def ambiguous_syndrome_pairs(pairs) -> set[tuple[str, str]]:
+    """哪些 `(证型名, 病名)` 组合在这一批里**不止一条**。
+
+    **两张图共用这一处**（R37）：图谱浏览器扫的是持久图的证型节点，问诊图扫的是
+    这一次几位医家给出的证型——问的是同一个问题（"这个标签在这张图上分得清吗"），
+    所以判断只有一处。摆成一行还是两行是排版，不是同一个问题，各图自己决定。
+    """
+    seen: dict[tuple[str, str], int] = {}
+    for name, disease in pairs:
+        key = (name or "", (disease or "").strip())
+        seen[key] = seen.get(key, 0) + 1
+    return {k for k, n in seen.items() if n > 1}
+
+
+def syndrome_code_suffix(*, ambiguous: bool, code: str | None) -> str:
+    """撞名时补的那截编码。**补不补这件事只有这一处判断。**
+
+    只在**确实还撞着**且**真有编码**时补：给每条都挂编码会让图上全是 TB-xxx
+    的噪音，而没有编码时补一个空括号比不补更糟（那是"查过了、没有"和"没查"
+    分不开的经典形状）。
+    """
+    return f"（{code}）" if (ambiguous and code) else ""
+
+
 def ambiguous_syndrome_keys(store) -> set[tuple[str, str]]:
     """哪些 (证型名, 病名) 组合在图里**不止一条**。
 
@@ -324,13 +367,10 @@ def ambiguous_syndrome_keys(store) -> set[tuple[str, str]]:
     是另一个根因（见 tests/test_syndrome_disease_label.py 最后那条判据）。
     显示层能做的是**不装作它们一样**：这几组再补一个 code。
     """
-    seen: dict[tuple[str, str], int] = {}
-    for _nid, d in store.g.nodes(data=True):
-        if d.get("node_type") != "syndrome":
-            continue
-        key = (d.get("name") or "", (d.get("disease") or "").strip())
-        seen[key] = seen.get(key, 0) + 1
-    return {k for k, n in seen.items() if n > 1}
+    return ambiguous_syndrome_pairs(
+        (d.get("name") or "", d.get("disease") or "")
+        for _nid, d in store.g.nodes(data=True)
+        if d.get("node_type") == "syndrome")
 
 
 def _display_label(node_id: str, data: dict,
@@ -360,7 +400,10 @@ def _display_label(node_id: str, data: dict,
     disease = (data.get("disease") or "").strip()
     # 病名 + 编码都齐时才补编码，而且只在这一组确实还撞着的时候补——
     # 给每条都挂编码会让图上全是 TB-xxx 的噪音。
-    if ambiguous and (name, disease) in ambiguous and data.get("code"):
+    suffix = syndrome_code_suffix(
+        ambiguous=bool(ambiguous and (name, disease) in ambiguous),
+        code=data.get("code"))
+    if suffix:
         inner = f"{disease} {data['code']}" if disease else str(data["code"])
         return f"{name}\n（{inner}）"
     return f"{name}\n（{disease}）" if disease else name
@@ -561,6 +604,31 @@ def api_graph_neighbors(node: str, limit: int = 200, node_types: str | None = No
         "page": {"limit": limit, "returned": len(picked), "total": total,
                  "truncated": len(picked) < total},
     }
+
+
+#: 节点释义接口的入参长度上限。**不是怕慢，是怕日志/错误信息里被塞长串**
+#: （同 MAX_COMPLAINT_CHARS 那条理由）。节点 id 最长的形状是
+#: `herb::{physician}::{方名}::{药名}`，200 字绰绰有余。
+MAX_NODE_ID_CHARS = 200
+
+
+@app.get("/api/node_explain")
+def api_node_explain(node: str, name: str | None = None) -> dict:
+    """R37：图上一个节点的四节释义。**零 LLM 调用**，判据全在 core/node_explain.py。
+
+    `name` 是显示名覆盖：问诊图的证型节点 id 是 `syn::{physician}`（那个 id 是
+    证据链侧栏反查的键，改不得），名字只在 label 里，所以前端把 label 一起传来。
+
+    取不到时返回 `available=False` + 一句 `note`，**HTTP 仍然是 200**：
+    "这个节点没有释义"不是错误，而 4xx 会让前端把它当故障弹红条。
+    前端据 `available` 整块隐藏这个面板，不显示"暂无信息"的空壳。
+    """
+    if len(node or "") > MAX_NODE_ID_CHARS or len(name or "") > MAX_NODE_ID_CHARS:
+        raise HTTPException(status_code=400,
+                            detail=f"node/name 超过 {MAX_NODE_ID_CHARS} 字")
+    from core.node_explain import explain_node
+
+    return explain_node(node, name=name)
 
 
 @app.get("/api/graph/search")
@@ -1239,7 +1307,13 @@ def api_consult_stream_answer(stream_id: str, req: ConsultStreamAnswer) -> dict:
 
 
 def _serialize_followup(followup) -> dict | None:
-    return followup.model_dump() if followup is not None else None
+    if followup is None:
+        return None
+    out = followup.model_dump()
+    # 中文名跟着结论一起下发（同 `VerificationResult.to_dict` 的 `status_label`）：
+    # 前端只负责显示，不再自己攒一张停因表。
+    out["stopped_by_label"] = stop_label(out.get("stopped_by", ""))
+    return out
 
 
 def _serialize_residual(residual: dict | None) -> dict | None:
@@ -1501,6 +1575,10 @@ def to_graph(
         nodes.append({"data": {"id": node_id, **data}})
 
     dropped: list[tuple[str, str]] = []
+    # 这一次几位医家的 (证型, 病名) 里哪些撞了。**先算好再进循环**：
+    # 边画边判会让第一个撞上的那位医家不带编码（它那时还不知道后面有人重名）。
+    ambiguous_syn = ambiguous_syndrome_pairs(
+        (r["s3"].syndrome, r["s3"].disease or "") for r in results)
 
     def add_edge(source: str, target: str, **data) -> None:
         # 已知易错点：只有两端节点都已存在才建边，否则前端渲染会指向空节点。
@@ -1562,7 +1640,14 @@ def to_graph(
         syn_id = f"syn::{physician}"
         s3 = r["s3"]
         label = f"{s3.disease} · {s3.syndrome}" if s3.disease else s3.syndrome
-        add_node(syn_id, label=label, layer=2, phys=physician, pname=pname)
+        # R37：两位医家给出同一个「病名 · 证型」时，图上并排两个一模一样的方块
+        # ——身份色分得开，**标签分不开**（截图、投影、打印出来都只剩标签）。
+        # 撞名就补证候编码，判断走 `syndrome_code_suffix` 那一处（跟图谱浏览器
+        # 同一个判断）。编码从证候表查，查不到就不补（不补一个空括号）。
+        suffix = syndrome_code_suffix(
+            ambiguous=(s3.syndrome, (s3.disease or "").strip()) in ambiguous_syn,
+            code=(syndrome_row(s3.syndrome) or {}).get("code"))
+        add_node(syn_id, label=label + suffix, layer=2, phys=physician, pname=pname)
 
         for hit in r["s2"].elements:
             elem_id = f"elem::{hit.element}"

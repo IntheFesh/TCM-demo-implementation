@@ -55,6 +55,7 @@ from core.llm import (
 )
 from core.followup import (
     AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
+    stop_label,
 )
 from core.physicians import (
     PHYSICIANS,
@@ -2131,7 +2132,10 @@ def consult(
     followup = run_followup(
         s1.symptoms, [h.element for h in s2.elements], ask_fn
     )
-    emit("followup_done", stopped_by=followup.stopped_by, rounds=followup.rounds,
+    # 中文名跟事件一起发：进度日志是给人读的，`max_rounds` 这种 id 印在那里
+    # 跟印在结论里一样不可读（`stop_label` 是停因的唯一一张表）。
+    emit("followup_done", stopped_by=followup.stopped_by,
+         stopped_by_label=stop_label(followup.stopped_by), rounds=followup.rounds,
          asserted=followup.asserted, denied=followup.denied)
     extra_calls = 0
     if followup.stopped_by == "safety":

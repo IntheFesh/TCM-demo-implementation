@@ -159,11 +159,16 @@ def test_there_is_only_one_stylesheet_builder():
 
 def test_the_browser_gets_the_same_stylesheet_without_physician_colours():
     """浏览器调的是同一个函数、不传 physicianColors。传了的话国标证型会被
-    染成某位医家的颜色——那是在说"这个国标证型是叶天士的"，而它不是。"""
+    染成某位医家的颜色——那是在说"这个国标证型是叶天士的"，而它不是。
+
+    R37 起这个调用多带一个 `slot: "browser"`（label 宽度与字号按槽位取），
+    **判据跟着改，问的还是同一件事**：同一个 builder + 不传医家色。
+    写死 `buildStylesheet()` 那种"一个字都不许多"的断言会把"加一个跟染色
+    无关的参数"也判成违规，而那不是这条要防的事。"""
     src = _graph_js()
     body = src[src.index("function ensureGraphBrowserCanvas"):]
     body = body[:body.index("function gbBuildIndex")]
-    assert "style: buildStylesheet()," in body
+    assert "style: buildStylesheet({ slot: \"browser\" })," in body
     # 只看代码行：注释里提到 physicianColors 是在解释"为什么不传"，
     # 不该让这条断言反过来劝人别写注释。
     code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("//"))
@@ -197,13 +202,29 @@ def test_formula_border_encodes_the_three_sources():
 
 def test_elements_are_typographically_the_hub():
     """§3.2 规格 11：节点 label 13px 黑体，证素 15px 宋体 600。证素比别的节点
-    大一号，因为**它是图谱浏览器的枢纽**，在问诊图上也是"症状收敛到哪里"那一层。"""
+    大一号，因为**它是图谱浏览器的枢纽**，在问诊图上也是"症状收敛到哪里"那一层。
+
+    R37 把字号绑到槽位（`nodeFontFor` / `elementFontFor` 读 CSS 令牌），所以
+    这里不再查那两个常量名出现在样式块里，而是**查真正在用的那几个值**：
+    两张图各自的证素字号都要严格大于它自己的节点字号。常量只剩兜底作用
+    （令牌取不到时），那一层也一起查。"""
+    import re
     src = _graph_js()
     assert "const NODE_FONT_SIZE = 13;" in src
     assert "const ELEMENT_FONT_SIZE = 15;" in src
     block = src[src.index('node[node_type = "element"]'):]
     block = block[:block.index("},")]
-    assert "ELEMENT_FONT_SIZE" in block and '"font-weight": 600' in block
+    assert "elementFontFor(slot)" in block and '"font-weight": 600' in block
+    # 令牌层：两张图各自都要"证素大一号"。这是规格说的那件事，
+    # 而它现在写在 app.css 里，不在 graph.js 里。
+    css = (Path(__file__).resolve().parent.parent / "web" / "app.css").read_text(encoding="utf-8")
+    def token(name: str) -> float:
+        m = re.search(rf"{name}:\s*([0-9.]+)px", css)
+        assert m, f"app.css 里没有 {name}"
+        return float(m.group(1))
+    for slot in ("consult", "browser"):
+        assert token(f"--element-font-{slot}") > token(f"--node-font-{slot}"), \
+            f"{slot} 这张图上证素没有比别的节点大"
 
 
 def test_the_lambda1_note_text_has_exactly_one_source():

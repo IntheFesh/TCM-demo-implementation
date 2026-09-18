@@ -74,6 +74,42 @@ REVISE_RULES: tuple[str, ...] = (
 )
 ALL_RULES: tuple[str, ...] = VETO_RULES + REVISE_RULES
 
+#: 规则名 / 结论名 → 中文名。**展示层只认中文名，id 只在数据层出现**
+#: （CLAUDE.md「标识符只有一种规范形式」的显示层版本）。
+#:
+#: 为什么这张表在后端而不在前端：规则清单本身在这里（`ALL_RULES`），
+#: 前端另建一张表就意味着以后加规则要改两处，而漏改那一处的表现是界面上
+#: 冒出一个英文 id——R37 的截图上「meridian_coverage缺归经」就是这么印出来的。
+#: 序列化时随每条违规一起下发（`to_dict` 的 `rule_label`），前端只负责显示。
+RULE_LABELS: dict[str, str] = {
+    "incompatible_pair": "配伍禁忌",
+    "dose_exceeds": "超量",
+    "herb_grounded": "药味有本体出处",
+    "meridian_coverage": "归经覆盖病位",
+    "nature_conflict": "寒热方向",
+    "effect_matches_method": "功效对得上治法",
+    "role_structure": "君臣佐使结构",
+}
+
+#: 四种结论的中文名。次序即严重性，见 `VerificationResult.status`。
+STATUS_LABELS: dict[str, str] = {
+    "vetoed": "拦截",
+    "revise_needed": "需重开",
+    "partially_verified": "部分验证",
+    "verified": "已验证",
+}
+
+
+def rule_label(rule: str) -> str:
+    """规则 id → 中文名。**查不到就回落到 id 本身**：显示一个陌生的英文名
+    比显示空白好（至少能搜到它是什么），但那说明这张表漏了一条，
+    `test_every_rule_has_a_chinese_label` 会先一步红。"""
+    return RULE_LABELS.get(rule, rule)
+
+
+def status_label(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
+
 Severity = Literal["veto", "revise"]
 
 #: 闭环最多重开几轮。**不是无限循环**：`llm_calls` 要可预测（manifest 里那个数
@@ -200,6 +236,7 @@ class VerificationResult:
     def to_dict(self) -> dict:
         return {
             "status": self.status,
+            "status_label": status_label(self.status),
             "passed": self.passed,
             "ontology_available": self.ontology_available,
             "checked_rules": list(self.checked_rules),
@@ -207,12 +244,14 @@ class VerificationResult:
             "n_revise": len(self.revisables),
             "n_unverifiable": len(self.unverifiable),
             "violations": [
-                {"rule": v.rule, "severity": v.severity, "herbs": list(v.herbs),
+                {"rule": v.rule, "rule_label": rule_label(v.rule),
+                 "severity": v.severity, "herbs": list(v.herbs),
                  "reason": v.reason, "counterexample": v.counterexample}
                 for v in self.violations
             ],
             "unverifiable": [
-                {"rule": u.rule, "herbs": list(u.herbs),
+                {"rule": u.rule, "rule_label": rule_label(u.rule),
+                 "herbs": list(u.herbs),
                  "missing_predicate": u.missing_predicate, "reason": u.reason}
                 for u in self.unverifiable
             ],

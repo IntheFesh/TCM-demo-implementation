@@ -535,7 +535,33 @@ TRUSTED_PROXY_HOPS=1 QUOTA_PER_IP_DAILY_CALLS=55 QUOTA_GLOBAL_DAILY_CALLS=2200 \
 | 7 | **两环图谱浏览器** | 收成正好两环（是枢纽 / 不是枢纽）。原来三档会出现三四个半径相近的环，而"在第几环"本来要一眼读出"离枢纽多远"。环的含义写在画布下方的图例里，不靠人猜 |
 | 8 | **顶栏折叠 + 建议层渲染 + token 面板** | 顶栏设置可折叠（**默认展开**）；R23 的建议按 severity 分三档颜色 + 没跑的规则如实列出；R21 的 token 面板（本次前缀各段 / 本次命中率 / 今日累计）挂在 manifest 旁边 |
 
-**验收**：`python -m scripts.screenshot_states` 20 种状态全过，其中 R24 四张
+### R37：structured 模式的结论是**一条九段的链**，不是"三列里只剩一列"
+
+R33 把五位医家融合成一份结论之后，`S3_MODE=structured` 下页面上就只有一列了。
+R37 把它改成一条链，段与段之间那条竖线就是 `S3Structured` 里的
+`from_organs` / `from_syndrome` / `from_method`（上一段的结论是下一段的输入）：
+
+```
+① 主诉与标准化症状  ② 证素  ③ 追问        ← S1 / S2
+④ 病变脏腑  ⑤ 证型  ⑥ 治法  ⑦ 方剂  ⑧ 药物组成  ⑨ 校验与出处   ← S3
+```
+
+- **两种形态互斥**：`S3_MODE=legacy` 仍然是三列集注（R38 的消融要用它当对照组），
+  structured 下三列**清空**而不是藏起来。判断走"这份响应有几条结论"这个事实，
+  不是"服务端默认哪种模式"这个可能回落的配置——一份多医家的响应永远不会被画成单链。
+- **点词看释义**：`GET /api/node_explain?node=...&name=...`，四节（是什么 / 出处原文 /
+  名医怎么用 / 注意），**零 LLM 调用**，全部来自已有的本草·方剂本体、证候表、
+  医案三元组。查不到就整块隐藏，不显示"暂无信息"的空壳。
+- **链顶写明"这是谁的结论"**，旁边那行「本次引到 N 位医家的医案」按
+  `physicians_cited` 照实数，不拿"五家"这个名字当数。
+
+**验收**：`python -m scripts.screenshot_states` **29** 种状态全过，其中 R37 八张
+（三种分辨率的单链、跑到一半的骨架、取消按钮、节点释义、单链图）。
+这一轮 Playwright 抓到四件 Python 测试全绿的事——包括**单链区因为两个隐藏开关
+叠在一起而从没显示过**（四张截图全空白、判据全绿）。四件都记在
+`data/SOURCES.md` 第 94~98 条。
+
+**验收（R24 当轮的数）**：`python -m scripts.screenshot_states` 当时 20 种状态全过，其中 R24 四张
 （`r24_epigraph` / `r24_select_open` / `r24_advice_panel` / `r24_rings`）。
 这一轮 Playwright 抓到两件纯函数测试全绿的事：对照带换成 SVG 之后旧判据还在查
 `.rx-seg`（结构没了），以及 token 面板嵌在折叠区里时 `innerText` 读回空串
@@ -549,6 +575,7 @@ TRUSTED_PROXY_HOPS=1 QUOTA_PER_IP_DAILY_CALLS=55 QUOTA_GLOBAL_DAILY_CALLS=2200 \
 一句静态的"请耐心等待"；系统要追问时页面上直接弹输入框，答完流继续往下走。
 结果出来后是六层生长图（症状→证素→病名·证型→方剂→药材，方剂/药材是
 compound 父子节点）+ 各位医家的结论对照 + 分歧度（医家数取自 `core/physicians.py` 注册表，现在是三位）。
+`S3_MODE=structured` 下结论区换成上面那条九段链（见「R37」一节），图仍然照画。
 
 **图谱浏览器页**——浏览持久知识图谱（`data/graph.json` 的国标结构层）。
 R16 起**首屏铺的是证素**（20 个 `../data/graph.json:graph.n_elements=20`），

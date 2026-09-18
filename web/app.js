@@ -31,7 +31,19 @@ const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640, 4: 730 };
 // 一起用，两处缺一处都解决不了 M5 报告标注的"药材纵向堆叠间距小"。
 const Y_MIN = 60, Y_MAX = 620;
 // 单味药材之间的目标纵向间距（逻辑单位，不是像素——最终经 cy.fit() 统一缩放）。
-const HERB_GAP = 26;
+//
+// **R37 从 26 提到 36，因为 26 那个数依赖的前提早就不成立了。** M7 定 26 时
+// 算的是"药材节点高约 23 个逻辑单位（字号 **11** + 上下 padding 6）"，
+// 而样式表里节点字号是 `NODE_FONT_SIZE = 13`（§3.2 规格 11 就写着 13）——
+// 按 13 算，节点高约 13×1.2 + 6×2 ≈ 27.6，比 26 还大。于是相邻两味药的包围盒
+// 一直**压着 1~2px**，只是此前没有任何判据去比它们两两的包围盒：
+// `rings` 那条两两比包围盒的判据是给图谱浏览器写的，问诊图这一侧从来没有。
+// R37 给单链图加上同一条判据，第一次跑就红了。
+//
+// 36 = 27.6（节点自身）+ 8 的余量，实测（`--only single_chain_graph` 的
+// 两两包围盒判据）不再重叠。**这个数跟节点字号绑着**：以后改
+// `--node-font-consult` 要回头看这里。
+const HERB_GAP = 36;
 
 let cy = null;
 
@@ -368,10 +380,22 @@ function buildEvidenceIndex(data) {
   }
 }
 
+// 置信度三档的中文名，**只有这一处**。
+// 它跟 `URGENCY_LABEL` 的键长得一样（high/medium/low），但回答的**不是同一个
+// 问题**——那张回答"这次要不要催病人马上就医"（导诊分级），这张回答"这条证素
+// 推得有多稳"（模型自评）。合并成一张，以后改一边会连带动另一边，而两边的
+// 阈值语义根本不同（CLAUDE.md 那条例外：不同问题就该是两张表，并写清区别）。
+//
+// 方剂来源那张（经典方/加减方/自拟方）在 graph.js：两张图都要用，而**依赖方向
+// 只能 app.js → graph.js**（R13/R14 断开的那个循环），所以共用的东西放那边。
+const CONFIDENCE_LABEL = { high: "高", medium: "中", low: "低" };
+
+function confidenceLabel(v) { return CONFIDENCE_LABEL[v] || v || ""; }
+
 function evidenceSectionHtml(s) {
   const rows = [];
-  if (s.element_kind) rows.push(`<div class="meta">${s.element_kind}　置信度 ${s.confidence}</div>`);
-  if (s.explained_by) rows.push(`<div class="meta">由证素「${escapeHtml(s.explained_by)}」解释　置信度 ${s.confidence}</div>`);
+  if (s.element_kind) rows.push(`<div class="meta">${s.element_kind}　置信度 ${escapeHtml(confidenceLabel(s.confidence))}</div>`);
+  if (s.explained_by) rows.push(`<div class="meta">由证素「${escapeHtml(s.explained_by)}」解释　置信度 ${escapeHtml(confidenceLabel(s.confidence))}</div>`);
   if (s.supporting && s.supporting.length) {
     rows.push(`<div class="label">支撑症状</div><div>${escapeHtml(s.supporting.join("、"))}</div>`);
   }
@@ -382,11 +406,11 @@ function evidenceSectionHtml(s) {
   // formula:: 节点的 payload 才会带 source 字段，症状/证素/证型的 payload
   // 里没有这个键，条件判断天然把两类节点分开，不用额外传节点类型标记。
   if (s.source) {
-    const srcLabel = { classic: "经典方", modified: "加减方", composed: "自拟方" }[s.source] || s.source;
+    const srcLabel = formulaSourceLabel(s.source);
     const metaParts = [
       escapeHtml(srcLabel),
       s.base_formula ? "原方：" + escapeHtml(s.base_formula) : "",
-      "置信度 " + escapeHtml(s.confidence || ""),
+      "置信度 " + escapeHtml(confidenceLabel(s.confidence)),
       s.selected ? "★已选" : "",
     ].filter(Boolean);
     rows.push(`<div class="meta">${metaParts.join("　")}</div>`);
@@ -674,6 +698,10 @@ async function initDemoModeBanner() {
     EXAMPLE_COMPLAINTS = health.example_complaints || [];
     renderExamples(EXAMPLE_COMPLAINTS);
     renderConsultLambda1Note(health.lambda1_note);
+    // R37：这台服务的 S3 形状。**在点「辨证」之前就要到位**——它决定骨架是
+    // 单链九段还是三列集注。拿不到（老服务、/health 失败）时保持 null，
+    // isSingleChain() 会回落到 legacy 三列，跟 R36 及以前的行为一致。
+    SERVER_S3_MODE = health.s3_mode || null;
     renderOfflineBanner(true);
   } catch (e) {
     // 网络不通时 fetch 会抛。身份色有 CSS 兜底、示例主诉不显示——都不致命，
@@ -1491,7 +1519,7 @@ function rxCompareHtml(divergence, results) {
   const parts = [`<span class="rx-group"><span class="rx-tag">共用 ${shared.length}</span>${dotsHtml(shared.length, "dot-shared")}</span>`];
   for (const pid of order) {
     const own = unique[pid] || [];
-    const name = PHYSICIAN_NAMES[pid] || pid;
+    const name = physicianName(pid);
     parts.push(`<span class="rx-group" data-physician="${escapeHtml(pid)}">`
       + `<span class="rx-tag">${escapeHtml(name)}独有 ${own.length}</span>`
       + dotsHtml(own.length, "dot-own", `var(--phys-${pid}, var(--ink))`)
@@ -1533,6 +1561,20 @@ function renderRxCompare(divergence, results) {
 // Playwright 实测就是这么发现的：running/insufficient/followup 三个状态的
 // 「不是三列，是 5」。纯函数测试测不出来——它们要么不调这个函数，要么自己喂
 // 一份三人的 PHYSICIAN_META。
+// 展示层只认中文名，id 只在数据层出现（CLAUDE.md「标识符只有一种规范形式」）。
+// **一处解析**：先看这次问诊的结果（`physician_name`），再回落到 /health 那份
+// 注册表，最后才是 id 本身。为什么必须有第二级：`renderConsultResult()` 每次
+// 都把 `PHYSICIAN_NAMES` 清空重填，而 structured 模式下 `results` 只有
+// 「五家综合」一条——§⑧ 的用药归属和 §⑨ 的「引到的医家」要显示叶天士、李可，
+// 只查那份映射就会把 `ye_tianshi` 这个 id 直接印到界面上（R37 实测截图上
+// 就是这么印的）。这是 SOURCES.md 第 31 条那件事的显示层版本。
+function physicianName(pid) {
+  if (!pid) return "";
+  return PHYSICIAN_NAMES[pid]
+    || (PHYSICIAN_META[pid] && PHYSICIAN_META[pid].name)
+    || pid;
+}
+
 function physicianOrder() {
   return Object.keys(PHYSICIAN_META).filter((pid) => !REFERENCE_PHYSICIANS.includes(pid));
 }
@@ -1556,7 +1598,7 @@ function columnStepsHtml(reached) {
 
 function columnRunningHtml(physician, reached) {
   const meta = PHYSICIAN_META[physician] || {};
-  return columnShellHtml(physician, meta.name || PHYSICIAN_NAMES[physician] || physician,
+  return columnShellHtml(physician, meta.name || physicianName(physician),
                          meta, "running", columnStepsHtml(reached));
 }
 
@@ -1593,6 +1635,345 @@ function clearColumns() {
   const el = document.getElementById("columns");
   if (el) el.innerHTML = "";
 }
+
+// ---------- R37：单链问诊流程（九段） ----------
+//
+// **结构化模式只有一份结论，三列等宽的版面在这里没有意义**（空着两列比摆一列
+// 更像"坏了"）。九段是一条链，纵向排、段号显式——链条这件事在 schema 层就是
+// 真的（`from_organs` / `from_syndrome` / `from_method` 逐字校验，见
+// core/schemas.py::_S3StructuredBase），界面只是把它显示出来。
+//
+// 九段的顺序 = 申报书 2.1 的五步链 + 它前面的三步（主诉/证素/追问）
+// + 后面的一步（校验与出处）。**不许重排**：顺序本身是"先说依据、再说结论"。
+const CHAIN_SECTIONS = [
+  { key: "complaint", no: "①", title: "主诉与标准化症状", step: "s1" },
+  { key: "elements", no: "②", title: "证素", step: "s2" },
+  { key: "followup", no: "③", title: "追问", step: "s2" },
+  { key: "organs", no: "④", title: "病变脏腑", step: "s3" },
+  { key: "syndrome", no: "⑤", title: "证型", step: "s3" },
+  { key: "method", no: "⑥", title: "治法", step: "s3" },
+  { key: "formula", no: "⑦", title: "方剂", step: "s3" },
+  { key: "herbs", no: "⑧", title: "药物组成", step: "s3" },
+  { key: "checks", no: "⑨", title: "校验与出处", step: "s3" },
+];
+
+// 这台服务的 S3 形状。**问诊开始之前就要知道**（/health 下发），
+// 否则跑的那几十秒里只能先摆一个可能是错的骨架、再当场换掉。
+// 一次问诊结束后以 manifest.s3_mode 为准（那份记的是真的跑了哪一条）。
+let SERVER_S3_MODE = null;
+
+function isSingleChain(manifest) {
+  if (manifest && manifest.s3_mode) return manifest.s3_mode === "structured";
+  return SERVER_S3_MODE === "structured";
+}
+
+// 这一份**响应**该不该画成单链。跟 `isSingleChain()` 分开是因为两者回答的不是
+// 同一个问题：那个回答"这台服务/这次问诊跑的是哪条链"（模式），这个回答"眼前这
+// 份数据能不能按一条链画"（形状）。`renderChainFlow()` 只读 `results[0]`，所以
+// 一份多医家的响应走进单链分支 = 另外几位医家的结论被静默丢掉——而模式在
+// manifest 缺 `s3_mode` 时（回放的老响应、fixture）是**回落猜的**，结论条数是
+// 事实。事实优先于猜测。
+function isSingleChainResult(data) {
+  if (((data || {}).results || []).length > 1) return false;
+  return isSingleChain((data || {}).manifest);
+}
+
+// 「某位医家影响了哪一步」里那个 step 的中文名。**复用九段自己的段名**，
+// 不另建一张表——影响的就是这几段，页面上两处出现同一个概念时必须同名
+// （`PhysicianInfluence.step` 的枚举是 organ/syndrome/method/formula/herbs，
+// 而段的 key 是 `organs`——schema 用单数，这一处是唯一要照顾的差别）。
+function influenceStepLabel(step) {
+  const key = step === "organ" ? "organs" : step;
+  const sec = CHAIN_SECTIONS.find((x) => x.key === key);
+  return sec ? sec.title : (step || "");
+}
+
+function chainLine(key, value) {
+  if (value === null || value === undefined || value === "") return "";
+  return `<div class="chain-line"><span class="chain-key">${escapeHtml(key)}</span>${value}</div>`;
+}
+
+// 可点开释义的词。`data-node` 是节点 id、`data-name` 是显示名——
+// 证型节点的 id 是 `syn::{physician}`（那个 id 是证据链反查的键，改不得），
+// 名字只在 label 里，所以两个都带上（见 core/node_explain.explain_node 的文档）。
+function explainable(nodeId, text, name) {
+  return `<span class="explainable" data-node="${escapeHtml(nodeId)}"`
+    + ` data-name="${escapeHtml(name || text)}" role="button" tabindex="0">`
+    + `${escapeHtml(text)}</span>`;
+}
+
+function chainSectionHtml(sec, state, body) {
+  return `<section class="chain-sec" data-key="${sec.key}" data-state="${state}">
+    <h3><span class="chain-no">${sec.no}</span>${escapeHtml(sec.title)}</h3>
+    <div class="chain-body">${body || ""}</div>
+  </section>`;
+}
+
+// 跑到哪一步了 → 九段各自的状态。step 的取值跟 COLUMN_STEPS 同一套
+// （s1/s2/s3），**复用那套而不是另编一套**：两套的话进度会各走各的。
+function chainStateFor(sec, reached) {
+  const order = COLUMN_STEPS.map((x) => x.key);
+  const at = order.indexOf(reached);
+  const mine = order.indexOf(sec.step);
+  if (mine < at) return "done";
+  if (mine === at) return "active";
+  return "todo";
+}
+
+function renderChainSkeleton(reached) {
+  const el = document.getElementById("chain-flow");
+  if (!el) return;
+  el.innerHTML = CHAIN_SECTIONS.map((sec) => chainSectionHtml(
+    sec, chainStateFor(sec, reached),
+    chainStateFor(sec, reached) === "todo" ? "" : "<span class=\"chain-key\">推理中…</span>",
+  )).join("");
+  showChainFlow();
+}
+
+function showChainFlow() {
+  const flow = document.getElementById("chain-flow");
+  const cols = document.getElementById("columns");
+  if (flow) flow.classList.add("show");
+  // **三列不是藏起来，是清空**：留在 DOM 里的话"这次跑的是哪一条"看不出来，
+  // 而且上一次 legacy 的三列会被滚出来（同 showSafetyBlock 那条理由）。
+  if (cols) cols.innerHTML = "";
+}
+
+function hideChainFlow() {
+  const flow = document.getElementById("chain-flow");
+  if (flow) { flow.classList.remove("show"); flow.innerHTML = ""; }
+  closeNodeExplain();
+}
+
+function chainHerbRow(choice, pid) {
+  const item = (choice && choice.item) || {};
+  const nodeId = `herb::${pid}::x::${item.name || ""}`;
+  const dose = item.dose ? `${item.dose}${item.dose_unit || "g"}` : "";
+  const bits = [
+    explainable(nodeId, stripDose(item.name || ""), stripDose(item.name || "")),
+    item.role ? `<span class="chain-key">${escapeHtml(item.role)}</span>` : "",
+    dose ? escapeHtml(dose) : "",
+    choice.for_element ? `→ ${escapeHtml(choice.for_element)}` : "",
+    choice.effect_cited ? `（${escapeHtml(choice.effect_cited)}）` : "",
+    choice.physician_source
+      ? `【${escapeHtml(physicianName(choice.physician_source))}】` : "",
+  ].filter(Boolean);
+  return `<div class="chain-line">${bits.join(" ")}</div>`;
+}
+
+function stripDose(name) {
+  // 药名剥剂量：跟后端 label 的做法对齐（id 保原样、label 剥）。
+  return String(name || "").replace(/[（(][^）)]*[）)]/g, "").replace(/\d+(\.\d+)?\s*[gG克钱两]/g, "").trim();
+}
+
+// 九段的填充。**每一段的数据来源写在对应分支的注释里**——一段填不出来时
+// 显示的是"这一步没有产出"而不是空白（空白看起来像坏了）。
+function renderChainFlow(data) {
+  const el = document.getElementById("chain-flow");
+  if (!el) return;
+  const r = (data.results || [])[0] || {};
+  const st = r.s3_structured || null;
+  const s3 = r.s3 || {};
+  const pid = r.physician || "synthesis";
+  const s1 = data.s1 || {};
+  const s2 = data.s2 || {};
+  const parts = [];
+
+  // **这条链是谁的**：三列有列头，单链没有——名字要是不写在链顶上，页面上就只有
+  // §⑨ 的归因里能翻出来。而"五家综合"和"叶天士一家"是两种完全不同的结论
+  // （structured 给的是综合，legacy 单跑一家给的是那一家），读的人必须一眼看见
+  // 自己在看哪一种。引到几位医家的医案照实数（`physicians_cited`），
+  // 不拿"五家"这个名字当数——名字是配置，数是这次真跑出来的。
+  const cited = new Set([...(r.physicians_cited || []),
+                         ...(r.physician_influences || []).map((x) => x.physician)]);
+  parts.push(`<header class="chain-head">`
+    + `<span class="chain-who">${escapeHtml(r.physician_name || pid)}</span>`
+    + (r.school ? `<span class="chain-school">${escapeHtml(r.school)}</span>` : "")
+    + (cited.size
+        ? `<span class="chain-note">本次引到 ${cited.size} 位医家的医案</span>` : "")
+    + `</header>`);
+
+  for (const sec of CHAIN_SECTIONS) {
+    let body = "";
+    if (sec.key === "complaint") {
+      body = chainLine("主诉", escapeHtml(LAST_COMPLAINT || ""))
+        + chainLine("症状", (s1.symptoms || []).map((x) =>
+            explainable(`sym::${x}`, x)).join("、"))
+        + chainLine("舌", escapeHtml(s1.tongue || "未记"))
+        + chainLine("脉", escapeHtml(s1.pulse || "未记"))
+        + ((s1.unmapped || []).length
+            ? chainLine("未归类表述", escapeHtml((s1.unmapped || []).join("、"))) : "");
+    } else if (sec.key === "elements") {
+      const hits = (s2.elements || []).map((h) =>
+        `${explainable(`elem::${h.element}`, h.element)}`
+        + `<span class="chain-key">${escapeHtml(h.kind === "location" ? "病位" : "病性")}</span>`
+        + `${escapeHtml(confidenceLabel(h.confidence))}`
+        + `（依据：${escapeHtml((h.supporting_symptoms || []).join("、"))}）`);
+      body = hits.length ? hits.map((x) => `<div class="chain-line">${x}</div>`).join("")
+                         : chainLine("证素", "（这一步没有推出证素）");
+      if ((s2.unexplained_symptoms || []).length) {
+        body += chainLine("未被解释的症状",
+          escapeHtml((s2.unexplained_symptoms || []).join("、")));
+      }
+    } else if (sec.key === "followup") {
+      const f = data.followup;
+      body = f
+        ? chainLine("轮数", `${escapeHtml(String(f.rounds))}`
+            + `（${escapeHtml(f.stopped_by_label || f.stopped_by || "")}）`)
+          + ((f.asserted || []).length ? chainLine("问出的症状",
+              escapeHtml((f.asserted || []).join("、"))) : "")
+          + ((f.denied || []).length ? chainLine("已排除",
+              escapeHtml((f.denied || []).join("、"))) : "")
+        : chainLine("追问", "（这一次没有追问：没有提问渠道或 FAST_MODE）");
+    } else if (sec.key === "organs") {
+      body = st && (st.organs || []).length
+        ? (st.organs || []).map((o) => `<div class="chain-line">`
+            + `${explainable(`elem::${o.organ}`, o.organ)} `
+            + `${escapeHtml(o.pathogenesis || "")}`
+            + `（依据：${escapeHtml((o.supporting_symptoms || []).join("、"))}）</div>`).join("")
+        : chainLine("病变脏腑", "（legacy 模式不产出这一步，见第⑤段的证型推理）");
+    } else if (sec.key === "syndrome") {
+      const name = st ? st.syndrome.name : s3.syndrome;
+      const disease = st ? st.syndrome.disease : s3.disease;
+      body = chainLine("证型", explainable(`syn::${pid}`,
+                disease ? `${disease} · ${name}` : (name || ""), name || ""))
+        + (st ? chainLine("从哪些脏腑推出",
+              escapeHtml((st.syndrome.from_organs || []).join("、"))) : "")
+        + chainLine("推理", escapeHtml((st ? st.syndrome.reasoning : s3.reasoning) || ""))
+        + (st && st.syndrome.reasoning_plain
+            ? chainLine("白话", escapeHtml(st.syndrome.reasoning_plain)) : "");
+    } else if (sec.key === "method") {
+      body = chainLine("治法", escapeHtml((st ? st.method.principle : s3.treatment_principle) || ""))
+        + (st ? chainLine("接住的证型", escapeHtml(st.method.from_syndrome || "")) : "")
+        + (st ? chainLine("针对", escapeHtml((st.method.targets || []).join("、"))) : "");
+    } else if (sec.key === "formula") {
+      const cand = st ? st.formula.candidate
+                      : ((s3.formula_candidates || [])[s3.selected || 0] || {});
+      body = chainLine("方剂", explainable(`formula::${pid}::${cand.name || ""}`, cand.name || ""))
+        + (st ? chainLine("接住的治法", escapeHtml(st.formula.from_method || "")) : "")
+        + chainLine("来源", escapeHtml(formulaSourceLabel(cand.source)))
+        + chainLine("理由", escapeHtml(cand.rationale || ""))
+        + (st && (st.formula.ontology_refs || []).length
+            ? chainLine("本体出处", (st.formula.ontology_refs || []).map((x) =>
+                escapeHtml(`${x.predicate}：${x.span}`)).join("；")) : "");
+    } else if (sec.key === "herbs") {
+      const choices = st ? (st.herb_choices || []) : [];
+      if (choices.length) {
+        body = choices.map((c) => chainHerbRow(c, pid)).join("");
+      } else {
+        const cand = (s3.formula_candidates || [])[s3.selected || 0] || {};
+        body = (cand.herb_items || []).map((it) =>
+          chainHerbRow({ item: it }, pid)).join("")
+          || chainLine("药物组成", "（这一步没有产出）");
+      }
+    } else if (sec.key === "checks") {
+      const v = r.verification || null;
+      const m = r.verifier_metrics || null;
+      body = v
+        // 中文名由后端随结论一起下发（`core/formula_verifier.RULE_LABELS`），
+        // 前端只负责显示、并在拿不到时回落到 id——不在这里再建一张表。
+        ? chainLine("符号验证", escapeHtml(v.status_label || v.status || ""))
+          + chainLine("违规", `veto ${escapeHtml(String(v.n_veto || 0))}`
+              + ` / revise ${escapeHtml(String(v.n_revise || 0))}`)
+          // **判不了的那几条要显示出来**：查不到依据 ≠ 查到了且通过（R34a）。
+          + chainLine("判不了", escapeHtml(String(v.n_unverifiable || 0))
+              + ((v.unverifiable || []).length
+                  ? `（${(v.unverifiable || []).map((u) =>
+                      escapeHtml(`${u.rule_label || u.rule}缺${u.missing_predicate}`))
+                      .join("；")}）` : ""))
+        : chainLine("符号验证", "（legacy 模式不跑符号验证器）");
+      if (m && m.revise_rounds !== undefined) {
+        body += chainLine("重开轮数", escapeHtml(String(m.revise_rounds)));
+      }
+      if (r.herbs_grounded_ratio !== null && r.herbs_grounded_ratio !== undefined) {
+        // 这个数必须带口径：分母是**这一方的药味数**，不是本体总药味
+        // （R34b 那两个分母）。少了这句话它会被当成"本体覆盖率"。
+        body += chainLine("带本体出处的药味占比",
+          `${Math.round(r.herbs_grounded_ratio * 100)}%`
+          + `<span class="chain-key">分母＝本方药味数</span>`);
+      }
+      if ((r.physicians_cited || []).length) {
+        body += chainLine("引到的医家", (r.physicians_cited || []).map((x) =>
+          escapeHtml(physicianName(x))).join("、"));
+      }
+      for (const inf of (r.physician_influences || [])) {
+        body += chainLine(`${physicianName(inf.physician)}·${influenceStepLabel(inf.step)}`,
+          `${escapeHtml(inf.contribution || "")}`
+          + `（医案 ${escapeHtml((inf.cited_case_ids || []).join("、"))}）`);
+      }
+      if ((r.hallucinated || []).length) {
+        body += chainLine("⚠ 编造的医案号", escapeHtml((r.hallucinated || []).join("、")));
+      }
+    }
+    parts.push(chainSectionHtml(sec, "done", body));
+  }
+  el.innerHTML = parts.join("");
+  showChainFlow();
+}
+
+// ---------- R37：节点释义面板（零 LLM，四节，取不到就整块隐藏） ----------
+
+let NODE_EXPLAIN_SEQ = 0;
+
+async function openNodeExplain(nodeId, name) {
+  const el = document.getElementById("node-explain");
+  if (!el) return;
+  const seq = ++NODE_EXPLAIN_SEQ;
+  try {
+    const qs = `node=${encodeURIComponent(nodeId)}`
+      + (name ? `&name=${encodeURIComponent(name)}` : "");
+    const resp = await fetch(`/api/node_explain?${qs}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    // **过期响应不渲染**：连点两个节点时先回来的那个不该覆盖后点的那个。
+    if (seq !== NODE_EXPLAIN_SEQ) return;
+    if (!data.available) { closeNodeExplain(); return; }
+    renderNodeExplain(data);
+  } catch (err) {
+    // 释义取不到不该弹红条打断问诊——它是附加信息。整块隐藏即可。
+    if (seq === NODE_EXPLAIN_SEQ) closeNodeExplain();
+  }
+}
+
+function renderNodeExplain(data) {
+  const el = document.getElementById("node-explain");
+  if (!el) return;
+  const secs = (data.sections || []).map((s) => `<div class="ne-sec">
+      <div class="ne-head">${escapeHtml(s.heading)}</div>
+      ${(s.lines || []).map((ln) => `<div class="ne-line">${escapeHtml(ln)}</div>`).join("")}
+      ${s.source ? `<div class="ne-src">出处：${escapeHtml(s.source)}</div>` : ""}
+    </div>`).join("");
+  el.innerHTML = `<div><span class="ne-close" data-ne-close="1">×</span>
+      <span class="ne-title">${escapeHtml(data.title || "")}</span>
+      <span class="ne-kind">${escapeHtml(NODE_KIND_LABEL[data.kind] || data.kind || "")}</span>
+    </div>${secs}`;
+  el.classList.add("show");
+}
+
+const NODE_KIND_LABEL = {
+  symptom: "症状", element: "证素", syndrome: "证型",
+  formula: "方剂", herb: "药材", case: "医案",
+};
+
+function closeNodeExplain() {
+  const el = document.getElementById("node-explain");
+  if (el) { el.classList.remove("show"); el.innerHTML = ""; }
+}
+
+// 事件委托挂在 document 上一次，不给每个 .explainable 各挂一个——
+// 九段每次重渲染都会换掉所有节点，逐个挂等于每次泄一批监听器
+// （同 #columns 那处 delegation 的理由）。
+document.addEventListener("click", (e) => {
+  const closer = e.target.closest("[data-ne-close]");
+  if (closer) { closeNodeExplain(); return; }
+  const hit = e.target.closest(".explainable");
+  if (hit) openNodeExplain(hit.dataset.node, hit.dataset.name);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const hit = e.target.closest && e.target.closest(".explainable");
+  if (hit) { e.preventDefault(); openNodeExplain(hit.dataset.node, hit.dataset.name); }
+});
 
 function renderColumnsPlaceholder(builder) {
   const el = document.getElementById("columns");
@@ -1904,7 +2285,7 @@ function referenceCaseHtml(c) {
 
 function referenceBlockHtml(pid, data) {
   const meta = (data && data.physician) || {};
-  const name = meta.name || PHYSICIAN_NAMES[pid] || pid;
+  const name = meta.name || physicianName(pid);
   // 身份色走 CSS 变量，不把 /api 返回的色值直接写进 style——变量由
   // injectPhysicianColors 从同一份注册表注入，两条路会漂。
   const head = `<div class="ref-head" style="border-left-color: var(--phys-${pid})">`
@@ -2075,6 +2456,7 @@ function buildConsultRequestBody(complaint) {
 function renderConsultResult(data) {
   resetSecondaryPanels();
   hidePatientView();
+  hideChainFlow();
   if (data.rejected) {
     // 安全拦截：**整页替换**（§3.1）。不是在三列上面加个红横幅——总纲的原话是
     // "什么都标红会训练用户忽略标红"，这个系统只在真危重时打断，所以打断必须
@@ -2163,9 +2545,16 @@ function renderConsultResult(data) {
   // 前端再把裁剪过的空壳摆出来只会让人以为"这次没开出方"。
   if (getSelectedRole() === "patient") {
     document.getElementById("columns").innerHTML = "";
+    hideChainFlow();
     renderPatientView(data);
+  } else if (isSingleChainResult(data)) {
+    // R37：结构化模式 = 单链九段。**patient 角色仍然走患者视图**（那是另一种
+    // 形态，不是这条链的裁剪版），所以这个分支在它后面。
+    hidePatientView();
+    renderChainFlow(data);
   } else {
     hidePatientView();
+    hideChainFlow();
     renderColumns(data.results, getSelectedRole());
   }
   // R18-I：参考医家那一栏不等三列、也不阻塞后面的渲染——它自己 fetch，
@@ -2194,14 +2583,20 @@ function clearProgress() {
 // ---------- R36：S3 流式增量 ----------
 //
 // 服务端已经把增量合并过了（core/chain.py 的 S3DeltaEmitter，80 字或 120ms 一帧），
-// 所以这里**不需要再攒一层**；要做的是限制重排频率：每帧都写 DOM 的话，一次 S3
-// 几十帧 × 每帧一次 layout 仍然会让长列表卡顿。用 requestAnimationFrame 合并到
-// 一帧一次渲染（≈16ms），这是浏览器这一侧的节流点。
-const s3Stream = { text: new Map(), pending: false, order: [] };
+// 所以这里**不需要再攒一层**；要做的是限制重排频率。
+//
+// **R37 把节流从 requestAnimationFrame（≈16ms）改成 ≥50ms 的时间闸。** rAF 的
+// 节奏跟屏幕刷新率绑，60Hz 下是 16ms、120Hz 的屏上是 8ms——这个区域的内容是
+// 模型吐的 JSON，人眼在 50ms 和 8ms 之间分辨不出差别，而每次重排都要把这一大段
+// 文本重新排版。50ms（20 次/秒）是"看起来连续"的下限，再快只是白烧 CPU；
+// 而 1280×800 的投影仪那台机器上，白烧的那部分会让整页跟着掉帧。
+const S3_STREAM_RENDER_MS = 50;
+const s3Stream = { text: new Map(), pending: false, order: [], lastRender: 0 };
 
 function clearS3Stream() {
   s3Stream.text.clear();
   s3Stream.order.length = 0;
+  s3Stream.lastRender = 0;
   const box = document.getElementById("s3-stream");
   if (box) { box.textContent = ""; box.classList.remove("show"); }
 }
@@ -2217,11 +2612,15 @@ function onS3Delta(data) {
   s3Stream.text.set(key, s3Stream.text.get(key) + (data.text || ""));
   if (s3Stream.pending) return;
   s3Stream.pending = true;
-  requestAnimationFrame(renderS3Stream);
+  const since = Date.now() - (s3Stream.lastRender || 0);
+  // 距上次渲染够久就立刻画（第一帧不该等 50ms），否则排到 50ms 边界上。
+  const wait = since >= S3_STREAM_RENDER_MS ? 0 : S3_STREAM_RENDER_MS - since;
+  setTimeout(renderS3Stream, wait);
 }
 
 function renderS3Stream() {
   s3Stream.pending = false;
+  s3Stream.lastRender = Date.now();
   const box = document.getElementById("s3-stream");
   if (!box) return;
   box.classList.add("show");
@@ -2351,7 +2750,8 @@ function describeProgressEvent(name, data) {
     case "followup_done":
       if (data.stopped_by === "no_answer") return "③ 追问：无提问渠道，跳过";
       if (data.stopped_by === "fast_mode") return "③ 追问：FAST_MODE 已跳过";
-      return `③ 追问结束（${data.rounds} 轮，${data.stopped_by}）`;
+      return `③ 追问结束（${data.rounds} 轮，`
+        + `${data.stopped_by_label || data.stopped_by}）`;
     case "residual_done":
       return `④ 残差辨证：补充解释「${(data.newly_explained || []).join("、") || "无"}」`;
     case "physician_start":
@@ -2458,7 +2858,14 @@ async function submitConsult() {
   renderComplaintBody(complaint);
   setConsultState("running");
   resetColumnProgress();
-  renderColumnsPlaceholder((pid) => columnRunningHtml(pid, "s1"));
+  if (isSingleChain(null)) {
+    // R37：structured 下**问诊一开始就摆九段骨架**。/health 已经告诉了前端
+    // 这台服务的形状，所以不必先摆三列再当场换掉——那一下闪烁正是"界面在猜"。
+    renderChainSkeleton("s1");
+  } else {
+    hideChainFlow();
+    renderColumnsPlaceholder((pid) => columnRunningHtml(pid, "s1"));
+  }
   currentStreamId = null;
 
   currentAbort = new AbortController();
@@ -2525,7 +2932,10 @@ async function submitConsult() {
         // R12 之后三位医家是并发跑的，叶天士的 done 完全可能排在张锡纯的
         // start 后面（docs/DESIGN.md §4.7 的订正）。
         const step = columnStepForEvent(name, data);
-        if (step) setColumnStep(step.physician, step.step);
+        if (step) {
+          if (isSingleChain(null)) renderChainSkeleton(step.step);
+          else setColumnStep(step.physician, step.step);
+        }
         if (name === "followup_answered") hideNeedInput();
       }
     });

@@ -18,6 +18,16 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// 方剂来源三种的中文名。**展示层只认中文名，id 只在数据层**——放在这一层是
+// 因为图谱 tooltip 和问诊页的九段都要用，而依赖方向只能 app.js → graph.js
+// （见上面那段），共用的东西必须落在被依赖的一侧。
+const FORMULA_SOURCE_LABEL = { classic: "经典方", modified: "加减方", composed: "自拟方" };
+
+function formulaSourceLabel(v) {
+  // 认不出的值原样回落：显示一个陌生词好过显示空白（至少能搜）。
+  return FORMULA_SOURCE_LABEL[v] || v || "";
+}
+
 function escapeHtml(str) {
   // 引号也转：这个函数的输出偶尔会被放进属性值里（title="..."），只转尖括号
   // 的话一个带引号的医案 id 就能从属性里逃出来。
@@ -320,7 +330,44 @@ function graphPalette() {
 const NODE_FONT_SIZE = 13;
 const ELEMENT_FONT_SIZE = 15;
 
-function buildStylesheet({ physicianColors = null } = {}) {
+// R37：**两张图的 label 宽度分开定**（`slot` = "consult" | "browser"）。
+//
+// 为什么必须分开：两张图对同一个数字的诉求相反。问诊图一屏只有一条链、
+// label 越完整越好（`病名 · 证型` 拼起来能有十几个字）；图谱浏览器一屏要摆
+// 十几二十个证型节点，label 一宽就摆不下——R28 正是因为 label 变成两行、
+// 最宽 124px，才把一次展开的上限从 20 砍到 14（见 GB_EXPAND_CAP 的注释）。
+// 一个写死的 90px 同时服务两张图，等于让其中一张永远将就另一张。
+//
+// **但它管不住中文名字的宽度**：`text-wrap: wrap` 只在空白/换行处断行，
+// 「疫毒炽盛（急黄）证」里没有断行机会，这个上限对它无效（R37 实测：收到
+// 84px 之后最宽标签仍是 125px）。它真正收窄的是重名时补的 `（病名 编码）`
+// 那一行——那行里有空格。**不要拿这个令牌当"标签变窄了"的依据**去放宽
+// 一次展开的上限，R37 就是这么错过一次的（见 GB_EXPAND_CAP）。
+//
+// 值从 CSS 令牌取（`--label-max-consult` / `--label-max-browser`），取不到时
+// 回落到 R28 之前那个 90px——**回落值写在这里而不是分散在调用点**。
+const LABEL_MAX_FALLBACK = "90px";
+
+function labelMaxFor(slot) {
+  return cssVar(slot === "browser" ? "--label-max-browser" : "--label-max-consult")
+    || LABEL_MAX_FALLBACK;
+}
+
+// 字号同理绑到槽位：投影仪上（1280×800）问诊图的字要大一点才看得清，
+// 而浏览器那张图节点多、字大了就压字。R37 起两张图各取自己那一档。
+function nodeFontFor(slot) {
+  const v = cssVar(slot === "browser" ? "--node-font-browser" : "--node-font-consult");
+  const n = Number.parseFloat(v || "");
+  return Number.isFinite(n) && n > 0 ? n : NODE_FONT_SIZE;
+}
+
+function elementFontFor(slot) {
+  const v = cssVar(slot === "browser" ? "--element-font-browser" : "--element-font-consult");
+  const n = Number.parseFloat(v || "");
+  return Number.isFinite(n) && n > 0 ? n : ELEMENT_FONT_SIZE;
+}
+
+function buildStylesheet({ physicianColors = null, slot = "consult" } = {}) {
   const pal = graphPalette();
   const style = [
     {
@@ -333,7 +380,7 @@ function buildStylesheet({ physicianColors = null } = {}) {
         label: "data(label)",
         "text-valign": "center",
         "text-halign": "center",
-        "font-size": NODE_FONT_SIZE,
+        "font-size": nodeFontFor(slot),
         "font-family": cssVar("--font-ui"),
         color: pal.symptom.text,
         "background-color": pal.symptom.bg,
@@ -343,7 +390,7 @@ function buildStylesheet({ physicianColors = null } = {}) {
         width: "label",
         height: "label",
         "text-wrap": "wrap",
-        "text-max-width": "90px",
+        "text-max-width": labelMaxFor(slot),
       }),
     },
     // 按 node_type 分色。**两张图读的是同一组规则**——问诊图的 layer 1 和
@@ -353,7 +400,7 @@ function buildStylesheet({ physicianColors = null } = {}) {
       style: pick({
         "background-color": pal.element.bg, "border-color": pal.element.border,
         color: pal.element.text,
-        "font-size": ELEMENT_FONT_SIZE,
+        "font-size": elementFontFor(slot),
         "font-family": cssVar("--font-classic"),
         "font-weight": 600,
       }),
@@ -520,7 +567,7 @@ function describeNodeTooltip(data) {
       return `<b>证型</b>　${escapeHtml(data.label)}<div class="tt-meta">${escapeHtml(physName)}</div>`;
     case 3: {
       // M5：层 3 从"用药"改成"方剂"，用药下沉到层 4。
-      const srcLabel = { classic: "经典方", modified: "加减方", composed: "自拟方" }[data.source] || data.source || "";
+      const srcLabel = formulaSourceLabel(data.source);
       const flags = [];
       if (data.selected) flags.push("★已选");
       if (data.safety_blocking) flags.push("⚠ 安全拦截");
@@ -764,8 +811,9 @@ function ensureGraphBrowserCanvas() {
   gbCy = cytoscape({
     container: document.getElementById("gb-cy"),
     elements: [],
-    // 跟问诊图同一份样式表，只是不传 physicianColors（见 buildStylesheet 的注释）
-    style: buildStylesheet(),
+    // 跟问诊图同一份样式表，只是不传 physicianColors、并且槽位是 browser
+    // （label 宽度与字号按槽位取，见 labelMaxFor 的注释）
+    style: buildStylesheet({ slot: "browser" }),
     // per-consult 图（cy）用 preset 布局：症状/证素/病名证型/方剂/药材天然分层
     // （药材是方剂的 compound 子节点），坐标是 computeLayout() 算好摆的。
     // 这张图没有那种天然分层——点开才逐步长大，
@@ -995,6 +1043,15 @@ const GB_TYPE_LABEL = { element: "证素", syndrome: "证型", symptom: "症状"
 // 见 api/main.py 的 _symptom_counts_by_syndrome_code）。同分按 id 排，
 // 保证"同一次点击两次结果一样"——按加载顺序取前 20 看起来也有理由，
 // 其实取决于 networkx 的遍历顺序，那不是理由。
+//   R37：**试过回到 20，量出来不行，退回 14。** 理由不是"看着挤"：
+//        1) `--label-max-browser: 84px` 收不住中文名字（`text-wrap` 只在空白
+//           处断行），实测最宽标签仍然是 125px——"标签变窄了"这个前提是假的；
+//        2) 1280×800 下真浏览器逐对量包围盒（`--only rings` 的判据）：
+//           20 个压字 2 对、19 个 1 对、18 个 4 对、17 个 7 对、16 个 6 对
+//           （少反而更差：14 个以上会从两排扇面变成三排，三排的径向间距
+//           放不下 125×41 的标签）；14 个 0 对。
+//        3) 面积也对得上：这个扇面约 11.2 万 px²，一个位置要 124×62≈7,700px²,
+//           理想排布也就 14 个上下——20 个是几何上就放不下，不是参数没调好。
 const GB_EXPAND_CAP = 14;
 
 function gbSymptomCount(node) {
@@ -1689,6 +1746,8 @@ window.TCM = Object.assign(window.TCM || {}, {
   // sleep 不在清单里：搬过来之后只有 growGraph 用，app.js 一次都没调——
   // 清单只列**对面真的用到的**，多列一个就是给"清单齐全"那条测试留一个假绿点。
   escapeHtml,
+  // 方剂来源的中文名（app.js 的九段也要用，见定义处的注释）
+  formulaSourceLabel,
   // 宿主在启动时注册自己的 UI 实现
   setGraphHooks,
 });

@@ -73,6 +73,27 @@
 
     /* ---- 间距（§2.3）：8 档 ---- */
     --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+
+    /* ---- R37：两张图的 label 宽度与字号（`slot` 令牌，web/graph.js 读） ----
+       **分开定不是排版偏好**：两张图对同一个数字的诉求相反。
+       问诊图一屏只有一条链，label 越完整越好（`病名 · 证型` 十几个字）；
+       图谱浏览器一屏要摆十几二十个节点，label 一宽就摆不下——R28 正是因为
+       label 变两行、最宽 124px，才把一次展开上限从 20 砍到 14。
+
+       **这个令牌管不了中文标签的宽度**（R37 实测，一度照它把上限改回 20 又
+       改回来）：cytoscape 的 `text-wrap: wrap` 只在**空白和换行**处断行，
+       而「疫毒炽盛（急黄）证」这样的名字里没有断行机会，`text-max-width`
+       对它不起作用——把这个数从 124px 收到 84px 之后，量出来的最宽标签
+       仍然是 125px。它真正能收窄的是**带空格的那一行**（重名时补的
+       `（病名 编码）`）。所以标签宽度的上限由最长的那个名字决定，
+       不由这个令牌决定；一次展开的上限见 GB_EXPAND_CAP 的实测记录。
+       判据是 Playwright 的 rings 状态（两两比包围盒 + 字号下限 ≥12px）。 */
+    --label-max-consult: 120px;   /* 单链一屏放得下，宁可宽一点让名字完整 */
+    --label-max-browser: 84px;    /* 只收得住带空格的那一行，见上面那段 */
+    --node-font-consult: 13px;
+    --node-font-browser: 13px;
+    --element-font-consult: 15px;
+    --element-font-browser: 14px; /* 浏览器首屏全是证素，比问诊图小一号才不压字 */
     --s5: 24px; --s6: 32px; --s7: 48px; --s8: 64px;
 
     /* ---- 圆角（§2.3）：**按层级区分，不是所有元素一个值**
@@ -1482,17 +1503,97 @@
   padding: 8px 10px;
   max-height: 160px;
   overflow-y: auto;
-  border-left: 3px solid var(--ink-3);
-  background: var(--paper-2);
+  border-left: 3px solid var(--muted);
+  background: var(--surface-2);
   /* 走 --font-mono 这一个令牌（§3.3：等宽只准通过它用，有测试钉） */
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
-  color: var(--ink-1);
+  color: var(--ink);
 }
 #s3-stream.show { display: block; }
 /* 思考过程用更淡的颜色：它不是结论，不该跟正式输出一样显眼 */
-#s3-stream .s3-reasoning { color: var(--ink-3); font-style: italic; }
+#s3-stream .s3-reasoning { color: var(--muted); font-style: italic; }
 #s3-stream .s3-who { font-weight: 600; color: var(--ink-2); }
+
+/* ---------- R37：单链问诊流程（九段） ---------- */
+/* **单列**：结构化模式只有一份结论，三列等宽的版面在这里没有意义
+   （空着两列比摆一列更像"坏了"）。九段是一条链，所以纵向排、段号显式。 */
+#chain-flow { display: none; }
+#chain-flow.show { display: block; max-width: 900px; margin: 0 auto; }
+/* 链顶的"这是谁的结论"。字比段标题大一号——它是整条链的主语。 */
+.chain-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 0 0 8px 0;
+  border-bottom: 1px solid var(--rule);
+  margin: 0 0 6px 0;
+}
+.chain-head .chain-who {
+  font-family: var(--font-ui);
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.chain-head .chain-school,
+.chain-head .chain-note {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--muted);
+}
+.chain-sec {
+  border-left: 3px solid var(--rule);
+  padding: 10px 0 10px 14px;
+  margin: 0 0 4px 0;
+}
+.chain-sec[data-state="active"] { border-left-color: var(--ink); }
+.chain-sec[data-state="todo"] { opacity: 0.45; }
+.chain-sec[data-state="done"] { border-left-color: var(--muted); }
+.chain-sec > h3 {
+  margin: 0 0 6px 0;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-2);
+  letter-spacing: 0.02em;
+}
+.chain-sec .chain-no { color: var(--muted); margin-right: 6px; }
+.chain-sec .chain-body { font-size: 14px; line-height: 1.75; color: var(--ink); }
+.chain-sec .chain-body .chain-line { margin: 2px 0; }
+.chain-sec .chain-body .chain-key { color: var(--muted); margin-right: 6px; }
+/* 口径标注跟在数后面（「25% 分母＝本方药味数」），右边距管不到它的左侧——
+   不留这个左边距两段会黏成「25%分母＝…」。 */
+.chain-sec .chain-body .chain-key:not(:first-child) { margin-left: 6px; }
+/* 段与段之间那条竖线是"链"的视觉表达：上一段的结论是下一段的输入
+   （schema 层的 from_organs / from_syndrome / from_method 就是这条线）。 */
+.chain-sec + .chain-sec { border-top: 1px dashed var(--rule); }
+/* 可点开释义的词：下划虚线，不是按钮——它是词，不是操作 */
+.explainable {
+  border-bottom: 1px dashed var(--muted);
+  cursor: help;
+}
+.explainable:hover { border-bottom-style: solid; }
+
+/* ---------- R37：节点释义面板 ---------- */
+#node-explain { display: none; }
+#node-explain.show {
+  display: block;
+  margin: 8px auto;
+  max-width: 900px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-md);
+}
+#node-explain .ne-title { font-weight: 600; font-size: 15px; color: var(--ink); }
+#node-explain .ne-kind { color: var(--muted); font-size: 12px; margin-left: 6px; }
+#node-explain .ne-close { float: right; cursor: pointer; color: var(--muted); }
+#node-explain .ne-sec { margin-top: 8px; }
+#node-explain .ne-head { font-size: 13px; font-weight: 600; color: var(--ink-2); }
+#node-explain .ne-line { font-size: 13px; line-height: 1.7; color: var(--ink); }
+/* 出处那一行要小一号、淡一点：它是凭据，不是正文 */
+#node-explain .ne-src { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
