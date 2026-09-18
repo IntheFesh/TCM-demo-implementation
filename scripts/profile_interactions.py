@@ -72,6 +72,22 @@ INP_BUDGET_MS = 200
 #: "必须瞬时"的那几类交互（纯前端、不发请求）。慢于这个数人就会觉得卡。
 INP_TIGHT_BUDGET_MS = 100
 
+#: "点到结果出现"的上限。**这是跟 INP 并列的第二个数，不是替代**。
+#:
+#: R43 的基线跑完发现一件事：全部 12 个交互的 INP `processing` 段都是 ~0 ms，
+#: 因为这个应用的点击处理函数**都是立刻返回的**——真正的工作（fetch、合并、
+#: 重排）发生在 await 之后，落在 INP 的观测窗口之外。
+#: 也就是说**光看 INP 会得出"这个站一点延迟都没有"的结论，而用户明明在等**。
+#:
+#: 所以再量一个"从点下去到结果真的出现在屏幕上"（settle）。两个数各自回答：
+#:   INP    —— 点下去有没有立刻响应（界面卡不卡）
+#:   settle —— 这件事总共等了多久（快不快）
+#: 两个都要，缺一个就会把"卡"和"慢"混成一件事。
+#:
+#: 1000 ms 这个上限的来处：Nielsen 的经典阈值——**1 秒是"思路不被打断"的界**
+#: （0.1 秒=瞬时、1 秒=不打断思路、10 秒=注意力流失）。不是自己拍的数。
+SETTLE_BUDGET_MS = 1000
+
 #: 每次交互重复几遍取中位数。**单次读数在浏览器里没有意义**（GC、字体加载、
 #: 首次 JIT 都会让第一次特别慢），而 INP 的定义本身就是"最差的那几次之一"，
 #: 所以这里同时报中位数与最大值。
@@ -102,7 +118,14 @@ OBSERVER_JS = r"""
       }
     }).observe({ type: "longtask", buffered: true });
   } catch (err) { /* 老浏览器没有 longtask */ }
-  window.__inpReset = () => { window.__inp.events = []; window.__inp.longTasks = []; };
+    // "点到结果出现"的起点。**用 pointerdown 而不是 click**：click 在鼠标抬起
+  // 之后才派发，中间那 ~50 ms 是 Playwright 的按下-抬起间隔，不该算进等待。
+  window.__clickAt = null;
+  document.addEventListener("pointerdown", () => { window.__clickAt = performance.now(); },
+                            { capture: true });
+  window.__inpReset = () => {
+    window.__inp.events = []; window.__inp.longTasks = []; window.__clickAt = null;
+  };
 })();
 """
 
@@ -127,11 +150,17 @@ SCENES: dict[str, dict] = {
         "click": "#tab-btn-graph-browser",
         "reset": "switchTab('consult');",
         "tight": True,
+        # 切到图谱页 = 拉全量证素 + 建索引 + 首次布局。**这是全站最重的一次点击。**
+        # **只量第一次（冷态）**：第二次起数据已经在内存里，`gbCy.nodes()` 一开始
+        # 就非空，判据立刻成立——量出来是 9 ms，而那 9 ms 什么都没等。
+        # 报一个"什么都没等"的数比不报更糟。
+        "settle": "() => gbCy && gbCy.nodes().length > 0",
+        "settle_first_only": True,
     },
     "example_pick": {
         "what": "点首屏的示例主诉（填进输入框）",
         "setup": "",
-        "click": ".example-item",
+        "click": "#examples .example",
         "reset": "document.getElementById('complaint').value = '';",
         "tight": True,
     },
@@ -146,7 +175,7 @@ SCENES: dict[str, dict] = {
         "what": "展开/折叠九段里的一段",
         "setup": ("renderComplaintBody(window.COMPLAINT); SERVER_S3_MODE = 'structured';"
                   " renderConsultResult(window.R37_DONE_PAYLOAD);"),
-        "click": "#chain-flow .chain-sec .chain-head",
+        "click": "#chain-flow .chain-sec",
         "tight": True,
     },
     "graph_node_click": {
@@ -157,6 +186,7 @@ SCENES: dict[str, dict] = {
                   " skipAnimation(); await new Promise(r => setTimeout(r, 800));"),
         "click_canvas": True,
         "tight": False,
+        "settle": "() => document.getElementById('graph-tooltip').classList.contains('show')",
     },
     "graph_replay": {
         "what": "重播生长动画（整张图重画一遍）",
@@ -179,7 +209,7 @@ SCENES: dict[str, dict] = {
     "role_switch": {
         "what": "切换角色（自绘下拉：打开）",
         "setup": "",
-        "click": "#role-select + .sel-btn, .sel-btn",
+        "click": ".cs-wrap button",
         "tight": True,
     },
     "browser_expand": {
@@ -188,6 +218,31 @@ SCENES: dict[str, dict] = {
                   " await new Promise(r => setTimeout(r, 600));"),
         "click_gb_canvas": True,
         "tight": False,
+    },
+    # ---- 规模场景：**真实规模才找得到延迟**（本沙盒持久图 2356 节点 / 3682 边）----
+    "browser_search_broad": {
+        "what": "图谱浏览器：搜一个宽词（「痛」命中上百条，走服务端 + 合并 + 重排）",
+        "setup": ("switchTab('graph-browser'); await loadGraphBrowserData();"
+                  " await new Promise(r => setTimeout(r, 600));"
+                  " document.getElementById('gb-search').value = '痛';"),
+        "click": "#gb-search-btn",
+        "tight": False,
+        # 状态栏每次先清空再等它填上——不清的话上一轮留下的字会让判据立刻成立。
+        "reset": "document.getElementById('gb-search-status').textContent = '';",
+        "settle": ("() => (document.getElementById('gb-search-status').textContent || '')"
+                   ".includes('找到')"),
+    },
+    "browser_expand_repeat": {
+        "what": ("图谱浏览器：连展开 5 个证素之后再展一个"
+                 "——**合并与索引的累积成本在这里才看得出来**"),
+        "setup": ("switchTab('graph-browser'); await loadGraphBrowserData();"
+                  " await new Promise(r => setTimeout(r, 600));"
+                  " const ids = gbCy.nodes().map(n => n.id()).slice(0, 5);"
+                  " for (const id of ids) { await gbExpandNode(id);"
+                  "   await new Promise(r => setTimeout(r, 150)); }"),
+        "click_gb_canvas": True,
+        "tight": False,
+        "settle": "() => gbCy.nodes('[node_type = \"syndrome\"]').length > 0",
     },
     "browser_reset": {
         "what": "图谱浏览器：重置视图（清空 + 重铺首屏）",
@@ -227,18 +282,30 @@ def _run_scene(browser, base_url: str, name: str) -> dict:
             elif scene.get("click_canvas"):
                 # cytoscape 画在 canvas 上，点不到"元素"——问它一个节点的屏幕坐标，
                 # 然后用**真实鼠标**点那个点。这是唯一能拿到可信事件的办法。
+                #
+                # **先把画布滚进视口**：图在折叠区里、位置很靠下，
+                # `getBoundingClientRect()` 给的是视口坐标，画布在折叠区里时
+                # y 会超出视口高度，`mouse.click` 点到的是页面外——表现是
+                # "交互做了但什么都没发生"，而那跟"功能坏了"长得一模一样。
                 pt = page.evaluate("""() => {
+                    const el = document.getElementById('cy');
+                    el.scrollIntoView({ block: 'center' });
                     const n = cy.nodes().filter(x => !x.isParent())[0];
                     const p = n.renderedPosition();
-                    const b = document.getElementById('cy').getBoundingClientRect();
-                    return { x: b.left + p.x, y: b.top + p.y };
+                    const b = el.getBoundingClientRect();
+                    return { x: b.left + p.x, y: b.top + p.y,
+                             ok: b.top >= 0 && b.bottom <= window.innerHeight };
                 }""")
+                if not pt.get("ok"):
+                    raise RuntimeError(f"画布滚不进视口：{pt}")
                 page.mouse.click(pt["x"], pt["y"])
             elif scene.get("click_gb_canvas"):
                 pt = page.evaluate("""() => {
+                    const el = document.getElementById('gb-cy');
+                    el.scrollIntoView({ block: 'center' });
                     const n = gbCy.nodes()[0];
                     const p = n.renderedPosition();
-                    const b = document.getElementById('gb-cy').getBoundingClientRect();
+                    const b = el.getBoundingClientRect();
                     return { x: b.left + p.x, y: b.top + p.y };
                 }""")
                 page.mouse.click(pt["x"], pt["y"])
@@ -247,6 +314,17 @@ def _run_scene(browser, base_url: str, name: str) -> dict:
         except Exception as exc:  # noqa: BLE001
             note = f"交互做不成：{exc}"
             break
+        settle_ms = None
+        if scene.get("settle") and not (scene.get("settle_first_only") and i):
+            # **从点下去开始算**，不是从这一行开始算：上面那几句 Playwright 调用
+            # 本身有几毫秒的 IPC，算进去会让这个数虚高。所以用页面里的时钟：
+            # `__clickAt` 由 `add_init_script` 里的 pointerdown 监听打点。
+            try:
+                page.wait_for_function(scene["settle"], timeout=8000)
+                settle_ms = page.evaluate(
+                    "() => window.__clickAt ? Math.round(performance.now() - window.__clickAt) : null")
+            except Exception as exc:  # noqa: BLE001
+                note = f"等不到结果：{str(exc)[:80]}"
         page.wait_for_timeout(500)   # 等 observer 把 entry 交付上来
         got = page.evaluate("window.__inp")
         if got.get("unsupported"):
@@ -255,11 +333,12 @@ def _run_scene(browser, base_url: str, name: str) -> dict:
         evs = got.get("events") or []
         if not evs:
             # **"没量到"不等于"很快"**（R40 那条纪律）：如实记，不写 0。
-            samples.append({"n_events": 0})
+            samples.append({"n_events": 0, "settle": settle_ms})
             continue
         worst = max(evs, key=lambda e: e["duration"])
         samples.append({
             "n_events": len(evs),
+            "settle": settle_ms,
             "inp": round(worst["duration"], 1),
             "input_delay": round(worst["input_delay"], 1),
             "processing": round(worst["processing"], 1),
@@ -270,9 +349,16 @@ def _run_scene(browser, base_url: str, name: str) -> dict:
     page.close()
 
     got = [s for s in samples if s.get("inp") is not None]
+    settles = [s["settle"] for s in samples if s.get("settle") is not None]
     out = {"scene": name, "what": scene["what"], "repeats": len(samples),
            "n_measured": len(got), "errors": errors[:3], "note": note,
            "budget_ms": INP_TIGHT_BUDGET_MS if scene.get("tight") else INP_BUDGET_MS}
+    if settles:
+        out["settle_median_ms"] = round(_med(settles), 1)
+        out["settle_max_ms"] = round(max(settles), 1)
+        out["settle_budget_ms"] = SETTLE_BUDGET_MS
+        out["settle_n"] = len(settles)
+        out["settle_cold_only"] = bool(scene.get("settle_first_only"))
     if got:
         out.update({
             "inp_median_ms": round(_med([s["inp"] for s in got]), 1),
@@ -311,6 +397,10 @@ def run(only: str | None) -> dict:
                 flag = ""
                 if r.get("inp_median_ms") is not None:
                     flag = "  ✗ 超预算" if r["inp_median_ms"] > r["budget_ms"] else "  ✓"
+                settle = (f"  ｜ 点到出结果 {r['settle_median_ms']} ms"
+                          f"（上限 {r['settle_budget_ms']}）"
+                          + ("  ✗" if r["settle_median_ms"] > r["settle_budget_ms"] else "")
+                          if r.get("settle_median_ms") is not None else "")
                 print(f"{name:22s} "
                       + (f"INP 中位 {r.get('inp_median_ms')} ms "
                          f"（延迟 {r.get('input_delay_median_ms')} / "
@@ -318,7 +408,7 @@ def run(only: str | None) -> dict:
                          f"呈现 {r.get('presentation_median_ms')}）"
                          f" 上限 {r['budget_ms']}{flag}"
                          if r.get("inp_median_ms") is not None
-                         else f"—— {r.get('reason')}"), flush=True)
+                         else f"—— {r.get('reason')}") + settle, flush=True)
             browser.close()
     finally:
         server.terminate()

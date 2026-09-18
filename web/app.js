@@ -2072,6 +2072,11 @@ async function openNodeExplain(nodeId, name) {
   const el = document.getElementById("node-explain");
   if (!el) return;
   const seq = ++NODE_EXPLAIN_SEQ;
+  // R43：**点下去立刻有反馈。** 改之前面板要等响应回来才出现——点一个节点之后
+  // 屏幕上什么都不变，人会以为"点了没反应"再点一下（于是又发一次请求）。
+  // 先摆一个带节点名的骨架，拿到内容再替换；`available=false` 时整块隐藏的
+  // 语义没变（那一条在下面）。
+  showNodeExplainPending(name || nodeId);
   try {
     const qs = `node=${encodeURIComponent(nodeId)}`
       + (name ? `&name=${encodeURIComponent(name)}` : "");
@@ -2088,6 +2093,19 @@ async function openNodeExplain(nodeId, name) {
   }
 }
 
+//: 等待态的骨架。**不是一个转圈图标**：这里能立刻说出"正在查哪个节点"，
+//: 那比一个匿名的加载动画有用得多（人据此确认自己点对了）。
+//: `aria-busy` 让读屏软件知道这一块还在变。
+function showNodeExplainPending(title) {
+  const el = document.getElementById("node-explain");
+  if (!el) return;
+  el.innerHTML = `<div><span class="ne-close" data-ne-close="1">×</span>
+      <span class="ne-title">${escapeHtml(String(title || ""))}</span>
+      <span class="ne-kind">查询中…</span></div>`;
+  el.setAttribute("aria-busy", "true");
+  el.classList.add("show");
+}
+
 function renderNodeExplain(data) {
   const el = document.getElementById("node-explain");
   if (!el) return;
@@ -2100,6 +2118,7 @@ function renderNodeExplain(data) {
       <span class="ne-title">${escapeHtml(data.title || "")}</span>
       <span class="ne-kind">${escapeHtml(NODE_KIND_LABEL[data.kind] || data.kind || "")}</span>
     </div>${secs}`;
+  el.setAttribute("aria-busy", "false");
   el.classList.add("show");
 }
 
@@ -2114,7 +2133,11 @@ const NODE_KIND_LABEL = {
 
 function closeNodeExplain() {
   const el = document.getElementById("node-explain");
-  if (el) { el.classList.remove("show"); el.innerHTML = ""; }
+  if (el) {
+    el.classList.remove("show");
+    el.innerHTML = "";
+    el.setAttribute("aria-busy", "false");
+  }
 }
 
 // 事件委托挂在 document 上一次，不给每个 .explainable 各挂一个——

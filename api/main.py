@@ -146,6 +146,58 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="名医辨证对照 demo", lifespan=_lifespan)
 
 
+# ---------- R43：响应压缩（**选择性**，不是无脑全开） ----------
+#
+# 实测（R43 基线）：`/api/graph?limit=200` 的响应体 **352 KB，一个字节都没压**
+# ——这是点开「图谱」页签之后用户在等的那一段。三甲内网的带宽不是问题，但
+# 教材扩完之后这张图要翻几倍（证候 337 → 1444、症状 1282 → 约 7000），
+# 而 JSON 是压缩率最高的那一类数据。
+#
+# **两类必须跳过，无脑全开会出事：**
+#
+# 1. **SSE（`text/event-stream`）。** starlette 的 GZipMiddleware 对流式响应是
+#    逐块写进 gzip 缓冲再发，而 gzip 在攒够一个块之前不产出任何字节——于是
+#    "一边推理一边出字"会变成"憋一会儿吐一大段"。R36 花了一整轮把流式做出来，
+#    不能在这里被压缩缓冲抵消掉。
+# 2. **已经压过的二进制**（woff2 / png / 图片）。再压一遍省不下几个字节，
+#    却要为每个请求付一次 CPU；字体那 1.13 MB 是首屏的大头，白烧 CPU 会
+#    直接体现在首屏时间上。
+#
+# 判据按**路径**定而不是按 content-type：中间件在响应头出来之前就要决定走不走
+# 压缩，按路径是确定的、可测的；按 content-type 要先等响应开始、逻辑绕一圈，
+# 而这两条规则本来就跟路径一一对应。
+GZIP_MIN_BYTES = 1024
+#: 不压的路径前缀。SSE 那条见上；`/app/vendor/fonts` 与图片同理。
+GZIP_SKIP_PREFIXES = ("/api/consult/stream",)
+#: 不压的扩展名（已经是压缩格式）。
+GZIP_SKIP_SUFFIXES = (".woff2", ".woff", ".png", ".jpg", ".jpeg", ".webp", ".gz")
+
+
+def _gzip_skip(path: str) -> bool:
+    return (path.startswith(GZIP_SKIP_PREFIXES)
+            or path.endswith(GZIP_SKIP_SUFFIXES))
+
+
+class SelectiveGZipMiddleware:
+    """按路径决定要不要走 gzip。**压缩本身复用 starlette 的实现**，
+    这里只负责"走不走"——自己写一遍 gzip 响应器就是同一件事的第二处实现。"""
+
+    def __init__(self, app, minimum_size: int = GZIP_MIN_BYTES) -> None:
+        from starlette.middleware.gzip import GZipMiddleware
+
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or _gzip_skip(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+        await self.gzip(scope, receive, send)
+
+
+app.add_middleware(SelectiveGZipMiddleware)
+
+
 def _public_text(text: str) -> str:
     """把要发给客户端的文字里的项目绝对路径抹掉。core 层的报错（`未找到
     /home/xxx/data/element_index.json`）对命令行用户是有用信息，对匿名的 HTTP

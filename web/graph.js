@@ -1447,14 +1447,22 @@ function gbBuildIndex() {
   const nodeById = new Map();
   for (const n of gbGraphData.graph.nodes) nodeById.set(n.data.id, n);
   const edgesByNode = new Map();
+  // R43：**边 id 的集合跟着索引一起长期留着**，不在每次合并时重建。
+  // 改之前 `gbMergeGraph` 每次都 `new Set(全部边.map(e => e.data.id))`——
+  // 那是 O(已累积的边数)，而一次浏览会合并很多次（首屏、每次展开、每次搜索），
+  // 合起来是 O(边数 × 合并次数)。本沙盒的持久图是 2356 节点 / 3682 边，
+  // 教材扩完还要翻几倍，而这段代码跑在**点击的处理函数里**——正是 INP 的
+  // "processing" 那一段。
+  const edgeIds = new Set();
   for (const e of gbGraphData.graph.edges) {
     const { source, target } = e.data;
+    edgeIds.add(e.data.id);
     if (!edgesByNode.has(source)) edgesByNode.set(source, []);
     if (!edgesByNode.has(target)) edgesByNode.set(target, []);
     edgesByNode.get(source).push(e);
     edgesByNode.get(target).push(e);
   }
-  gbIndex = { nodeById, edgesByNode };
+  gbIndex = { nodeById, edgesByNode, edgeIds };
 }
 
 function gbApplyPhysicianWeighting() {
@@ -1555,8 +1563,45 @@ function gbAddNodes(nodeIds) {
 // F1：展开改成问服务端。
 // 原来是在本地全量邻接表上展开——图一分页，本地就没有全量邻接表了，展开会
 // **静默只展开"恰好在本页里"的那部分**。那不是没找到，是没找过，比报错更误导。
-async function gbFetchInto(url, statusText, pick) {
+//: 请求超过这个时间还没回来，就把状态文案升一级。**不是加载动画**——
+//: 300 ms 以下的等待人感觉不到，弹一个转圈反而制造"刚才是不是卡了"的印象；
+//: 超过它才需要告诉人"还在等"。300 ms 是 Nielsen 三档里 0.1 s（瞬时）与
+//: 1 s（不打断思路）之间的实用分界。
+const GB_PENDING_HINT_MS = 300;
+
+//: 每一类请求"正在做什么"的话。**说清在做什么，不写一个笼统的「加载中」**：
+//: 三甲内网上这几件事的耗时差一个量级，而人只有看到"在搜索"还是"在展开"
+//: 才知道该不该继续等。
+const GB_BUSY_TEXT = {
+  search: "搜索中…",
+  expand: "展开中…",
+  layer: "切换图层中…",
+};
+
+//: 请求序号。**后发的响应才算数**——连点两次搜索时，先回来的那个不该覆盖
+//: 后点的那次的状态文案（同 `openNodeExplain` 的 `NODE_EXPLAIN_SEQ`，
+//: 那是同一类竞态的另一个入口，两处都得有）。
+let gbFetchSeq = 0;
+
+async function gbFetchInto(url, statusText, pick, busyKey) {
   const status = document.getElementById("gb-search-status");
+  const seq = ++gbFetchSeq;
+  // R43：**点下去立刻有反馈。** 改之前状态栏要等响应回来才变——在三甲内网上
+  // 点「搜索」之后按钮看起来是死的，而"点了没反应"正是这个项目一直在防的
+  // 那种失败（只不过这一次不是静默出错，是静默等待）。
+  const busy = GB_BUSY_TEXT[busyKey] || "加载中…";
+  let slow = null;
+  if (status) {
+    status.textContent = busy;
+    status.setAttribute("aria-busy", "true");
+    slow = setTimeout(() => {
+      if (seq === gbFetchSeq) status.textContent = `${busy}（这张图比较大，稍候）`;
+    }, GB_PENDING_HINT_MS);
+  }
+  const done = () => {
+    if (slow) clearTimeout(slow);
+    if (status) status.setAttribute("aria-busy", "false");
+  };
   try {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1568,10 +1613,15 @@ async function gbFetchInto(url, statusText, pick) {
     const picked = pick ? pick(data.graph, data.page) : {graph: data.graph, dropped: 0};
     gbMergeGraph(picked.graph);
     data.dropped = picked.dropped || 0;
-    if (status && statusText) status.textContent = statusText(data.page, data.dropped);
+    done();
+    // **过期响应不改文案**：连点两次时先回来的那个不该覆盖后点的那次。
+    if (status && statusText && seq === gbFetchSeq) {
+      status.textContent = statusText(data.page, data.dropped);
+    }
     return data;
   } catch (err) {
-    if (status) status.textContent = `加载失败：${err.message || err}`;
+    done();
+    if (status && seq === gbFetchSeq) status.textContent = `加载失败：${err.message || err}`;
     return null;
   }
 }
@@ -1584,7 +1634,7 @@ function gbMergeGraph(graph) {
     if (!gbIndex.nodeById.has(n.data.id)) gbGraphData.graph.nodes.push(n);
     gbIndex.nodeById.set(n.data.id, n);
   }
-  const seen = new Set(gbGraphData.graph.edges.map((e) => e.data.id));
+  const seen = gbIndex.edgeIds;      // R43：长期留着，不每次重建（见 gbBuildIndex）
   for (const e of graph.edges || []) {
     if (seen.has(e.data.id)) continue;
     seen.add(e.data.id);
@@ -1700,7 +1750,8 @@ async function gbExpandNode(nodeId) {
   const data = await gbFetchInto(
     `/api/graph/neighbors?node=${encodeURIComponent(nodeId)}&limit=${GB_MAX_NEW_NODES}${typeParam}`,
     (page, dropped) => gbExpandStatusText(page, dropped, wantLabel),
-    (graph) => gbCapExpansion(graph, GB_EXPAND_CAP)
+    (graph) => gbCapExpansion(graph, GB_EXPAND_CAP),
+    "expand"
   );
   if (!data) return;
   const added = [...gbVisibleIds].filter((id) => !before.has(id));
@@ -1995,7 +2046,8 @@ async function gbSearch(query) {
       ? "未找到匹配节点"
       : (page.truncated
           ? `找到 ${page.total} 个匹配节点，只显示前 ${page.returned} 个`
-          : `找到 ${page.total} 个匹配节点`)
+          : `找到 ${page.total} 个匹配节点`),
+    null, "search"
   );
   if (!found || !found.page.total) return;
   const matches = found.graph.nodes;
@@ -2026,7 +2078,8 @@ async function gbToggleLayer() {
     (page) => page.next_cursor !== null
       ? `医案层共 ${page.total} 条，显示前 ${page.returned} 条。`
         + `它们跟国标层之间没有边——这正是 λ1 恒为 0 的原因，不是没加载出来。`
-      : `医案层 ${page.returned} 条`
+      : `医案层 ${page.returned} 条`,
+    null, "layer"
   );
 }
 
