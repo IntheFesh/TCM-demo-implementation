@@ -1,7 +1,7 @@
 """R53 第二相：符号验证扩到医理一致性——四条新规则，数据源是 `core/theory.py`
 （R51 医理规则层），不是 `core/ontology.py`（本草/方剂本体）。
 
-跟 `tests/test_formula_verifier.py` 的分工：那份文件测 R34 起（R59 拆出一条后八条）的本体规则
+跟 `tests/test_formula_verifier.py` 的分工：那份文件测 R34 起（R59/R60 各拆出一条后九条）的本体规则
 （含规则表的通用行为、`passed`/`status` 定义），这份文件专测 R53 新增的
 `principle_matches_syndrome`/`method_not_contraindicated`/
 `pathomechanism_consistent`/`role_structure_by_rule` 四条，以及它们跟本体
@@ -82,7 +82,7 @@ def test_theory_rules_is_exactly_four_and_all_revise():
 def test_ontology_and_theory_rules_partition_all_rules():
     assert set(ONTOLOGY_RULES) | set(THEORY_RULES) == set(ALL_RULES)
     assert set(ONTOLOGY_RULES) & set(THEORY_RULES) == set(), "两张表不能有交集"
-    assert len(ONTOLOGY_RULES) == 8 and len(THEORY_RULES) == 4
+    assert len(ONTOLOGY_RULES) == 9 and len(THEORY_RULES) == 4
 
 
 def test_every_theory_rule_has_a_chinese_label_and_an_implementation():

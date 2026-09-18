@@ -876,9 +876,10 @@ class OntologyRef(BaseModel):
     """一条本体引用：指向本草/方剂条目的某个谓词，并**带上原文片段**。
 
     `span` 是 `Field(min_length=1)` 而不是可选：一条"引用"如果说不出原文写了什么，
-    它就不是引用，只是又一句模型自己的话。`herb_source_fabricated` 规则（R34 起，
-    R59 从 `herb_grounded` 拆出来）要拿它当反例，空 span 会让那条规则的反例变成
-    空字符串——等于没有反例。
+    它就不是引用，只是又一句模型自己的话。`herb_source_fabricated`（张冠李戴，
+    R34 起，R59 从 `herb_grounded` 拆出来）和 `herb_source_paraphrased`（转述
+    未照抄，R60 从 `herb_source_fabricated` 再拆出来）都要拿它当反例，空 span
+    会让那条规则的反例变成空字符串——等于没有反例。
 
     `book` 可以为空：本体条目里有 `book` 的话模型应当照填，但模型看到的是知识块里
     的那一段，不一定带书名。**这个字段的真实性由 R34 回查本体核对**，不靠模型自觉，

@@ -258,6 +258,49 @@ def test_detail_trimming_drops_preparation_first(ont, s1s2):
     assert "麸炒" not in thin
 
 
+# ---------- R60：知识块必须给出可摘录的原文，不能只给归纳词 ----------
+
+def test_the_knowledge_block_carries_the_verbatim_span_not_just_the_summary(ont, s1s2):
+    """`ont` 夹具里"白术·功效"的 `_row` 造的 `source_span` 是
+    "白术，功效：健脾益气、燥湿利水"——跟 `parse_effects` 解析出来的归纳词
+    "健脾益气、燥湿利水"字面不同（多了"白术，功效："这个前缀）。模型要能
+    在知识块里看到这个前缀齐全的版本，才谈得上"逐字照抄"。"""
+    s1, s2 = s1s2
+    case = _case(case_id="ye_tianshi-001", syndrome="脾胃气虚", herbs=["白术"])
+    text, _ = build_focused_knowledge(s1, s2, [(case, 0.9)], [], ontology=ont)
+    assert "可摘录原文" in text
+    assert "白术，功效：健脾益气、燥湿利水" in text
+
+
+def test_the_verbatim_span_section_is_trimmed_together_with_preparation(ont, s1s2):
+    """"可摘录原文"跟"炮制"共用同一个 `detail` 开关——超预算时一起砍，不是
+    独立的第三级裁剪（裁剪顺序表 `FOCUSED_CUT_ORDER` 没有为它单独加一档）。"""
+    s1, s2 = s1s2
+    case = _case(case_id="ye_tianshi-001", syndrome="脾胃气虚", herbs=["白术"])
+    thin, stats = build_focused_knowledge(s1, s2, [(case, 0.9)], [], ontology=ont, budget=1)
+    assert "materia_detail" in stats["trimmed_sections"]
+    assert "可摘录原文" not in thin
+
+
+def test_the_verbatim_span_section_caps_how_many_spans_per_predicate(ont, s1s2):
+    """一个谓词收录了很多条原文时（炮制变体合并进来的常见情况），"可摘录
+    原文"这一节只展示 `FOCUSED_MAX_SPANS_PER_PREDICATE` 条，不是全展示
+    ——全展示会顶爆预算。**用只查子串会数到"功效："归纳行里的全部 5 条**
+    （`parse_effects` 对这种没有顿号/逗号的短句几乎不做切分，5 条各自成词），
+    所以只在"可摘录原文"这一节自己的文本范围内数，不数整段知识块。"""
+    from core.context_prefix import FOCUSED_MAX_SPANS_PER_PREDICATE
+    from core.ontology import Ontology as _Ontology
+
+    rows = [_row("麻黄", "功效", f"功效原文第{i}条") for i in range(5)]
+    ont_many = _Ontology(materia_rows=rows, formulary_rows=[], patterns=[])
+    s1, s2 = s1s2
+    case = _case(case_id="ye_tianshi-001", syndrome="脾胃气虚", herbs=["麻黄"])
+    text, _ = build_focused_knowledge(s1, s2, [(case, 0.9)], [], ontology=ont_many)
+    verbatim_section = text.split("可摘录原文")[1]
+    shown = sum(1 for i in range(5) if f"功效原文第{i}条" in verbatim_section)
+    assert shown == FOCUSED_MAX_SPANS_PER_PREDICATE
+
+
 # ---------- manifest ----------
 
 def test_the_manifest_records_the_three_knowledge_fields():

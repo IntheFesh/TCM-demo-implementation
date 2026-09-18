@@ -405,11 +405,27 @@ FOCUSED_MAX_PATTERNS_PER_PHYSICIAN = 12
 FOCUSED_MAX_CASE_IDS = 8
 
 
+#: R60：`ontology_refs.span` 要求模型"照抄知识块里的那段原文"，但原来
+#: `_focused_herb_block` 只展示 `h.effects`/`h.nature` 这些**解析后的归纳词**
+#: （比如"发汗解表、宣肺平喘"，顿号连接），跟本体里真正的 `source_span` 原文
+#: （比如"发汗解表，宣肺平喘，利水消肿。"，逗号+句号）不是同一份文本——模型
+#: 严格照抄它唯一能看到的内容，抄出来的东西反而会被 `check_herb_source_fabricated`
+#: 判成"编造"，因为那句话根本不在本体的 `refs` 里逐字出现过。这是提示词
+#: 与验证器"预期的原文"没对齐，不是模型的错（R60 §1 诊断的 T1 类）。
+#: 每个谓词最多展示这么多条 span——某些药材（炮制变体合并进来的）单个谓词
+#: 能有 7 条以上，全展示会顶爆预算；模型只要能摘到一条真实原文就够验证器核对。
+FOCUSED_MAX_SPANS_PER_PREDICATE = 2
+
+#: `ontology_refs` 里模型可能引用的谓词，跟 `_focused_herb_block` 已经展示的
+#: 归纳字段一一对应（性味展示成"性味"一行，但原文可能拆在"性味"这个谓词下）。
+_CITABLE_HERB_PREDICATES = ("性味", "归经", "功效", "用量", "禁忌", "炮制")
+
+
 def _focused_herb_block(h, *, detail: bool) -> str:
     """一味药在知识块里的一行/一段。
 
-    `detail=False` 时省掉炮制与别名两项——它们对"这味药该不该用"没有判据价值，
-    是超预算时第一批该砍的（见 FOCUSED_CUT_ORDER）。
+    `detail=False` 时省掉炮制、别名、可摘录原文三项——它们对"这味药该不该用"
+    没有判据价值，是超预算时第一批该砍的（见 FOCUSED_CUT_ORDER）。
     """
     parts = [f"### {h.name}"]
     if h.nature or h.flavor:
@@ -424,6 +440,15 @@ def _focused_herb_block(h, *, detail: bool) -> str:
         parts.append(f"- 禁忌：{'、'.join(h.contraindications)}")
     if detail and h.preparation:
         parts.append(f"- 炮制：{'、'.join(h.preparation)}")
+    if detail:
+        spans = []
+        for p in _CITABLE_HERB_PREDICATES:
+            for ref in h.refs.get(p, ())[:FOCUSED_MAX_SPANS_PER_PREDICATE]:
+                if ref.span:
+                    spans.append(f"  - [{p}] {ref.span}")
+        if spans:
+            parts.append("- 可摘录原文（ontology_refs.span 要从这里逐字抄，"
+                         "不要抄上面归纳出来的词）：\n" + "\n".join(spans))
     return "\n".join(parts)
 
 

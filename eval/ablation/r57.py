@@ -183,10 +183,20 @@ def _syndrome_method_formula(s3_structured) -> tuple[str | None, str | None, str
 
 
 def metrics_from_result(result: dict | None) -> dict:
+    """R60 §2.5：一次问诊被 `SymbolicVeto` 拦下时 `result["results"]` 恒为
+    `[]`（`core/chain.py::_stopped` 的既有设计——被拦的请求不产出任何方药），
+    这个函数原来一见 `results` 空就直接 `return {"has_output": False}`，
+    把 `result` 顶层的 `verification_veto`（拦截当时的 `final_violations`：
+    rule/herbs/reason/counterexample，`core/chain.py` 那条 `except SymbolicVeto`
+    分支已经在存）连同 `has_output=False` 一起扔了——**排障因此必须重跑一次
+    真机才能看到"到底是哪条规则、哪条反例"**，这正是用户实测抓到的记账问题。
+    现在两条分支都把它带出来（有就带、没有不硬造 None 占位）。"""
     results = (result or {}).get("results") or []
     r = results[0] if results else {}
+    veto = (result or {}).get("verification_veto")
+    veto_kw = {"verification_veto": veto} if veto else {}
     if not r or r.get("s3") is None:
-        return {"has_output": False}
+        return {"has_output": False, **veto_kw}
     vm = r.get("verifier_metrics") or {}
     completeness = r.get("derivation_completeness_ratio")  # None：A 组没有这个键，不适用
     syn, method, formula = _syndrome_method_formula(r.get("s3_structured"))
@@ -197,6 +207,7 @@ def metrics_from_result(result: dict | None) -> dict:
         "rule_refs_completeness": completeness,
         "n_hallucinated_ids": len(r.get("hallucinated") or []),
         "syndrome": syn, "method": method, "formula": formula,
+        **veto_kw,
         "llm_calls": ((result or {}).get("manifest") or {}).get("llm_calls"),
         "s3_mode": ((result or {}).get("manifest") or {}).get("s3_mode"),
     }

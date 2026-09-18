@@ -448,6 +448,19 @@ def _build_herbs(rows: list[dict]) -> dict[str, Herb]:
         aliases = tuple({raw_name} - {name})
         refs = {p: _refs_for(rows, raw_name, p) for p in preds}
         existing = out.get(name)
+        # R60：几十味药有多个写法归一到同一个正名（"蜜麻黄"→"麻黄"），每个写法
+        # 在原始 jsonl 里是独立的行，各自带一份 source_span。`effects`/`nature`
+        # 等派生字段一直是**累加**多个写法的解析结果（`existing.xxx + parse_xxx(...)`），
+        # 但这一行原来是 `{**existing.refs, **refs}`——同一个谓词键被后处理的写法
+        # 直接覆盖掉，不是累加。于是 `effects` 里能看到"麻黄"原文解析出的词，
+        # 而 `refs["功效"]` 却只剩"蜜麻黄"那一份 span——模型引用"麻黄"原文中
+        # 真实存在的一句，会因为 `refs` 里找不到而被 `check_herb_source_fabricated`
+        # 误判编造。实测 189 味药、293 个 (药, 谓词) 槏位有这个问题，全部是
+        # 常用药材（麻黄/桂枝这类有炮制变体的）。修法：per-predicate 累加元组，
+        # 不覆盖；`dict.fromkeys` 去重（同一句原文可能因为多行重复收录而撞上）。
+        merged_refs = dict(existing.refs) if existing else {}
+        for p, r in refs.items():
+            merged_refs[p] = tuple(dict.fromkeys(merged_refs.get(p, ()) + r))
         herb = Herb(
             name=name,
             aliases=tuple(sorted(set(aliases) | set(existing.aliases if existing else ()))),
@@ -465,7 +478,7 @@ def _build_herbs(rows: list[dict]) -> dict[str, Herb]:
             preparation=tuple(dict.fromkeys(
                 (existing.preparation if existing else ())
                 + parse_effects(preds.get("炮制", [])))),
-            refs={**(existing.refs if existing else {}), **refs},
+            refs=merged_refs,
         )
         out[name] = herb
     return out

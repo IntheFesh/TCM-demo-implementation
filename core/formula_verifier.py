@@ -13,16 +13,19 @@
 一条可以指着原文说出来的错，而"指着原文"正是 LLM-Modulo 那条实证
 （幻觉 63% → 1.7%）的机制所在。
 
-## 十二条规则，两种级别，两个数据源（R53 起；R59 把 `herb_grounded` 拆成两条）
+## 十三条规则，两种级别，两个数据源（R53 起；R59 把 `herb_grounded` 拆成两条，
+## R60 从 `herb_source_fabricated` 再拆出一条）
 
-前八条（R34+R59）都从 `core/ontology.py`（本草/方剂本体）取证；R53 加的四条从
-`core/theory.py`（R51 的医理规则层）取证——**两个数据源各自独立可用/不可用**，
-`ont.available` 是 0/1、`load_theory()` 是另一个 0/1，一个数据源缺了不该把
-另一个数据源能判的规则也一起打成 unverifiable（`ONTOLOGY_RULES`/`THEORY_RULES`
-两张表分别管各自的开关，见 `verify_formula`）。
+前九条（R34+R59+R60）都从 `core/ontology.py`（本草/方剂本体）取证；R53 加的
+四条从 `core/theory.py`（R51 的医理规则层）取证——**两个数据源各自独立
+可用/不可用**，`ont.available` 是 0/1、`load_theory()` 是另一个 0/1，
+一个数据源缺了不该把另一个数据源能判的规则也一起打成 unverifiable
+（`ONTOLOGY_RULES`/`THEORY_RULES` 两张表分别管各自的开关，见 `verify_formula`）。
 
 revise（可改，回灌重开）：
   `herb_not_in_ontology`       **药名在本体里查不到**（本体，R59 新增，见下）
+  `herb_source_paraphrased`    **引用的原文本体全范围都查不到**（本体，R60
+                               新增，见下——转述/概括，不是逐字照抄）
   `meridian_coverage`          方中药的归经覆盖不了辨出来的病变脏腑（本体）
   `nature_conflict`            证型寒热方向与主方药性相悖（本体）
   `effect_matches_method`      药的功效跟治法对不上（本体）
@@ -35,8 +38,9 @@ revise（可改，回灌重开）：
 veto（不可下发，残余不发）：
   `incompatible_pair`       十八反十九畏（本体）
   `dose_exceeds`            超药典常用上限（本体）
-  `herb_source_fabricated`  **引用了本体里不存在的原文**（编造出处，本体；
-                            R59 之前叫 `herb_grounded`，见下）
+  `herb_source_fabricated`  **引用的原文真实存在，但属于另一味药**（张冠李戴，
+                            本体；R59 之前叫 `herb_grounded`，R60 把"转述"这一类
+                            拆给了 `herb_source_paraphrased`，见下）
 
 ## 为什么 R53 那四条都是 revise，不是 veto
 
@@ -81,7 +85,45 @@ R59 把这两个问题拆成两条独立的规则，各自回答自己的问题�
 是"药名查不到"这个此前只默默进 `Unverifiable`、从不回灌的分支，现在会主动
 给模型一次修正机会。
 
-## `Unverifiable`：查不到依据 ≠ 查到了且通过
+## R60：`herb_source_fabricated` 从 87% 误杀收窄到只判张冠李戴
+
+用户真机实测：`--limit 2` 跑 A/B/C/D 四组共 8 条问诊，7 条全被
+`herb_source_fabricated` 拦截（`n_ok` 0/0/0/1）。逐条把模型写的 span 与本体
+原文并排核对，发现这条 veto 判据原来把三类完全不同的情况一锅端了——
+详细诊断见 `docs/reports/R60_report.md` §1，这里只记结论：
+
+  - **知识块本身给不了可摘录的原文**：`core/context_prefix.py::_focused_herb_block`
+    只展示 `parse_effects` 解析后的归纳词（顿号拼接），不是本体的
+    `source_span` 原文（逗号+书名号）。模型照抄它唯一能看到的内容，抄出来
+    的东西天然对不上本体的 `refs`——这是提示词（"逐字照抄"）与知识块
+    （给不了可抄的东西）没对齐，不是模型的错。R60 已经在 `_focused_herb_block`
+    里加了"可摘录原文"小节，直接展示 `h.refs` 里的真实 span。
+  - **`_build_herbs` 合并炮制变体时，`refs` 是覆盖不是累加**：一味药有多个
+    写法归一到同一个正名时（"蜜麻黄"→"麻黄"），`effects`/`nature` 等派生
+    字段一直是累加多个写法的解析结果，但 `refs` 原来是后处理的写法直接
+    覆盖前面的——189 味药、293 个 (药,谓词) 槏位因此丢失了真实 span，模型
+    引用"麻黄"原文里确实存在的一句，因为 `refs` 只剩"蜜麻黄"那份而被误判
+    编造。已在 `core/ontology.py::_build_herbs` 改成累加。
+  - 上面两条修完之后，仍有残余的"模型转述/概括而不是照抄"——这不是编造，
+    是没有逐字对上；`herb_source_paraphrased`（revise）就是留给这一类的
+    出口，跟"引用了另一味药的真实原文"（`herb_source_fabricated` 维持的
+    veto）在程度上不是一件事。
+
+`check_herb_source_fabricated` 现在只在**能在全本体范围内找到这段话真正
+属于哪味药**时才 veto（`_find_span_owner` 命中）；找不到主人的，交给
+`check_herb_source_paraphrased` 判 revise。两条规则共享
+`_span_matches_any`/`_find_same_herb_other_predicate`/`_find_span_owner`
+三个辅助函数，各自只登记自己那一档结论——**一个函数不能同时产出 veto 和
+revise**，`Violation.__post_init__` 按规则名固定级别，见 `VETO_RULES`/
+`REVISE_RULES` 的定义与那条 `__post_init__` 的校验。
+
+**同一味药同一条 ref，内容真实但填错了谓词（T2）不产出任何 Violation/
+Unverifiable**——`_find_same_herb_other_predicate` 命中就直接放过。这是
+故意的：内容是真的，没有东西要模型改，够不上"需要重开"，因此**不计入
+`checked_rules` 之外的任何统计**（`verify_formula` 的调用方看到的仍然是
+"这条 ref 通过了"）。如果以后需要把"填错位"单独统计出来，这里需要一个
+新的、贯穿全部 12→13 条规则签名的 notes 通道，R60 判断这个需求还没到，
+不为它扩大接口。
 
 本体的缺谓词是实测出来的：归经缺 **598/1232（49%）**、用量缺 **672（55%）**、
 禁忌缺 770、炮制 790。一条规则要用归经而那味药没有归经，正确的结论是
@@ -127,6 +169,10 @@ REVISE_RULES: tuple[str, ...] = (
     # 排在本体其余 revise 规则之前——药名解析不了，后面几条判据本来就依赖
     # 解析出来的 Herb 对象，顺序上它更基础。
     "herb_not_in_ontology",
+    # R60：从 herb_source_fabricated 收窄出来的 T1（转述，本体全范围都查
+    # 不到），跟 herb_not_in_ontology 同属"药味引用基础问题"，排在它后面、
+    # 其余本体 revise 规则之前。
+    "herb_source_paraphrased",
     "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
     # R53：医理一致性四条，接在本体那五条 revise 规则后面。
     "principle_matches_syndrome", "method_not_contraindicated",
@@ -134,15 +180,17 @@ REVISE_RULES: tuple[str, ...] = (
 )
 ALL_RULES: tuple[str, ...] = VETO_RULES + REVISE_RULES
 
-#: R34 起的八条（R59 把 `herb_grounded` 拆成两条），数据源是
-#: `core/ontology.py`（本草/方剂本体）。**顺序跟 `ALL_RULES` 的
-#: veto-先-revise-后一致**（`herb_source_fabricated` 在 `VETO_RULES` 里，
-#: `herb_not_in_ontology` 在 `REVISE_RULES` 里）——`verify_formula` 按这张表
-#: 的顺序遍历，`checked_rules` 的输出顺序要跟 `ALL_RULES` 过滤出的本体子序列
-#: 一致，两条测试（`test_every_rule_has_an_implementation_and_vice_versa`、
+#: R34 起的九条（R59 把 `herb_grounded` 拆成两条，R60 从 `herb_source_fabricated`
+#: 再拆出 `herb_source_paraphrased`），数据源是 `core/ontology.py`（本草/方剂
+#: 本体）。**顺序跟 `ALL_RULES` 的 veto-先-revise-后一致**（`herb_source_fabricated`
+#: 在 `VETO_RULES` 里，`herb_not_in_ontology`/`herb_source_paraphrased` 在
+#: `REVISE_RULES` 里）——`verify_formula` 按这张表的顺序遍历，`checked_rules`
+#: 的输出顺序要跟 `ALL_RULES` 过滤出的本体子序列一致，两条测试
+#: （`test_every_rule_has_an_implementation_and_vice_versa`、
 #: `test_batching_does_not_change_the_verdict`）钉着这件事。
 ONTOLOGY_RULES: tuple[str, ...] = (
-    "incompatible_pair", "dose_exceeds", "herb_source_fabricated", "herb_not_in_ontology",
+    "incompatible_pair", "dose_exceeds", "herb_source_fabricated",
+    "herb_not_in_ontology", "herb_source_paraphrased",
     "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
 )
 #: R53 新增的四条，数据源是 `core/theory.py`（R51 医理规则层）。**两张表互斥、
@@ -164,7 +212,8 @@ RULE_LABELS: dict[str, str] = {
     "incompatible_pair": "配伍禁忌",
     "dose_exceeds": "超量",
     "herb_not_in_ontology": "药名本体未收",
-    "herb_source_fabricated": "药味出处编造",
+    "herb_source_fabricated": "药味出处张冠李戴",
+    "herb_source_paraphrased": "药味出处转述未照抄",
     "meridian_coverage": "归经覆盖病位",
     "nature_conflict": "寒热方向",
     "effect_matches_method": "功效对得上治法",
@@ -289,7 +338,7 @@ class VerificationResult:
 
     violations: tuple[Violation, ...] = ()
     unverifiable: tuple[Unverifiable, ...] = ()
-    #: 本体可用吗。False 时 `ONTOLOGY_RULES` 那八条全部落进 `unverifiable`。
+    #: 本体可用吗。False 时 `ONTOLOGY_RULES` 那九条全部落进 `unverifiable`。
     ontology_available: bool = True
     #: 医理规则层（R51/R53）可用吗。False 时 `THEORY_RULES` 那四条全部落进
     #: `unverifiable`——跟 `ontology_available` 是两个独立的开关（两个数据源，
@@ -358,7 +407,7 @@ class VerificationResult:
         }
 
 
-# ---------- 本体八条规则（R34 起七条 + R59 拆出一条） ----------
+# ---------- 本体九条规则（R34 起七条 + R59 拆出一条 + R60 再拆出一条） ----------
 #
 # 每条规则的签名都是 `(s3, ont) -> (violations, unverifiable, checked)`：
 # `checked` 是这条规则**真的判了**的时候它自己的名字，判不了时为空。
@@ -470,17 +519,80 @@ def check_herb_not_in_ontology(s3, ont) -> tuple[list[Violation], list[Unverifia
     return out, [], ["herb_not_in_ontology"]
 
 
+def _span_matches_any(span: str, texts: list[str]) -> bool:
+    """双向子串——模型照抄时可能只抄了其中一句（本体原文往往是一整段），
+    要求逐字相等会把正确的引用判成编造。"""
+    return any(span in t or t in span for t in texts if t)
+
+
+def _find_same_herb_other_predicate(span: str, refs: dict, *, exclude_predicate: str) -> str | None:
+    """R60 T2：这段话没对上模型自己填的谓词，但对上了**同一味药**别的谓词
+    （比如把归经原文填进了性味）——内容是真的，只是填错了位置，不该跟
+    张冠李戴同等对待。返回命中的谓词名，没命中返回 `None`。"""
+    for p, rs in refs.items():
+        if p == exclude_predicate:
+            continue
+        if _span_matches_any(span, [r.span.strip() for r in rs]):
+            return p
+    return None
+
+
+def _find_span_owner(span: str, ont, *, exclude_name: str) -> tuple[str, str] | None:
+    """R60 T3 vs T1 的分界：在全本体范围内（排除这味药自己）找这段话**真的
+    存在**在哪味药、哪条原文里。找到了 → 这段话是本体里真实存在的原文，只是
+    被安到了另一味药头上，这才是真正的张冠李戴（T3，veto 没有反驳空间）；
+    找不到 → 本体全范围内哪儿都没有这段话，大概率是模型自己转述/概括出来的
+    （T1，不是查得到却硬要赖给别的药，程度上跟 T3 不是一件事，见
+    `check_herb_source_paraphrased`）。
+
+    扫全本体（约 1200 味 × 数条 refs）是这次验证里最贵的一步，但只在**已经
+    对不上自己这味药**之后才会走到，一次验证顶多几十次，不值得为它另建
+    反向索引。
+    """
+    for other_name, other_herb in ont.herbs.items():
+        if other_name == exclude_name:
+            continue
+        for rs in other_herb.refs.values():
+            for r in rs:
+                t = r.span.strip()
+                if t and (span in t or t in span):
+                    return other_name, t
+    return None
+
+
 def check_herb_source_fabricated(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
     """模型给的 `OntologyRef` 在本体里**找得到那段原文**吗——前提是这味药
     已经在本体里查到了（`herb is None` 的情况交给 `check_herb_not_in_ontology`，
     两条规则回答不同的问题，见模块文档字符串）。
 
-    **判的是"编造出处"，不是"这味药不在本体里"**：
-      - 引用的 span 在本体该 (药名, 谓词) 下找不到 → veto（编造）
-      - 这味药在本体里但模型一条 ref 都没给 → unverifiable（没有可核的主张）
+    **跟 `prompts/v1/s3_derived.yaml` 的约定是同一份**：那份提示词在
+    "## ontology_refs" 一节明确写了"这条 span 系统怎么核对"，指名就是这两个
+    函数（`check_herb_source_fabricated`/`check_herb_source_paraphrased`）——
+    改这两个函数的判据、或改提示词那一节的措辞，**两处都要一起看**，
+    `tests/test_prompt_verifier_contract.py` 用源码级 grep 钉着两处不会
+    只改一边（R60）。
 
-    span 的比对用**双向子串**而不是相等：模型照抄时可能只抄了其中一句
-    （本体原文往往是一整段），要求逐字相等会把正确的引用判成编造。
+    **R60：这条规则收窄到只判"张冠李戴"（T3）**——用户真机实测这条规则
+    毙掉了 87% 的正常输出（8 条问诊 7 条全挂在它上面），逐条核对模型写的
+    span 与本体原文后发现：绝大多数不是编造，是三类完全不同的情况被同一条
+    veto 判据一锅端了：
+
+      - **T1 转述**：模型写的是自己归纳的话，本体原文找不到这句——原来
+        `_focused_herb_block` 给模型看的知识块本身就不是可摘录的原文
+        （是 `parse_effects` 解析后用顿号拼起来的归纳词），模型没有"抄"的
+        对象，这不是模型的错，见 `core/context_prefix.py` R60 的改动。
+        改判 `herb_source_paraphrased`（revise），不在这条里处理。
+      - **T2 谓词错配**：内容是真的，只是填错了谓词（归经原文填进了性味）
+        ——`_find_same_herb_other_predicate` 命中就直接放过，不产出任何
+        Violation/Unverifiable（降为"不计分"，见该函数文档字符串）。
+      - **T3 张冠李戴**：引用的原文在本体里真实存在，但属于**另一味药**
+        ——这才是真编造，查不到反驳空间，维持 veto。
+
+    判定顺序：自己这味药这个谓词命中 → 通过；自己这味药别的谓词命中（T2）→
+    放过；这个谓词本身没有收录（原 T4，跟 `check_herb_not_in_ontology` 是
+    "药不在"与"谓词不在"两个不同缺口）→ unverifiable；全本体找到真正
+    的主人（T3）→ veto；哪儿都找不到（T1）→ 交给 `check_herb_source_paraphrased`
+    处理，这条不产出任何结论。
     """
     out: list[Violation] = []
     unver: list[Unverifiable] = []
@@ -501,6 +613,10 @@ def check_herb_source_fabricated(s3, ont) -> tuple[list[Violation], list[Unverif
                 continue
             span = ref.span.strip()
             真 = [r.span.strip() for r in herb.refs.get(ref.predicate, ()) if r.span.strip()]
+            if _span_matches_any(span, 真):
+                continue  # 对上了，通过
+            if _find_same_herb_other_predicate(span, herb.refs, exclude_predicate=ref.predicate):
+                continue  # T2：内容真实、谓词填错，不计分
             if not 真:
                 unver.append(Unverifiable(
                     rule="herb_source_fabricated", herbs=(name,), missing_predicate=ref.predicate,
@@ -508,16 +624,63 @@ def check_herb_source_fabricated(s3, ont) -> tuple[list[Violation], list[Unverif
                            f"而本体里这味药没有{ref.predicate}这一项，对不了",
                 ))
                 continue
-            if not any(span in t or t in span for t in 真):
-                out.append(Violation(
-                    rule="herb_source_fabricated", severity="veto", herbs=(name,),
-                    reason=f"模型引用的「{name}·{ref.predicate}」原文在本体里找不到，"
-                           "这是编造出处",
-                    counterexample=f"模型写的是「{span}」；本体里「{name}」的"
-                                   f"{ref.predicate}原文是「{真[0]}」",
-                    refs=(ref,),
-                ))
+            owner = _find_span_owner(span, ont, exclude_name=name)
+            if owner is None:
+                continue  # T1：交给 check_herb_source_paraphrased，这条不重复判
+            owner_name, owner_span = owner
+            out.append(Violation(
+                rule="herb_source_fabricated", severity="veto", herbs=(name,),
+                reason=f"模型引用的「{name}·{ref.predicate}」原文，实际是「{owner_name}」"
+                       "的原文——张冠李戴，不是查不到，是查到了但安错了药",
+                counterexample=f"模型写的是「{span}」；这段话本体里真实存在，但属于"
+                               f"「{owner_name}」——「{owner_span}」——不是「{name}」",
+                refs=(ref,),
+            ))
     return out, unver, ["herb_source_fabricated"]
+
+
+def check_herb_source_paraphrased(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
+    """R60 新增，T1：模型引用的原文在本体全范围内（这味药、其他所有药）都
+    找不到——大概率是转述/概括出来的，不是照抄。
+
+    **revise，不是 veto**：这段话有实质内容（不是空话），只是没有逐字对上
+    本体收录的原文，跟"引了另一味药的真实原文"（`herb_source_fabricated`
+    维持的 T3）性质不同——那是查到了却安错了地方，这是压根没查到过，程度
+    上够不上"编造"，给模型一次机会照抄本体原文重填。
+
+    跟 `check_herb_source_fabricated` 共享判定逻辑（`_find_same_herb_other_predicate`
+    / `_find_span_owner`），这里只取它判定为"哪儿都没找到"（T1）的那一部分
+    ——**不是重复判一遍再瞎猜，是同一次比对拿两条不同的结论各自登记成
+    各自的规则**（两条规则必须分属 `VETO_RULES`/`REVISE_RULES` 各自固定
+    的级别，一个函数产出两种级别是这个模块的架构不允许的，见
+    `Violation.__post_init__`），所以只能是两个函数各查一遍。
+    """
+    out: list[Violation] = []
+    for choice in s3.herb_choices:
+        name = choice.item.name
+        herb = ont.herb(name)
+        if herb is None:
+            continue
+        for ref in choice.ontology_refs:
+            if ref.kind != "herb":
+                continue
+            span = ref.span.strip()
+            真 = [r.span.strip() for r in herb.refs.get(ref.predicate, ()) if r.span.strip()]
+            if not 真 or _span_matches_any(span, 真):
+                continue  # 没收录（交给 herb_not_in_ontology/herb_source_fabricated 的 unverifiable 分支）或已经对上
+            if _find_same_herb_other_predicate(span, herb.refs, exclude_predicate=ref.predicate):
+                continue  # T2，不计分
+            if _find_span_owner(span, ont, exclude_name=name) is not None:
+                continue  # T3，交给 herb_source_fabricated 判 veto
+            out.append(Violation(
+                rule="herb_source_paraphrased", severity="revise", herbs=(name,),
+                reason=f"模型引用的「{name}·{ref.predicate}」原文，在本体全范围内逐字查不到，"
+                       "像是转述/概括出来的，不是照抄",
+                counterexample=f"模型写的是「{span}」；本体里「{name}」的{ref.predicate}原文是"
+                               f"「{真[0]}」——请照抄这一段，不要改写、不要概括",
+                refs=(ref,),
+            ))
+    return out, [], ["herb_source_paraphrased"]
 
 
 def check_meridian_coverage(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
@@ -862,7 +1025,7 @@ def check_role_structure_by_rule(s3, ont) -> tuple[list[Violation], list[Unverif
 
 
 class BatchedOntology:
-    """把一张方里的药名**一次全解析完**，本体那八条规则共用这一份。
+    """把一张方里的药名**一次全解析完**，本体那九条规则共用这一份。
 
     R40 实测的动机：本体那几条规则各自逐味 `ont.herb()`，而 `herb()` 每次都要跑一遍
     `normalize_herb`（去炮制前缀、去剂量、查别名）。一张 12 味的方 = 7×12 = 84 次
@@ -915,6 +1078,7 @@ RULE_FUNCS = {
     "dose_exceeds": check_dose_exceeds,
     "herb_source_fabricated": check_herb_source_fabricated,
     "herb_not_in_ontology": check_herb_not_in_ontology,
+    "herb_source_paraphrased": check_herb_source_paraphrased,
     "meridian_coverage": check_meridian_coverage,
     "nature_conflict": check_nature_conflict,
     "effect_matches_method": check_effect_matches_method,
@@ -928,8 +1092,8 @@ RULE_FUNCS = {
 
 def verify_formula(s3: _S3StructuredBase, *, ontology: Ontology | None = None
                    ) -> VerificationResult:
-    """跑十二条规则（R34+R59 八条 + R53 四条）。**两个数据源分别判断可用性**：
-    本体不可用时 `ONTOLOGY_RULES` 那八条全部进 unverifiable，医理规则层
+    """跑十三条规则（R34+R59+R60 九条 + R53 四条）。**两个数据源分别判断可用性**：
+    本体不可用时 `ONTOLOGY_RULES` 那九条全部进 unverifiable，医理规则层
     不可用时 `THEORY_RULES` 那四条全部进 unverifiable——两件事独立发生，
     一个数据源缺了不该连累另一个数据源能判的规则（模块文档字符串那条）。
 

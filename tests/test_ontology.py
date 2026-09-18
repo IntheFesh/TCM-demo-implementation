@@ -294,6 +294,51 @@ def test_stats_counts_missing_predicates_per_herb(ont):
     assert s["missing_predicate_counts"]["炮制"] == 4
 
 
+# ---------- R60：多个写法归一到同一正名时，refs 要累加不能覆盖 ----------
+
+def test_refs_accumulate_across_merged_aliases_not_overwrite():
+    """"蜜麻黄"归一后并入"麻黄"（`_AFFIX_CHARS` 剥"蜜"）。`effects` 这类派生
+    字段一直是累加两个写法的解析结果，`refs`（原文出处）原来是后处理的写法
+    直接覆盖先处理的——"麻黄"自己的功效原文会被"蜜麻黄"的覆盖掉，模型引用
+    "麻黄"原文里真实存在的一句会因为 `refs` 只剩"蜜麻黄"那份而被
+    `check_herb_source_fabricated` 误判编造（R60 §0.4 实测触发的根因之一）。
+    这里两个写法都造，断言两份原文都在 `refs["功效"]` 里，不是只剩后一个。"""
+    ont = Ontology(materia_rows=[
+        _row("麻黄", "功效", "发汗解表"),
+        _row("蜜麻黄", "功效", "止咳平喘"),
+    ], formulary_rows=[], patterns=[])
+    h = ont.herb("麻黄")
+    assert h.name == "麻黄" and "蜜麻黄" in h.aliases
+    spans = {r.span for r in h.refs["功效"]}
+    assert spans == {"麻黄，功效：发汗解表", "蜜麻黄，功效：止咳平喘"}
+
+
+def test_refs_accumulation_does_not_duplicate_an_identical_span():
+    """两个写法碰巧给出完全相同的一句原文时不重复收——`dict.fromkeys` 去重，
+    不是简单拼接。"""
+    ont = Ontology(materia_rows=[
+        _row("麻黄", "性味", "辛温", span="辛温，归肺经"),
+        _row("蜜麻黄", "性味", "辛温", span="辛温，归肺经"),
+    ], formulary_rows=[], patterns=[])
+    h = ont.herb("麻黄")
+    assert len(h.refs["性味"]) == 1
+
+
+def test_refs_accumulation_covers_three_or_more_merged_written_forms():
+    """不是只处理两个写法合并这一种情况——三个写法都归一到同一个正名时，
+    三份原文都要保留。"""
+    ont = Ontology(materia_rows=[
+        _row("甘草", "功效", "补脾益气"),
+        _row("炙甘草", "功效", "益气复脉"),
+        _row("生甘草", "功效", "清热解毒"),
+    ], formulary_rows=[], patterns=[])
+    h = ont.herb("甘草")
+    spans = {r.span for r in h.refs["功效"]}
+    assert len(spans) == 3
+    assert all(name in h.aliases or name == h.name
+              for name in ("甘草", "炙甘草", "生甘草"))
+
+
 # ---------- 惰性单例与 CLI ----------
 
 def test_get_ontology_is_lazy_and_returns_the_same_object():

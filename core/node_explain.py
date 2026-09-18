@@ -14,7 +14,7 @@ R37 立这个面板时是四节。R42 把图重做成九层单链之后，图上
 | 3 | 药理 | 结构化药理属性值，**缺哪个谓词如实列出** | 药理层三元组（性味/归经/功效/用量/炮制/禁忌） |
 | 4 | 出处原文 | 上面那些值各自出自哪一句 | 三元组的 `source_span` + `book` |
 | 5 | 名老中医经验 | 五家在医案里怎么用它 | R35 的 `prescribing_patterns.jsonl` |
-| 6 | 验证结果 | 符号验证器的十二条规则里哪几条**能**对它求值 | `core/formula_verifier.py` 的 `RULE_LABELS` |
+| 6 | 验证结果 | 符号验证器的十三条规则里哪几条**能**对它求值 | `core/formula_verifier.py` 的 `RULE_LABELS` |
 | 7 | 循证对照 | 它的依据落在哪几部书、对照基准是什么 | `Ontology.source_books()` / 证候表 `source` |
 | 8 | 注意 | 剂量上限 / 十八反 / 要单煎先煎 | `core.safety_output`（同一张表） |
 
@@ -161,7 +161,7 @@ def syndrome_row(name: str) -> dict | None:
 #: 全部经它转一道，不在 45 处调用点各自决定怎么措辞（CLAUDE.md 第 31 条）。
 #: 只收精确匹配；表外的兜底交给 `_display_source()` 的正则那一步。
 _SOURCE_LABELS: dict[str, str] = {
-    "core/formula_verifier.py 的八条规则": "符号验证规则表",
+    "core/formula_verifier.py 的九条规则": "符号验证规则表",
     "core/formula_verifier.py::check_effect_matches_method": "符号验证规则表·治法与功效匹配",
     "core/safety_output.py 同一张表": "剂量与配伍安全表",
     "data/standard/syndromes.jsonl": "标准证候表",
@@ -249,12 +249,12 @@ def _evidence_section(lines: list[str], source: str) -> dict | None:
 # 这一节报的是**可验证性**，不是本次处方的验证结论。
 #
 # 为什么不报结论：结论是 `core/formula_verifier.py` 对**一整张方**求值出来的
-# （本体八条规则里有六条要同时看方里所有药），而这个接口拿到的只有一个节点 id，
+# （本体九条规则里有六条要同时看方里所有药），而这个接口拿到的只有一个节点 id，
 # 没有本次问诊的上下文。硬要在这里现算一个"这味药的验证结果"就得自己拼一个
 # 假的 S3——那是同一个概念的第二处实现，而且算出来的结论跟问诊结果那一份
 # 可能不一致（两处实现的典型症状）。
 #
-# 所以这一节回答的是另一个问题：**这个节点身上的数据够不够让本体那八条规则求值？**
+# 所以这一节回答的是另一个问题：**这个节点身上的数据够不够让本体那九条规则求值？**
 # 这个问题只需要本地数据，答案确定，而且正是"缺哪个谓词"这件事的直接呈现。
 # 本次处方的实际结论在问诊响应的 `verification` 段里，这一节末尾指过去。
 
@@ -265,7 +265,7 @@ _VERIFICATION_POINTER = (
 
 
 def _herb_verifiability(herb, norm: str) -> list[str]:
-    """本体那八条规则对**这一味药**能不能求值，缺什么就说缺什么；R53 加的
+    """本体那九条规则对**这一味药**能不能求值，缺什么就说缺什么；R53 加的
     四条医理一致性规则不按单味药判（跟证型/治法/脏腑相关，不跟某一味药相关），
     所以只报"按什么判"，不重复本体那八条的"可验证/不可验证"判法——
     每条规则的中文名都出自 `RULE_LABELS`（唯一一张表），不在这里另抄一份。"""
@@ -287,9 +287,17 @@ def _herb_verifiability(herb, norm: str) -> list[str]:
             out.append(f"{rule_label(r)}：不可验证——本草本体里没有这味药")
     else:
         out.append(f"{rule_label('herb_not_in_ontology')}：不命中（本体里有这味药）")
+        # R60：herb_source_fabricated（张冠李戴）跟 herb_source_paraphrased（转述未照抄）
+        # 判定"能不能求值"的前提完全一样——都要这味药至少一个谓词有非空出处，
+        # 区别只在对不上之后往哪条规则登记，不在"能不能查"这一步，所以两条
+        # 共用同一个可验证性判据，不重复算一遍。
+        has_source = any(herb.has(p) for p in MATERIA_PREDICATES)
         out.append(f"{rule_label('herb_source_fabricated')}：可验证（本体条目带非空出处）"
-                   if any(herb.has(p) for p in MATERIA_PREDICATES)
+                   if has_source
                    else f"{rule_label('herb_source_fabricated')}：不可验证——条目在但每个谓词的出处都是空的")
+        out.append(f"{rule_label('herb_source_paraphrased')}：可验证（本体条目带非空出处）"
+                   if has_source
+                   else f"{rule_label('herb_source_paraphrased')}：不可验证——条目在但每个谓词的出处都是空的")
         out.append(f"{rule_label('meridian_coverage')}：可验证（归经 {'、'.join(sorted(herb.meridians))}）"
                    if herb.meridians
                    else f"{rule_label('meridian_coverage')}：不可验证——缺「归经」谓词")
@@ -403,7 +411,7 @@ def _herb_sections(name: str, *, ontology=None, patterns_limit: int = 3) -> list
 
     # 验证结果（可验证性）
     out.append(_section("验证结果", _herb_verifiability(herb, norm),
-                        source="core/formula_verifier.py 的八条规则"))
+                        source="core/formula_verifier.py 的九条规则"))
 
     # 循证对照
     ev = [_books_line(ont, "materia_medica", "本草层")]
@@ -569,7 +577,7 @@ def _syndrome_sections(name: str, *, ontology=None) -> list[dict]:
             else f"{rule_label('nature_conflict')}：不可验证——"
                  f"证候表这一条的病性（{'、'.join(nat) or '空'}）里没有寒热方向",
             _VERIFICATION_POINTER,
-        ], source="core/formula_verifier.py 的八条规则"))
+        ], source="core/formula_verifier.py 的九条规则"))
     # 循证对照
     by_source: dict[str, int] = {}
     for r in rows:
@@ -662,7 +670,7 @@ def _formula_sections(name: str, *, ontology=None) -> list[dict]:
             f"{rule_label('herb_grounded')}、{rule_label('dose_exceeds')}、"
             f"{rule_label('incompatible_pair')}：按方里每一味药逐个判，点那味药看它那一节",
             _VERIFICATION_POINTER,
-        ], source="core/formula_verifier.py 的八条规则"))
+        ], source="core/formula_verifier.py 的九条规则"))
         got_books = sorted({r.book for refs in f.refs.values() for r in refs
                             if r.span.strip() and r.book})
         out.append(_evidence_section([

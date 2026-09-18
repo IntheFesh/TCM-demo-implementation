@@ -111,6 +111,50 @@ def test_metrics_from_result_no_output_when_s3_is_none():
     assert m == {"has_output": False}
 
 
+# ---------- R60 §2.5：被 SymbolicVeto 拦下的那一行不许把违规细节也扔了 ----------
+
+def _fake_symbolic_veto_result(rule="herb_source_fabricated") -> dict:
+    """跟 `core/chain.py` 里 `except SymbolicVeto` 分支实际拼出来的形状一致：
+    `results` 恒为空列表，违规细节挂在顶层 `verification_veto`。"""
+    return {
+        "results": [], "rejected": True,
+        "reject_reason": f"这张方在符号验证中有不可下发的问题（{rule}），"
+                         "系统已按本体原文重开 1 轮仍未消除，因此不给出方药。",
+        "verification_veto": [
+            {"rule": rule, "herbs": ["党参"], "reason": "模型引用的原文对不上",
+             "counterexample": "模型写的是「回阳救逆」；本体里党参的功效原文是「补中益气」"},
+        ],
+    }
+
+
+def test_metrics_from_result_keeps_verification_veto_when_rejected():
+    """这是本条修复的核心：`has_output=False` 分支原来直接扔掉整个 `result`，
+    现在必须把 `verification_veto` 带出来，不然排障只能重跑真机。"""
+    m = metrics_from_result(_fake_symbolic_veto_result())
+    assert m["has_output"] is False
+    assert m["verification_veto"] == [
+        {"rule": "herb_source_fabricated", "herbs": ["党参"], "reason": "模型引用的原文对不上",
+         "counterexample": "模型写的是「回阳救逆」；本体里党参的功效原文是「补中益气」"},
+    ]
+
+
+def test_metrics_from_result_verification_veto_carries_the_actual_rule_name():
+    """换一条规则名（`herb_source_paraphrased`）也要原样带出来——不是只认
+    `herb_source_fabricated` 这一个硬编码的规则名。"""
+    m = metrics_from_result(_fake_symbolic_veto_result(rule="incompatible_pair"))
+    assert m["verification_veto"][0]["rule"] == "incompatible_pair"
+
+
+def test_metrics_from_result_does_not_invent_a_verification_veto_key_when_absent():
+    """正常产出的问诊（没被拦）不该多出一个空的 `verification_veto` 键——
+    没有就是没有，不是 `None` 占位，免得下游把"没被拦"跟"被拦了但值是 None"
+    弄混。"""
+    m = metrics_from_result(_fake_derived_result())
+    assert "verification_veto" not in m
+    m2 = metrics_from_result({"results": [{"s3": None}]})
+    assert "verification_veto" not in m2
+
+
 def test_aggregate_marks_rule_refs_not_applicable_for_structured_group():
     """跟 R38 的「不适用不是 0」同一条诚实约束：A 组走 structured，
     rule_refs 完整率这一格恒是「不适用」，不管跑了多少条主诉——**不看这一组
