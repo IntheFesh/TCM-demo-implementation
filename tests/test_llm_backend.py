@@ -451,6 +451,13 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         # 模型填 id 时照着看）。调用方是 core/chain.py::run_synthesis。
         "s3_structured": {"physicians", "physician_ids", "elements_summary",
                           "symptoms", "refs"},
+        # R52：第一相「演绎推导」的 prompt（`S3_MODE=derived` 走它，产品默认）。
+        # 没有 `refs`——这一相不检索任何医案，$refs 占位符从设计上就不存在。
+        # $theory_rules 是医理规则块（core/chain.py::_format_theory_rules），
+        # $knowledge 是本草/方剂本体块（跟 s3_structured 的 $refs 里含知识块
+        # 不同，这里知识块单独占一个占位符，因为没有医案块可以合并进去）。
+        # 调用方是 core/chain.py::run_derivation。
+        "s3_derived": {"elements_summary", "symptoms", "theory_rules", "knowledge"},
         # physician_id 是 P1-1.1b 加的（模型要填 id 不是中文名，SOURCES.md 第 31 条），
         # 调用方 core/react.py::run_react 已同步传它——这条是有意的契约变更。
         "s3_react": {"name", "physician_id", "symptoms", "elements_summary", "tools", "history", "remaining"},

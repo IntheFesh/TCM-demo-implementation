@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from core.herbs import split_western_drugs
+from core.theory import rule as _theory_rule
 
 # ---------- 离线：医案结构化 ----------
 
@@ -987,6 +988,65 @@ class PhysicianInfluence(BaseModel):
 S3_CHAIN_STEPS: tuple[str, ...] = ("organ", "syndrome", "method", "formula", "herbs")
 
 
+def _check_no_step_skipping(organs, syndrome, method, formula, herb_choices) -> None:
+    """五步链「不可跳步」的四条 + 一条来源校验的唯一实现。
+
+    `_S3StructuredBase`（检索到医案时用）与 `S3Derived`（R52 演绎推导，
+    看不到医案）共用这一份——两套 schema 字段形状不同（医案引用 vs 规则引用），
+    但"上一步的结论有没有被下一步接住"是同一个问题，答案不能因为问的是哪个
+    schema 而不同（CLAUDE.md「同一概念的匹配逻辑只能有一处实现」）。两边的
+    字段名刻意保持一致（`organ`/`from_organs`/`from_syndrome`/`principle`/
+    `from_method`/`candidate`/`herb_items`/`for_element`/`targets`），
+    这份函数靠鸭子类型直接读，不关心传进来的是哪个类。
+    """
+    organ_names = {o.organ for o in organs}
+    missing = [o for o in syndrome.from_organs if o not in organ_names]
+    if missing:
+        raise ValueError(
+            f"第 2 步（证型）的 from_organs 里 {missing} 没有出现在第 1 步的病变脏腑 "
+            f"{sorted(organ_names)} 里——证型必须从已经定位的脏腑推出来，不能跳步。"
+        )
+    if method.from_syndrome != syndrome.name:
+        raise ValueError(
+            f"第 3 步（治法）的 from_syndrome={method.from_syndrome!r} "
+            f"跟第 2 步的证型 {syndrome.name!r} 不一致（要求逐字相同，"
+            "不接受「上述证型」这类指代——那样等于没有接住上一步的结论）。"
+        )
+    if formula.from_method != method.principle:
+        raise ValueError(
+            f"第 4 步（方剂）的 from_method={formula.from_method!r} "
+            f"跟第 3 步的治法 {method.principle!r} 不一致（要求逐字相同）。"
+        )
+    in_formula = {i.name for i in formula.candidate.herb_items}
+    explained = {c.item.name for c in herb_choices}
+    unexplained = sorted(in_formula - explained)
+    extraneous = sorted(explained - in_formula)
+    if unexplained or extraneous:
+        # **两个方向一起报**，不是先报一个。这条错误会被 generate() 回灌给模型
+        # 重试，只报一半的话它改完一半再撞另一半，白花一次重试——而重试只有两次。
+        parts = []
+        if unexplained:
+            parts.append(
+                f"方里有 {unexplained} 但 herb_choices 里没有给出用药理由"
+                "（每一味开出去的药都要说得出针对哪条病机、依据哪条功效）")
+        if extraneous:
+            parts.append(
+                f"herb_choices 里的 {extraneous} 并不在这张方的 herb_items 里"
+                "（给一味没开的药写理由，说明这两处对不上，不是多写了几句）")
+        raise ValueError(
+            "herb_choices 与 formula.candidate.herb_items 的药名集合必须完全一致："
+            + "；".join(parts) + "。"
+        )
+    allowed = organ_names | set(method.targets)
+    stray = sorted({c.for_element for c in herb_choices} - allowed)
+    if stray:
+        raise ValueError(
+            f"这几味药的 for_element {stray} 既不是第 1 步的病变脏腑、"
+            f"也不是第 3 步治法的 targets（可选：{sorted(allowed)}）——"
+            "针对一条没被辨出来的病机加药，就是无依据的加减。"
+        )
+
+
 class _S3StructuredBase(BaseModel):
     """`S3Structured` 与 `S3StructuredUnreferenced` 共享的五步链与「不可跳步」校验。
 
@@ -1027,52 +1087,7 @@ class _S3StructuredBase(BaseModel):
 
     @model_validator(mode="after")
     def _no_step_skipping(self) -> "_S3StructuredBase":
-        organ_names = {o.organ for o in self.organs}
-        missing = [o for o in self.syndrome.from_organs if o not in organ_names]
-        if missing:
-            raise ValueError(
-                f"第 2 步（证型）的 from_organs 里 {missing} 没有出现在第 1 步的病变脏腑 "
-                f"{sorted(organ_names)} 里——证型必须从已经定位的脏腑推出来，不能跳步。"
-            )
-        if self.method.from_syndrome != self.syndrome.name:
-            raise ValueError(
-                f"第 3 步（治法）的 from_syndrome={self.method.from_syndrome!r} "
-                f"跟第 2 步的证型 {self.syndrome.name!r} 不一致（要求逐字相同，"
-                "不接受「上述证型」这类指代——那样等于没有接住上一步的结论）。"
-            )
-        if self.formula.from_method != self.method.principle:
-            raise ValueError(
-                f"第 4 步（方剂）的 from_method={self.formula.from_method!r} "
-                f"跟第 3 步的治法 {self.method.principle!r} 不一致（要求逐字相同）。"
-            )
-        in_formula = {i.name for i in self.formula.candidate.herb_items}
-        explained = {c.item.name for c in self.herb_choices}
-        unexplained = sorted(in_formula - explained)
-        extraneous = sorted(explained - in_formula)
-        if unexplained or extraneous:
-            # **两个方向一起报**，不是先报一个。这条错误会被 generate() 回灌给模型
-            # 重试，只报一半的话它改完一半再撞另一半，白花一次重试——而重试只有两次。
-            parts = []
-            if unexplained:
-                parts.append(
-                    f"方里有 {unexplained} 但 herb_choices 里没有给出用药理由"
-                    "（每一味开出去的药都要说得出针对哪条病机、依据哪条功效）")
-            if extraneous:
-                parts.append(
-                    f"herb_choices 里的 {extraneous} 并不在这张方的 herb_items 里"
-                    "（给一味没开的药写理由，说明这两处对不上，不是多写了几句）")
-            raise ValueError(
-                "herb_choices 与 formula.candidate.herb_items 的药名集合必须完全一致："
-                + "；".join(parts) + "。"
-            )
-        allowed = organ_names | set(self.method.targets)
-        stray = sorted({c.for_element for c in self.herb_choices} - allowed)
-        if stray:
-            raise ValueError(
-                f"这几味药的 for_element {stray} 既不是第 1 步的病变脏腑、"
-                f"也不是第 3 步治法的 targets（可选：{sorted(allowed)}）——"
-                "针对一条没被辨出来的病机加药，就是无依据的加减。"
-            )
+        _check_no_step_skipping(self.organs, self.syndrome, self.method, self.formula, self.herb_choices)
         return self
 
     # ---- 派生视图：下游一个调用方都不用改 ----
@@ -1210,6 +1225,300 @@ class S3StructuredUnreferenced(_S3StructuredBase):
     def physician_influences(self) -> list["PhysicianInfluence"]:
         """同上，永远是空——说不出医案的"影响"这个 schema 不收。"""
         return []
+
+
+# ---------- R52：第一相·演绎推导。看不到任何医案，依据换成医理规则 ----------
+#
+# `S3Structured`/`S3StructuredUnreferenced` 靠"检索到的医案"防幻觉：说不出
+# 医案 id 就不收。这一相反过来——prompt 里从设计上就不给医案，模型只能靠
+# R51 医理规则层（`core/theory.py`）与本体（`core/ontology.py`）推导，
+# 所以防幻觉换成"说不出规则 id 就不收，说不出规则也可以，但必须显式承认"。
+# 这不是把约束改松：`cited_case_ids: Field(min_length=1)` 变成了
+# `rule_refs` 非空 **或** `insufficient` 非空的二选一校验，能接受的值集合
+# 变小了（多了"必须显式声明缺口"这条），不是变可选。
+
+
+class TheoryRef(BaseModel):
+    """一条医理规则引用：指向 `core/theory.py` 里的一条规则，并带上引用理由。
+
+    `rule_id` 必须真实存在——校验器直接回查 `core.theory.rule()`，查不到
+    就在第一次构造时拒绝，不用等到人工审查才发现是编的 id。跟
+    `OntologyRef.span` 是同一条防幻觉纪律：一条"依据"如果指不出真实存在的
+    东西，就不是依据，是模型自己的话。
+    """
+
+    rule_id: str = Field(min_length=1)
+    note: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _rule_must_exist(self) -> "TheoryRef":
+        if _theory_rule(self.rule_id) is None:
+            raise ValueError(
+                f"rule_refs 引用的规则 id {self.rule_id!r} 在医理规则层（core/theory.py）"
+                "查不到——演绎推导的每一步依据必须指向一条真实存在的规则，不能凭空编一个 id。"
+            )
+        return self
+
+
+class InsufficientNote(BaseModel):
+    """某一步在医理规则层里确实找不到可引的规则时，显式声明"依据不足"，
+    而不是留空或编一条规则凑数。
+
+    `missing_rule_kind` 说清楚缺的是哪一类规则，跟 R51 `core/theory.py` 的
+    四个查询接口一一对应——R57 消融实验要按这个字段统计"到底缺什么"，
+    不是笼统一句"没查到"。
+    """
+
+    what: str = Field(min_length=1)
+    missing_rule_kind: Literal[
+        "organ_relation", "pathomechanism", "treatment_principle", "compatibility"
+    ]
+
+
+def _require_rule_refs_or_insufficient(step_label: str, rule_refs: list, insufficient) -> None:
+    """`rule_refs` 非空 或 `insufficient` 非空——二选一，不能两者都不给。
+
+    五个 Derived 步骤类共用同一条判据（CLAUDE.md「同一概念的匹配逻辑只能有
+    一处实现」）：判断"这一步有没有交代依据"跟具体是脏腑/证型/治法/方剂/
+    哪一味药无关，只是错误信息里要带上步骤名。
+    """
+    if not rule_refs and insufficient is None:
+        raise ValueError(
+            f"{step_label}既没有给 rule_refs 也没有标 insufficient——"
+            "演绎推导的每一步要么指得出依据的医理规则，要么显式承认「依据不足」，"
+            "不能两者都不给（那样就是凭记忆编一个结论，跟看医案模仿没有区别）。"
+        )
+
+
+class OrganLocusDerived(BaseModel):
+    """演绎推导第 1 步：病变脏腑。跟 `OrganLocus` 同形状（`supporting_symptoms`
+    仍然必填——脏腑定位必须落在患者症状上，这条跟依据来自哪里无关），
+    但换成医理规则（`rule_refs`，通常引藏象关系 `organ_relation`）做依据，
+    不是模型看着医案模仿出来的"看起来像"。
+    """
+
+    organ: str = Field(min_length=1)
+    supporting_symptoms: list[str] = Field(min_length=1)
+    pathogenesis: str = Field(min_length=1)
+    rule_refs: list[TheoryRef] = Field(default_factory=list)
+    insufficient: InsufficientNote | None = None
+
+    @model_validator(mode="after")
+    def _cites_or_flags(self) -> "OrganLocusDerived":
+        _require_rule_refs_or_insufficient(
+            f"第 1 步（病变脏腑 {self.organ!r}）", self.rule_refs, self.insufficient)
+        return self
+
+
+class SyndromeStepDerived(BaseModel):
+    """演绎推导第 2 步：证型。`from_organs` 校验跟结构化模式一样（不可跳步），
+    依据通常引病机传变 `pathomechanism`。"""
+
+    name: str = Field(min_length=1)
+    disease: str | None = None
+    from_organs: list[str] = Field(min_length=1)
+    reasoning: str = Field(min_length=1)
+    reasoning_plain: str = Field(min_length=1)
+    rule_refs: list[TheoryRef] = Field(default_factory=list)
+    insufficient: InsufficientNote | None = None
+
+    @model_validator(mode="after")
+    def _cites_or_flags(self) -> "SyndromeStepDerived":
+        _require_rule_refs_or_insufficient("第 2 步（证型）", self.rule_refs, self.insufficient)
+        return self
+
+
+class MethodStepDerived(BaseModel):
+    """演绎推导第 3 步：治法。依据通常引治则推导 `treatment_principle`
+    （`core/theory.py::principles_for` 按证型的 nature/location 查出来的那批）。"""
+
+    principle: str = Field(min_length=1)
+    from_syndrome: str = Field(min_length=1)
+    targets: list[str] = Field(min_length=1)
+    rule_refs: list[TheoryRef] = Field(default_factory=list)
+    insufficient: InsufficientNote | None = None
+
+    @model_validator(mode="after")
+    def _cites_or_flags(self) -> "MethodStepDerived":
+        _require_rule_refs_or_insufficient("第 3 步（治法）", self.rule_refs, self.insufficient)
+        return self
+
+
+class FormulaStepDerived(BaseModel):
+    """演绎推导第 4 步：方剂。`ontology_refs` 照抄 `FormulaStep`（本体引用，
+    跟"依据哪条医理规则"是两件事，不合并）；`rule_refs` 通常引配伍理论
+    `compatibility`（君臣佐使结构、药对配伍）。
+
+    自拟方（`FormulaCandidate.source="composed"`）不用改 schema 就能表达：
+    `name` 仍然必填，模型给一个描述性方名（如"健脾理气方"）即可，
+    `base_formula` 留空由 `FormulaCandidate._check_base_formula` 校验。
+    """
+
+    candidate: FormulaCandidate
+    from_method: str = Field(min_length=1)
+    ontology_refs: list[OntologyRef] = Field(default_factory=list)
+    rule_refs: list[TheoryRef] = Field(default_factory=list)
+    insufficient: InsufficientNote | None = None
+
+    @model_validator(mode="after")
+    def _cites_or_flags(self) -> "FormulaStepDerived":
+        _require_rule_refs_or_insufficient("第 4 步（方剂）", self.rule_refs, self.insufficient)
+        return self
+
+
+class HerbChoiceDerived(BaseModel):
+    """演绎推导第 5 步：一味药为什么进这张方。
+
+    **没有 `physician_source`**——`HerbChoice.physician_source` 是"这味药的
+    用法受哪位医家影响"，是这一相要从设计上消除的东西（R52 §0：`cited_case_ids`
+    / `physician_influences` / `physician_source` / `dose_evidence` 一起去掉，
+    不是留着不填）。`ontology_refs` 保留（本体引用，跟"是不是模仿某位医家"
+    是两件事）。
+    """
+
+    item: HerbItem
+    for_element: str = Field(min_length=1)
+    effect_cited: str = Field(min_length=1)
+    ontology_refs: list[OntologyRef] = Field(default_factory=list)
+    rule_refs: list[TheoryRef] = Field(default_factory=list)
+    insufficient: InsufficientNote | None = None
+
+    @model_validator(mode="after")
+    def _cites_or_flags(self) -> "HerbChoiceDerived":
+        _require_rule_refs_or_insufficient(
+            f"第 5 步（用药 {self.item.name!r}）", self.rule_refs, self.insufficient)
+        return self
+
+
+class S3Derived(BaseModel):
+    """R52 第一相：演绎推导的结果。**看不到任何医案**——`prompts/v1/s3_derived.yaml`
+    全文没有参考医案块，模型只能依据 R51 医理规则层与本体推导；说不出依据
+    必须显式 `insufficient`，不能像检索模式那样退回"编一段像医案的话"。
+
+    跟 `_S3StructuredBase` 是**并列而非继承**（CLAUDE.md：不同字段形状继承
+    会让一边的校验污染另一边）：这里没有 `cited_case_ids`、没有
+    `physician_influences`，替换成 `rule_refs`/`insufficient`。
+
+    五步链「不可跳步」的校验跟结构化模式**共用同一份实现**
+    （`_check_no_step_skipping`）：看不到医案不等于可以跳步，这条约束
+    跟"依据来自哪里"是两个维度，不能因为换了防幻觉手段就连带放松。
+
+    `to_s3_syndrome()` 恒返回 `S3SyndromeUnreferenced`——这一相的产出天然
+    没有 `cited_case_ids`；R54 医案佐证是独立的第三相，事后在旁路补充，
+    不回头改这里（"绝不回头改推导"是 R54 的硬约束，这个方法从第一相起
+    就没有留一个能被第三相塞值进来的字段）。
+    """
+
+    organs: list[OrganLocusDerived] = Field(min_length=1)
+    syndrome: SyndromeStepDerived
+    method: MethodStepDerived
+    formula: FormulaStepDerived
+    herb_choices: list[HerbChoiceDerived] = Field(min_length=1)
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _no_step_skipping(self) -> "S3Derived":
+        _check_no_step_skipping(self.organs, self.syndrome, self.method, self.formula, self.herb_choices)
+        return self
+
+    # ---- 派生视图：跟 `_S3StructuredBase` 同名同形状，下游按 hasattr 判断即可 ----
+
+    @property
+    def ontology_refs(self) -> list["OntologyRef"]:
+        """全链条上的本体引用（方级 + 药级），去重保序。跟
+        `_S3StructuredBase.ontology_refs` 是同一段逻辑（字段名相同），
+        没有再抽公共函数是因为总共只有这一处重复、且两边就地读 self 的写法
+        比额外传参更直接——抽出来反而要多传 5 个位置参数。"""
+        out: list[OntologyRef] = []
+        seen: set[tuple] = set()
+        for ref in [*self.formula.ontology_refs,
+                    *(r for c in self.herb_choices for r in c.ontology_refs)]:
+            key = (ref.kind, ref.name, ref.predicate, ref.span)
+            if key not in seen:
+                seen.add(key)
+                out.append(ref)
+        return out
+
+    @property
+    def rule_refs(self) -> list["TheoryRef"]:
+        """全链条上引用的医理规则，去重保序。R57 消融实验的 rule_refs 完整度
+        指标、前端「本例知识地图」都读这个，不各自遍历一遍嵌套结构。"""
+        out: list[TheoryRef] = []
+        seen: set[tuple] = set()
+        items = [*self.organs, self.syndrome, self.method, self.formula, *self.herb_choices]
+        for it in items:
+            for ref in it.rule_refs:
+                key = (ref.rule_id, ref.note)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(ref)
+        return out
+
+    @property
+    def insufficient_notes(self) -> list["InsufficientNote"]:
+        """哪几条断言标了"依据不足"。前端要如实展示，不是藏起来。"""
+        items = [*self.organs, self.syndrome, self.method, self.formula, *self.herb_choices]
+        return [it.insufficient for it in items if it.insufficient is not None]
+
+    def derivation_completeness_ratio(self) -> float:
+        """演绎链上"给出了 rule_refs 而非 insufficient"的条目占比。
+
+        分母是链上每一条独立断言（每个脏腑定位、证型、治法、方剂、每味药），
+        不是固定按 5 步算：脏腑与药味本身是列表，按 5 步算的话一步里有一条
+        不够、九条够，也会被算成这步"不够"，会把真实比例压低或抬高，跟
+        `herbs_grounded_ratio` 选"按条目而不是按步"是同一个理由。
+        """
+        items = [*self.organs, self.syndrome, self.method, self.formula, *self.herb_choices]
+        if not items:
+            return 0.0
+        grounded = sum(1 for it in items if it.rule_refs)
+        return grounded / len(items)
+
+    def herbs_grounded_ratio(self) -> float:
+        """带本体引用的药味占比。跟 `_S3StructuredBase.herbs_grounded_ratio`
+        同一段逻辑（字段名相同：`herb_choices[].ontology_refs`），`core/
+        formula_verifier.py::herbs_grounded_ratio(s3)` 转发到这个方法，
+        `verifier_metrics` 靠它拿 R34 三指标之一——两套 schema 都要有这个方法，
+        R53 把符号验证扩到医理一致性时不用再判一次"这是哪种 schema"。
+        """
+        if not self.herb_choices:
+            return 0.0
+        grounded = sum(1 for c in self.herb_choices if c.ontology_refs)
+        return grounded / len(self.herb_choices)
+
+    def to_s3_syndrome(self) -> "S3SyndromeUnreferenced":
+        """转成下游认识的 `S3SyndromeUnreferenced`——只此一处实现
+        （第 31 条：同一概念的匹配/转换逻辑只能有一处）。
+
+        恒是 `Unreferenced` 变体，不是 `S3Syndrome`：后者要求非空
+        `cited_case_ids`，而演绎推导天生没有——这不是"退化成没有医案"，
+        是这一相设计上就不该有。
+        """
+        chain_lines = [
+            "病变脏腑：" + "；".join(
+                f"{o.organ}（{'、'.join(o.supporting_symptoms)} → {o.pathogenesis}）"
+                for o in self.organs),
+            f"证型：{self.syndrome.name}（自 {'、'.join(self.syndrome.from_organs)}）",
+            f"治法：{self.method.principle}（针对 {'、'.join(self.method.targets)}）",
+            f"方剂：{self.formula.candidate.name}",
+        ]
+        parts = [self.syndrome.reasoning, "", "—— 五步链条（演绎推导，未参考医案） ——", *chain_lines]
+        refs = self.rule_refs
+        if refs:
+            parts += ["", "—— 医理依据 ——", *(f"【{r.rule_id}】{r.note}" for r in refs)]
+        notes = self.insufficient_notes
+        if notes:
+            parts += ["", "—— 依据不足 ——", *(f"{n.what}（缺 {n.missing_rule_kind}）" for n in notes)]
+        return S3SyndromeUnreferenced(
+            disease=self.syndrome.disease,
+            syndrome=self.syndrome.name,
+            reasoning="\n".join(parts),
+            reasoning_plain=self.syndrome.reasoning_plain,
+            treatment_principle=self.method.principle,
+            formula_candidates=[self.formula.candidate],
+            selected=0,
+            note=self.note,
+        )
 
 
 # ---------- R35：名医用药规律（确定性统计，不是 LLM 输出） ----------

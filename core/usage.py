@@ -57,15 +57,21 @@ def calls_per_consult(n_physicians: int | None = None, best_of_n: int | None = N
     前端不自己算（它读 `/api/usage` 给的 `calls_per_consult`），额度默认值、
     看板、README 都问这里。
 
-    公式**随 S3 模式变**（R33）：
+    公式**随 S3 模式变**（R33，R52 扩到三档）：
 
       legacy      `2 + n_physicians × best_of_n`  —— 每位医家各采 N 次
       structured  `2 + best_of_n`                 —— 五家融合成**一次**调用
+      derived     `2 + best_of_n`                 —— 演绎推导也是**一次**调用
 
-    structured 下医家数不进公式，这是这一轮最大的一笔省：五位医家 × N=3 是
+    structured 下医家数不进公式，这是那一轮最大的一笔省：五位医家 × N=3 是
     15 次 S3，融合成一次之后是 3 次（`best_of_n` 仍然乘上来——采样是"同一份
     产出采几次挑最好的"，跟"几位医家"是两件不同的事）。
     **不是把 n_physicians 当成 1**：那样写下次改公式的人会以为这里少了个变量。
+
+    derived 下 `n_physicians` 恒为 0（`physicians_for_mode("derived")` 的文档：
+    这一相没有"哪位医家参与"这件事），公式跟 structured 走同一条分支——不是
+    因为两者的"医家数"碰巧都不进公式，是因为两者都是"一次调用产出一份结论"
+    这同一种形状，只是产出这份结论靠的是检索医案还是查医理规则。
 
     三个参数都默认从当前配置取：模式问 `core.llm.s3_mode()`，医家数问
     `core.physicians.physicians_for_mode(mode)`（**按模式取名单**——structured 下
@@ -89,10 +95,11 @@ def calls_per_consult(n_physicians: int | None = None, best_of_n: int | None = N
         from core.llm import s3_best_of_n
 
         best_of_n = s3_best_of_n()
-    if mode == "structured":
-        # 医家数不进公式：五家在**同一次**调用里融合。n_physicians 仍然接在
-        # 参数表里且被校验，好让调用方（前端的"约剩 N 次"、README）不用记住
-        # "这个模式下那个参数会被忽略"——它会被忽略这件事写在这里，只写一次。
+    if mode in ("structured", "derived"):
+        # 医家数不进公式：这一步在**同一次**调用里产出一份结论（融合五家，
+        # 或者演绎推导）。n_physicians 仍然接在参数表里且被校验，好让调用方
+        # （前端的"约剩 N 次"、README）不用记住"这个模式下那个参数会被忽略"
+        # ——它会被忽略这件事写在这里，只写一次。
         return fixed_steps_per_consult() + best_of_n
     return fixed_steps_per_consult() + n_physicians * best_of_n
 # 开了 ReAct 之后每位医家额外的取证循环步数（估算用，结算时会被真实值覆盖）。

@@ -369,14 +369,19 @@ S3_REASONING_EFFORT_FULL_CONTEXT = "max"
 
 
 # R33：S3 这一步产出哪种形状。
-#   structured —— 五位医家融合成**一份**结构化诊断（S3Structured，五步链、一张方）
+#   derived    —— R52 演绎推导：五步链 + 医理规则依据（S3Derived），
+#                  prompt 里**没有任何医案**，检索只在验证通过之后做佐证（R54）
+#   structured —— 五位医家融合成**一份**结构化诊断（S3Structured，五步链、一张方），
+#                  推导前就把检索到的医案摆进 prompt 当参考
 #   legacy     —— 各家各自一份 S3Syndrome（2–3 个候选方），三列集注并置
-# **默认 structured**：用户的要求是「五位医家进行综合分析，不要给出多个答案」。
-# legacy 保留成一档而不是删掉（§0.6）：R38 的消融要拿它当对照组，
-# 而且 R1~R32 全部数字都是在它下面跑出来的——删了那些数就没有可比的基线。
-S3_MODES = ("structured", "legacy")
+# **默认 derived**：R51-R58 的定位是「按医理药理演绎推导，医案退为事后佐证」，
+# 不是「检索几位医家再模仿」——structured 与 legacy 都在推导之前就把医案摆进
+# prompt，默认走哪一档就是把产品做成哪一种。structured/legacy 保留成两档而不是
+# 删掉（§0.6）：R38/R57 的消融要拿它们当对照组，而且 R1~R32（legacy）、
+# R33~R51（structured）全部数字都是在它们下面跑出来的——删了那些数就没有可比的基线。
+S3_MODES = ("derived", "structured", "legacy")
 S3_MODE_ENV = "S3_MODE"
-S3_MODE_DEFAULT = "structured"
+S3_MODE_DEFAULT = "derived"
 
 
 def s3_mode() -> str:

@@ -91,10 +91,18 @@ from core.schemas import (
     S1Normalize,
     S1S2Merged,
     S2Elements,
+    S3Derived,
     S3Structured,
     S3StructuredUnreferenced,
     S3Syndrome,
     S3SyndromeUnreferenced,
+)
+from core.theory import (
+    load_theory,
+    organ_relations as theory_organ_relations,
+    principles_for as theory_principles_for,
+    role_construction_rules as theory_role_construction_rules,
+    transitions as theory_transitions,
 )
 
 # min_score 不再是 core/retrieval.py 写死的 MIN_RETRIEVAL_SCORE=0.70，改成
@@ -512,6 +520,81 @@ def _ref_row(case: CaseRecord, score: float) -> dict:
     }
 
 
+#: R52：每一类医理规则最多摆几条进演绎推导 prompt。避免 prompt 随症状数线性
+#: 膨胀——跟 `FOCUSED_MAX_PATTERNS_PER_PHYSICIAN` 同一条纪律（预算摆在明处，
+#: 超出的部分要报"砍了多少"，不是悄悄截断）。
+THEORY_RULES_MAX_PER_KIND = 12
+
+_THEORY_KIND_LABELS = {
+    "organ_relation": "藏象关系",
+    "pathomechanism": "病机传变",
+    "treatment_principle": "治则推导",
+    "compatibility": "配伍理论（君臣佐使）",
+}
+
+
+def _format_theory_rules(s2: S2Elements) -> tuple[str, dict]:
+    """R52：把 S2 证素对应的医理规则渲染成 `s3_derived.yaml` 的 `$theory_rules` 块。
+
+    **这里没有医案，只有规则**——这个函数在演绎推导 prompt 里的位置，就是
+    `run_synthesis`/`run_physician` 里 `$refs`（参考医案块）的位置，但内容来源
+    完全不同（`core/theory.py`，R51 的四类规则），这正是"检索几位医家再模仿"
+    改成"按医理药理演绎推导"的落地点。
+
+    按 S2 给出的脏腑（location）与病性（nature）查，不是把全量规则表塞进去：
+    `data/standard/tcm_theory.jsonl` 会随后续轮次继续增补，prompt 不能随着
+    规则库增长而线性膨胀——`THEORY_RULES_MAX_PER_KIND` 兜底，超出的部分记进
+    `trimmed_sections`（跟 `build_focused_knowledge` 同一条纪律：放了多少、
+    砍了什么都要可核）。
+
+    规则库缺文件（`data/standard/tcm_theory.jsonl` 不在）时返回空文本 + `available:
+    False`——跟 `build_focused_knowledge` 本体不可用时的处理一致，不假装有规则。
+    """
+    locations = [h.element for h in s2.elements if h.kind == "location"]
+    natures = [h.element for h in s2.elements if h.kind == "nature"]
+
+    if not load_theory():
+        return "", {"available": False, "n_rules": 0, "by_kind": {}, "trimmed_sections": []}
+
+    picked: dict[str, list] = {k: [] for k in _THEORY_KIND_LABELS}
+    trimmed: list[str] = []
+    seen_ids: set[str] = set()
+
+    def _add(kind: str, rules) -> None:
+        for r in rules:
+            if r.id in seen_ids:
+                continue
+            if len(picked[kind]) >= THEORY_RULES_MAX_PER_KIND:
+                if kind not in trimmed:
+                    trimmed.append(kind)
+                continue
+            seen_ids.add(r.id)
+            picked[kind].append(r)
+
+    for element in [*locations, *natures]:
+        _add("organ_relation", theory_organ_relations(element))
+    _add("treatment_principle", theory_principles_for(natures, locations))
+    _add("pathomechanism", theory_transitions([*natures, *locations]))
+    _add("compatibility", theory_role_construction_rules())
+
+    lines: list[str] = []
+    for kind, label in _THEORY_KIND_LABELS.items():
+        rules = picked[kind]
+        if not rules:
+            continue
+        lines.append(f"## {label}")
+        for r in rules:
+            lines.append(f"- [{r.id}]（{r.confidence}）{r.span}")
+    text = "\n".join(lines)
+    stats = {
+        "available": True,
+        "n_rules": sum(len(v) for v in picked.values()),
+        "by_kind": {k: len(v) for k, v in picked.items()},
+        "trimmed_sections": trimmed,
+    }
+    return text, stats
+
+
 # E3/E4 消融（eval/run_eval.py）用的三种取值：
 #   own     —— 改造前的默认行为，检索这位医家自己的医案库
 #   swapped —— 检索另一位医家的医案库（见 _swap_physician_id），但仍然以这位
@@ -638,16 +721,21 @@ def _as_s3_syndrome(raw):
     """把 S3 这一步的原始产出统一成下游认识的 `S3Syndrome`。
 
     `S3_MODE=structured` 下 `generate()` 返回的是 `S3Structured`（五步链、一张方），
-    legacy 下返回的已经是 `S3Syndrome`。**只此一处转换**——打分、X2 输出侧安全、
-    幻觉检查、病名校验、方剂建议、分歧度、api 的角色裁剪、前端，全都只认识
-    `S3Syndrome`，让它们各自 `isinstance` 一遍等于把这一跳抄七遍（第 31 条）。
+    `S3_MODE=derived`（R52）下是 `S3Derived`（五步链、无医案），legacy 下返回的
+    已经是 `S3Syndrome`。**只此一处转换**——打分、X2 输出侧安全、幻觉检查、
+    病名校验、方剂建议、分歧度、api 的角色裁剪、前端，全都只认识 `S3Syndrome`，
+    让它们各自判断一遍"这是哪种 schema"等于把这一跳抄七遍（第 31 条）。
 
-    转换本身在 `_S3StructuredBase.to_s3_syndrome()` 里，不在这里——这个函数只回答
+    判据是 `hasattr(raw, "to_s3_syndrome")` 而不是 `isinstance(raw, _S3StructuredBase)`
+    ——`S3Derived` 跟 `_S3StructuredBase` 是并列关系（R52 的 schema 文档字符串：
+    字段形状不同，继承会让案例引用的校验污染进没有医案的 schema），`isinstance`
+    检查不出它，鸭子类型检查两边都认。
+
+    转换本身在各自 schema 的 `to_s3_syndrome()` 里，不在这里——这个函数只回答
     "要不要转"，"怎么转"是 schema 自己的事。
     """
-    from core.schemas import _S3StructuredBase
-
-    return raw.to_s3_syndrome() if isinstance(raw, _S3StructuredBase) else raw
+    to_s3 = getattr(raw, "to_s3_syndrome", None)
+    return to_s3() if callable(to_s3) else raw
 
 
 def _score_candidate(s3) -> tuple[float, dict]:
@@ -1575,6 +1663,155 @@ def run_synthesis(
     }
 
 
+def run_derivation(
+    s1: S1Normalize,
+    s2: S2Elements,
+    followup: FollowupResult | None = None,
+    bypass_safety: bool = False,
+    on_step: StepFn | None = None,
+    refs_mode: str = "own",
+) -> dict:
+    """R52 第一相：演绎推导，**不检索任何医案**（`S3_MODE=derived`，R52 之后的默认值）。
+
+    跟 `run_synthesis`/`run_physician` 是**并列的第三条路径**，不是它们的分支：
+    这条路径的 prompt（s3_derived）、schema（`S3Derived`）从设计上就没有医案
+    引用的位置——本函数体内**一次都不调用 `_search_cases`**，不是调用了但没塞进
+    prompt。这不是"检索失败退化成没有医案"（那是 `S3StructuredUnreferenced` 的
+    场景），是这一相**从不检索**。
+
+    ## 为什么不接 ReAct（`use_react` 不是这个函数的参数）
+
+    `core/react.py` 的工具集里 `search_cases` / `query_case_graph` 直接查医案库
+    ——接了 ReAct 等于从工具调用这道后门把医案检索请回来，「看不到任何医案」
+    这条约束就名存实亡了。`run_physician`/`run_synthesis` 的 `use_react` 参数
+    在这里索性不存在，不是接了但默认关：调用方想给这一相接工具，得先有一套
+    只查医理规则、不碰医案库的工具集（不在这一轮范围内）。
+
+    ## refs_mode 为什么还在参数列表里
+
+    单纯为了跟 `run_physician`/`run_synthesis` 保持同一个调用签名，方便
+    `consult()` 按 mode 分派时不用为每条路径记一份不同的参数表。这一相没有
+    医案检索，这个参数**不产生任何效果**——不是被悄悄忽略，是文档字符串在这里
+    明说了它无效，调用方看得到。
+
+    ## 返回值
+
+    跟 `run_synthesis` 同一套键（`results` 的元素结构是既有契约），但没有
+    `refs`/`no_reference_cases`/`physician_influences` 这几个案例相关字段的
+    真实内容——`refs` 恒为空列表、`no_reference_cases` 恒为 True、
+    `physician_influences` 恒为空列表（`hallucinated` 同样恒为空列表：schema
+    校验已经把编造的 rule_id 挡在了 `S3Derived` 能被构造出来之前，不会有漏网的）。
+    新增三个键（R57 消融实验、R56 前端「本例知识地图」都读这些，不必各自重新
+    遍历 `s3_structured` 的嵌套结构）：
+      - `theory`：这次进了 prompt 的医理规则统计（`_format_theory_rules` 的第二个返回值）
+      - `rule_refs`：全链条引用过的医理规则（扁平化、去重）
+      - `insufficient_notes`：哪几步标了"依据不足"
+      - `derivation_completeness_ratio`：链上有规则支撑（非 insufficient）的条目占比
+    """
+    if refs_mode not in ALLOWED_REFS_MODES:
+        raise ValueError(f"未知的 refs_mode={refs_mode!r}，目前支持 {sorted(ALLOWED_REFS_MODES)}")
+
+    symptoms_text = "；".join(s1.symptoms)
+
+    theory_text, theory_stats = _format_theory_rules(s2)
+    knowledge_text, knowledge_stats = build_focused_knowledge(s1, s2, [], [], syndromes=[])
+
+    s3_prompt = load_prompt("s3_derived")
+    s3_system = render(
+        s3_prompt["system"],
+        elements_summary=_format_elements_summary(s2),
+        symptoms=symptoms_text,
+        theory_rules=theory_text or "（这次没有查到相关的医理规则，如实在 insufficient 里说明。）",
+        knowledge=knowledge_text or "（本体不可用，本草/方剂知识块为空——ontology_refs 留空即可。）",
+    )
+    if followup is not None:
+        s3_system = s3_system + format_followup_for_s3(followup)
+
+    if on_step is not None:
+        on_step("s3_start", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                             "physician_name": SYNTHESIS_PHYSICIAN_NAME})
+    emitter = S3DeltaEmitter(on_step, SYNTHESIS_PHYSICIAN_ID, SYNTHESIS_PHYSICIAN_NAME)
+    raw, candidates_scored = _best_of_n_s3(s3_system, S3Derived, SYNTHESIS_PHYSICIAN_ID,
+                                           on_delta=emitter)
+    emitter.flush()
+    if on_step is not None:
+        on_step("s3_done", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                            "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+                            **emitter.summary(),
+                            "streaming_note": _streaming_note(len(candidates_scored))})
+    # R34（延伸到 R52）：同一套验证闭环，S3Derived 靠字段名跟 S3Structured 保持
+    # 一致这件事直接免费获得（core/formula_verifier.py 的七条规则全是鸭子类型）。
+    raw, s3, verify_rounds, revise_calls = _verify_and_revise(
+        raw, s3_system, S3Derived, on_step=on_step,
+    )
+    for cand in s3.formula_candidates:
+        cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
+    selected_safety = s3.formula_candidates[s3.selected].safety
+    revised = len(verify_rounds) > 1
+
+    disease_candidates = match_disease(
+        s1.symptoms, [h.element for h in s2.elements if h.kind == "location"]
+    )
+    if s3.disease is not None and get_disease(s3.disease) is None:
+        warn = f"病名「{s3.disease}」不在病名参考表（含别名）里，未做规则校验。"
+        s3.note = f"{s3.note}；{warn}" if s3.note else warn
+
+    formula_check = check_formula(s3.syndrome, s3.formula_candidates[s3.selected].herb_items)
+
+    return {
+        "physician": SYNTHESIS_PHYSICIAN_ID,
+        "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+        "s2": s2,
+        "s3": s3,
+        # 五步链原件。**跟 `run_synthesis` 用同一个键**——R37 的单链前端与
+        # api/main.py 读的是 organs/syndrome/method/formula/herb_choices 这几个
+        # 通用字段名，`S3Derived` 跟 `S3Structured` 字段名相同，键名换了反而要
+        # 前端多判一次"这是哪种模式"。
+        "s3_structured": raw,
+        # 这一相没有案例引用，两个字段恒空——保留键是为了 `results` 的元素结构
+        # 跨三条路径一致（前端/eval 收集器按同一套键读）。
+        "physician_influences": [],
+        "physicians_cited": [],
+        "herbs_grounded_ratio": raw.herbs_grounded_ratio(),
+        "n_ontology_refs": len(raw.ontology_refs),
+        "verification": verify_rounds[-1].to_dict(),
+        "verifier_metrics": verifier_metrics(verify_rounds, raw),
+        "knowledge": {"mode": "focused" if knowledge_stats.get("available") else "none",
+                      **knowledge_stats, "prefix_assembled": False},
+        # R52 新增：医理规则层的使用情况，`run_synthesis`/`run_physician` 没有
+        # 这个键——那两条路径没有这一层依据。
+        "theory": theory_stats,
+        "rule_refs": [r.model_dump() for r in raw.rule_refs],
+        "insufficient_notes": [n.model_dump() for n in raw.insufficient_notes],
+        "derivation_completeness_ratio": raw.derivation_completeness_ratio(),
+        "streaming": {**emitter.summary(),
+                      "note": _streaming_note(len(candidates_scored))},
+        "disease_candidates": disease_candidates,
+        # 恒空/恒真：这一相**没有检索**，不是"检索了但没查到"。
+        "refs": [],
+        "refs_mode": refs_mode,
+        "no_reference_cases": True,
+        "low_discrimination": False,
+        "lora": get_llm().lora_for(SYNTHESIS_PHYSICIAN_ID),
+        # schema 校验已经把编造的 rule_id 挡在 S3Derived 能被构造出来之前，
+        # 不存在"引了一个不存在的规则却通过了校验"这种情况——恒空列表，
+        # 不是没检查。
+        "hallucinated": [],
+        "safety_flag": None,
+        "safety_output": {
+            "incompatible": selected_safety.incompatible,
+            "thermal_warning": selected_safety.thermal_warning,
+            "revised": revised,
+        },
+        "react_trace": None,
+        "advice": advice_dicts(formula_check),
+        "advice_skipped": list(formula_check.skipped),
+        "formula_score": formula_check.score,
+        "candidates_scored": candidates_scored,
+        "best_of_n": len(candidates_scored),
+    }
+
+
 def cases_sha256() -> str | None:
     """cases.json 的 sha256 前 12 位，文件不存在时 None。
 
@@ -2028,6 +2265,36 @@ def _run_physicians_into(
     `get_llm()` 拿到的是进程单例，BYOK 静默失效、访问者的 key 没被用上、额度照扣。
     每个 worker 一份独立的拷贝：一个 `Context` 只能被 `run` 一次。
     """
+    if mode == "derived":
+        # R52：演绎推导，全程不检索任何医案。跟 structured 分支共用同一个保留
+        # 身份（SYNTHESIS_PHYSICIAN_ID/NAME）——对外都是"这次问诊的一份结论，
+        # 不挂在某位医家名下"，两条路径的区别在**内部怎么产出**（演绎推导 vs
+        # 五家医案融合），不在"这份结论叫什么"。
+        if use_react:
+            # `run_derivation` 不接 use_react（见它的文档字符串：ReAct 的工具集
+            # 里有 search_cases/query_case_graph，接了等于从工具调用这道后门把
+            # 医案检索请回来）。这里提前抛，不等到 run_derivation 内部才发现——
+            # 跟 retriever_mode/refs_mode 不认识时立刻抛是同一条纪律。
+            raise ValueError(
+                "S3_MODE=derived 不支持 use_react=True——ReAct 的工具集会重新引入"
+                "医案检索，这一相的设计就是不检索任何医案。"
+            )
+        if on_step is not None:
+            on_step("physician_start", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                                        "physician_name": SYNTHESIS_PHYSICIAN_NAME})
+        r = run_derivation(
+            s1, s2, followup=followup, bypass_safety=bypass, on_step=on_step,
+            refs_mode=refs_mode,
+        )
+        if on_step is not None:
+            on_step("physician_done", {
+                "physician": SYNTHESIS_PHYSICIAN_ID,
+                "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+                "syndrome": r["s3"].syndrome, "herbs": r["s3"].herbs,
+            })
+        results.append(r)
+        return
+
     if mode == "structured":
         # 五家融合成一份。事件仍然发 physician_start / physician_done，`physician`
         # 字段是保留 id `synthesis`——前端按这个字段路由（DESIGN §4.7），

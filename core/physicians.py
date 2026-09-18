@@ -186,11 +186,19 @@ def physicians_for_mode(mode: str, registry: dict[str, dict] | None = None) -> d
     `mode` 由调用方传进来、不在这里读环境变量：同一个请求的几处判断必须用同一个
     值（跟 `run_physician` 的 `retriever_mode`、`bypass_safety` 同一条纪律——
     进程级环境变量会让两个并发请求互相污染）。
+
+    `derived`（R52）恒返回**空字典**，不是 `physicians_enabled` 也不是
+    `physicians_for_synthesis` 的某个子集：演绎推导阶段不检索任何医案，也就
+    没有"哪位医家参与了这次结论"这件事——0 是这个问题在这一相唯一诚实的答案，
+    不是"数据缺失暂记 0"。`calls_per_consult`/`scripts/demo_preflight.py` 读到
+    的这个 0 就是对的，不是需要另外特殊处理的边界情况。
     """
     from core.llm import S3_MODES
 
     if mode not in S3_MODES:
         raise ValueError(f"S3 模式 {mode!r} 不认识，只能是：{' / '.join(S3_MODES)}")
+    if mode == "derived":
+        return {}
     return (physicians_for_synthesis(registry) if mode == "structured"
             else physicians_enabled(registry))
 

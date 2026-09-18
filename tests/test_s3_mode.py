@@ -119,14 +119,16 @@ def structured(monkeypatch):
 
 # ---------- 模式本身 ----------
 
-def test_the_product_default_is_structured(monkeypatch):
+def test_the_product_default_is_derived(monkeypatch):
     """**这一条是那个钉子的对立面。** conftest 把 `S3_MODE` 钉成 legacy 好让
-    上百条老测试继续测 legacy；这里把环境变量清掉，断言产品默认是 structured
-    ——用户的要求是「五位医家进行综合分析，不要给出多个答案」。"""
+    上百条老测试继续测 legacy；这里把环境变量清掉，断言产品默认是 R52 的
+    derived——R51-R58 的定位是「按医理药理演绎推导，医案退为事后佐证」，
+    不是「检索几位医家再模仿」，structured（推导前就把医案摆进 prompt）不再
+    是默认，但仍然是消融实验（R57）的对照组之一，没有被删掉。"""
     monkeypatch.delenv("S3_MODE", raising=False)
-    assert s3_mode() == "structured"
-    assert S3_MODE_DEFAULT == "structured"
-    assert S3_MODES == ("structured", "legacy")
+    assert s3_mode() == "derived"
+    assert S3_MODE_DEFAULT == "derived"
+    assert S3_MODES == ("derived", "structured", "legacy")
 
 
 def test_the_mode_is_case_insensitive(monkeypatch):

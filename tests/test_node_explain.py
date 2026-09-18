@@ -262,7 +262,7 @@ def test_health_reports_the_s3_shape():
     """前端要在问诊开始之前就知道骨架是单链还是三列（R37）。"""
     client = TestClient(api_main.app)
     body = client.get("/health").json()
-    assert body["s3_mode"] in ("structured", "legacy")
+    assert body["s3_mode"] in ("derived", "structured", "legacy")
 
 
 # ---------- 六、同一概念一处实现 ----------
