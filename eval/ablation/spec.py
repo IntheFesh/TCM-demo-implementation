@@ -107,3 +107,10 @@ def group_by_key(key: str) -> R57Group:
 GATE_C_VERIFIER_FIRST_PASS_VS = "A"          # C 组一次通过率 ≥ A 组
 GATE_C_RULE_REFS_COMPLETENESS_MIN = 0.9      # C 组 rule_refs 完整率 ≥ 0.9
 GATE_CD_CONSISTENCY_MIN = 0.9                # C 与 D 的证型/治法/主方一致率 ≥ 0.9
+
+#: R59：闸门判定要求的最小有效样本。**唯一出处**——`--limit 2` 这类小样本
+#: 探针把 C 组一次通过率量成 1（1/1）也会通过阈值比较，但那不是"判过了"，
+#: 是"样本太小、比较没有意义"。低于这个数时，不管比率算出来是多少，
+#: 那条闸门都判 `passed=None`（⏳ 样本不足），不判 True 也不判 False——
+#: CLAUDE.md 的三分返回值在这里的实例：没测出来 / 测出来没过 / 测出来过了。
+GATE_MIN_SAMPLE_SIZE = 5

@@ -62,3 +62,46 @@ def test_chuanlianzi_keeps_its_canonical_name():
 ])
 def test_compound_doses_are_fully_stripped(raw, expected):
     assert normalize_herb(raw) == expected
+
+
+# ---------- R59：HERB_ALIASES 从 70 条扩到 293 条，逐一核实没有把
+# 药典分列的品种收成一条。这五对是 R59 任务书点名的例子——南/北五味子、
+# 川/怀牛膝、川/广木香、生/熟地黄、生/制首乌各自药性或基原不同，新扩的
+# 产地前缀候选（"广木香"→"木香"这类）必须只把写法并到它自己那个品种，
+# 不能连带把另一个药典分列的品种也拖进来。 ----------
+
+@pytest.mark.parametrize("a,b", [
+    ("南五味子", "北五味子"),
+    ("川牛膝", "怀牛膝"),
+    ("川木香", "广木香"),
+    ("生地黄", "熟地黄"),
+    ("生首乌", "制首乌"),
+])
+def test_r59_pharmacopoeia_distinct_pairs_stay_apart(a, b):
+    """这五对药典分列的品种，扩表前后都不能被 normalize_herb 并成一个名字。"""
+    assert normalize_herb(a) != normalize_herb(b), f"{a} 与 {b} 被归成了同一个名字"
+
+
+def test_r59_guangmuxiang_alias_does_not_pull_in_chuanmuxiang():
+    """R59 新收的"广木香"→"木香"是产地前缀候选，"川木香"本体里是单独一条
+    正名（跟"木香"不同基原）——广木香并入木香，不能连带把川木香也拖过来。"""
+    from core.ontology import get_ontology
+    ont = get_ontology()
+    guang = ont.herb("广木香")
+    chuan = ont.herb("川木香")
+    assert guang is not None and chuan is not None
+    assert guang.name == "木香"
+    assert chuan.name == "川木香"
+    assert guang.name != chuan.name
+
+
+def test_r59_huai_niuxi_alias_does_not_pull_in_chuan_niuxi():
+    """同理："怀牛膝"并入本体的"牛膝"，"川牛膝"必须仍是它自己那条正名。"""
+    from core.ontology import get_ontology
+    ont = get_ontology()
+    huai = ont.herb("怀牛膝")
+    chuan = ont.herb("川牛膝")
+    assert huai is not None and chuan is not None
+    assert huai.name == "牛膝"
+    assert chuan.name == "川牛膝"
+    assert huai.name != chuan.name

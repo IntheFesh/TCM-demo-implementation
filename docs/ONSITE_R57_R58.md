@@ -42,8 +42,11 @@ cat .env | grep -E "^LLM_MODE|^LLM_API_KEY|^LLM_MODEL"
 跑不出内容指标）
 
 ```bash
-python3 -c "import json; d=json.load(open('data/cases.json')); print(len(d), '条医案')"
+python3 -c "import json; d=json.load(open('cases.json')); print(len(d), '条医案')"
 ```
+
+（`cases.json` 在仓库根目录，不在 `data/` 下——`core/retrieval.py::CASES_PATH`
+唯一出处。）
 
 报错说明文件不在，按 `README.md`「快速开始」第 3 步生成（如果之前已经在
 这台机器上跑过 demo，这一步通常已经做过，不用重做）。

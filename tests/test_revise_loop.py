@@ -186,16 +186,23 @@ def test_the_reopen_prompt_keeps_the_original_system_prompt(run):
 
 
 def test_the_reopen_prompt_does_not_carry_unverifiable_items(run, ont):
-    """本体缺数据时模型改方也改不出数据来——写进去只会让它去改一个本来对的地方。"""
+    """本体缺数据时模型改方也改不出数据来——写进去只会让它去改一个本来对的地方。
+
+    这里的"缺数据"场景是"模型没给 `ontology_refs`"（`herb_source_fabricated`
+    的 unverifiable 分支）——**R59 之后不能再拿"药不在本体里"当这个例子**：
+    那件事现在是 `herb_not_in_ontology`，一条真正会回灌的 revise（见
+    `tests/test_formula_verifier.py::
+    test_a_herb_absent_from_the_ontology_actually_reaches_the_revise_feedback`，
+    这条改动的意义正是让它从"判不了、不说"变成"说了、给机会改"）。"""
     _out, llm = run([
-        dict(herbs=("党参", "鲤鱼"), roles=["臣", "臣"]),   # 鲤鱼不在本体里
+        dict(herbs=("党参", "白术"), roles=["臣", "臣"]),   # 缺君药；两味药都在
+                                                          # 本体里，但都没给 ontology_refs
         dict(herbs=("党参", "白术")),
     ])
     second = llm.s3_systems_full[1]
     assert "role_structure" in second
-    assert "鲤鱼" not in second.split("【符号验证不通过】")[1], (
-        "判不了的条目不该出现在回灌段落里"
-    )
+    feedback = second.split("【符号验证不通过】")[1]
+    assert "没有可核的引用" not in feedback, "判不了的条目不该出现在回灌段落里"
 
 
 # ---------- veto 残余不下发 ----------

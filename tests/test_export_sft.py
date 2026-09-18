@@ -491,15 +491,24 @@ def test_textbook_element_step_has_no_rationale_when_the_definition_lacks_the_wo
 
 def test_to_chain_sample_reaches_all_six_target_steps_when_all_three_sources_are_present():
     """三源合并的验收点：教材接前三步，医案接治法/方剂，药理层补药材依据——
-    目标六步全齐，而且每一步的出处各自不同。"""
+    目标六步全齐，而且每一步的出处各自不同。
+
+    `materia_medica` 字典的 key 必须是**归一之后**的正名——生产环境
+    `load_materia_medica_rationales` 建这张表时就是拿 `normalize_herb` 处理过
+    的写法当 key（`offline/export_sft.py::_herb_item` 查表时同样先归一再查），
+    这里直接写死原串"飞滑石"曾经在 HERB_ALIASES 还没收这个写法时凑巧能对上，
+    R59 把"飞滑石"→"滑石"收进别名表之后原串就查不到了——这是 fixture 没有
+    模拟真实建表流程，不是生产代码的 bug，所以用 `normalize_herb()` 现算 key，
+    不管别名表以后再扩，这条测试都还是在验证真实的建表方式。"""
+    from core.herbs import normalize_herb
     from offline.export_sft import TARGET_CHAIN, to_chain_sample
 
     case = _case(syndrome="风寒束表证", formula="逍遥散")
     sample = to_chain_sample(
         case,
         [_triple("ye_tianshi-001", "治以", "清肃上焦", "治以清肃上焦")],
-        materia_medica={"杏仁": ("杏仁降气止咳平喘", "materia_medica:中药学"),
-                        "飞滑石": ("滑石利水通淋", "materia_medica:中药学")},
+        materia_medica={normalize_herb("杏仁"): ("杏仁降气止咳平喘", "materia_medica:中药学"),
+                        normalize_herb("飞滑石"): ("滑石利水通淋", "materia_medica:中药学")},
         formulary={"逍遥散": ("功用疏肝解郁，养血健脾", "formulary:方剂学")},
         lookup=_fake_lookup(_TB_ENTRY),
     )

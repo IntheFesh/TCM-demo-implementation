@@ -1,4 +1,4 @@
-"""R34 符号验证器七条规则。
+"""R34 符号验证器（R59 拆出一条后）十二条规则。
 
 **每条规则都要能指着本体原文说出哪里不对**——那是 LLM-Modulo 那条实证
 （幻觉 63% → 1.7%）的机制所在，也是这一层跟既有两层（safety_output 判"能不能发"、
@@ -86,12 +86,15 @@ def _rules(result, severity=None):
 
 # ---------- 规则表本身 ----------
 
-def test_eleven_rules_split_into_three_veto_and_eight_revise():
-    """R53：七条（R34，本体）扩到十一条（+ 四条 R53 医理一致性规则）。"""
-    assert len(ALL_RULES) == 11
-    assert len(VETO_RULES) == 3 and len(REVISE_RULES) == 8
-    assert set(VETO_RULES) == {"incompatible_pair", "dose_exceeds", "herb_grounded"}
+def test_twelve_rules_split_into_three_veto_and_nine_revise():
+    """R53：七条（R34，本体）扩到十一条（+ 四条 R53 医理一致性规则）；
+    R59 把 `herb_grounded` 拆成 `herb_not_in_ontology`（revise）+
+    `herb_source_fabricated`（veto），十一条变十二条。"""
+    assert len(ALL_RULES) == 12
+    assert len(VETO_RULES) == 3 and len(REVISE_RULES) == 9
+    assert set(VETO_RULES) == {"incompatible_pair", "dose_exceeds", "herb_source_fabricated"}
     assert set(REVISE_RULES) == {
+        "herb_not_in_ontology",
         "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
         "principle_matches_syndrome", "method_not_contraindicated",
         "pathomechanism_consistent", "role_structure_by_rule",
@@ -193,44 +196,73 @@ def test_a_missing_dose_is_unverifiable_not_a_pass(ont):
     assert "不是" in u[0].reason
 
 
-def test_herb_grounded_vetoes_a_fabricated_span(ont):
-    """引用了本体里不存在的原文 = 编造出处。"""
+def test_herb_source_fabricated_vetoes_a_fabricated_span(ont):
+    """引用了本体里不存在的原文 = 编造出处。**前提是这味药已经在本体里查到了**
+    ——R59 把"药不在本体里"拆给 `herb_not_in_ontology`，这条只处理"药在、但
+    引用对不上"的局面（见下面 `test_a_herb_absent_from_the_ontology_*`）。"""
     refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
                       "span": "回阳救逆、通经活络"}]}
     r = verify_formula(mk(["党参", "白术"], refs=refs), ontology=ont)
-    assert "herb_grounded" in _rules(r, "veto")
-    v = next(v for v in r.violations if v.rule == "herb_grounded")
+    assert "herb_source_fabricated" in _rules(r, "veto")
+    v = next(v for v in r.violations if v.rule == "herb_source_fabricated")
     assert "回阳救逆" in v.counterexample, "要把模型写的那段引出来"
     assert "补中益气" in v.counterexample, "也要把本体里的真原文引出来"
     assert v.refs and v.refs[0].span == "回阳救逆、通经活络"
 
 
-def test_herb_grounded_accepts_a_real_span_even_if_only_partially_quoted(ont):
+def test_herb_source_fabricated_accepts_a_real_span_even_if_only_partially_quoted(ont):
     """span 用双向子串比而不是相等：本体原文往往是一整段，模型照抄时可能只抄一句，
     要求逐字相等会把正确的引用判成编造。"""
     for span in ("补中益气", "【功效】补中益气、健脾益肺", "补中益气、健脾益肺"):
         refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
                           "span": span}]}
         r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
-        assert "herb_grounded" not in _rules(r), f"「{span}」被误判成编造"
+        assert "herb_source_fabricated" not in _rules(r), f"「{span}」被误判成编造"
 
 
-def test_a_herb_absent_from_the_ontology_is_unverifiable_not_a_veto(ont):
-    """**这是 R34 最要紧的一条设计**：实测 `cases.json` 里归一后 578 种药名，
-    本体查得到 230 种（39.8%）。把"不在本体里"当 veto，几乎每张方都会被否掉
-    ——而那不是模型的错，是药理层覆盖不全这个数据事实。"""
+def test_a_herb_absent_from_the_ontology_is_revise_not_veto(ont):
+    """**R59 从 `herb_grounded` 拆出来的那一半**：药不在本体里是数据覆盖面问题，
+    不是模型编造，定成 veto 会让几乎每张方被否掉——所以是 `herb_not_in_ontology`，
+    revise 级，不是 veto。（R34 时代这条是 `Unverifiable`、不进回灌，R59 改成
+    真正的 `Violation`，见下一条测试。）"""
     r = verify_formula(mk(["鲤鱼", "党参"]), ontology=ont)
-    assert "herb_grounded" not in _rules(r, "veto")
-    u = [u for u in r.unverifiable
-         if u.rule == "herb_grounded" and u.herbs == ("鲤鱼",)]
-    assert len(u) == 1
-    assert u[0].missing_predicate == "本体条目"
-    assert "不是模型编造" in u[0].reason
+    assert "herb_not_in_ontology" not in _rules(r, "veto")
+    assert "herb_not_in_ontology" in _rules(r, "revise")
+    v = next(v for v in r.violations
+            if v.rule == "herb_not_in_ontology" and v.herbs == ("鲤鱼",))
+    assert "不是模型编造" not in v.reason or "覆盖不全" in v.reason  # 措辞允许变，但不能说是编造
+    assert "本体共收录" in v.counterexample and "4" in v.counterexample  # 夹具本体 4 味药
+
+
+def test_a_herb_absent_from_the_ontology_actually_reaches_the_revise_feedback(ont):
+    """R59 这条改动真正要解决的问题：R34 时代"药不在本体里"是 `Unverifiable`，
+    `format_violations_for_revise` 明确不把 `unverifiable` 写进反馈——模型
+    永远不知道这味药查不到，没有机会换一味写法更规范的药。改成 `Violation`
+    之后必须真的能走到反馈文本里，不然拆规则这件事只是换了个名字，没有
+    改变行为。"""
+    r = verify_formula(mk(["鲤鱼", "党参"]), ontology=ont)
+    feedback = format_violations_for_revise(r)
+    assert "鲤鱼" in feedback
+    assert "herb_not_in_ontology" in feedback
+
+
+def test_herb_not_in_ontology_and_herb_source_fabricated_never_both_fire(ont):
+    """结构上不可能重叠：一味药要么解析不到（`herb_not_in_ontology`），要么
+    解析到了才可能被判编造出处（`herb_source_fabricated`）——不需要额外的
+    去重判据，这条测试钉住"不需要"这件事本身没有被破坏。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "回阳救逆"}]}
+    r = verify_formula(mk(["鲤鱼", "党参"], refs=refs), ontology=ont)
+    fired_not_in_ontology = {v.herbs for v in r.violations if v.rule == "herb_not_in_ontology"}
+    fired_fabricated = {v.herbs for v in r.violations if v.rule == "herb_source_fabricated"}
+    assert fired_not_in_ontology & fired_fabricated == set()
+    assert fired_not_in_ontology == {("鲤鱼",)}
+    assert fired_fabricated == {("党参",)}
 
 
 def test_a_herb_with_no_refs_at_all_is_unverifiable(ont):
     r = verify_formula(mk(["党参"]), ontology=ont)
-    u = [u for u in r.unverifiable if u.rule == "herb_grounded"]
+    u = [u for u in r.unverifiable if u.rule == "herb_source_fabricated"]
     assert len(u) == 1 and u[0].missing_predicate == "ontology_refs"
     assert "不算编造，算没引" in u[0].reason
 
@@ -240,7 +272,7 @@ def test_a_ref_to_a_predicate_the_ontology_lacks_is_unverifiable(ont):
     refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "禁忌",
                       "span": "孕妇慎用"}]}
     r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
-    assert "herb_grounded" not in _rules(r, "veto")
+    assert "herb_source_fabricated" not in _rules(r, "veto")
     assert any(u.missing_predicate == "禁忌" for u in r.unverifiable)
 
 
@@ -417,7 +449,7 @@ def test_status_orders_by_severity():
 
 
 def test_an_unavailable_ontology_puts_only_the_ontology_rules_in_unverifiable():
-    """药理层数据不在的机器上，本体那七条规则「符号验证通过」必须报成
+    """药理层数据不在的机器上，本体那八条规则「符号验证通过」必须报成
     「一条都没验」——否则那句话在没有本体的环境里恒真，而它恒真时毫无意义。
 
     R53：本体不可用**不该连累医理规则层那四条**（数据源不是一回事，见
@@ -438,7 +470,7 @@ def test_an_unavailable_ontology_puts_only_the_ontology_rules_in_unverifiable():
 def test_an_unavailable_theory_layer_puts_only_the_theory_rules_in_unverifiable(
     monkeypatch, ont):
     """跟上一条对称：医理规则层不在时，只有 `THEORY_RULES` 那四条进
-    unverifiable，本体那七条该跑还跑。"""
+    unverifiable，本体那八条该跑还跑。"""
     import core.formula_verifier as fv
 
     monkeypatch.setattr(fv, "load_theory", lambda: ())

@@ -13,15 +13,16 @@
 一条可以指着原文说出来的错，而"指着原文"正是 LLM-Modulo 那条实证
 （幻觉 63% → 1.7%）的机制所在。
 
-## 十一条规则，两种级别，两个数据源（R53 起）
+## 十二条规则，两种级别，两个数据源（R53 起；R59 把 `herb_grounded` 拆成两条）
 
-前七条（R34）都从 `core/ontology.py`（本草/方剂本体）取证；R53 加的四条从
+前八条（R34+R59）都从 `core/ontology.py`（本草/方剂本体）取证；R53 加的四条从
 `core/theory.py`（R51 的医理规则层）取证——**两个数据源各自独立可用/不可用**，
 `ont.available` 是 0/1、`load_theory()` 是另一个 0/1，一个数据源缺了不该把
 另一个数据源能判的规则也一起打成 unverifiable（`ONTOLOGY_RULES`/`THEORY_RULES`
 两张表分别管各自的开关，见 `verify_formula`）。
 
 revise（可改，回灌重开）：
+  `herb_not_in_ontology`       **药名在本体里查不到**（本体，R59 新增，见下）
   `meridian_coverage`          方中药的归经覆盖不了辨出来的病变脏腑（本体）
   `nature_conflict`            证型寒热方向与主方药性相悖（本体）
   `effect_matches_method`      药的功效跟治法对不上（本体）
@@ -32,9 +33,10 @@ revise（可改，回灌重开）：
   `role_structure_by_rule`     君药没有针对主病机（医理，看 for_element 对不对得上）
 
 veto（不可下发，残余不发）：
-  `incompatible_pair`     十八反十九畏（本体）
-  `dose_exceeds`          超药典常用上限（本体）
-  `herb_grounded`         **引用了本体里不存在的原文**（编造出处，本体）
+  `incompatible_pair`       十八反十九畏（本体）
+  `dose_exceeds`            超药典常用上限（本体）
+  `herb_source_fabricated`  **引用了本体里不存在的原文**（编造出处，本体；
+                            R59 之前叫 `herb_grounded`，见下）
 
 ## 为什么 R53 那四条都是 revise，不是 veto
 
@@ -45,14 +47,39 @@ veto 级现有三条判的是**具体、可核实的危险或欺骗**（配伍�
 不全"直接变成"这张方不能发"，那是拿数据覆盖率的锅让患者背——所以是"拟得
 不够好，回灌重开"，不是"不可下发"。
 
-## `herb_grounded` 为什么判的是"编造出处"而不是"这味药不在本体里"
+## R59：`herb_grounded` 拆成两条规则，答两个不同的问题
 
-实测（R34）：`cases.json` 里归一后 578 种药名，本体查得到 **230 种（39.8%）**。
-把"不在本体里"当 veto，几乎每张方都会被否掉——而那不是模型的错，是**药理层
-覆盖不全**这个数据事实。两件事必须分开：
+R34 起 `herb_grounded` 一个函数回答两个问题——"这味药本体里有没有"和"模型
+引用的原文对不对"——`herb is None` 时给 `Unverifiable`（数据缺，不是模型的
+错），`span` 对不上真实原文时给 `Violation(severity="veto")`（编造出处）。
+两个分支返回类型不同，但共享同一个规则名 `herb_grounded`，导致一条重要的
+反馈被埋没：`Unverifiable` **不进回灌**（`format_violations_for_revise` 的
+既有设计——本体缺数据时写进反馈只会让模型误以为自己错了）。这意味着"药名在
+本体里查不到"这件事，模型从头到尾都不知道，没有任何机会换一味写法更规范、
+更容易核实的药——它只是悄悄以 `partially_verified` 状态被下发了。
 
-  - 模型给了一条 `OntologyRef`，而那个 `span` 在本体里查不到 → **编造出处，veto**
-  - 这味药本体里根本没有 → **`Unverifiable`，不是违规**（见下）
+R59 把这两个问题拆成两条独立的规则，各自回答自己的问题：
+
+  - `herb_not_in_ontology`（**revise**）：药名在本体里查不到——这确实可能是
+    药理层覆盖不全，但**给模型一次机会**总比默认接受一张带无法验证药味的方
+    更好：反例是"本体收录多少味、没有这个写法"的事实陈述，回灌文本明确说
+    "请换一味有据可查的药，或核实这味药的规范写法"。跟 R53 那四条同一条
+    理由——不确定的事定成 revise 不是 veto，改完仍然可能改不出数据来，
+    改不出就照常下发、如实标在 `verification` 里，不整方毙掉。
+  - `herb_source_fabricated`（保持 **veto**）：模型给出的 `ontology_refs`
+    指向本体里查不到的原文——这条跟"药存不存在"无关，前提就是**这味药已经
+    在本体里查到了**（`herb is not None`）——**这才是真编造，查不到反驳
+    空间，必须毙**。
+
+**两条互不重叠**：`herb_not_in_ontology` 只在 `herb is None` 时触发；
+`herb_source_fabricated` 的判断入口第一步就跳过 `herb is None` 的情况（交给
+前者），只处理"herb 已解析、但引用的原文对不上"这一种局面。一味药同时命中
+两条是结构上不可能发生的事，不需要额外判据去重。
+
+**这条改动不改变"编造出处判定为编造"这件事的语义**——`herb_source_fabricated`
+的判断逻辑跟原来的 `herb_grounded` 编造分支逐字相同，只是改了名字。改变的
+是"药名查不到"这个此前只默默进 `Unverifiable`、从不回灌的分支，现在会主动
+给模型一次修正机会。
 
 ## `Unverifiable`：查不到依据 ≠ 查到了且通过
 
@@ -94,18 +121,28 @@ from core.theory import (
 )
 
 #: 规则名。**顺序即报告顺序**，veto 在前（先看能不能发，再看拟得对不对）。
-VETO_RULES: tuple[str, ...] = ("incompatible_pair", "dose_exceeds", "herb_grounded")
+VETO_RULES: tuple[str, ...] = ("incompatible_pair", "dose_exceeds", "herb_source_fabricated")
 REVISE_RULES: tuple[str, ...] = (
+    # R59：药名查不到本体单独成一条 revise（给模型一次换写法的机会），
+    # 排在本体其余 revise 规则之前——药名解析不了，后面几条判据本来就依赖
+    # 解析出来的 Herb 对象，顺序上它更基础。
+    "herb_not_in_ontology",
     "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
-    # R53：医理一致性四条，接在本体那四条 revise 规则后面。
+    # R53：医理一致性四条，接在本体那五条 revise 规则后面。
     "principle_matches_syndrome", "method_not_contraindicated",
     "pathomechanism_consistent", "role_structure_by_rule",
 )
 ALL_RULES: tuple[str, ...] = VETO_RULES + REVISE_RULES
 
-#: R34 起的七条，数据源是 `core/ontology.py`（本草/方剂本体）。
+#: R34 起的八条（R59 把 `herb_grounded` 拆成两条），数据源是
+#: `core/ontology.py`（本草/方剂本体）。**顺序跟 `ALL_RULES` 的
+#: veto-先-revise-后一致**（`herb_source_fabricated` 在 `VETO_RULES` 里，
+#: `herb_not_in_ontology` 在 `REVISE_RULES` 里）——`verify_formula` 按这张表
+#: 的顺序遍历，`checked_rules` 的输出顺序要跟 `ALL_RULES` 过滤出的本体子序列
+#: 一致，两条测试（`test_every_rule_has_an_implementation_and_vice_versa`、
+#: `test_batching_does_not_change_the_verdict`）钉着这件事。
 ONTOLOGY_RULES: tuple[str, ...] = (
-    "incompatible_pair", "dose_exceeds", "herb_grounded",
+    "incompatible_pair", "dose_exceeds", "herb_source_fabricated", "herb_not_in_ontology",
     "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
 )
 #: R53 新增的四条，数据源是 `core/theory.py`（R51 医理规则层）。**两张表互斥、
@@ -126,7 +163,8 @@ THEORY_RULES: tuple[str, ...] = (
 RULE_LABELS: dict[str, str] = {
     "incompatible_pair": "配伍禁忌",
     "dose_exceeds": "超量",
-    "herb_grounded": "药味有本体出处",
+    "herb_not_in_ontology": "药名本体未收",
+    "herb_source_fabricated": "药味出处编造",
     "meridian_coverage": "归经覆盖病位",
     "nature_conflict": "寒热方向",
     "effect_matches_method": "功效对得上治法",
@@ -251,7 +289,7 @@ class VerificationResult:
 
     violations: tuple[Violation, ...] = ()
     unverifiable: tuple[Unverifiable, ...] = ()
-    #: 本体可用吗。False 时 `ONTOLOGY_RULES` 那七条全部落进 `unverifiable`。
+    #: 本体可用吗。False 时 `ONTOLOGY_RULES` 那八条全部落进 `unverifiable`。
     ontology_available: bool = True
     #: 医理规则层（R51/R53）可用吗。False 时 `THEORY_RULES` 那四条全部落进
     #: `unverifiable`——跟 `ontology_available` 是两个独立的开关（两个数据源，
@@ -320,7 +358,7 @@ class VerificationResult:
         }
 
 
-# ---------- 七条规则 ----------
+# ---------- 本体八条规则（R34 起七条 + R59 拆出一条） ----------
 #
 # 每条规则的签名都是 `(s3, ont) -> (violations, unverifiable, checked)`：
 # `checked` 是这条规则**真的判了**的时候它自己的名字，判不了时为空。
@@ -404,12 +442,41 @@ def check_dose_exceeds(s3, ont) -> tuple[list[Violation], list[Unverifiable], li
     return out, unver, ["dose_exceeds"]
 
 
-def check_herb_grounded(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
-    """模型给的 `OntologyRef` 在本体里**找得到那段原文**吗。
+def check_herb_not_in_ontology(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
+    """这味药本体里**根本没有**——跟"引用的原文对不对"是两个问题
+    （R59 从 `herb_grounded` 拆出来，见模块文档字符串）。
 
-    **判的是"编造出处"，不是"这味药不在本体里"**（见模块文档字符串）：
+    **revise 级**：药理层覆盖不全是数据事实，不是模型的错，但默默接受一张
+    带无法验证药味的方也不是唯一选项——给模型一次机会换一味写法更规范、
+    更容易核实的药，改不出来就照常下发（跟 R53 那四条同一条理由）。
+
+    `counterexample` 不是本体原文（这味药本来就没有），是一句可核实的事实
+    陈述："本体收录多少味、没有这个写法"——`Violation.__post_init__` 只要求
+    非空，不要求内容是逐字引用，这条规则回答的问题本来就不是"原文对不对"。
+    """
+    out: list[Violation] = []
+    for choice in s3.herb_choices:
+        name = choice.item.name
+        if ont.herb(name) is not None:
+            continue
+        out.append(Violation(
+            rule="herb_not_in_ontology", severity="revise", herbs=(name,),
+            reason=f"「{name}」在本系统收录的本草本体里查不到，无法核实它的功效依据"
+                   "——可能是写法未被归一（产地/炮制前缀、简称），也可能这味药本身"
+                   "不在收录范围",
+            counterexample=f"本体共收录 {len(ont.herbs)} 味药材，逐一核对（含别名表）"
+                           f"均不含「{name}」这个写法",
+        ))
+    return out, [], ["herb_not_in_ontology"]
+
+
+def check_herb_source_fabricated(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
+    """模型给的 `OntologyRef` 在本体里**找得到那段原文**吗——前提是这味药
+    已经在本体里查到了（`herb is None` 的情况交给 `check_herb_not_in_ontology`，
+    两条规则回答不同的问题，见模块文档字符串）。
+
+    **判的是"编造出处"，不是"这味药不在本体里"**：
       - 引用的 span 在本体该 (药名, 谓词) 下找不到 → veto（编造）
-      - 这味药本体里根本没有 → unverifiable（数据缺，不是模型的错）
       - 这味药在本体里但模型一条 ref 都没给 → unverifiable（没有可核的主张）
 
     span 的比对用**双向子串**而不是相等：模型照抄时可能只抄了其中一句
@@ -421,15 +488,10 @@ def check_herb_grounded(s3, ont) -> tuple[list[Violation], list[Unverifiable], l
         name = choice.item.name
         herb = ont.herb(name)
         if herb is None:
-            unver.append(Unverifiable(
-                rule="herb_grounded", herbs=(name,), missing_predicate="本体条目",
-                reason=f"本体里没有「{name}」这味药（本草 {len(ont.herbs)} 味覆盖不到它），"
-                       "它的功效依据无法核实——这是药理层覆盖不全，不是模型编造",
-            ))
-            continue
+            continue  # 交给 check_herb_not_in_ontology，不在这里重复判
         if not choice.ontology_refs:
             unver.append(Unverifiable(
-                rule="herb_grounded", herbs=(name,), missing_predicate="ontology_refs",
+                rule="herb_source_fabricated", herbs=(name,), missing_predicate="ontology_refs",
                 reason=f"「{name}」在本体里有条目，但模型没有给出任何 ontology_refs，"
                        "没有可核的引用——不算编造，算没引",
             ))
@@ -441,21 +503,21 @@ def check_herb_grounded(s3, ont) -> tuple[list[Violation], list[Unverifiable], l
             真 = [r.span.strip() for r in herb.refs.get(ref.predicate, ()) if r.span.strip()]
             if not 真:
                 unver.append(Unverifiable(
-                    rule="herb_grounded", herbs=(name,), missing_predicate=ref.predicate,
+                    rule="herb_source_fabricated", herbs=(name,), missing_predicate=ref.predicate,
                     reason=f"模型引了「{name}」的{ref.predicate}，"
                            f"而本体里这味药没有{ref.predicate}这一项，对不了",
                 ))
                 continue
             if not any(span in t or t in span for t in 真):
                 out.append(Violation(
-                    rule="herb_grounded", severity="veto", herbs=(name,),
+                    rule="herb_source_fabricated", severity="veto", herbs=(name,),
                     reason=f"模型引用的「{name}·{ref.predicate}」原文在本体里找不到，"
                            "这是编造出处",
                     counterexample=f"模型写的是「{span}」；本体里「{name}」的"
                                    f"{ref.predicate}原文是「{真[0]}」",
                     refs=(ref,),
                 ))
-    return out, unver, ["herb_grounded"]
+    return out, unver, ["herb_source_fabricated"]
 
 
 def check_meridian_coverage(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:
@@ -800,9 +862,9 @@ def check_role_structure_by_rule(s3, ont) -> tuple[list[Violation], list[Unverif
 
 
 class BatchedOntology:
-    """把一张方里的药名**一次全解析完**，七条规则共用这一份。
+    """把一张方里的药名**一次全解析完**，本体那八条规则共用这一份。
 
-    R40 实测的动机：七条规则各自逐味 `ont.herb()`，而 `herb()` 每次都要跑一遍
+    R40 实测的动机：本体那几条规则各自逐味 `ont.herb()`，而 `herb()` 每次都要跑一遍
     `normalize_herb`（去炮制前缀、去剂量、查别名）。一张 12 味的方 = 7×12 = 84 次
     归一 + 84 次查表，其中 72 次是重复劳动。改成一次 `herbs_batch()` 之后是
     12 次。`_span_of()` 也走 `herb()`，所以它一起受益。
@@ -838,9 +900,9 @@ class BatchedOntology:
 def _all_names(s3: _S3StructuredBase) -> list[str]:
     """预解析要覆盖的全部药名：方中药 + `herb_choices` 里的药。
 
-    **两处都要**：`check_herb_grounded` 遍历的是 `herb_choices`，它跟
-    `formula.candidate.herb_items` 通常一致但 schema 上是两个字段，
-    只取前者会让 grounded 那一条全部落到 `misses` 上。
+    **两处都要**：`check_herb_not_in_ontology`/`check_herb_source_fabricated`
+    遍历的是 `herb_choices`，它跟 `formula.candidate.herb_items` 通常一致但
+    schema 上是两个字段，只取前者会让这两条全部落到 `misses` 上。
     """
     names = [i.name for i in _items(s3)]
     names += [c.item.name for c in getattr(s3, "herb_choices", ())]
@@ -851,7 +913,8 @@ def _all_names(s3: _S3StructuredBase) -> list[str]:
 RULE_FUNCS = {
     "incompatible_pair": check_incompatible_pair,
     "dose_exceeds": check_dose_exceeds,
-    "herb_grounded": check_herb_grounded,
+    "herb_source_fabricated": check_herb_source_fabricated,
+    "herb_not_in_ontology": check_herb_not_in_ontology,
     "meridian_coverage": check_meridian_coverage,
     "nature_conflict": check_nature_conflict,
     "effect_matches_method": check_effect_matches_method,
@@ -865,8 +928,8 @@ RULE_FUNCS = {
 
 def verify_formula(s3: _S3StructuredBase, *, ontology: Ontology | None = None
                    ) -> VerificationResult:
-    """跑十一条规则（R34 七条 + R53 四条）。**两个数据源分别判断可用性**：
-    本体不可用时 `ONTOLOGY_RULES` 那七条全部进 unverifiable，医理规则层
+    """跑十二条规则（R34+R59 八条 + R53 四条）。**两个数据源分别判断可用性**：
+    本体不可用时 `ONTOLOGY_RULES` 那八条全部进 unverifiable，医理规则层
     不可用时 `THEORY_RULES` 那四条全部进 unverifiable——两件事独立发生，
     一个数据源缺了不该连累另一个数据源能判的规则（模块文档字符串那条）。
 
@@ -886,7 +949,8 @@ def verify_formula(s3: _S3StructuredBase, *, ontology: Ontology | None = None
                                 "formulary.jsonl 不在），这条规则一次都没跑")
             for r in ONTOLOGY_RULES)
     else:
-        # R40：**7N → 1**。七条规则原先各自逐味查本体，这里一次解析完再共用。
+        # R40：**7N → 1**（R59 之后是 8N → 1）。本体那几条规则原先各自逐味
+        # 查本体，这里一次解析完再共用。
         # 包一层而不是改规则的签名：规则的入参形状是这一层的公开契约
         # （`(s3, ont) -> (violations, unverifiable, checked)`，医院要增补规则就照它写），
         # 为了查得快去改那个契约，等于让每一条将来新增的规则都背上批量表这个细节。
@@ -919,10 +983,15 @@ def verify_formula(s3: _S3StructuredBase, *, ontology: Ontology | None = None
 #: 只需要**药名（+剂量）**就能判的规则。这两条不依赖证型/治法/君臣佐使，
 #: 所以 S3 还在流式输出、药名刚出来时就能先跑。
 #:
-#: 为什么只有这两条：`herb_grounded` 要 `ontology_refs`（模型写在后面），
-#: `meridian_coverage` 要 `organs`，`nature_conflict` 要证型名，
+#: 为什么只有这两条：`herb_source_fabricated` 要 `ontology_refs`（模型写在
+#: 后面），`meridian_coverage` 要 `organs`，`nature_conflict` 要证型名，
 #: `effect_matches_method` 要治法，`role_structure` 要 role——都在药名之后才有。
 #: **表里多放一条就是在不完整的输入上下结论**，那比晚一点知道糟得多。
+#:
+#: `herb_not_in_ontology`（R59）理论上也只需要药名，跟这两条一样够格进这张
+#: 表——但流式期间药名本身可能还在陆续吐出（一味药的名字被截断成半个词），
+#: 这一条**没有**并进来，是本轮没有余量验证"药名截断时不会误判"这件事，
+#: 不是判断过它不该进来，留给下一轮要动 INCREMENTAL_RULES 时一起做。
 INCREMENTAL_RULES: tuple[str, ...] = ("incompatible_pair", "dose_exceeds")
 
 
@@ -932,7 +1001,7 @@ def verify_incremental(items: list[HerbItem] | tuple[HerbItem, ...], *,
 
     ## 这一项省的不是吞吐，是"知道得早"
 
-    R40 实测：完整七条规则在一张 12 味的方上是 **0.137 ms**（批量查表之后），
+    R40 实测：完整本体规则在一张 12 味的方上是 **0.137 ms**（批量查表之后），
     所以"提前把一部分活干掉"在耗时上省不出任何东西——这一点必须先说清楚，
     否则这个函数看起来像一个没有收益的优化。
 
@@ -943,7 +1012,7 @@ def verify_incremental(items: list[HerbItem] | tuple[HerbItem, ...], *,
 
     ## 结果不复用进最终验证
 
-    最终的 `verify_formula` 照样把七条全跑一遍，**不跳过这两条**。理由：
+    最终的 `verify_formula` 照样把本体规则全跑一遍，**不跳过这两条**。理由：
     流式期间拿到的药名是**可能不完整的**（解析中途的 JSON），在不完整输入上
     得出的"通过"不能算通过。投机执行的定义就是"结果可能作废"，把它当成
     已经验过的部分会让"符号验证通过"这句话失去意义。

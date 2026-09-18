@@ -466,7 +466,8 @@ def _r37_payload():
                              missing_predicate="性味", reason="甘草 在本体里没有性味条目"),
             ),
             ontology_available=True,
-            checked_rules=("incompatible_pair", "dose_exceeds", "herb_grounded"),
+            checked_rules=("incompatible_pair", "dose_exceeds", "herb_not_in_ontology",
+                          "herb_source_fabricated"),
         ).to_dict(),
         "verifier_metrics": {"revise_rounds": 1, "first_pass_status": "revise_needed"},
     }

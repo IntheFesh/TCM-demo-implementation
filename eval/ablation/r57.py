@@ -15,14 +15,33 @@ R51 补规则，不许把医案放回推导相凑数（那是回退，不是修�
 3. C 与 D 的证型/治法/主方一致率 ≥ 0.9——验的是 R54 的不变式："事后佐证
    不回流改推导"，C/D 唯一的差异就是要不要跑第三相佐证，结论不该跟着变。
 
+**三条门都要求有效样本 ≥ `GATE_MIN_SAMPLE_SIZE`（R59，见 spec.py）**，低于这
+个数一律判 `passed=None`（⏳ 样本不足），不管比率算出来是多少——`--limit 2`
+这类小样本探针把某条门的分母量成 1、比率算出 100%，那不是"测出来过了"，是
+"根本没测够"，真机 20 条 × 4 组才够格判定。
+
+## 三分总判定，不是二元 True/False（R59）
+
+`all_gates_passed` 只有在**三条门都是 True** 时才是 `True`；**任何一条是
+`False` 就整体 `False`**（不管别的门有没有测出来）；**没有 False、但至少
+一条是 `None`（⏳ 没测出来）就整体 `None`**——⏳ 不许被悄悄算成过了。这是
+真机探针（`--limit 2`）实测过的假阳性：旧逻辑先把 `None` 过滤掉再对剩下的
+门做 `all()`，两条门过、一条没测出来（C-D 一致率因为没跑 D 组）会被判成
+"三条全过"。
+
 ## 五个指标，每组都报
 
 `verifier_first_pass_rate`、`rule_refs_completeness_rate`、
 `herbs_grounded_ratio_mean`、`hallucination_rate`、`cost`（调用数 + 墙钟）——
-延续 R34/R38 那三个内容指标的做法（分母跟着比率一起报，不让读者自己数），
-`rule_refs_completeness_rate` 是这一轮新加的（A 组这一格恒是"不适用"：
-`run_synthesis` 根本不产出 `derivation_completeness_ratio` 这个键，不是
-凑巧算出 0）。
+延续 R34/R38 那三个内容指标的做法（**每个指标都带样本量**，不让读者自己数，
+也不让一个 `1（1/1）`这种量级的数字看起来跟真测过没区别）。
+`rule_refs_completeness_rate` 是 R57 新加的：A 组这一格恒是"不适用"
+（`run_synthesis` 根本不产出 `derivation_completeness_ratio` 这个键，不是
+凑巧算出 0）；**B 组这一格 R59 起也恒是"不适用"**——B 组 `THEORY_LAYER=off`，
+演绎链上根本没有医理规则可引，"完整率"在这一组结构上未定义，跟 A 组不
+是同一个原因（A 是"没有这个概念"，B 是"这个概念存在但这组关掉了"），两组
+各自的 `rule_refs_note` 说清楚是哪一种。真机探针实测出过"B 组满分、C 组
+0.375"这种反直觉数字——不是 C 比 B 差，是 B 那个满分本身没有意义。
 
 ## 沙盒里跑不出真机数
 
@@ -57,6 +76,7 @@ from eval.ablation.spec import (
     GATE_C_RULE_REFS_COMPLETENESS_MIN,
     GATE_C_VERIFIER_FIRST_PASS_VS,
     GATE_CD_CONSISTENCY_MIN,
+    GATE_MIN_SAMPLE_SIZE,
     GROUPS,
     R57Group,
     group_by_key,
@@ -229,21 +249,37 @@ def aggregate(rows: list[dict], group: R57Group, *, content_valid: bool) -> dict
     wall = [r["elapsed_s"] for r in ok if isinstance(r.get("elapsed_s"), (int, float))]
     hallu_runs = sum(1 for r in with_output if r["metrics"].get("n_hallucinated_ids"))
     note = None if content_valid else "假后端：内容指标不出数（产出是固定假文本）"
-    rule_refs_applicable = group.env["S3_MODE"] == "derived"
+    # R59：rule_refs 是否适用不能只看 S3_MODE——B 组也走 derived，但
+    # THEORY_LAYER=off 时演绎链上根本没有规则可引，"完整率" 在这一组结构上
+    # 未定义（不是模型不够好，是这一组的设计就不给它可引的规则）。B 组之前
+    # 被算成跟 C/D 同一档"适用"，实测出现过"B=1.0、C=0.375"这种反直觉的
+    # 数字——不是 C 比 B 差，是 B 那个 1.0 本身没有意义（真机探针报的原始
+    # bug，见 SOURCES.md）。判据跟 A 组同一条：结构上不适用就标 False，
+    # 不强行算出一个数字。
+    rule_refs_applicable = (group.env["S3_MODE"] == "derived"
+                            and group.env.get("THEORY_LAYER") != "off")
+    if group.env["S3_MODE"] != "derived":
+        rule_refs_note = ("这一组走 S3_MODE=structured，没有 rule_refs/"
+                          "derivation_completeness_ratio 这个键——不适用，不是 0")
+    elif group.env.get("THEORY_LAYER") == "off":
+        rule_refs_note = ("这一组 THEORY_LAYER=off，演绎链上没有医理规则可引"
+                          "（prompt 里根本不摆规则表）——rule_refs 完整率在这一组"
+                          "结构上未定义，不适用，不是满分也不是零分")
+    else:
+        rule_refs_note = None
     return {
         "n_queries": len(rows), "n_ok": len(ok), "n_with_output": len(with_output),
         "content_metrics_valid": content_valid, "content_note": note,
         "herbs_grounded_ratio_mean": (
-            round(statistics.fmean(grounded), 4) if (grounded and content_valid) else None),
+            {"value": round(statistics.fmean(grounded), 4), "n": len(grounded)}
+            if (grounded and content_valid) else None),
         "verifier_first_pass_rate": (
             _rate(sum(first_pass), len(first_pass)) if (first_pass and content_valid) else None),
         "rule_refs_completeness_rate": (
             {"value": round(statistics.fmean(completeness), 4), "n": len(completeness)}
-            if (completeness and content_valid) else None),
+            if (completeness and content_valid and rule_refs_applicable) else None),
         "rule_refs_applicable": rule_refs_applicable,
-        "rule_refs_note": (None if rule_refs_applicable else
-                           "这一组走 S3_MODE=structured，没有 rule_refs/"
-                           "derivation_completeness_ratio 这个键——不适用，不是 0"),
+        "rule_refs_note": rule_refs_note,
         "hallucination_rate": (_rate(hallu_runs, len(with_output)) if content_valid else None),
         "llm_calls_mean": (round(statistics.fmean(calls), 3) if calls else None),
         "elapsed_s_mean": (round(statistics.fmean(wall), 3) if wall else None),
@@ -289,30 +325,57 @@ def build_report(rows_by_group: dict[str, list[dict]], *, backend_info: dict,
     def _gate(name: str, ok: bool | None, detail: str) -> dict:
         return {"name": name, "passed": ok, "detail": detail}
 
+    def _too_small(*sizes: int | None) -> bool:
+        """R59：任一份样本量缺失或低于 `GATE_MIN_SAMPLE_SIZE` 就判"样本不足"。
+        `--limit 2` 这类探针跑出来的 1/1、2/2 不该被拿去跟阈值比——那不是
+        "测出来通过了"，是"根本没测够"。"""
+        return any(s is None or s < GATE_MIN_SAMPLE_SIZE for s in sizes)
+
     gates = []
-    a_fp = (groups.get("A", {}).get("verifier_first_pass_rate") or {}).get("value")
-    c_fp = (groups.get("C", {}).get("verifier_first_pass_rate") or {}).get("value")
-    if content_valid and a_fp is not None and c_fp is not None:
+    a_fp_d = groups.get("A", {}).get("verifier_first_pass_rate")
+    c_fp_d = groups.get("C", {}).get("verifier_first_pass_rate")
+    a_fp = (a_fp_d or {}).get("value")
+    c_fp = (c_fp_d or {}).get("value")
+    a_n = (a_fp_d or {}).get("denominator")
+    c_n = (c_fp_d or {}).get("denominator")
+    if content_valid and a_fp is not None and c_fp is not None and not _too_small(a_n, c_n):
         gates.append(_gate(
             f"C 组验证器一次过率 ≥ {GATE_C_VERIFIER_FIRST_PASS_VS} 组",
-            c_fp >= a_fp, f"C={c_fp} vs A={a_fp}"))
+            c_fp >= a_fp, f"C={c_fp}（n={c_n}） vs A={a_fp}（n={a_n}）"))
+    elif content_valid and a_fp is not None and c_fp is not None:
+        gates.append(_gate(
+            f"C 组验证器一次过率 ≥ {GATE_C_VERIFIER_FIRST_PASS_VS} 组", None,
+            f"样本不足（A n={a_n}, C n={c_n}，都要 ≥{GATE_MIN_SAMPLE_SIZE}）——"
+            "算出来的比率不代表任何东西，不能拿去跟阈值比"))
     else:
         gates.append(_gate(
             f"C 组验证器一次过率 ≥ {GATE_C_VERIFIER_FIRST_PASS_VS} 组", None,
             "假后端或缺数据，量不到"))
-    c_completeness = (groups.get("C", {}).get("rule_refs_completeness_rate") or {}).get("value")
-    if content_valid and c_completeness is not None:
+    c_comp_d = groups.get("C", {}).get("rule_refs_completeness_rate")
+    c_completeness = (c_comp_d or {}).get("value")
+    c_comp_n = (c_comp_d or {}).get("n")
+    if content_valid and c_completeness is not None and not _too_small(c_comp_n):
         gates.append(_gate(
             f"C 组 rule_refs 完整率 ≥ {GATE_C_RULE_REFS_COMPLETENESS_MIN}",
-            c_completeness >= GATE_C_RULE_REFS_COMPLETENESS_MIN, f"C={c_completeness}"))
+            c_completeness >= GATE_C_RULE_REFS_COMPLETENESS_MIN,
+            f"C={c_completeness}（n={c_comp_n}）"))
+    elif content_valid and c_completeness is not None:
+        gates.append(_gate(
+            f"C 组 rule_refs 完整率 ≥ {GATE_C_RULE_REFS_COMPLETENESS_MIN}", None,
+            f"样本不足（n={c_comp_n}，要 ≥{GATE_MIN_SAMPLE_SIZE}）"))
     else:
         gates.append(_gate(
             f"C 组 rule_refs 完整率 ≥ {GATE_C_RULE_REFS_COMPLETENESS_MIN}", None,
             "假后端或缺数据，量不到"))
-    if consistency and consistency.get("value") is not None:
+    cd_n = (consistency or {}).get("denominator")
+    if consistency and consistency.get("value") is not None and not _too_small(cd_n):
         gates.append(_gate(
             f"C 与 D 一致率 ≥ {GATE_CD_CONSISTENCY_MIN}",
-            consistency["value"] >= GATE_CD_CONSISTENCY_MIN, f"实测={consistency['value']}"))
+            consistency["value"] >= GATE_CD_CONSISTENCY_MIN,
+            f"实测={consistency['value']}（n={cd_n}）"))
+    elif consistency and consistency.get("value") is not None:
+        gates.append(_gate(f"C 与 D 一致率 ≥ {GATE_CD_CONSISTENCY_MIN}", None,
+                           f"样本不足（n={cd_n}，要 ≥{GATE_MIN_SAMPLE_SIZE}）"))
     else:
         gates.append(_gate(f"C 与 D 一致率 ≥ {GATE_CD_CONSISTENCY_MIN}", None,
                            (consistency or {}).get("note") or "缺数据，量不到"))
@@ -323,6 +386,20 @@ def build_report(rows_by_group: dict[str, list[dict]], *, backend_info: dict,
     theory_layer_net_contribution = (
         round(c_fp - b_fp, 4)
         if isinstance(c_fp, (int, float)) and isinstance(b_fp, (int, float)) else None)
+
+    # R59：三分判定，不是拿 True/False 硬凑。**⏳ 不许被悄悄算成通过**——
+    # 之前的写法是先把 passed=None 的门过滤掉再对剩下的做 all()，两条门过、
+    # 一条没测出来，会被判成"全过"（真机探针实测过这个假阳性）。正确顺序：
+    # 先看有没有真的 ❌（任何一条不达标，总判定就是不达标，不管别的门测没测
+    # 出来）；再看有没有 ⏳（没有 ❌ 但还有没测出来的，总判定是"判不了"，
+    # 不是"过了"）；只有三条都 ✅ 才是 ✅。
+    passed_values = [g["passed"] for g in gates]
+    if any(v is False for v in passed_values):
+        all_gates_passed = False
+    elif any(v is None for v in passed_values):
+        all_gates_passed = None
+    else:
+        all_gates_passed = True
 
     return {
         "kind": "ablation_r57",
@@ -336,8 +413,7 @@ def build_report(rows_by_group: dict[str, list[dict]], *, backend_info: dict,
         "c_vs_d_consistency": consistency,
         "b_to_c_verifier_first_pass_delta": theory_layer_net_contribution,
         "gates": gates,
-        "all_gates_passed": (all(g["passed"] for g in gates if g["passed"] is not None)
-                             if any(g["passed"] is not None for g in gates) else None),
+        "all_gates_passed": all_gates_passed,
         "rows": rows_by_group,
     }
 
@@ -350,11 +426,37 @@ def _fmt(value, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _fmt_rate(d: dict | None, suffix: str = "") -> str:
+    """R59：格式化一个 `{"value", "n"[, "denominator"]}` 形状的指标——**样本量
+    永远跟比率一起亮出来**，不是只给一个孤零零的数字。有 `denominator` 的
+    （`_rate()` 出来的命中率类：`n`=命中数、`denominator`=总数）显示
+    "命中/总数"；没有的（均值类，`n` 本身就是样本数）显示"n=样本数"。
+    样本量低于 `GATE_MIN_SAMPLE_SIZE` 时附一句"样本不足"——`1（1/1）`这种
+    量级的数字看起来跟真测过没区别，必须在数字旁边就说清楚它靠不住。"""
+    if not d or d.get("value") is None:
+        return "⏳"
+    value = d["value"]
+    text = f"{value:g}{suffix}" if isinstance(value, float) else f"{value}{suffix}"
+    if "denominator" in d:
+        sample_n = d["denominator"]
+        detail = f"{d['n']}/{sample_n}"
+    elif "n" in d:
+        sample_n = d["n"]
+        detail = f"n={sample_n}"
+    else:
+        return text
+    if sample_n is None or sample_n < GATE_MIN_SAMPLE_SIZE:
+        detail += "，样本不足"
+    return f"{text}（{detail}）"
+
+
 def to_markdown(report: dict) -> str:
     lines = ["# R57 消融：四组 × 五指标——证明「不靠模仿也能推」", ""]
     b = report.get("backend") or {}
     lines.append(f"后端 `{b.get('id')}`（{b.get('model')}），{report.get('n_queries')} 条"
-                 "脾胃门主诉（SDT Train）。")
+                 "脾胃门主诉（SDT Train）。三条硬指标要求有效样本 "
+                 f"≥{GATE_MIN_SAMPLE_SIZE}，低于这个数一律判「样本不足」，"
+                 "不当作测出来了。")
     if not report.get("content_metrics_valid"):
         lines.append("")
         lines.append("> ⚠ **这一份是假后端跑的**：内容指标（带本体出处占比、验证器一次过率、"
@@ -369,17 +471,27 @@ def to_markdown(report: dict) -> str:
             continue
         fp = row.get("verifier_first_pass_rate")
         rr = row.get("rule_refs_completeness_rate")
-        rr_cell = "不适用" if not row.get("rule_refs_applicable", True) else _fmt((rr or {}).get("value"))
+        rr_cell = "不适用" if not row.get("rule_refs_applicable", True) else _fmt_rate(rr)
         hr = row.get("hallucination_rate")
         lines.append(
             f"| {g.key} {g.name} | {g.describe().split('：', 1)[-1]} "
-            f"| {_fmt(row.get('herbs_grounded_ratio_mean'))} | {_fmt((fp or {}).get('value'))} "
-            f"| {rr_cell} | {_fmt((hr or {}).get('value'))} "
+            f"| {_fmt_rate(row.get('herbs_grounded_ratio_mean'))} | {_fmt_rate(fp)} "
+            f"| {rr_cell} | {_fmt_rate(hr)} "
             f"| {_fmt(row.get('llm_calls_mean'))} | {_fmt(row.get('elapsed_s_mean'), ' s')} |")
+    # R59：表格单元格里放不下长解释，"不适用"这三个字为什么不适用（A 组是
+    # structured 没这个键、B 组是 THEORY_LAYER=off 没规则可引，两组理由不同）
+    # 单独列在表下面——不让读者拿着一张"两组都写不适用"的表去猜两组是不是
+    # 同一个原因。
+    notes = [(g.key, g.name, (report.get("groups") or {}).get(g.key, {}).get("rule_refs_note"))
+            for g in GROUPS]
+    notes = [(k, n, note) for k, n, note in notes if note]
+    if notes:
+        lines.append("")
+        for k, n, note in notes:
+            lines.append(f"- rule_refs「不适用」（{k} {n}）：{note}")
     lines.append("")
     cons = report.get("c_vs_d_consistency") or {}
-    lines.append(f"**C 与 D 证型/治法/主方一致率**：{_fmt(cons.get('value'))}"
-                f"（{_fmt(cons.get('n'))}/{_fmt(cons.get('denominator'))}）"
+    lines.append(f"**C 与 D 证型/治法/主方一致率**：{_fmt_rate(cons if cons.get('value') is not None else None)}"
                 + (f"——{cons['note']}" if cons.get("note") else ""))
     if cons.get("mismatches"):
         lines.append(f"不一致的 {len(cons['mismatches'])} 条：" +

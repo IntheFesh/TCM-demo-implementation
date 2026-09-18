@@ -67,7 +67,7 @@ def test_the_prompt_construction_happens_before_the_s3_call(derived_env, monkeyp
 
 def test_verification_happens_after_the_s3_call_not_before(derived_env, monkeypatch):
     """验证闭环（`_verify_and_revise`）读的是 S3 的产出，天然只能在 S3 调用
-    之后发生——这里用一个会触发 revise 的 payload（本体不可用时七条规则全部
+    之后发生——这里用一个会触发 revise 的 payload（本体不可用时本体那八条规则全部
     unverifiable，`passed=False` 但不会真的重开，因为没有 violations 可回灌），
     断言 `verification` 字段确实来自这次真正跑过的 S3 产出，而不是一个提前
     算好的占位值。"""

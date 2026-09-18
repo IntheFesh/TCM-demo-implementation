@@ -15,8 +15,10 @@ import pytest
 
 from eval.ablation.r57 import (
     KNOBS,
+    _fmt_rate,
     aggregate,
     apply_group,
+    build_report,
     metrics_from_result,
     pair_consistency,
     select_pi_wei_men_complaints,
@@ -24,6 +26,7 @@ from eval.ablation.r57 import (
 from eval.ablation.spec import (
     GATE_C_RULE_REFS_COMPLETENESS_MIN,
     GATE_CD_CONSISTENCY_MIN,
+    GATE_MIN_SAMPLE_SIZE,
     GROUPS,
     group_by_key,
 )
@@ -184,6 +187,127 @@ def test_pair_consistency_is_meaningless_under_the_fake_backend():
 def test_the_two_gate_thresholds_are_the_ones_the_user_set():
     assert GATE_C_RULE_REFS_COMPLETENESS_MIN == 0.9
     assert GATE_CD_CONSISTENCY_MIN == 0.9
+
+
+# ---------- R59：三处判定 bug ----------
+# 用户真机跑 --limit 2 探针实测出来的三个假阳性：⏳ 被当成通过、样本量 1 也判
+# 通过、B 组 rule_refs 满分具有误导性。这里用 build_report 端到端复现每一条
+# （不是单独 mock 内部函数），因为 bug 本身就是"几个函数各自正确、拼起来才
+# 出问题"那一类——跟 CLAUDE.md 第 31 条「第三次这类最难查」同一条判据。
+
+def _rows(n: int, *, first_pass=True, completeness=1.0,
+         syndrome="脾气虚证") -> list[dict]:
+    # record_id **不带组前缀**：真实跑法是同一批主诉在四组里各跑一次，
+    # `pair_consistency` 靠 record_id 把 C/D 两组的同一条主诉配对——带上组
+    # 前缀（"C0"/"D0"）会让配对集合永远是空的，consistency 恒测不出来。
+    return [{"record_id": f"q{i}", "complaint": "x", "ok": True, "error": None,
+            "elapsed_s": 1.0, "llm_calls": 3,
+            "metrics": metrics_from_result(_fake_derived_result(
+                syndrome=syndrome, first_pass=first_pass, completeness=completeness))}
+           for i in range(n)]
+
+
+def _report(rows_by_group: dict, *, content_valid=True) -> dict:
+    n = max(len(v) for v in rows_by_group.values())
+    complaints = [{"record_id": f"q{i}", "syndrome": None, "complaint": "x"} for i in range(n)]
+    return build_report(rows_by_group, backend_info={"id": "fake", "model": "m",
+                                                      "comparability_warning": None},
+                        complaints=complaints, content_valid=content_valid)
+
+
+def test_a_pending_gate_does_not_get_silently_counted_as_passed():
+    """**真机实测过的假阳性**：C 组一次过率、rule_refs 完整率两条门跑够了样本
+    且都过，第三条（C-D 一致率，因为没跑 D 组）量不到——旧逻辑先把 None
+    过滤掉再对剩下的做 all()，两条 True 就被判"全过"。正确答案是「判不了」，
+    不是「过了」：⏳ 不是 ✅。"""
+    n = GATE_MIN_SAMPLE_SIZE
+    rows = {"A": _rows(n, first_pass=False), "C": _rows(n, first_pass=True,
+                                                             completeness=0.95)}
+    report = _report(rows)
+    passed = [g["passed"] for g in report["gates"]]
+    assert passed[0] is True   # C 一次过率 1.0 ≥ A 的 0.0
+    assert passed[1] is True   # C rule_refs 完整率 0.95 ≥ 0.9
+    assert passed[2] is None   # C-D 一致率：D 没跑，量不到
+    assert report["all_gates_passed"] is None, (
+        "两条过、一条没测出来 ≠ 全过——这正是真机报告里出现过的错误总判定")
+
+
+def test_any_failing_gate_makes_the_overall_verdict_fail_even_with_a_pending_gate():
+    n = GATE_MIN_SAMPLE_SIZE
+    rows = {"A": _rows(n, first_pass=True),
+           "C": _rows(n, first_pass=True, completeness=0.5)}  # 完整率不够
+    report = _report(rows)
+    assert report["gates"][1]["passed"] is False
+    assert report["gates"][2]["passed"] is None  # D 没跑
+    assert report["all_gates_passed"] is False, "有一条没过，不能因为另一条没测出来就打问号"
+
+
+def test_all_three_gates_passing_with_enough_samples_is_the_only_true_case():
+    n = GATE_MIN_SAMPLE_SIZE
+    rows = {"A": _rows(n, first_pass=False),
+           "C": _rows(n, first_pass=True, completeness=0.95),
+           "D": _rows(n, first_pass=True, completeness=0.95)}
+    report = _report(rows)
+    assert all(g["passed"] is True for g in report["gates"])
+    assert report["all_gates_passed"] is True
+
+
+def test_a_sample_of_one_does_not_pass_the_gate_even_at_a_perfect_ratio():
+    """**真机实测过的假阳性 #2**：`--limit 2` 探针里 C-D 一致率是「1（1/1）」——
+    分母 1，理论上"100% 一致"，但样本量太小，这个 1.0 不代表任何东西。
+    低于 `GATE_MIN_SAMPLE_SIZE` 时必须判「样本不足」，不能因为比率算出来
+    正好 ≥ 阈值就放行。"""
+    rows = {"A": _rows(1, first_pass=True), "C": _rows(1, first_pass=True,
+                                                            completeness=1.0),
+           "D": _rows(1, first_pass=True, completeness=1.0)}
+    report = _report(rows)
+    for gate in report["gates"]:
+        assert gate["passed"] is None, gate
+        assert "样本不足" in gate["detail"], gate
+    assert report["all_gates_passed"] is None
+
+
+def test_b_group_rule_refs_is_not_applicable_when_theory_layer_is_off():
+    """**真机实测过的假阳性 #3**：B 组（THEORY_LAYER=off）rule_refs 完整率
+    量出 1.0，C 组量出 0.375——不是"C 比 B 差"，是 B 那个 1.0 本身没有意义
+    （B 组根本没有规则可引）。R59 把 B 组也标成「不适用」，理由跟 A 组
+    （structured，没有这个键）不同，note 要能看出是哪一种不适用。"""
+    b_group = group_by_key("B")
+    assert b_group.env["THEORY_LAYER"] == "off"
+    rows = _rows(GATE_MIN_SAMPLE_SIZE, first_pass=True, completeness=1.0)
+    agg = aggregate(rows, b_group, content_valid=True)
+    assert agg["rule_refs_applicable"] is False
+    assert agg["rule_refs_completeness_rate"] is None
+    assert "THEORY_LAYER" in agg["rule_refs_note"]
+
+    a_group = group_by_key("A")
+    a_agg = aggregate(_rows(GATE_MIN_SAMPLE_SIZE), a_group, content_valid=True)
+    assert a_agg["rule_refs_applicable"] is False
+    assert a_agg["rule_refs_note"] != agg["rule_refs_note"], (
+        "A 组「不适用」和 B 组「不适用」是两个不同的原因，note 不能一样")
+
+
+def test_c_and_d_still_report_rule_refs_as_applicable():
+    for key in ("C", "D"):
+        g = group_by_key(key)
+        assert g.env["THEORY_LAYER"] == "on"
+        agg = aggregate(_rows(GATE_MIN_SAMPLE_SIZE, completeness=0.9), g, content_valid=True)
+        assert agg["rule_refs_applicable"] is True
+        assert agg["rule_refs_note"] is None
+
+
+def test_fmt_rate_shows_the_sample_size_next_to_the_ratio():
+    assert _fmt_rate({"value": 0.8, "n": 4, "denominator": 5}) == "0.8（4/5）"
+    assert _fmt_rate({"value": 0.95, "n": 20}) == "0.95（n=20）"
+    assert _fmt_rate(None) == "⏳"
+    assert _fmt_rate({"value": None}) == "⏳"
+
+
+def test_fmt_rate_flags_a_small_sample_even_at_a_clean_ratio():
+    small = _fmt_rate({"value": 1.0, "n": 1, "denominator": 1})
+    assert "样本不足" in small
+    big = _fmt_rate({"value": 1.0, "n": GATE_MIN_SAMPLE_SIZE, "denominator": GATE_MIN_SAMPLE_SIZE})
+    assert "样本不足" not in big
 
 
 # ---------- 主诉筛选（脾胃门 20 条） ----------

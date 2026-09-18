@@ -1765,7 +1765,7 @@ def run_derivation(
                             **emitter.summary(),
                             "streaming_note": _streaming_note(len(candidates_scored))})
     # R34（延伸到 R52/R53）：同一套验证闭环，S3Derived 靠字段名跟 S3Structured
-    # 保持一致这件事直接免费获得（core/formula_verifier.py 的十一条规则全是
+    # 保持一致这件事直接免费获得（core/formula_verifier.py 的十二条规则全是
     # 鸭子类型，含 R53 新增的四条医理一致性规则）。
     raw, s3, verify_rounds, revise_calls = _verify_and_revise(
         raw, s3_system, S3Derived, on_step=on_step,
@@ -1955,7 +1955,7 @@ def _ontology_manifest() -> dict:
 
     **为什么要进 manifest 而不是只写在报告里**：引用"符号验证通过"这句话的人
     必须能同时看到"验证依据的那份本体缺了多少"。归经缺 49%、用量缺 55% 的情况下，
-    七条规则里有两条在大多数药上判不了——这件事不在同一个地方出现，
+    八条规则里有两条在大多数药上判不了——这件事不在同一个地方出现，
     那句话就会被当成"全验过了"。
 
     本体不可用时只报 `available: False`，不编数。

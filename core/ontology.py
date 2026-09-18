@@ -327,7 +327,7 @@ class Ontology:
     def herbs_batch(self, names: list[str] | tuple[str, ...]) -> dict[str, Herb | None]:
         """一次解析一批药名。**"这些药在本体里是什么"这个问题的唯一批量入口。**
 
-        R40：符号验证器七条规则各自逐味 `ont.herb()`，一张 12 味的方要查 7×12 = 84
+        R40：符号验证器本体那几条规则各自逐味 `ont.herb()`，一张 12 味的方要查 7×12 = 84
         次（每次都重跑一遍 `normalize_herb`）。这个方法让调用方只问一次，
         重复的名字只归一一次。
 

@@ -92,8 +92,8 @@ def test_batched_ontology_delegates_everything_else(ont):
 
 
 def test_all_names_covers_herb_choices_too():
-    """`check_herb_grounded` 遍历的是 `herb_choices`。只取 `herb_items` 会让
-    grounded 那一条全部落到 misses 上。"""
+    """`check_herb_not_in_ontology`/`check_herb_source_fabricated` 遍历的是
+    `herb_choices`。只取 `herb_items` 会让这两条全部落到 misses 上。"""
     s3 = mk(["党参", "白术"])
     assert sorted(set(_all_names(s3))) == ["党参", "白术"]
     assert len(_all_names(s3)) == 4, "两个字段各贡献一份（去重交给 herbs_batch）"
@@ -101,7 +101,7 @@ def test_all_names_covers_herb_choices_too():
 
 def test_verify_formula_resolves_every_name_through_the_batch(ont, monkeypatch):
     """**7N→1 的验收判据**：一次 `verify_formula` 里 `herbs_batch` 只被调一次，
-    而七条规则加起来查了不止一次表——这两个数一起才说明批量真的生效了。"""
+    而本体那几条规则加起来查了不止一次表——这两个数一起才说明批量真的生效了。"""
     calls = []
     original = Ontology.herbs_batch
 
@@ -127,7 +127,7 @@ def test_batching_does_not_change_the_verdict(ont):
     """**不为性能牺牲正确性。** 逐条查和批量查必须给出一字不差的结论。"""
     s3 = mk(["党参", "白术"])
     batched = verify_formula(s3, ontology=ont).to_dict()
-    # 逐条查：直接用裸本体跑七条规则，自己拼同一份结论
+    # 逐条查：直接用裸本体跑全部规则，自己拼同一份结论
     raw_v, raw_u, raw_c = [], [], []
     for rule in ALL_RULES:
         v, u, c = RULE_FUNCS[rule](s3, ont)
