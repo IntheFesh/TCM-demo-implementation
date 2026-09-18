@@ -1,0 +1,200 @@
+{
+  "kind": "frontend_profile",
+  "generated_at": "2026-09-18T04:27:15Z",
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  },
+  "long_task_threshold_ms": 50,
+  "repeat": 1,
+  "runs": [
+    {
+      "scene": "first_paint",
+      "what": "首屏（只加载页面，不跑任何问诊）",
+      "goto_ms": 341.0,
+      "fcp_ms": 308,
+      "fp_ms": 308,
+      "lcp_ms": 308,
+      "cls": 0.0269,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 2,
+      "navigation": {
+        "dom_content_loaded_ms": 287,
+        "load_ms": 334,
+        "transfer_bytes": 14968
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1458054,
+        "blocking": 2,
+        "slow": [
+          {
+            "url": "cytoscape.min.js",
+            "ms": 208,
+            "bytes": 0,
+            "blocking": "blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "chain_done",
+      "what": "单链九段终态（R37 的问诊结果页）",
+      "goto_ms": 287.8,
+      "fcp_ms": 272,
+      "fp_ms": 272,
+      "lcp_ms": 368,
+      "cls": 0.6711,
+      "cls_entries": 3,
+      "cls_ignored_user_input": 0,
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 5,
+      "navigation": {
+        "dom_content_loaded_ms": 243,
+        "load_ms": 285,
+        "transfer_bytes": 14968
+      },
+      "network": {
+        "n": 11,
+        "bytes": 1831658,
+        "blocking": 2,
+        "slow": [
+          {
+            "url": "cytoscape.min.js",
+            "ms": 200,
+            "bytes": 0,
+            "blocking": "blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [
+        {
+          "label": "展开推理过程",
+          "selector": "details.col-reasoning > summary",
+          "error": "找不到 details.col-reasoning > summary"
+        },
+        {
+          "label": "展开参考医案",
+          "selector": "details.col-refs > summary",
+          "error": "找不到 details.col-refs > summary"
+        }
+      ]
+    },
+    {
+      "scene": "graph_tab",
+      "what": "问诊图（六层 + compound）",
+      "goto_ms": 296.3,
+      "fcp_ms": 280,
+      "fp_ms": 280,
+      "lcp_ms": 384,
+      "cls": 0.3011,
+      "cls_entries": 3,
+      "cls_ignored_user_input": 0,
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 6.1,
+      "navigation": {
+        "dom_content_loaded_ms": 253,
+        "load_ms": 293,
+        "transfer_bytes": 14968
+      },
+      "network": {
+        "n": 11,
+        "bytes": 1831658,
+        "blocking": 2,
+        "slow": [
+          {
+            "url": "cytoscape.min.js",
+            "ms": 208,
+            "bytes": 0,
+            "blocking": "blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [],
+      "frames": {
+        "n_frames": 91,
+        "median_gap_ms": 16.7,
+        "worst_gap_ms": 16.8,
+        "fps": 60
+      }
+    }
+  ],
+  "scenes": {
+    "first_paint": {
+      "scene": "first_paint",
+      "what": "首屏（只加载页面，不跑任何问诊）",
+      "n_runs": 1,
+      "fcp_ms": 308,
+      "lcp_ms": 308,
+      "tbt_ms": 0,
+      "cls": 0.027,
+      "heap_mb": 2,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 341.0,
+      "network": {
+        "n": 10,
+        "bytes": 1458054,
+        "blocking": 2
+      }
+    },
+    "chain_done": {
+      "scene": "chain_done",
+      "what": "单链九段终态（R37 的问诊结果页）",
+      "n_runs": 1,
+      "fcp_ms": 272,
+      "lcp_ms": 368,
+      "tbt_ms": 0,
+      "cls": 0.671,
+      "heap_mb": 5,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 287.8,
+      "network": {
+        "n": 11,
+        "bytes": 1831658,
+        "blocking": 2
+      }
+    },
+    "graph_tab": {
+      "scene": "graph_tab",
+      "what": "问诊图（六层 + compound）",
+      "n_runs": 1,
+      "fcp_ms": 280,
+      "lcp_ms": 384,
+      "tbt_ms": 0,
+      "cls": 0.301,
+      "heap_mb": 6.1,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 296.3,
+      "network": {
+        "n": 11,
+        "bytes": 1831658,
+        "blocking": 2
+      },
+      "frames": {
+        "fps": 60,
+        "worst_gap_ms": 16.8
+      }
+    }
+  }
+}

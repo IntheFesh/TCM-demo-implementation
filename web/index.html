@@ -6,7 +6,9 @@
 <title>名医辨证对照</title>
 <!-- 内联 data URI 的 favicon：不额外加静态文件，也不再每次加载吃一个 404。 -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232C5F5A'/%3E%3Ctext x='16' y='23' font-size='20' text-anchor='middle' fill='white' font-family='sans-serif'%3E%E8%AF%81%3C/text%3E%3C/svg%3E" />
-<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<!-- R41：cytoscape 不在这里加载，理由见 graph.js 的 ensureCytoscape()。三个 script 用 defer，理由见 tests/test_web_split.py。preload 两个首屏字体：它们本来要等 CSS 解析完、布局判定"这一段确实用到这个字重"之后才开始下，preload 让下载跟 HTML 解析并行，缩短 FOUT 那一段；另外两个字重（serif 600 / sans 500）不 preload——它们在首屏之下，preload 会把带宽从要用的那两个身上抢走。 -->
+<link rel="preload" as="font" type="font/woff2" href="vendor/fonts/noto-serif-sc-400-subset.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="vendor/fonts/noto-sans-sc-400-subset.woff2" crossorigin>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -242,9 +244,9 @@
   <div id="evidence-body"></div>
 </aside>
 
-<script src="ui/select.js"></script>
-<script src="graph.js"></script>
-<script src="app.js"></script>
+<script src="ui/select.js" defer></script>
+<script src="graph.js" defer></script>
+<script src="app.js" defer></script>
 
 </body>
 </html>

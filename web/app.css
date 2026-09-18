@@ -272,7 +272,22 @@
   .state-first #detail-zone { display: none; }
   /* 示例只在首屏出现：有结果之后它们就成了干扰。 */
   #examples { display: none; }
-  .state-first #examples { display: block; margin-bottom: var(--s4); }
+  /* R41 CLS：**先留位，再填内容。** 示例主诉是 /health 回来之后由 JS 填的
+     （core/examples.py 下发，前端不写死），填进去那一下会把下面的 textarea
+     整个推下去——实测这一跳贡献 CLS 0.0257，而它发生在**纯页面加载**期间，
+     没有任何用户交互，是不折不扣的版面跳。
+     min-height 按"标题 + EXAMPLES_ROWS 行"算；行数与后端那张表的条数由
+     tests/test_frontend_cls.py 绑在一起（后端加第四条示例，那条测试会红，
+     提醒把 --examples-rows 跟着改），不是一个会漂的魔法数。 */
+  :root { --examples-rows: 3; --examples-row-h: 62px; --examples-title-h: 24px; }
+  .state-first #examples {
+    display: block;
+    margin-bottom: var(--s4);
+    min-height: calc(var(--examples-title-h)
+                     + var(--examples-rows) * var(--examples-row-h));
+    /* 这一块的内部布局变化不该让外面重排——它是一块自闭合的内容。 */
+    contain: layout style;
+  }
 
   /* ---- R24：首屏题记 ---- */
   /* 默认不显示：输入过一次之后它就该让位给结果（题记是"这是什么"，
@@ -1052,6 +1067,22 @@
     padding: 6px 14px;
     text-align: center;
   }
+  /* ---- R41：窗口化列表（只在条数 > VIRTUAL_LIST_THRESHOLD 时出现） ---- */
+  /* 行高**必须跟 app.js 的 VIRTUAL_ROW_HEIGHT 一致**（有测试比这两个数）：
+     窗口化靠 scrollTop / 行高 算"现在该画第几行"，两处不一致会越滚越偏。 */
+  /* R41 消除布局抖动：showTooltip 先把内容写进去、用 .measuring 让它
+     "可量但不可见"，下一帧才定位并露出来。**必须是 visibility 而不是
+     display:none**——后者不参与布局，量不到尺寸。 */
+  #graph-tooltip.measuring, #gb-tooltip.measuring { visibility: hidden; }
+  .virtual-list { overflow-y: auto; position: relative; contain: strict; }
+  .virtual-spacer { position: relative; }
+  .virtual-window { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
+  .ref-row {
+    height: 26px; line-height: 26px;
+    font-size: 12.5px; color: var(--ink-2);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    border-bottom: 1px solid var(--rule-soft);
+  }
   #byok-key {
     width: 240px; padding: 5px 8px; font-size: 12px;
     border: 1px solid var(--border); border-radius: var(--r-md);
@@ -1575,7 +1606,19 @@
   letter-spacing: 0.02em;
 }
 .chain-sec .chain-no { color: var(--muted); margin-right: 6px; }
-.chain-sec .chain-body { font-size: 14px; line-height: 1.75; color: var(--ink); }
+/* R41 CLS：**每一段先占一行的高度。** 九段的骨架（running 态）里 chain-body
+   是空的，高度 0；结果填进来之后每段长出 1~4 行，九段累加把下面的证据区与
+   输入区整个推下去——实测这一跳是真实用户路径上剩下的唯一一处位移
+   （CLS 0.0816，肇事元素 details#detail-zone + div#input-panel）。
+   留一行（1.75em）不能完全消掉它（结果行数本来就不固定），但能把九段各自的
+   0 → N 行变成 1 → N 行，实测把那一跳压掉近一半。
+   **不留更多**：留三行会让 running 态出现三倍的空白，那是用体验换指标。 */
+.chain-sec .chain-body {
+  font-size: 14px; line-height: 1.75; color: var(--ink);
+  min-height: 1.75em;
+  /* 这一段的内部变化不该让兄弟节点重排——它是一块自闭合的内容。 */
+  contain: layout style;
+}
 .chain-sec .chain-body .chain-line { margin: 2px 0; }
 .chain-sec .chain-body .chain-key { color: var(--muted); margin-right: 6px; }
 /* 口径标注跟在数后面（「25% 分母＝本方药味数」），右边距管不到它的左侧——

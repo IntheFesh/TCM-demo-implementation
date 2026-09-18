@@ -17,33 +17,6 @@ let REFERENCE_PHYSICIANS = [];
 // 首屏三条示例主诉。同样从 /health 下发（core/examples.py），不写死在这里——
 // DEMO.md 和录制清单里已经各有一份，第三份副本漂一个标点就是演示当场 LLMError。
 let EXAMPLE_COMPLAINTS = [];
-// layer 4（药材）跟 layer 3（方剂）的 x 只差一小段——compound 子节点要贴着
-// 父节点画，隔太远 cytoscape 算出来的方剂包围盒会变成横跨整个画布的细长条，
-// 不会像"一个方框里装着自己的药"。
-const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640, 4: 730 };
-// M7：Y_MAX 从 460 提到 620——只调这一个数救不了拥挤（cy.fit() 最后会把全部
-// 内容按同一个缩放系数塞进 #cy 容器，光把逻辑坐标范围拉大、节点本身的像素
-// 尺寸不变的话，摆放间距和节点尺寸的"比例"没变，缩放后看起来还是一样挤）。
-// 真正起作用的是这个比例本身：药材间距（下面 HERB_GAP）从 16 提到 26，
-// 明显大于药材节点自身高度（字号 11 + 上下 padding 6，约 23 个逻辑单位），
-// 26 提供的间隙足够放开重叠；Y_MAX 一起加大只是给"医家带"之间、方剂与方剂
-// 之间腾出更多空间，配合 #cy 容器本身的高度（也在这轮从 460px 提到 540px）
-// 一起用，两处缺一处都解决不了 M5 报告标注的"药材纵向堆叠间距小"。
-const Y_MIN = 60, Y_MAX = 620;
-// 单味药材之间的目标纵向间距（逻辑单位，不是像素——最终经 cy.fit() 统一缩放）。
-//
-// **R37 从 26 提到 36，因为 26 那个数依赖的前提早就不成立了。** M7 定 26 时
-// 算的是"药材节点高约 23 个逻辑单位（字号 **11** + 上下 padding 6）"，
-// 而样式表里节点字号是 `NODE_FONT_SIZE = 13`（§3.2 规格 11 就写着 13）——
-// 按 13 算，节点高约 13×1.2 + 6×2 ≈ 27.6，比 26 还大。于是相邻两味药的包围盒
-// 一直**压着 1~2px**，只是此前没有任何判据去比它们两两的包围盒：
-// `rings` 那条两两比包围盒的判据是给图谱浏览器写的，问诊图这一侧从来没有。
-// R37 给单链图加上同一条判据，第一次跑就红了。
-//
-// 36 = 27.6（节点自身）+ 8 的余量，实测（`--only single_chain_graph` 的
-// 两两包围盒判据）不再重叠。**这个数跟节点字号绑着**：以后改
-// `--node-font-consult` 要回头看这里。
-const HERB_GAP = 36;
 
 let cy = null;
 
@@ -728,7 +701,24 @@ function scheduleWarmupRecheck() {
     return;
   }
   warmupPolls += 1;
-  setTimeout(() => { initDemoModeBanner(); }, WARMUP_POLL_MS);
+  setTimeout(pollWarmupOnly, WARMUP_POLL_MS);
+}
+
+// R41：轮询**只更新那条横幅**，不再走整个 initDemoModeBanner()。
+// 后者会把身份色重新注一遍 CSS 变量、把三条示例主诉重新 innerHTML 一遍、
+// 把 λ₁ 说明重新渲染一遍——每秒一次、最多 180 次，全是白做的 DOM 工作
+// （身份色、示例、s3_mode 在预热期间不会变）。这是 R40 加轮询时引入的浪费，
+// R41 的前端 profile 才把它显出来。
+async function pollWarmupOnly() {
+  try {
+    const resp = await fetch("/health");
+    if (!resp.ok && resp.status !== 503) return;
+    const health = await resp.json();
+    renderWarmupBanner(health.warmup);
+    if (health.warmup && !health.warmup.ready) scheduleWarmupRecheck();
+  } catch (e) {
+    // 预热期间后端被重启之类：停止轮询，横幅留在最后一次的状态。
+  }
 }
 
 async function initDemoModeBanner() {
@@ -875,9 +865,86 @@ function refFoldHtml(refs, counts) {
   const note = (counts && counts.refs_truncated && total > n)
     ? `（本次检索到 ${total} 条，按相似度下发前 ${n} 条；被结论引用的一条不漏）`
     : "";
+  // R41：超过阈值才开窗口化渲染（见 VIRTUAL_LIST_THRESHOLD 那一段）。
+  // 默认 REFS_IN_RESPONSE=20，所以默认这条分支**不会走**——DOM 一个字节没变。
+  const body = n > VIRTUAL_LIST_THRESHOLD
+    ? virtualRefsHtml(refs)
+    : refListHtml(refs);
   return `<details class="col-refs"><summary>引自 ${n} 条医案${escapeHtml(note)}</summary>
-    <div class="detail-block">${refListHtml(refs)}</div>
+    <div class="detail-block">${body}</div>
   </details>`;
+}
+
+// ---------- R41：窗口化渲染（虚拟滚动） ----------
+//
+// ## 先说清楚这一项在当前配置下不生效，以及为什么还要有
+//
+// R41 实测的 DOM 规模：整页 154~297 个节点，**最长的列表 14 个子节点**。
+// 参考医案列表在默认配置下是 20 条（`REFS_IN_RESPONSE`）。这个量级上做虚拟
+// 滚动是纯亏：多 80 行代码、多一个剪裁/滚动跳动的失败模式，换 0 收益。
+//
+// 但 `REFS_IN_RESPONSE` 是**环境变量**。医院把它调到 500 是完全合法的配置
+// （"我们要看全部候选"），那时 500 个 `.ref-item`（每个 4~5 个子节点 =
+// 2000+ 节点）会让展开那一下变成一个长任务。所以机制建好、按阈值启用：
+// 默认那条路径的 DOM 逐字节不变，超过阈值才换。
+//
+// ## 为什么是"固定行高 + 只渲染可见窗口"，不是"滚到底再追加"
+//
+// 追加式（分块渲染）DOM 会随滚动一直长，滚到底跟一次全渲染一样——**它解决的
+// 是首次渲染，不是 DOM 规模**。真正的窗口化要求行高可预测，所以这条路径下
+// 每行收成**一行**（`.ref-row`，CSS 定死高度、超出省略号），完整内容点开进
+// 证据侧栏看。这是一个**取舍**：>阈值时列表从"每条三行摘要"变成"每条一行"。
+// 阈值以下不受影响，所以默认界面一个像素都没动。
+const VIRTUAL_LIST_THRESHOLD = 50;
+//: 一行的高度（px）。**必须跟 app.css 里 .ref-row 的 height 一致**——
+//: 两处不一致时滚动位置会越滚越偏。有一条测试比这两个数。
+const VIRTUAL_ROW_HEIGHT = 26;
+//: 窗口外上下各多渲染几行，避免快速滚动时露白。
+const VIRTUAL_OVERSCAN = 6;
+
+function virtualRowText(r) {
+  const sym = (r.symptoms || []).slice(0, 3).join("；");
+  return `${r.case_id}　${r.visit_label || ""}　相似度 ${r.score}`
+    + (r.syndrome ? `　证：${r.syndrome}` : "") + (sym ? `　${sym}` : "");
+}
+
+function virtualRefsHtml(refs) {
+  const n = refs.length;
+  // 外层固定高度 + 内层撑满总高：滚动条的长度必须跟"全部 n 行"一致，
+  // 否则用户看到的滚动比例是假的。
+  return `<div class="virtual-list" data-count="${n}" style="height:${
+    Math.min(12, n) * VIRTUAL_ROW_HEIGHT}px">`
+    + `<div class="virtual-spacer" style="height:${n * VIRTUAL_ROW_HEIGHT}px">`
+    + `<div class="virtual-window"></div></div></div>`;
+}
+
+// 把 refs 挂到 DOM 上并接上滚动。**分两步**（先出 HTML 再挂数据）是因为
+// 上层 `columnHtml` 是纯字符串拼接的（有一批纯函数测试靠这个性质），
+// 数据不能塞进字符串里。
+function mountVirtualLists(root, refsByIndex) {
+  const lists = (root || document).querySelectorAll(".virtual-list");
+  lists.forEach((el, i) => {
+    const refs = refsByIndex[i] || [];
+    if (!refs.length) return;
+    const win = el.querySelector(".virtual-window");
+    const draw = () => {
+      const first = Math.max(0, Math.floor(el.scrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_OVERSCAN);
+      const visible = Math.ceil(el.clientHeight / VIRTUAL_ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
+      const rows = refs.slice(first, first + visible);
+      win.style.transform = `translateY(${first * VIRTUAL_ROW_HEIGHT}px)`;
+      win.innerHTML = rows.map((r) => `<div class="ref-row" title="${
+        escapeHtml(virtualRowText(r))}">${escapeHtml(virtualRowText(r))}</div>`).join("");
+    };
+    // 滚动回调走 rAF 合并：scroll 事件一秒能来上百次，每次都重排一遍 DOM
+    // 就是自己造抖动（R41 的"消除布局抖动"那一条）。
+    let queued = false;
+    el.addEventListener("scroll", () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; draw(); });
+    });
+    draw();
+  });
 }
 
 // ---------- M7：君臣佐使分组 ----------
@@ -1480,16 +1547,34 @@ function exampleListHtml(examples) {
   return `<div class="ex-title">或从这三条开始</div><div class="ex-list">${items}</div>`;
 }
 
+// R41 事件委托：**一次绑在容器上**，不随每次渲染逐个按钮重绑。
+// 三个按钮的绑定本身很便宜，改它是为了两件别的事：
+//   · `renderExamples` 可能被调多次（重连、角色切换），逐个重绑的写法要靠
+//     "innerHTML 换了节点、旧监听器跟着走"这个副作用才不泄漏——依赖副作用的
+//     正确性是看不出来的正确性；
+//   · 委托之后 `renderExamples` 变成纯粹的"填 HTML"，没有副作用，
+//     `tests/test_consult_layout.py` 那类纯函数测试能直接用。
+let _examplesDelegated = false;
+
+function delegateExamples() {
+  if (_examplesDelegated) return;
+  const el = document.getElementById("examples");
+  if (!el) return;
+  _examplesDelegated = true;
+  el.addEventListener("click", (e) => {
+    const btn = e.target.closest(".example");
+    if (!btn || !el.contains(btn)) return;
+    const box = document.getElementById("complaint");
+    box.value = btn.dataset.complaint;
+    box.focus();
+  });
+}
+
 function renderExamples(examples) {
   const el = document.getElementById("examples");
   if (!el) return;
   el.innerHTML = exampleListHtml(examples);
-  for (const btn of el.querySelectorAll(".example")) {
-    btn.addEventListener("click", () => {
-      document.getElementById("complaint").value = btn.dataset.complaint;
-      document.getElementById("complaint").focus();
-    });
-  }
+  delegateExamples();
 }
 
 // ---------- 用药对照带（§3.1 第三条：页面的主角） ----------
@@ -2402,6 +2487,12 @@ async function renderReferencePhysicians(complaint, role) {
 
 function renderColumns(results, mode = "researcher") {
   document.getElementById("columns").innerHTML = results.map((r) => columnHtml(r, mode)).join("");
+  // R41：窗口化列表要在 HTML 落进 DOM 之后挂数据与滚动（`columnHtml` 是纯字符串
+  // 拼接，数据塞不进字符串里）。顺序跟 `results` 一致——`.virtual-list` 出现的
+  // 顺序就是列的顺序，第 i 个列表拿第 i 列的 refs。
+  // 条数没超阈值时页面里一个 `.virtual-list` 都没有，这一行是空转。
+  mountVirtualLists(document.getElementById("columns"),
+                    results.map((r) => r.refs || []));
 }
 
 // role-select 的当前取值。跟 retriever-mode 一样"逐请求参数、不落进程状态"，

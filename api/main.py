@@ -2002,5 +2002,34 @@ def api_prescription_export(req: PrescriptionExportRequest) -> dict:
     return {"text": text, "audit_id": str(record.seq)}
 
 
+#: R41：静态资源的缓存策略。**两类资源两种，不能给同一个值。**
+#:
+#: | 类 | 谁 | 策略 | 为什么 |
+#: |---|---|---|---|
+#: | 不变的第三方产物 | `vendor/`（字体 1.13 MB + cytoscape 373 KB） | `max-age=1 年, immutable` | 内容跟文件名绑定（字体子集是 `scripts/subset_fonts.py` 的产物、cytoscape 带版本），换内容必然换文件名。二次访问一个字节都不用取——这 1.5 MB 是首屏字节数的 84% |
+#: | 会改的自家代码 | `index.html` / `app.js` / `app.css` / `graph.js` | `no-cache` | **必须每次问服务器**。`max-age` 一给，升级之后医生刷新页面还是旧的 JS 配新的后端，而那是一类最难查的故障（R45 的升级回滚要靠这条）。`no-cache` 不是"不缓存"，是"缓存但每次带 ETag 问一句"——304 只有几十字节 |
+#:
+#: 为什么不靠 StaticFiles 的默认值：它只给 ETag / Last-Modified，没有
+#: `Cache-Control`。浏览器于是按启发式自己猜一个新鲜期——猜多久取决于浏览器版本，
+#: 而"取决于浏览器版本"意味着现场表现不可复现。
+CACHE_IMMUTABLE_SECONDS = 31536000       # 1 年
+CACHE_IMMUTABLE_PREFIXES = ("vendor/",)
+
+
+class _CachingStatic(StaticFiles):
+    """给静态响应补 `Cache-Control`。**只补，不改别的**——ETag 与
+    Last-Modified 仍由 StaticFiles 处理，304 的逻辑一行没动。"""
+
+    async def get_response(self, path: str, scope):  # noqa: ANN001 - 跟基类签名一致
+        resp = await super().get_response(path, scope)
+        if resp.status_code in (200, 304):
+            if path.startswith(CACHE_IMMUTABLE_PREFIXES):
+                resp.headers["Cache-Control"] = (
+                    f"public, max-age={CACHE_IMMUTABLE_SECONDS}, immutable")
+            else:
+                resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 # 静态文件挂在 /app，不要挂在根路径——否则会遮蔽上面的 API 路由。
-app.mount("/app", StaticFiles(directory=str(WEB_ROOT), html=True), name="web")
+app.mount("/app", _CachingStatic(directory=str(WEB_ROOT), html=True), name="web")

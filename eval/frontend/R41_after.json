@@ -1,0 +1,2879 @@
+{
+  "kind": "frontend_profile",
+  "generated_at": "2026-09-18T04:48:05Z",
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  },
+  "long_task_threshold_ms": 50,
+  "repeat": 3,
+  "runs": [
+    {
+      "scene": "first_paint",
+      "what": "首屏（只加载页面，不跑任何问诊）",
+      "goto_ms": 128.0,
+      "fcp_ms": 148,
+      "fp_ms": 148,
+      "lcp_ms": 148,
+      "cls": 0.0001,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0001,
+          "at": 124,
+          "who": [
+            "?"
+          ]
+        },
+        {
+          "value": 0,
+          "at": 137,
+          "who": [
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 2.1,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 57,
+        "load_ms": 125,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 9,
+        "bytes": 1475897,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 41,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 7,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 40,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 21,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 21,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 10,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 12,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "chain_done",
+      "what": "单链九段终态（R37 的问诊结果页）",
+      "goto_ms": 103.1,
+      "fcp_ms": 132,
+      "fp_ms": 132,
+      "lcp_ms": 132,
+      "cls": 0.6524,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.6523,
+          "at": 160,
+          "who": [
+            "div#tab-consult.tab-panel",
+            "div#input-panel"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 104,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 4.6,
+      "dom": {
+        "n_nodes": 286,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 18.8,
+        "fallback_reason": null,
+        "n_nodes": 12
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 44,
+        "load_ms": 100,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 5,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 34,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 6,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 34,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 9,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 13,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [
+        {
+          "label": "展开参考医案",
+          "selector": "details.col-refs > summary",
+          "error": "找不到 details.col-refs > summary"
+        },
+        {
+          "label": "切换角色下拉",
+          "selector": "#role-select",
+          "ms": 25.1
+        },
+        {
+          "label": "点第九段节点",
+          "selector": ".chain-sec[data-key='formula'] h3",
+          "ms": 31.4
+        }
+      ]
+    },
+    {
+      "scene": "chain_done_via_click",
+      "what": "真实用户路径：点「辨证」→ running → 终态（CLS 的正确口径）",
+      "goto_ms": 115.8,
+      "fcp_ms": 140,
+      "fp_ms": 140,
+      "lcp_ms": 140,
+      "cls": 0.0001,
+      "cls_entries": 1,
+      "cls_ignored_user_input": 1,
+      "shifts": [
+        {
+          "value": 0.0001,
+          "at": 114,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 5.3,
+      "dom": {
+        "n_nodes": 289,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 18.5,
+        "fallback_reason": null,
+        "n_nodes": 12
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 35,
+        "load_ms": 110,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 5,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 49,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 18,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 49,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 11,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 16,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "graph_tab",
+      "what": "问诊图（六层 + compound）",
+      "goto_ms": 103.8,
+      "fcp_ms": 132,
+      "fp_ms": 132,
+      "lcp_ms": 132,
+      "cls": 0.2742,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.2741,
+          "at": 171,
+          "who": [
+            "div#tab-consult.tab-panel",
+            "div#input-panel"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 104,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 6.8,
+      "dom": {
+        "n_nodes": 297,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 11
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 18.8,
+        "fallback_reason": null,
+        "n_nodes": 11
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 37,
+        "load_ms": 101,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 34,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 18,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 34,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 9,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 13,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [],
+      "frames": {
+        "n_frames": 91,
+        "median_gap_ms": 16.7,
+        "worst_gap_ms": 16.8,
+        "fps": 60
+      }
+    },
+    {
+      "scene": "repeat_visit",
+      "what": "二次访问（走缓存）——字体与 vendor 的 1.13 MB 应该一个字节都不取",
+      "goto_ms": 113.1,
+      "fcp_ms": 40,
+      "fp_ms": 40,
+      "lcp_ms": 40,
+      "cls": 0.0051,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0028,
+          "at": 32,
+          "who": [
+            "button#topbar-toggle",
+            "div#topbar-controls.tb-controls"
+          ]
+        },
+        {
+          "value": 0.0023,
+          "at": 50,
+          "who": [
+            "textarea#complaint",
+            "div.input-row"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 2.7,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 21,
+        "load_ms": 25,
+        "transfer_bytes": 300
+      },
+      "network": {
+        "n": 9,
+        "bytes": 3941,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 0,
+            "decoded": 320248,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 0,
+            "decoded": 315552,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 0,
+            "decoded": 250356,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 0,
+            "decoded": 246468,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 22,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 5,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 7,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 7,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "graph_browser",
+      "what": "图谱浏览器页签（持久知识图谱，分页拉证素）",
+      "goto_ms": 95.9,
+      "fcp_ms": 124,
+      "fp_ms": 124,
+      "lcp_ms": 156,
+      "cls": 0.0453,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0452,
+          "at": 236,
+          "who": [
+            "div#gb-toolbar",
+            "::after",
+            "::after"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 96,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 5.8,
+      "dom": {
+        "n_nodes": 174,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 39,
+        "load_ms": 92,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 12,
+        "bytes": 1856365,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 34,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 10,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 34,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 9,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 8,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph?node_types=element&limit=200",
+            "kind": "fetch",
+            "bytes": 3432,
+            "decoded": 3132,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph?node_types=element&limit=200",
+            "kind": "fetch",
+            "bytes": 3432,
+            "decoded": 3132,
+            "ms": 32,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 13,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [
+        {
+          "label": "重置视图",
+          "selector": "#gb-reset-btn",
+          "ms": 18.2
+        }
+      ],
+      "frames": {
+        "n_frames": 91,
+        "median_gap_ms": 16.7,
+        "worst_gap_ms": 16.8,
+        "fps": 60
+      }
+    },
+    {
+      "scene": "first_paint",
+      "what": "首屏（只加载页面，不跑任何问诊）",
+      "goto_ms": 101.3,
+      "fcp_ms": 108,
+      "fp_ms": 108,
+      "lcp_ms": 108,
+      "cls": 0.0024,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0023,
+          "at": 97,
+          "who": [
+            "textarea#complaint",
+            "div.input-row"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 111,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 2.1,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 38,
+        "load_ms": 99,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 9,
+        "bytes": 1475897,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 37,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 37,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 9,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 12,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 13,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "chain_done",
+      "what": "单链九段终态（R37 的问诊结果页）",
+      "goto_ms": 100.8,
+      "fcp_ms": 116,
+      "fp_ms": 116,
+      "lcp_ms": 188,
+      "cls": 0.6555,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.6523,
+          "at": 169,
+          "who": [
+            "div#tab-consult.tab-panel",
+            "div#input-panel"
+          ]
+        },
+        {
+          "value": 0.0031,
+          "at": 102,
+          "who": [
+            "?",
+            "?",
+            "textarea#complaint"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 6,
+      "dom": {
+        "n_nodes": 286,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 20.7,
+        "fallback_reason": null,
+        "n_nodes": 12
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 42,
+        "load_ms": 94,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 36,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 12,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 33,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 12,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 19,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 19,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 11,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 19,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 12,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [
+        {
+          "label": "展开参考医案",
+          "selector": "details.col-refs > summary",
+          "error": "找不到 details.col-refs > summary"
+        },
+        {
+          "label": "切换角色下拉",
+          "selector": "#role-select",
+          "ms": 23.6
+        },
+        {
+          "label": "点第九段节点",
+          "selector": ".chain-sec[data-key='formula'] h3",
+          "ms": 31.5
+        }
+      ]
+    },
+    {
+      "scene": "chain_done_via_click",
+      "what": "真实用户路径：点「辨证」→ running → 终态（CLS 的正确口径）",
+      "goto_ms": 101.2,
+      "fcp_ms": 116,
+      "fp_ms": 116,
+      "lcp_ms": 116,
+      "cls": 0.0024,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 1,
+      "shifts": [
+        {
+          "value": 0.0023,
+          "at": 96,
+          "who": [
+            "textarea#complaint",
+            "div.input-row"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 103,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 5.3,
+      "dom": {
+        "n_nodes": 289,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 17.4,
+        "fallback_reason": null,
+        "n_nodes": 12
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 34,
+        "load_ms": 99,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 6,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 39,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 9,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 40,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 10,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 7,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 14,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "graph_tab",
+      "what": "问诊图（六层 + compound）",
+      "goto_ms": 96.5,
+      "fcp_ms": 128,
+      "fp_ms": 128,
+      "lcp_ms": 200,
+      "cls": 0.2742,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.2741,
+          "at": 170,
+          "who": [
+            "div#tab-consult.tab-panel",
+            "div#input-panel"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 106,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 7,
+      "dom": {
+        "n_nodes": 297,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 11
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 18.2,
+        "fallback_reason": null,
+        "n_nodes": 11
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 38,
+        "load_ms": 94,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 41,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 11,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 40,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 11,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 13,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 10,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 13,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 13,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [],
+      "frames": {
+        "n_frames": 91,
+        "median_gap_ms": 16.7,
+        "worst_gap_ms": 16.8,
+        "fps": 60
+      }
+    },
+    {
+      "scene": "repeat_visit",
+      "what": "二次访问（走缓存）——字体与 vendor 的 1.13 MB 应该一个字节都不取",
+      "goto_ms": 107.8,
+      "fcp_ms": 48,
+      "fp_ms": 48,
+      "lcp_ms": 48,
+      "cls": 0.0023,
+      "cls_entries": 1,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0023,
+          "at": 38,
+          "who": [
+            "textarea#complaint",
+            "div.input-row"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 2.6,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 19,
+        "load_ms": 23,
+        "transfer_bytes": 300
+      },
+      "network": {
+        "n": 9,
+        "bytes": 3941,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 0,
+            "decoded": 320248,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 0,
+            "decoded": 315552,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 0,
+            "decoded": 250356,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 0,
+            "decoded": 246468,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 13,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 2,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 3,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 5,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 6,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "graph_browser",
+      "what": "图谱浏览器页签（持久知识图谱，分页拉证素）",
+      "goto_ms": 95.4,
+      "fcp_ms": 120,
+      "fp_ms": 120,
+      "lcp_ms": 268,
+      "cls": 0.0483,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0452,
+          "at": 240,
+          "who": [
+            "div#gb-toolbar",
+            "::after",
+            "::after"
+          ]
+        },
+        {
+          "value": 0.0031,
+          "at": 102,
+          "who": [
+            "?",
+            "?",
+            "textarea#complaint"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 5.8,
+      "dom": {
+        "n_nodes": 174,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 39,
+        "load_ms": 92,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 12,
+        "bytes": 1856365,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 37,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 8,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 35,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 14,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph?node_types=element&limit=200",
+            "kind": "fetch",
+            "bytes": 3432,
+            "decoded": 3132,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph?node_types=element&limit=200",
+            "kind": "fetch",
+            "bytes": 3432,
+            "decoded": 3132,
+            "ms": 28,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 11,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [
+        {
+          "label": "重置视图",
+          "selector": "#gb-reset-btn",
+          "ms": 22.1
+        }
+      ],
+      "frames": {
+        "n_frames": 91,
+        "median_gap_ms": 16.7,
+        "worst_gap_ms": 16.8,
+        "fps": 60
+      }
+    },
+    {
+      "scene": "first_paint",
+      "what": "首屏（只加载页面，不跑任何问诊）",
+      "goto_ms": 104.6,
+      "fcp_ms": 124,
+      "fp_ms": 124,
+      "lcp_ms": 124,
+      "cls": 0.0001,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0001,
+          "at": 112,
+          "who": [
+            "?"
+          ]
+        },
+        {
+          "value": 0,
+          "at": 97,
+          "who": [
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 2.1,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 41,
+        "load_ms": 98,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 9,
+        "bytes": 1475897,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 39,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 17,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 39,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 16,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 9,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 13,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 14,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "chain_done",
+      "what": "单链九段终态（R37 的问诊结果页）",
+      "goto_ms": 101.5,
+      "fcp_ms": 136,
+      "fp_ms": 136,
+      "lcp_ms": 136,
+      "cls": 0.6524,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.6523,
+          "at": 156,
+          "who": [
+            "div#tab-consult.tab-panel",
+            "div#input-panel"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 102,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 6,
+      "dom": {
+        "n_nodes": 286,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 19.9,
+        "fallback_reason": null,
+        "n_nodes": 12
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 38,
+        "load_ms": 98,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 37,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 10,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 36,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 19,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 18,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 18,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 12,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 18,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 12,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [
+        {
+          "label": "展开参考医案",
+          "selector": "details.col-refs > summary",
+          "error": "找不到 details.col-refs > summary"
+        },
+        {
+          "label": "切换角色下拉",
+          "selector": "#role-select",
+          "ms": 30.2
+        },
+        {
+          "label": "点第九段节点",
+          "selector": ".chain-sec[data-key='formula'] h3",
+          "ms": 31
+        }
+      ]
+    },
+    {
+      "scene": "chain_done_via_click",
+      "what": "真实用户路径：点「辨证」→ running → 终态（CLS 的正确口径）",
+      "goto_ms": 98.4,
+      "fcp_ms": 112,
+      "fp_ms": 112,
+      "lcp_ms": 112,
+      "cls": 0.0025,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 1,
+      "shifts": [
+        {
+          "value": 0.0024,
+          "at": 94,
+          "who": [
+            "?",
+            "textarea#complaint",
+            "div.input-row"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 100,
+          "who": [
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 5.3,
+      "dom": {
+        "n_nodes": 289,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 20.7,
+        "fallback_reason": null,
+        "n_nodes": 12
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 34,
+        "load_ms": 96,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 5,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 38,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 10,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 38,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 10,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 8,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 13,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "graph_tab",
+      "what": "问诊图（六层 + compound）",
+      "goto_ms": 118.3,
+      "fcp_ms": 156,
+      "fp_ms": 156,
+      "lcp_ms": 156,
+      "cls": 0.2742,
+      "cls_entries": 2,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.2741,
+          "at": 178,
+          "who": [
+            "div#tab-consult.tab-panel",
+            "div#input-panel"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 126,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 7.1,
+      "dom": {
+        "n_nodes": 297,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-done"
+        },
+        "depth_max": 11
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 20.6,
+        "fallback_reason": null,
+        "n_nodes": 11
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 51,
+        "load_ms": 116,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 42,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 23,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 41,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 24,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 23,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 23,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 13,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 22,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 17,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [],
+      "frames": {
+        "n_frames": 91,
+        "median_gap_ms": 16.7,
+        "worst_gap_ms": 16.8,
+        "fps": 60
+      }
+    },
+    {
+      "scene": "repeat_visit",
+      "what": "二次访问（走缓存）——字体与 vendor 的 1.13 MB 应该一个字节都不取",
+      "goto_ms": 105.2,
+      "fcp_ms": 28,
+      "fp_ms": 28,
+      "lcp_ms": 28,
+      "cls": 0.0023,
+      "cls_entries": 1,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0023,
+          "at": 40,
+          "who": [
+            "textarea#complaint",
+            "div.input-row"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 2.7,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 15,
+        "load_ms": 21,
+        "transfer_bytes": 300
+      },
+      "network": {
+        "n": 9,
+        "bytes": 3941,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 0,
+            "decoded": 320248,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 0,
+            "decoded": 315552,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 0,
+            "decoded": 250356,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 0,
+            "decoded": 246468,
+            "ms": 0,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 3,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 3,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 5,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 300,
+            "decoded": 0,
+            "ms": 6,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": []
+    },
+    {
+      "scene": "graph_browser",
+      "what": "图谱浏览器页签（持久知识图谱，分页拉证素）",
+      "goto_ms": 104.5,
+      "fcp_ms": 112,
+      "fp_ms": 112,
+      "lcp_ms": 280,
+      "cls": 0.0476,
+      "cls_entries": 3,
+      "cls_ignored_user_input": 0,
+      "shifts": [
+        {
+          "value": 0.0452,
+          "at": 251,
+          "who": [
+            "div#gb-toolbar",
+            "::after",
+            "::after"
+          ]
+        },
+        {
+          "value": 0.0023,
+          "at": 100,
+          "who": [
+            "textarea#complaint",
+            "div.input-row"
+          ]
+        },
+        {
+          "value": 0.0001,
+          "at": 106,
+          "who": [
+            "?",
+            "?"
+          ]
+        }
+      ],
+      "tbt_ms": 0,
+      "long_tasks": [],
+      "heap_mb": 5.8,
+      "dom": {
+        "n_nodes": 174,
+        "longest_list": {
+          "n": 14,
+          "selector": "div#consult-page.state-first"
+        },
+        "depth_max": 9
+      },
+      "layout": {
+        "where": null,
+        "ms": 0,
+        "fallback_reason": null,
+        "n_nodes": 0
+      },
+      "navigation": {
+        "dom_content_loaded_ms": 35,
+        "load_ms": 102,
+        "transfer_bytes": 15602
+      },
+      "network": {
+        "n": 12,
+        "bytes": 1856365,
+        "blocking": 1,
+        "slow": [],
+        "all": [
+          {
+            "url": "cytoscape.min.js",
+            "kind": "script",
+            "bytes": 373604,
+            "decoded": 373304,
+            "ms": 4,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-600-subset.woff2",
+            "kind": "css",
+            "bytes": 320548,
+            "decoded": 320248,
+            "ms": 35,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-serif-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 315852,
+            "decoded": 315552,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-500-subset.woff2",
+            "kind": "css",
+            "bytes": 250656,
+            "decoded": 250356,
+            "ms": 35,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "noto-sans-sc-400-subset.woff2",
+            "kind": "link",
+            "bytes": 246768,
+            "decoded": 246468,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.js",
+            "kind": "script",
+            "bytes": 161490,
+            "decoded": 161190,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph.js",
+            "kind": "script",
+            "bytes": 100555,
+            "decoded": 100255,
+            "ms": 14,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "app.css",
+            "kind": "link",
+            "bytes": 66756,
+            "decoded": 66456,
+            "ms": 7,
+            "blocking": "blocking"
+          },
+          {
+            "url": "select.js",
+            "kind": "script",
+            "bytes": 10531,
+            "decoded": 10231,
+            "ms": 11,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph?node_types=element&limit=200",
+            "kind": "fetch",
+            "bytes": 3432,
+            "decoded": 3132,
+            "ms": 15,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "graph?node_types=element&limit=200",
+            "kind": "fetch",
+            "bytes": 3432,
+            "decoded": 3132,
+            "ms": 28,
+            "blocking": "non-blocking"
+          },
+          {
+            "url": "health",
+            "kind": "fetch",
+            "bytes": 2741,
+            "decoded": 2441,
+            "ms": 15,
+            "blocking": "non-blocking"
+          }
+        ]
+      },
+      "observers_failed": [],
+      "page_errors": [],
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "interactions": [
+        {
+          "label": "重置视图",
+          "selector": "#gb-reset-btn",
+          "ms": 31.8
+        }
+      ],
+      "frames": {
+        "n_frames": 91,
+        "median_gap_ms": 16.7,
+        "worst_gap_ms": 16.8,
+        "fps": 60
+      }
+    }
+  ],
+  "scenes": {
+    "first_paint": {
+      "scene": "first_paint",
+      "what": "首屏（只加载页面，不跑任何问诊）",
+      "n_runs": 3,
+      "fcp_ms": 124,
+      "lcp_ms": 124,
+      "tbt_ms": 0,
+      "cls": 0.0,
+      "heap_mb": 2.1,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 104.6,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list_n": 14,
+        "longest_list": "div#consult-page.state-first",
+        "depth_max": 9
+      },
+      "network": {
+        "n": 9,
+        "bytes": 1475897,
+        "blocking": 1
+      }
+    },
+    "chain_done": {
+      "scene": "chain_done",
+      "what": "单链九段终态（R37 的问诊结果页）",
+      "n_runs": 3,
+      "fcp_ms": 132,
+      "lcp_ms": 136,
+      "tbt_ms": 0,
+      "cls": 0.652,
+      "heap_mb": 6,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 101.5,
+      "dom": {
+        "n_nodes": 286,
+        "longest_list_n": 14,
+        "longest_list": "div#consult-page.state-done",
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 19.9,
+        "n_nodes": 12,
+        "fallback_reason": null
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1
+      },
+      "interactions": [
+        {
+          "label": "切换角色下拉",
+          "ms": 25.1
+        },
+        {
+          "label": "点第九段节点",
+          "ms": 31.4
+        }
+      ]
+    },
+    "chain_done_via_click": {
+      "scene": "chain_done_via_click",
+      "what": "真实用户路径：点「辨证」→ running → 终态（CLS 的正确口径）",
+      "n_runs": 3,
+      "fcp_ms": 116,
+      "lcp_ms": 116,
+      "tbt_ms": 0,
+      "cls": 0.002,
+      "heap_mb": 5.3,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 101.2,
+      "dom": {
+        "n_nodes": 289,
+        "longest_list_n": 14,
+        "longest_list": "div#consult-page.state-done",
+        "depth_max": 10
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 18.5,
+        "n_nodes": 12,
+        "fallback_reason": null
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1
+      }
+    },
+    "graph_tab": {
+      "scene": "graph_tab",
+      "what": "问诊图（六层 + compound）",
+      "n_runs": 3,
+      "fcp_ms": 132,
+      "lcp_ms": 156,
+      "tbt_ms": 0,
+      "cls": 0.274,
+      "heap_mb": 7,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 103.8,
+      "dom": {
+        "n_nodes": 297,
+        "longest_list_n": 14,
+        "longest_list": "div#consult-page.state-done",
+        "depth_max": 11
+      },
+      "layout": {
+        "where": "worker",
+        "ms": 18.8,
+        "n_nodes": 11,
+        "fallback_reason": null
+      },
+      "network": {
+        "n": 10,
+        "bytes": 1849501,
+        "blocking": 1
+      },
+      "frames": {
+        "fps": 60,
+        "worst_gap_ms": 16.8
+      }
+    },
+    "repeat_visit": {
+      "scene": "repeat_visit",
+      "what": "二次访问（走缓存）——字体与 vendor 的 1.13 MB 应该一个字节都不取",
+      "n_runs": 3,
+      "fcp_ms": 40,
+      "lcp_ms": 40,
+      "tbt_ms": 0,
+      "cls": 0.002,
+      "heap_mb": 2.7,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 107.8,
+      "dom": {
+        "n_nodes": 154,
+        "longest_list_n": 14,
+        "longest_list": "div#consult-page.state-first",
+        "depth_max": 9
+      },
+      "network": {
+        "n": 9,
+        "bytes": 3941,
+        "blocking": 1
+      }
+    },
+    "graph_browser": {
+      "scene": "graph_browser",
+      "what": "图谱浏览器页签（持久知识图谱，分页拉证素）",
+      "n_runs": 3,
+      "fcp_ms": 120,
+      "lcp_ms": 268,
+      "tbt_ms": 0,
+      "cls": 0.048,
+      "heap_mb": 5.8,
+      "n_long_tasks": 0,
+      "worst_long_task_ms": 0,
+      "goto_ms": 95.9,
+      "dom": {
+        "n_nodes": 174,
+        "longest_list_n": 14,
+        "longest_list": "div#consult-page.state-first",
+        "depth_max": 9
+      },
+      "network": {
+        "n": 12,
+        "bytes": 1856365,
+        "blocking": 1
+      },
+      "interactions": [
+        {
+          "label": "重置视图",
+          "ms": 22.1
+        }
+      ],
+      "frames": {
+        "fps": 60,
+        "worst_gap_ms": 16.8
+      }
+    }
+  }
+}

@@ -41,7 +41,10 @@ def test_the_custom_select_lives_in_its_own_file_and_loads_first():
     app.js 末尾要调 `enhanceAllSelects()`，顺序反了那个函数还不存在。"""
     html = load_html()
     assert (WEB / "ui" / "select.js").exists()
-    assert html.index('<script src="ui/select.js">') < html.index('<script src="app.js">')
+    # R41：三个 script 都带了 `defer`，所以开标签不再是 `...js">` 结尾。
+    # 判据本来要的就是"位置先后"，匹配到 src 那一截就够；`defer` 保证执行顺序
+    # 仍然按文档顺序（不是 async），有 tests/test_web_split.py 专门钉住。
+    assert html.index('<script src="ui/select.js"') < html.index('<script src="app.js"')
 
 
 def test_the_native_select_stays_the_single_source_of_the_value():

@@ -46,15 +46,94 @@ def test_index_html_has_no_inline_script_or_style():
     assert "<script>" not in html, "index.html 里又出现了内联脚本"
     assert "<style>" not in html, "index.html 里又出现了内联样式"
     for name in SCRIPT_FILES:
-        assert f'<script src="{name}"></script>' in html, f"index.html 没有引 {name}"
+        # R41：三个都带 `defer`。判据从"逐字匹配整个标签"改成"src 在且带 defer"
+        # ——前者会因为多一个属性就红，而那不是它要防的事（它防的是内联脚本
+        # 和漏引某个文件）。defer 本身由下面那条专门的测试钉。
+        assert f'<script src="{name}"' in html, f"index.html 没有引 {name}"
     assert '<link rel="stylesheet" href="app.css">' in html
 
 
+def test_every_script_is_deferred_so_html_parsing_and_downloading_overlap():
+    """R41：三个脚本都要带 `defer`。
+
+    它们在 `</body>` 之前，本来就不阻塞首次绘制——`defer` 买到的是**边解析
+    HTML 边并行下载**这三个文件（实测 157 + 89 + 10 KB），而不是解析到那一行
+    才开始取。
+
+    `defer` 而不是 `async`：`async` **不保证执行顺序**，而这三个有硬顺序
+    （app.js 用 graph.js 定义的 `formulaSourceLabel`，顺序反了是 ReferenceError）。
+    这条测试同时钉住"不许改成 async"。
+    """
+    html = load_html()
+    for name in SCRIPT_FILES:
+        i = html.index(f'<script src="{name}"')
+        tag = html[i:html.index(">", i) + 1]
+        assert " defer" in tag, f"{name} 没带 defer：{tag}"
+        assert " async" not in tag, f"{name} 用了 async——顺序就不保证了：{tag}"
+
+
+def test_the_head_no_longer_loads_cytoscape_synchronously():
+    """R41：`<head>` 里那个同步的 CDN `<script>` 已经去掉了。
+
+    实测它 `renderBlockingStatus: "blocking"`、240 ms，而那 373 KB 只有图谱页
+    要用。加上三甲内网取不到 cdnjs，那条请求会一直挂到超时——而"断网可用"
+    正是录制回放这条路线存在的理由。
+
+    唯一的加载路径现在是 `graph.js` 的 `ensureCytoscape()`（用时插入本地副本）。
+    """
+    html = load_html()
+    assert "cdnjs" not in html, "index.html 又从 CDN 取东西了"
+    # 判据是 `<head>` 里**一个 `<script` 标签都没有**，不是"没出现 cytoscape
+    # 这个词"——注释里提它是正常的（那正是解释为什么不在这里加载）。
+    head = html.split("<body")[0]
+    assert "<script" not in head, f"<head> 里又出现了 script 标签：{head[-300:]}"
+    graph_js = (WEB / "graph.js").read_text(encoding="utf-8")
+    assert 'el.src = "vendor/cytoscape.min.js"' in graph_js, (
+        "本地副本那条加载路径没了——那 index.html 里也不加载的话图就永远画不出来")
+
+
+#: 结构文件的行数上限。R13 定 250；**R41 提到 254**，多出来的四行是
+#: 两条 `<link rel="preload">`（首屏字体，见 test_the_first_screen_fonts_are_preloaded）
+#: 加一行解释性注释再加一行余量——它们都是结构，不是逻辑。
+#:
+#: 这个数的用途是防"HTML 又长回 3574 行、改版面得在里面找 DOM"，不是卡到个位数。
+#: 每次提它都要在这里写明多出来的是什么，否则它会一轮一轮地被磨掉。
+INDEX_HTML_MAX_LINES = 254
+
+
 def test_index_html_is_structure_only():
-    """结构文件要短到能一眼读完——R13 的判据是 ≤ 250 行。拆分的全部意义就是
-    "改版面时不用在 3574 行里找 DOM"。"""
+    """结构文件要短到能一眼读完。拆分的全部意义就是
+    "改版面时不用在 3574 行里找 DOM"。上限见 `INDEX_HTML_MAX_LINES`。"""
     lines = load_html().splitlines()
-    assert len(lines) <= 250, f"index.html 有 {len(lines)} 行，结构文件不该这么长"
+    assert len(lines) <= INDEX_HTML_MAX_LINES, (
+        f"index.html 有 {len(lines)} 行，上限 {INDEX_HTML_MAX_LINES}"
+        "——结构文件不该这么长")
+
+
+def test_the_first_screen_fonts_are_preloaded():
+    """R41：首屏那两个字重要 `preload`。
+
+    不 preload 时它们要等 CSS 解析完、布局判定"这一段确实用到这个字重"之后
+    才开始下载，而 CJK 子集是 246–320 KB/个——那段等待就是 FOUT（先系统字体、
+    再换成 Noto）的长度。
+
+    **另外两个字重刻意不 preload**：serif 600 / sans 500 在首屏之下，
+    preload 它们会把带宽从真正要用的那两个身上抢走（preload 是"现在就下"，
+    不是"提前知道"）。这条测试同时钉住这个边界——四个全 preload 跟一个都不
+    preload 一样是错的。
+    """
+    html = load_html()
+    preloaded = [ln for ln in html.splitlines() if 'rel="preload"' in ln]
+    assert len(preloaded) == 2, f"preload 的字体不是两个：{preloaded}"
+    for want in ("noto-serif-sc-400-subset.woff2", "noto-sans-sc-400-subset.woff2"):
+        assert any(want in ln for ln in preloaded), f"没 preload {want}"
+    for dont in ("noto-serif-sc-600", "noto-sans-sc-500"):
+        assert not any(dont in ln for ln in preloaded), f"{dont} 不该 preload"
+    for ln in preloaded:
+        # 字体的 preload **必须带 crossorigin**，否则浏览器会再下一遍
+        # （字体请求本身是匿名 CORS 模式，两个请求的缓存键不一样）。
+        assert "crossorigin" in ln, f"字体 preload 少了 crossorigin：{ln}"
+        assert 'as="font"' in ln, f"preload 少了 as=font：{ln}"
 
 
 def test_the_scripts_load_in_the_same_order_the_tests_concatenate_them():
@@ -62,7 +141,7 @@ def test_the_scripts_load_in_the_same_order_the_tests_concatenate_them():
     的代码可能因为初始化顺序在浏览器里炸。**graph.js 在前、app.js 在后**：app.js
     末尾有一批加载时就执行的初始化，它必须排在所有函数定义之后。"""
     html = load_html()
-    positions = [html.index(f'<script src="{name}"></script>') for name in SCRIPT_FILES]
+    positions = [html.index(f'<script src="{name}"') for name in SCRIPT_FILES]
     assert positions == sorted(positions), f"HTML 里的顺序跟 SCRIPT_FILES 不一致：{SCRIPT_FILES}"
 
 

@@ -63,6 +63,14 @@ function setGraphHooks(hooks) {
 // 兜底不写成第二个内联脚本标签，因为 12 个前端测试都靠"按开标签切分、取最后
 // 一段"的办法抽这份脚本，多一个字面开标签就会静默抽错
 // （见 tests/test_web_single_script.py 钉住的那条）。改成用时才动态插入。
+//
+// R41：**CDN 那一路整个去掉了。** index.html 原来在 `<head>` 里同步加载
+// cdnjs 上的 cytoscape，实测 `renderBlockingStatus: "blocking"`、240 ms，
+// 而那 373 KB 只有图谱页要用——不开图谱的人白等。加上三甲内网取不到 cdnjs，
+// 那条请求会一直挂到超时，而"断网可用"正是录制回放这条路线存在的理由。
+// 所以现在**只有这一条加载路径**：用时插入 web/vendor/cytoscape.min.js。
+// 下面那句 CYTOSCAPE_MISSING_MSG 里还提 CDN，是因为部署方可能自己改回去；
+// 判据在 tests/test_frontend_loading.py。
 let _cytoscapePromise = null;
 function ensureCytoscape() {
   if (typeof cytoscape !== "undefined") return Promise.resolve(true);
@@ -77,14 +85,155 @@ function ensureCytoscape() {
   return _cytoscapePromise;
 }
 const CYTOSCAPE_MISSING_MSG =
-  "图谱库没有加载成功：CDN 不可达，本地副本 web/vendor/cytoscape.min.js 也不存在。"
+  "图谱库没有加载成功：本地副本 web/vendor/cytoscape.min.js 不存在。"
   + "辨证结果本身不受影响，只有图画不出来——断网演示前先把这个文件放好"
   + "（见 README「离线演示」）。";
+
+// ---------- R41：布局算到 Worker 里去 ----------
+//
+// `computeLayout` 是**纯函数**（只读 nodes/edges，不碰 DOM、不碰 cytoscape），
+// 所以它能整段搬到 Worker 线程上算。搬它的理由不是"现在慢"——实测问诊图
+// （六层、十几个节点）的布局在主线程上是亚毫秒级，Worker 的收益为 0 甚至为负
+// （建 Worker 本身几毫秒）。理由是**图会长大**：R42 要把这一页整页重做成
+// dagre 布局的单条诊断链，图谱浏览器那张持久图是几百到几千个节点，
+// dagre 在那个规模上是几十到几百毫秒——那正是一个会让点击没反应的长任务。
+// 机制先立好、判据先钉住，换算法时不用再动这一层。
+//
+// ## 一个算法只有一处实现
+//
+// Worker 里**不重写一份布局**，而是 `importScripts` 把这份 graph.js 原样拉进去，
+// 直接调它自己的 `computeLayout`。代价是 graph.js 必须能在没有 `window` 的环境
+// 里被 import（见文件末尾那个 `typeof window !== "undefined"` 的护栏）。
+//
+// ## 三条兜底，缺一条这个优化就变成一个新的故障源
+//
+// 1. **Worker 建不起来**（老浏览器、CSP 挡了 blob:）→ 主线程算，正常出图；
+// 2. **Worker 算不出来**（import 失败、算法抛异常）→ 主线程算；
+// 3. **Worker 不回话**（卡死）→ `LAYOUT_WORKER_TIMEOUT_MS` 之后主线程算。
+// 任何一条触发都会在 `layoutStats` 里记下来（`fallback_reason`），
+// **不静默**：静默回落的表现是"Worker 毫无收益"，而人会以为是 Worker 没用。
+const LAYOUT_WORKER_TIMEOUT_MS = 2000;
+let _layoutWorker = null;
+let _layoutWorkerDead = false;
+//: 最近一次布局的统计。profiler 与测试读它。
+const layoutStats = { where: null, ms: 0, fallback_reason: null, n_nodes: 0 };
+
+function _graphJsUrl() {
+  // 找到自己这份脚本的 URL。`import.meta` 在传统 script 里没有，
+  // 所以从 document 里现查——**不要写死 "graph.js"**：部署可能挂在子路径下。
+  const el = typeof document !== "undefined"
+    ? document.querySelector('script[src*="graph.js"]') : null;
+  return el ? new URL(el.getAttribute("src"), document.baseURI).href : null;
+}
+
+function _layoutWorker_() {
+  if (_layoutWorkerDead || _layoutWorker) return _layoutWorker;
+  try {
+    const url = _graphJsUrl();
+    if (!url || typeof Worker === "undefined" || typeof Blob === "undefined") {
+      _layoutWorkerDead = true;
+      return null;
+    }
+    const boot = `importScripts(${JSON.stringify(url)});\n`
+      + "self.onmessage = (e) => {\n"
+      + "  try { self.postMessage({ ok: true, id: e.data.id,\n"
+      + "        positions: computeLayout(e.data.nodes, e.data.edges) }); }\n"
+      + "  catch (err) { self.postMessage({ ok: false, id: e.data.id,\n"
+      + "        error: String(err && err.message || err) }); }\n"
+      + "};\n";
+    _layoutWorker = new Worker(URL.createObjectURL(
+      new Blob([boot], { type: "text/javascript" })));
+    _layoutWorker.onerror = () => { _layoutWorkerDead = true; _layoutWorker = null; };
+  } catch (e) {
+    _layoutWorkerDead = true;
+    _layoutWorker = null;
+  }
+  return _layoutWorker;
+}
+
+let _layoutSeq = 0;
+
+async function layoutAsync(nodes, edges) {
+  const t0 = (typeof performance !== "undefined" ? performance.now() : 0);
+  const done = (where, positions, reason) => {
+    layoutStats.where = where;
+    layoutStats.ms = Math.round(
+      ((typeof performance !== "undefined" ? performance.now() : 0) - t0) * 100) / 100;
+    layoutStats.fallback_reason = reason || null;
+    layoutStats.n_nodes = (nodes || []).length;
+    return positions;
+  };
+  const w = _layoutWorker_();
+  if (!w) return done("main", computeLayout(nodes, edges), "Worker 建不起来");
+  const id = ++_layoutSeq;
+  const positions = await new Promise((resolve) => {
+    let settled = false;
+    const finish = (value, reason) => {
+      if (settled) return;
+      settled = true;
+      w.removeEventListener("message", onMsg);
+      clearTimeout(timer);
+      resolve({ value, reason });
+    };
+    const onMsg = (ev) => {
+      // **按 id 认领**：同一个 Worker 会被连续几次布局复用，不认 id 的话
+      // 上一次迟到的回复会被当成这一次的结果，图会用错的坐标画出来。
+      if (!ev.data || ev.data.id !== id) return;
+      if (ev.data.ok) finish(ev.data.positions, null);
+      else finish(null, "Worker 报错：" + ev.data.error);
+    };
+    const timer = setTimeout(() => finish(null, "Worker 超时"), LAYOUT_WORKER_TIMEOUT_MS);
+    w.addEventListener("message", onMsg);
+    try {
+      w.postMessage({ id, nodes, edges });
+    } catch (e) {
+      finish(null, "postMessage 失败：" + e.message);   // 结构化克隆不了
+    }
+  });
+  if (positions.value) return done("worker", positions.value, null);
+  return done("main", computeLayout(nodes, edges), positions.reason);
+}
 
 function evenY(index, total) {
   if (total <= 1) return (Y_MIN + Y_MAX) / 2;
   return Y_MIN + (Y_MAX - Y_MIN) * (index / (total - 1));
 }
+
+// ---------- 布局常量 ----------
+//
+// R41：**这三组常量原来在 app.js 里**，而用它们的只有本文件的 computeLayout /
+// evenY。浏览器里两个 script 共享全局作用域，所以从来没报错过——但它是一条
+// 反方向的跨文件依赖（文件顶部写明依赖方向只能 app → graph），而"看不出来的
+// 依赖"迟早会咬人：布局 Worker 用 importScripts 只拉 graph.js，于是
+// `LAYER_X is not defined`，Worker 每次都静默回落到主线程。
+// 这个 bug 是 R41 的前端 profile 把 `fallback_reason` 打出来才看见的。
+// layer 4（药材）跟 layer 3（方剂）的 x 只差一小段——compound 子节点要贴着
+// 父节点画，隔太远 cytoscape 算出来的方剂包围盒会变成横跨整个画布的细长条，
+// 不会像"一个方框里装着自己的药"。
+const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640, 4: 730 };
+// M7：Y_MAX 从 460 提到 620——只调这一个数救不了拥挤（cy.fit() 最后会把全部
+// 内容按同一个缩放系数塞进 #cy 容器，光把逻辑坐标范围拉大、节点本身的像素
+// 尺寸不变的话，摆放间距和节点尺寸的"比例"没变，缩放后看起来还是一样挤）。
+// 真正起作用的是这个比例本身：药材间距（下面 HERB_GAP）从 16 提到 26，
+// 明显大于药材节点自身高度（字号 11 + 上下 padding 6，约 23 个逻辑单位），
+// 26 提供的间隙足够放开重叠；Y_MAX 一起加大只是给"医家带"之间、方剂与方剂
+// 之间腾出更多空间，配合 #cy 容器本身的高度（也在这轮从 460px 提到 540px）
+// 一起用，两处缺一处都解决不了 M5 报告标注的"药材纵向堆叠间距小"。
+const Y_MIN = 60, Y_MAX = 620;
+// 单味药材之间的目标纵向间距（逻辑单位，不是像素——最终经 cy.fit() 统一缩放）。
+//
+// **R37 从 26 提到 36，因为 26 那个数依赖的前提早就不成立了。** M7 定 26 时
+// 算的是"药材节点高约 23 个逻辑单位（字号 **11** + 上下 padding 6）"，
+// 而样式表里节点字号是 `NODE_FONT_SIZE = 13`（§3.2 规格 11 就写着 13）——
+// 按 13 算，节点高约 13×1.2 + 6×2 ≈ 27.6，比 26 还大。于是相邻两味药的包围盒
+// 一直**压着 1~2px**，只是此前没有任何判据去比它们两两的包围盒：
+// `rings` 那条两两比包围盒的判据是给图谱浏览器写的，问诊图这一侧从来没有。
+// R37 给单链图加上同一条判据，第一次跑就红了。
+//
+// 36 = 27.6（节点自身）+ 8 的余量，实测（`--only single_chain_graph` 的
+// 两两包围盒判据）不再重叠。**这个数跟节点字号绑着**：以后改
+// `--node-font-consult` 要回头看这里。
+const HERB_GAP = 36;
 
 function computeLayout(nodes, edges) {
   const positions = {};
@@ -620,25 +769,53 @@ function describeEdgeTooltip(edgeData, sourceLabel, targetLabel, currentPhysicia
 // 另一个容器，要用同一套定位/显示逻辑但挂在不同的 DOM 节点上，不为它另写
 // 一份 showTooltip/hideTooltip——默认值就是原来 per-consult 图那两个 id，
 // 老调用方不用改。
+// R41 **消除布局抖动**：读、写、再读、再写 → 读完再写、第二次读挪进 rAF。
+//
+// 改之前这个函数是教科书式的 layout thrashing：
+//   写 innerHTML → 写 class → **读 getBoundingClientRect** → 写 style.left/top
+// 中间那次读会强制浏览器**同步**跑一遍布局（forced synchronous layout），
+// 而这个函数挂在图谱的 mouseover 上——鼠标在图上划一下就是几十次同步布局，
+// 每一次都在输入事件的处理里，直接表现为拖动图谱时的手感发涩。
+//
+// 改之后：
+//   1. 先读**不依赖 tooltip 内容**的那几个量（画布的位置与尺寸）；
+//   2. 写内容，但先别显示（`.measuring` 让它可量、不可见——`visibility:hidden`
+//      仍然参与布局，所以量得到尺寸；`display:none` 量不到）；
+//   3. 第二次读（tooltip 自己的尺寸）与最终定位放进 rAF：**从输入事件里搬出去**，
+//      事件处理函数立刻返回。
+// 代价是 tooltip 晚一帧出现（16.7 ms），换掉的是每次 mouseover 一次同步布局。
 function showTooltip(html, clientX, clientY, panelId = "graph-panel", tooltipId = "graph-tooltip") {
   const tip = document.getElementById(tooltipId);
   const panel = document.getElementById(panelId);
+  // ① 读：这三个量跟 tooltip 的内容无关，所以能在写之前读完。
   const panelRect = panel.getBoundingClientRect();
+  const panelW = panel.clientWidth;
+  const panelH = panel.clientHeight;
+  // ② 写：内容 + "可量但不可见"。
   tip.innerHTML = html;
+  tip.classList.add("measuring");
   tip.classList.add("show");
-  // 先显示、量出真实尺寸，再据此把 tooltip 夹在画布范围内——鼠标贴着
-  // 右/下边缘时不这么做的话，tooltip 会被裁出可视区域，看不全。
-  const tipRect = tip.getBoundingClientRect();
-  let left = clientX - panelRect.left + 14;
-  let top = clientY - panelRect.top + 14;
-  left = Math.min(left, panel.clientWidth - tipRect.width - 6);
-  top = Math.min(top, panel.clientHeight - tipRect.height - 6);
-  tip.style.left = `${Math.max(6, left)}px`;
-  tip.style.top = `${Math.max(6, top)}px`;
+  // ③ 下一帧再读自己的尺寸、定位、露出来。
+  requestAnimationFrame(() => {
+    // 这一帧里 tooltip 可能已经被 hideTooltip 关掉了（鼠标划过去了）。
+    if (!tip.classList.contains("show")) { tip.classList.remove("measuring"); return; }
+    const tipRect = tip.getBoundingClientRect();
+    let left = clientX - panelRect.left + 14;
+    let top = clientY - panelRect.top + 14;
+    left = Math.min(left, panelW - tipRect.width - 6);
+    top = Math.min(top, panelH - tipRect.height - 6);
+    tip.style.left = `${Math.max(6, left)}px`;
+    tip.style.top = `${Math.max(6, top)}px`;
+    tip.classList.remove("measuring");
+  });
 }
 
 function hideTooltip(tooltipId = "graph-tooltip") {
-  document.getElementById(tooltipId).classList.remove("show");
+  const tip = document.getElementById(tooltipId);
+  tip.classList.remove("show");
+  // measuring 也要清：showTooltip 的 rAF 如果还没跑到就被关掉了，
+  // 留着这个 class 会让下一次 show 出来是隐形的。
+  tip.classList.remove("measuring");
 }
 
 // ---------- M7：症状→方剂路径高亮 ----------
@@ -1618,14 +1795,28 @@ async function growGraph(graph, { animate = true } = {}) {
   if (cy && cy.resize) cy.resize(); // 容器高度改过之后要让 cytoscape 重新量一次
   // 配色随医家变化（physicians.py 是唯一源），每次重新应用样式表
   cy.style(buildStylesheet({ physicianColors: PHYSICIAN_COLORS }));
+
+  // R41：**令牌要在 await 之前领，清画布要在 await 之后做。**
+  //
+  // 布局改成异步（`layoutAsync`，Worker）之后，"清空画布"与"加节点"之间多了一个
+  // await，于是两次 growGraph 能交错：两边都先清空、都 await、都恢复、都加节点
+  // → cytoscape 抛 `Can not create second element with ID sym::xxx`，整页崩。
+  // Playwright 那两个图场景第一次跑就红了（`consult_graph` /
+  // `single_chain_graph`），这正是 CLAUDE.md 那条硬约定的意义：改了渲染时序，
+  // 单测（纯 JSON 结构）一条都测不出来。
+  //
+  // 改法是把既有的 `growToken` 机制往前挪：先领号，await 回来发现号过期就
+  // **原地退出**（后来的那一次会把画布清干净、重新画），而不是继续往一个
+  // 已经被别人接管的画布上加节点。
+  const myToken = ++growToken;
+  const positions = await layoutAsync(graph.nodes, graph.edges);
+  if (myToken !== growToken) return;      // 被后来的一次接管了
   cy.elements().remove();
   // M7：新图跟旧图的节点 id 不一定还对得上（换了个主诉），上一次点开的高亮
   // 状态没有意义了，清掉——不清的话 highlightedSymptomId 会残留一个新图里
   // 可能根本不存在的 id，再点同名症状（如果凑巧还叫这个名）会被误判成
   // "点第二下、取消"，其实用户是第一次点这张新图。
   highlightedSymptomId = null;
-
-  const positions = computeLayout(graph.nodes, graph.edges);
   const nodesByLayer = { 0: [], 1: [], 2: [], 3: [], 4: [] };
   for (const n of graph.nodes) {
     // E4：跟 computeLayout() 同一条兜底（那边的注释写着"layer 不在 0-4 时
@@ -1636,7 +1827,6 @@ async function growGraph(graph, { animate = true } = {}) {
     nodesByLayer[L].push(n);
   }
 
-  const myToken = ++growToken;
   const addNode = (n) =>
     cy.add({ group: "nodes", data: n.data, position: positions[n.data.id] });
 
@@ -1738,6 +1928,13 @@ let lastGraph = null;
 // （tests/test_web_split.py 从源码算出真实跨文件调用集合来比对——R13 那版是手写的
 // 33 个名字、对面一个都没用，那条测试等于没测）。
 // 反方向是空的：graph.js 不调用 app.js 的任何东西，宿主 UI 走 setGraphHooks 注入。
+//
+// R41：**这一句要挡一下 `window` 不存在的情况。** 布局 Worker 用
+// `importScripts("graph.js")` 把这份文件原样拉进去（一个算法只能有一处实现，
+// 见 layoutAsync 的注释），而 Worker 里没有 `window`——不挡的话 import 那一刻
+// 就 ReferenceError，Worker 永远起不来，而 layoutAsync 会静默回落到主线程，
+// 看起来像"Worker 没收益"。
+if (typeof window !== "undefined") {
 window.TCM = Object.assign(window.TCM || {}, {
   // app.js 用到的图谱侧函数
   gbApplyPhysicianWeighting, gbBrowseCategory, gbSearch, hideTooltip, loadGraphBrowserData,
@@ -1751,3 +1948,10 @@ window.TCM = Object.assign(window.TCM || {}, {
   // 宿主在启动时注册自己的 UI 实现
   setGraphHooks,
 });
+
+// R41：布局的去处与耗时。**刻意不挂在 window.TCM 上**——那张清单的契约是
+// "恰好等于 app.js 真正调用到的那些"（有一条测试从源码算真实调用集合来比），
+// 而这两样东西 app.js 一次都不用，是给量具（scripts/profile_frontend.py）
+// 和测试读的。混进去就等于给"清单齐全"那条测试留一个假绿点。
+window.__graphPerf = { layoutStats, layoutAsync, computeLayout };
+}
