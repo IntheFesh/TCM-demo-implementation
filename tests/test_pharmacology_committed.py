@@ -1,16 +1,10 @@
 """R18-F：药理层两个文件进版本控制。
 
-**这两个文件不在沙盒里**（在 AutoDL 上跑真实 LLM 抽取才有）。
+**这两个文件不在沙盒里**（10248 + 3737 条，在 AutoDL 上跑真实 LLM 抽取才有）。
 所以这个文件分两半：
   - 路径解析、回退顺序、覆盖优先、落盘目录——**在这里真测了**，它们只依赖代码；
-  - 规模数——只能在文件存在时校验，缺文件时 skip，不假装通过。
-
-**规模判据是下界，不是等号。** 抽取条数随配置变：2026-09-17 关闭思考模式重抽
-（推理模型默认开思考，实测 0.63 块/分，关掉后 19 块/分）得到 9776 / 3184，
-而开思考那一轮是 10248 / 3737。钉死某个具体数，等于每换一次抽取配置就红一次，
-而那不是缺陷。下界守住的是真正要守的东西：**文件不能是空的、也不能只抽出零头**
-——2026-09-17 就发生过一次 API key 没生效、30 次调用全失败、脚本仍然写盘，
-把 10248 条清成 0 条且无备份可恢复。真实条数以 eval/RESULTS.md 的凭据记号为准。
+  - 「10248 / 3737 条」这两个规模数——只能在文件存在时校验，缺文件时 skip，
+    不假装通过。上机命令见 R18 报告的「无法完成项」一节。
 """
 from __future__ import annotations
 
@@ -31,9 +25,19 @@ from core.schemas import FormularyRecord, MateriaMedicaRecord
 
 ROOT = CANONICAL_DIR.parent.parent
 KINDS = ("materia_medica", "formulary")
-# 规模**下界**（不是等号，理由见模块 docstring）。取值约为已知最少那一轮的九成：
-# 关思考抽出 9776 / 3184，开思考抽出 10248 / 3737。
-MIN_ROWS = {"materia_medica": 8800, "formulary": 2800}
+# 实测规模（R10 那一轮在 AutoDL 上跑出来的，eval/RESULTS.md 里有凭据记号）。
+# 落盘实测（R34，两份 jsonl 进版本控制之后第一次可核）。
+#
+# **这两个数换过一次，换的理由要留着**：R18-F 到 R33 期间这里写的是
+# 10248 / 3737 —— 那是 AutoDL 上一次抽取的**手抄**数字（eval/RESULTS.md 自己标着
+# ⏳「两个 jsonl 还没提交进来」）。R34 数据进版本控制后实测是 9776 / 3184，
+# 比手抄的少 472 / 553 条：落盘这一份是**另一次抽取**的产物（`c9ac580` 那轮把
+# 离线抽取改成关思考模式重跑过），不是同一批。
+#
+# 现在这两个数是**可核的**（`pharmacology.n_materia_medica` /
+# `pharmacology.n_formulary` 两个凭据键直接数文件行数），所以它们从"手抄"
+# 变成了"落盘即判据"——这正是 RESULTS.md 那一节说的"文件一进来凭据键就自动生效"。
+EXPECTED_ROWS = {"materia_medica": 9776, "formulary": 3184}
 
 
 # ---------- 落盘目录：必须是进版本控制的那个 ----------
@@ -187,17 +191,7 @@ def test_every_committed_row_validates_against_its_schema(kind, model):
 
 
 @pytest.mark.parametrize("kind", KINDS)
-def test_committed_row_counts_clear_the_floor(kind):
-    """规模**下界**，不是等号。
-
-    对照基准（CLAUDE.md「任何数字都必须带对照」）由 eval/RESULTS.md 的凭据记号
-    负责——那里记的是某一轮的实测值，随抽取配置变。这条测试守的是另一件事：
-    **文件不能是空的、也不能只抽出零头**。2026-09-17 发生过一次 API key 没生效、
-    30 次调用全失败、脚本仍然写盘，把 10248 条清成 0 条且无备份可恢复；
-    那种事故下界抓得住，而等号判据在换一次 thinking 设置时就会误报。
-    """
-    n = len(_rows(kind))
-    floor = MIN_ROWS[kind]
-    assert n >= floor, (
-        f"{kind} 只有 {n} 条，低于下界 {floor}——抽取多半失败了或被覆盖。"
-        f"真实条数以 eval/RESULTS.md 的凭据记号为准。")
+def test_committed_row_counts_match_the_recorded_numbers(kind):
+    """规模数有对照基准（CLAUDE.md「任何数字都必须带对照」）：
+    这两个数写在 eval/RESULTS.md 里、带凭据记号，这条测试是它们的另一端。"""
+    assert len(_rows(kind)) == EXPECTED_ROWS[kind]

@@ -166,7 +166,8 @@ SEGMENTS=(
   "7|8|top3|全套评测重跑|1200|no|最贵的一段：run_eval 四项 + SDT Test（会写台账）。钉 top3：E8 只遍历 TOP3_MODES，SDT 台账和 RESULTS.md 的历史值也全是这一系的"
   "8|9|top3|性能基准|38|no|bench_startup 冷/热各一次（0 调用）+ bench_consult 不开 ReAct ×3、开 ReAct ×1。钉 top3：要跟 R11 起的历史性能数可比"
   "9|3|full_context|R21~R24 的上机项|320|no|**闸门：不过则默认配置退回 hybrid，后面各段的成本口径随之改变**。前缀规模 0 + 缓存命中率 2 次问诊 ×11 = 22 + full_context 下 E3/E4（9 条主诉 × own/swapped/none 三种 × 11 次/问诊 ≈ 297）+ 字体子集化 0"
-  "10|10|n/a|R26 蒸馏（可选）|350|YES|**不做也能交付**：蒸馏是研究证据、不进演示路径。预估 350 次 = 70 条 × calls_per_consult(3 位医家, best_of_n=1)=5。70 这个数是 ¥40 预算按高峰价现算出来的（offline/distill_from_v4 --estimate），**不是配方要的 8000 条**——那要 ¥3956，见 docs/reports/R26_report.md 第三节"
+  "10|11|n/a|R26 蒸馏（可选）|350|YES|**不做也能交付**：蒸馏是研究证据、不进演示路径。预估 350 次 = 70 条 × calls_per_consult(3 位医家, best_of_n=1)=5。70 这个数是 ¥40 预算按高峰价现算出来的（offline/distill_from_v4 --estimate），**不是配方要的 8000 条**——那要 ¥3956，见 docs/reports/R26_report.md 第三节"
+  "11|10|top3|R38 消融 + 外部基准|150|no|四组消融（A/B/C/D）在 10 条主诉上跑：每条 3+5+5+2=15 次 × 10 条 = 150，另加一次预热（3 次，不计入任何一组）。**钉 top3**：R32 之后知识块进所有检索模式，三指标不需要 full_context 才量得到；而 top3 单价便宜 29 倍，且跟段 7/8 的历史值同一系。**检索模式不是这一轮的变量**，四组都在同一个模式下跑，报告里要写明这一点。MTCMB 另算——先跑 --probe 看字段（0 调用），条数定了才知道要花多少"
 )
 
 # 按**执行序**排好的段表（一行一段，格式同上）。段号不参与排序——那正是这一轮
@@ -563,6 +564,34 @@ seg_10() {
   echo "    判据：台账 eval/sdt/test_run_log.jsonl 多一行，且 RESULTS.md 那一行标明是蒸馏模型"
 }
 
+seg_11() {
+  # R38：四组消融 + 外部基准。**这一段产出的是 RESULTS.md 里 R38 那几行的真机数**
+  # ——沙盒里它们全是 ⏳（假后端的内容指标不出数，见 eval/ablation.py 的文档）。
+  echo "--- ① 先用假后端验一遍管道（0 调用）。判据：四组的调用数是 3/5/5/2 ---"
+  python -m eval.ablation --backend fake --limit 2 \
+    --out eval/bench/ablation_fake.json || return 1
+
+  echo "--- ② 真跑四组。判据：四组都有 n_ok == n_queries，且 A 组的三指标不是 None ---"
+  python -m eval.ablation --backend real --queries-path tests/queries.txt \
+    --out eval/report_ablation.json || return 1
+
+  echo "--- ③ MTCMB TCM-PR：**先探字段**（0 调用）。跳过这一步的代价见 eval/mtcmb/README.md ---"
+  if [ -n "${MTCMB_PR_DIR:-}" ]; then
+    python -m eval.mtcmb.run --dir "$MTCMB_PR_DIR" --probe || {
+      echo "  探针报了问题——**先把字段对上再往下跑**，不要花钱跑一份全 0 分的报告"
+      return 1
+    }
+    echo "--- ④ 两组都跑（baseline 1 次/条、chain 3 次/条），再并排 ---"
+    python -m eval.mtcmb.run --dir "$MTCMB_PR_DIR" --solver baseline \
+      --out out/mtcmb_pr_baseline.json || return 1
+    python -m eval.mtcmb.run --dir "$MTCMB_PR_DIR" --solver chain \
+      --out out/mtcmb_pr_chain.json || return 1
+    python -m eval.mtcmb.run --compare out/mtcmb_pr_baseline.json out/mtcmb_pr_chain.json
+  else
+    echo "  （没设 MTCMB_PR_DIR，跳过 MTCMB。数据见 eval/mtcmb/README.md）"
+  fi
+}
+
 run_segment() {
   local n="$1" name="$2" gate_flag="$3" seg_mode="${4:-n/a}"
   echo
@@ -616,6 +645,7 @@ run_segment() {
     # 段 10 这一支原来**不存在**：case 只到 9，于是段 10 什么都不跑、退出码 0，
     # 一个"跑完了"的假绿。读代码时发现的，补上并加了判据。
     10) seg_10 || rc=$? ;;
+    11) seg_11 || rc=$? ;;
   esac
   echo "--------------------------------------------------------------------------"
   echo "[段 $n] $name    结束 $(date -Is)    退出码 $rc"

@@ -143,7 +143,12 @@ def _isolate_runtime_env(monkeypatch):
                 # R33：S3_MODE 决定 S3 产出哪种 schema，也就决定 results 有
                 # 几个元素。开发者 shell 里留一个值会让一整批测试红在跟改动
                 # 无关的地方（跟 S3_BEST_OF_N 那条完全同理）。
-                "S3_MODE", "KNOWLEDGE_IN_PROMPT", "FOCUSED_KNOWLEDGE_MAX_TOKENS"):
+                "S3_MODE", "KNOWLEDGE_IN_PROMPT", "FOCUSED_KNOWLEDGE_MAX_TOKENS",
+                # R36：S1S2_MERGED 决定 S1/S2 是一次调用还是两次，直接改 llm_calls；
+                # FOCUSED_MAX_PATTERNS_PER_PHYSICIAN（R35）决定知识块放几条规律。
+                # 同上：shell 里留一个值会让一批数调用数/数条数的测试红在
+                # 跟改动无关的地方。
+                "S1S2_MERGED", "FOCUSED_MAX_PATTERNS_PER_PHYSICIAN"):
         monkeypatch.delenv(var, raising=False)
     # 清掉之后**再钉成 legacy**。这一句跟上面那一行做的是两件不同的事。
     #
@@ -163,6 +168,20 @@ def _isolate_runtime_env(monkeypatch):
     #   3. 断言"发给 LLM 的 system 出自 s3_structured.yaml"的测试也在那里面。
     # 钉子只影响"没有明说自己要哪一种"的那批测试，而它们的答案本来就是 legacy。
     monkeypatch.setenv("S3_MODE", "legacy")
+    # R47：**同一个钉法，同一条理由。** `PRODUCT_MODE` 默认是 1（正式版是
+    # 默认形态），而此前写下的几千条测试断言的是研究面的形状：默认角色是
+    # researcher、`/api/usage` 可达、响应里带 manifest、三列并列与分歧读数
+    # 都在。它们测的机制在两种模式下都存在，**要测的就是研究面那一支**。
+    #
+    # **为什么这不会把新默认藏起来**（R32「演示跑的那个配置从来没被测过」
+    # 那条教训的防线）：
+    #   1. `tests/test_product_mode.py` 第一条就显式 delenv 之后调
+    #      `is_product_mode()`，断言**产品默认是 True**，这个钉子改不掉它；
+    #   2. 那个文件里其余 20 多条全部显式 `PRODUCT_MODE=1`，走的是真的产品路径；
+    #   3. `tests/test_no_demo_artifacts.py` 扫的是源码文本，跟环境变量无关；
+    #   4. Playwright 的产品模式截图（`--product`）起的服务器是
+    #      `PRODUCT_MODE=1`，三档分辨率 × 三种角色 × 五种状态全都在产品形态下跑。
+    monkeypatch.setenv("PRODUCT_MODE", "0")
 
 
 @pytest.fixture(autouse=True)

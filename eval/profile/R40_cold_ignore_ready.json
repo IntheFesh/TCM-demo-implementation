@@ -1,0 +1,426 @@
+{
+  "generated_at": "2026-09-18T04:13:34Z",
+  "backend": {
+    "id": "fake",
+    "model": "fake-bench(latency=0.0s)"
+  },
+  "complaint": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+  "complaints": [
+    "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。"
+  ],
+  "warm": false,
+  "wait_ready": false,
+  "repeat": 1,
+  "runs": [
+    {
+      "kind": "profile",
+      "alloc_traced": false,
+      "elapsed_ms": 2831.556,
+      "n_stages": 17,
+      "missing_stages": [
+        "embedding_encode",
+        "graph_load",
+        "sse_flush"
+      ],
+      "total_stage_wall_ms": 12315.396,
+      "total_blocked_ms": 9857.756,
+      "blocked_ratio": 0.8004,
+      "stages": [
+        {
+          "name": "import",
+          "wall_ms": 342.926,
+          "cpu_ms": 342.926,
+          "blocked_ms": 0.0,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "config_load",
+          "wall_ms": 0.054,
+          "cpu_ms": 0.052,
+          "blocked_ms": 0.002,
+          "alloc_mb": 0.0,
+          "n_calls": 2,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "ontology_load",
+          "wall_ms": 4901.478,
+          "cpu_ms": 2294.296,
+          "blocked_ms": 2607.182,
+          "alloc_mb": 0.0,
+          "n_calls": 3,
+          "parent": null,
+          "n_parents": 1
+        },
+        {
+          "name": "retriever_load",
+          "wall_ms": 85.804,
+          "cpu_ms": 44.657,
+          "blocked_ms": 41.147,
+          "alloc_mb": 0.0,
+          "n_calls": 6,
+          "parent": null,
+          "n_parents": 1
+        },
+        {
+          "name": "s1",
+          "wall_ms": 64.57,
+          "cpu_ms": 3.601,
+          "blocked_ms": 60.969,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "s2",
+          "wall_ms": 8.134,
+          "cpu_ms": 1.873,
+          "blocked_ms": 6.261,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "followup",
+          "wall_ms": 0.03,
+          "cpu_ms": 0.031,
+          "blocked_ms": 0.0,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "retrieve",
+          "wall_ms": 1.041,
+          "cpu_ms": 1.043,
+          "blocked_ms": 0.0,
+          "alloc_mb": 0.0,
+          "n_calls": 5,
+          "parent": "s3_generate",
+          "n_parents": 1
+        },
+        {
+          "name": "knowledge_build",
+          "wall_ms": 0.526,
+          "cpu_ms": 0.524,
+          "blocked_ms": 0.002,
+          "alloc_mb": 0.0,
+          "n_calls": 3,
+          "parent": "s1",
+          "n_parents": 3
+        },
+        {
+          "name": "s3_generate",
+          "wall_ms": 2489.114,
+          "cpu_ms": 61.935,
+          "blocked_ms": 2427.179,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "verify",
+          "wall_ms": 2323.357,
+          "cpu_ms": 0.707,
+          "blocked_ms": 2322.65,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": "revise",
+          "n_parents": 1
+        },
+        {
+          "name": "revise",
+          "wall_ms": 2323.483,
+          "cpu_ms": 0.831,
+          "blocked_ms": 2322.652,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": "s3_generate",
+          "n_parents": 1
+        },
+        {
+          "name": "safety",
+          "wall_ms": 0.137,
+          "cpu_ms": 0.137,
+          "blocked_ms": 0.0,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "advice",
+          "wall_ms": 113.604,
+          "cpu_ms": 44.328,
+          "blocked_ms": 69.276,
+          "alloc_mb": 0.0,
+          "n_calls": 2,
+          "parent": "s3_generate",
+          "n_parents": 1
+        },
+        {
+          "name": "role_slice",
+          "wall_ms": 0.013,
+          "cpu_ms": 0.011,
+          "blocked_ms": 0.002,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "graph_build",
+          "wall_ms": 2.729,
+          "cpu_ms": 2.428,
+          "blocked_ms": 0.301,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "serialize",
+          "wall_ms": 0.974,
+          "cpu_ms": 0.841,
+          "blocked_ms": 0.133,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        },
+        {
+          "name": "audit_write",
+          "wall_ms": 0.348,
+          "cpu_ms": 0.348,
+          "blocked_ms": 0.0,
+          "alloc_mb": 0.0,
+          "n_calls": 1,
+          "parent": null,
+          "n_parents": 0
+        }
+      ],
+      "complaint": "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。",
+      "stream": false,
+      "ok": true,
+      "error": null,
+      "response_bytes": 83729,
+      "wrapped": [
+        "core.llm.get_backend→config_load",
+        "core.ontology.get_ontology→ontology_load",
+        "core.formula_verifier.get_ontology→ontology_load",
+        "core.retrieval.get_retriever→retriever_load",
+        "core.chain.get_retriever→retriever_load",
+        "core.tools.get_graph_store→graph_load",
+        "core.chain.normalize→s1",
+        "core.chain.infer_elements→s2",
+        "core.chain.normalize_and_infer_merged→s2",
+        "core.chain.run_followup→followup",
+        "core.chain._search_cases→retrieve",
+        "core.chain.build_focused_knowledge→knowledge_build",
+        "core.chain.assemble→knowledge_build",
+        "core.chain.render→knowledge_build",
+        "core.chain.run_synthesis→s3_generate",
+        "core.chain.run_physician→s3_generate",
+        "core.chain.verify_formula→verify",
+        "core.chain._verify_and_revise→revise",
+        "core.chain.check_safety→safety",
+        "core.chain.check_formula→advice",
+        "api.main._filter_response_by_role→role_slice",
+        "api.main.to_graph→graph_build",
+        "api.main.append_audit→audit_write",
+        "api.main._sse→sse_flush",
+        "fastapi.routing.serialize_response→serialize",
+        "core.retrieval.DenseRetriever._ensure_encoded→embedding_encode",
+        "fastapi.responses.JSONResponse.render→serialize"
+      ],
+      "unwrappable": [],
+      "llm_calls": null,
+      "retriever_mode": null,
+      "wait_ready": false,
+      "probe_errors": {},
+      "missing_reasons": [
+        {
+          "stage": "embedding_encode",
+          "kind": "not_on_this_path",
+          "why": "默认 full_context 模式用全量医案，不做向量编码；跑 --retriever-mode hybrid 才量得到"
+        },
+        {
+          "stage": "graph_load",
+          "kind": "not_on_this_path",
+          "why": "全局图谱只有 ReAct 工具层会读（query_graph/check_residual），结构化单链这条路不读它"
+        },
+        {
+          "stage": "sse_flush",
+          "kind": "not_on_this_path",
+          "why": "只有 --stream 那条路上才有"
+        }
+      ],
+      "import_note": "import 这一段量的是 api.main 的 import，**不是冷进程启动**（那个走 bench_startup）"
+    }
+  ],
+  "kind": "profile_median",
+  "n_runs": 1,
+  "n_ok": 1,
+  "total_stage_wall_ms": 12658.322,
+  "total_blocked_ms": 9857.756,
+  "blocked_ratio": 0.7788,
+  "stages": [
+    {
+      "name": "import",
+      "n_runs_with_stage": 1,
+      "wall_ms": 342.926,
+      "cpu_ms": 342.926,
+      "blocked_ms": 0.0,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "config_load",
+      "n_runs_with_stage": 1,
+      "wall_ms": 0.054,
+      "cpu_ms": 0.052,
+      "blocked_ms": 0.002,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "ontology_load",
+      "n_runs_with_stage": 1,
+      "wall_ms": 4901.478,
+      "cpu_ms": 2294.296,
+      "blocked_ms": 2607.182,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "retriever_load",
+      "n_runs_with_stage": 1,
+      "wall_ms": 85.804,
+      "cpu_ms": 44.657,
+      "blocked_ms": 41.147,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "s1",
+      "n_runs_with_stage": 1,
+      "wall_ms": 64.57,
+      "cpu_ms": 3.601,
+      "blocked_ms": 60.969,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "s2",
+      "n_runs_with_stage": 1,
+      "wall_ms": 8.134,
+      "cpu_ms": 1.873,
+      "blocked_ms": 6.261,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "followup",
+      "n_runs_with_stage": 1,
+      "wall_ms": 0.03,
+      "cpu_ms": 0.031,
+      "blocked_ms": 0.0,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "retrieve",
+      "n_runs_with_stage": 1,
+      "wall_ms": 1.041,
+      "cpu_ms": 1.043,
+      "blocked_ms": 0.0,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "knowledge_build",
+      "n_runs_with_stage": 1,
+      "wall_ms": 0.526,
+      "cpu_ms": 0.524,
+      "blocked_ms": 0.002,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "s3_generate",
+      "n_runs_with_stage": 1,
+      "wall_ms": 2489.114,
+      "cpu_ms": 61.935,
+      "blocked_ms": 2427.179,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "verify",
+      "n_runs_with_stage": 1,
+      "wall_ms": 2323.357,
+      "cpu_ms": 0.707,
+      "blocked_ms": 2322.65,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "revise",
+      "n_runs_with_stage": 1,
+      "wall_ms": 2323.483,
+      "cpu_ms": 0.831,
+      "blocked_ms": 2322.652,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "safety",
+      "n_runs_with_stage": 1,
+      "wall_ms": 0.137,
+      "cpu_ms": 0.137,
+      "blocked_ms": 0.0,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "advice",
+      "n_runs_with_stage": 1,
+      "wall_ms": 113.604,
+      "cpu_ms": 44.328,
+      "blocked_ms": 69.276,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "role_slice",
+      "n_runs_with_stage": 1,
+      "wall_ms": 0.013,
+      "cpu_ms": 0.011,
+      "blocked_ms": 0.002,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "graph_build",
+      "n_runs_with_stage": 1,
+      "wall_ms": 2.729,
+      "cpu_ms": 2.428,
+      "blocked_ms": 0.301,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "serialize",
+      "n_runs_with_stage": 1,
+      "wall_ms": 0.974,
+      "cpu_ms": 0.841,
+      "blocked_ms": 0.133,
+      "alloc_mb": 0.0
+    },
+    {
+      "name": "audit_write",
+      "n_runs_with_stage": 1,
+      "wall_ms": 0.348,
+      "cpu_ms": 0.348,
+      "blocked_ms": 0.0,
+      "alloc_mb": 0.0
+    }
+  ],
+  "missing_stages": [
+    "embedding_encode",
+    "graph_load",
+    "sse_flush"
+  ]
+}

@@ -312,6 +312,11 @@ class RecordingBackend(LLMBackend):
 
     def __init__(self, inner: LLMBackend | None = None, out_dir: Path | None = None):
         self.inner = inner or get_backend()
+        # 流式能力随内层（R36）：录制不改变"这次是不是真的边生成边吐"。
+        # 写成实例属性而不是类属性：同一个进程里内层可能是 DeepSeek（支持）
+        # 也可能是 claude_cli（不支持），类属性只能有一个值。
+        self.SUPPORTS_STREAMING = self.inner.SUPPORTS_STREAMING
+        self.STREAMING_IS_SIMULATED = self.inner.STREAMING_IS_SIMULATED
         self.out_dir = Path(out_dir) if out_dir else fixtures_dir()
         self.n_written = 0
         self.keys_written: list[str] = []
@@ -433,6 +438,14 @@ class ReplayBackend(LLMBackend):
     可能还不存在的目录。
     """
 
+    #: 回放能"流式"，但那是把录好的整段文本切开发的（R36）。
+    #: `STREAMING_IS_SIMULATED=True` 让 manifest 与前端能说出这句话——
+    #: 演示模式下切出来的流看起来跟真的一模一样，不标出来就是在骗人。
+    SUPPORTS_STREAMING = True
+    STREAMING_IS_SIMULATED = True
+    #: 每片多少字。40 是给人看的节奏（一行左右），不是性能参数。
+    SIMULATED_CHUNK_CHARS = 40
+
     def __init__(self, fixtures_path: Path | None = None):
         self._dir = Path(fixtures_path) if fixtures_path else fixtures_dir()
         self._fixtures: dict[str, Fixture] | None = None
@@ -524,7 +537,7 @@ class ReplayBackend(LLMBackend):
     # ---------- 回放 ----------
 
     def _complete(self, messages, temperature, max_tokens=None, schema=None,
-                  physician=None, **kwargs) -> str:
+                  physician=None, on_delta=None, **kwargs) -> str:
         _require_empty_user(messages)
         system = _system_of(messages)
         schema_name = schema.__name__ if schema is not None else "<no-schema>"
@@ -533,6 +546,14 @@ class ReplayBackend(LLMBackend):
         if fixture is None:
             raise LLMError(self._miss_message(key, schema_name, system))
         self.n_hits += 1
+        if on_delta is not None:
+            # **不 sleep。** 拿睡眠假装"生成得慢"会让演示的墙钟数变成假的，
+            # 而这个后端的全部意义是"不花钱也能跑一遍"。片段一次性发完，
+            # 前端照样走增量渲染那条路，manifest 里 simulated 标着。
+            text = fixture.output
+            n = max(1, self.SIMULATED_CHUNK_CHARS)
+            for i in range(0, len(text), n):
+                on_delta(text[i:i + n], "content")
         return fixture.output
 
     def _miss_message(self, key: str, schema_name: str, system: str) -> str:

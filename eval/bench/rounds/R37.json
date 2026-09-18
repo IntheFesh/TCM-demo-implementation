@@ -1,0 +1,28 @@
+{
+  "import_api_main_s": 0.459,
+  "import_api_main_repeats": 3,
+  "import_api_main_all_s": [
+    0.464,
+    0.459,
+    0.45
+  ],
+  "health_requests": 200,
+  "health_p50_ms_five": 11.552,
+  "health_p95_ms_five": 16.07,
+  "health_p50_ms_three": 11.53,
+  "health_p95_ms_three": 16.31,
+  "health_n_physicians_five": 5,
+  "health_n_physicians_three": 3,
+  "pytest_wall_s": 143.5,
+  "pytest_passed": 3560,
+  "pytest_skipped": 7,
+  "pytest_failed": 0,
+  "pytest_summary_line": "3560 passed, 7 skipped, 1 warning in 140.03s (0:02:20)",
+  "playwright_wall_s": 64.3,
+  "playwright_exit_code": 0,
+  "playwright_states_passed": 29,
+  "check_exit_code": 0,
+  "n_checked_docs": 22,
+  "generated_at": "2026-09-18T01:30:33Z",
+  "ran_all": true
+}

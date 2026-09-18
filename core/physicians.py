@@ -89,7 +89,10 @@ PHYSICIANS: dict[str, dict] = {
 }
 
 
-#: R33：结构化模式下那份「五家综合」结论的展示元数据。
+#: R33：结构化模式下那份结论的展示元数据。
+#: **R44 起显示名是「本次辨证」**（原来是「五家综合」）——理由见
+#: `core/chain.py::SYNTHESIS_PHYSICIAN_NAME` 那段注释（消除投票痕迹）。
+#: 名字只有那一处定义，这里的 `name` 从它取，不再抄一遍。
 #:
 #: **刻意不放进 `PHYSICIANS`。** 放进去的话 `resolve_physician_id("synthesis")`
 #: 会把它解析成一个合法医家，于是检索层会去找「synthesis 的医案库」（恒空）、
@@ -99,7 +102,11 @@ PHYSICIANS: dict[str, dict] = {
 #: 灰色兜底，而前端把灰色当「未知医家」显示。所以元数据在这里定义**一处**，
 #: 不在 api 层和前端各写一份（第 31 条：这次的"同一概念"是"这份结论长什么样"）。
 SYNTHESIS_DISPLAY: dict = {
-    "name": "五家综合",
+    # 从 core/chain.py 取，避免两处各写一份中文名（R44 改名时正是这种重复
+    # 会让其中一处漏改，而漏改的表现是界面上两个地方叫法不一样）。
+    # 延迟 import 放在下面 `_synthesis_name()` 里——core.chain 反过来 import
+    # 这个模块，顶层直接 import 会成环。
+    "name": None,
     "book": "叶天士《临证指南医案》/ 吴鞠通《吴鞠通医案》/ 张锡纯《医学衷中参西录》"
             "/ 李可医案 / 王云启治癌验案录",
     "years": None,      # 五家跨两百余年，给一个区间等于给一个假精确
@@ -107,6 +114,13 @@ SYNTHESIS_DISPLAY: dict = {
     "color": "#3B4A6B",   # 靛青。跟五位医家的身份色都不同——它不是其中任何一位
     "color_bg": "#E7EAF1",
 }
+
+
+def synthesis_display() -> dict:
+    """带上显示名的那一份。**名字的唯一定义在 `core.chain`**，这里现取。"""
+    from core.chain import SYNTHESIS_PHYSICIAN_NAME
+
+    return {**SYNTHESIS_DISPLAY, "name": SYNTHESIS_PHYSICIAN_NAME}
 
 
 def physicians_enabled(registry: dict[str, dict] | None = None) -> dict[str, dict]:

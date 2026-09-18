@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import queue
 import secrets
@@ -15,7 +16,8 @@ from pathlib import Path
 from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException, Header, Request, Response
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,26 +30,62 @@ from core.chain import (
 )
 from core.diseases import get_disease, triage_advice
 from core.examples import EXAMPLE_COMPLAINTS
+from core.followup import stop_label
 from core.herbs import is_western_drug, strip_dose_and_parens
-from core.llm import ByokBackend, LLMAuthError, check_api_key, get_llm, use_llm
+from core.llm import (
+    ByokBackend,
+    LLMAuthError,
+    check_api_key,
+    get_llm,
+    s3_mode,
+    use_llm,
+)
+from core.node_explain import syndrome_row
 from core.react import react_enabled
 from core import usage as usage_mod
 from core.physicians import (
     PHYSICIANS,
-    SYNTHESIS_DISPLAY,
+    synthesis_display,
     physicians_all,
     physicians_enabled,
     resolve_physician_id,
 )
 from core.prescription import compute_herb_diffs, format_pharmacy_text
+from core.emr_writer import (
+    apply_edits,
+    build_emr,
+    record_edits,
+    render_emr_text,
+    render_prescription_sheet,
+)
+from core.guideline_compare import coverage_stats
+from core.individualize import individualize
+from core.intake import (
+    IntakeForm,
+    TextOnlyInput,
+    InputKindRejected,
+    check_input_kinds,
+    form_fields_by_part,
+    form_to_text,
+    text_to_form,
+)
+from core.integration_auth import IntegrationDenied, check as integration_check
+from core.knowledge_panel import search as knowledge_search
+from core.product_mode import (
+    InternalOnly,
+    product_flags,
+    require_internal,
+    resolve_role,
+)
 from core.formula_check import advice_dicts, check_formula
 from core.safety_output import (
     INCOMPATIBLE_TRAINING_NOTE,
     assess_formula_safety,
     check_incompatible,
 )
-from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, S1Normalize
+from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, PatientProfile, S1Normalize
 from core.tools import GRAPH_PATH, get_graph_store, search_cases
+from core.version import PRODUCT_NAME, VERSION
 from offline.graph_stats import compute_stats, lambda1_note
 
 # M6：四种角色。前端按角色显示不同的 UI，但**字段裁剪在这里做，不在前端做**
@@ -70,44 +108,158 @@ _consult_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONSULTS)
 MAX_COMPLAINT_CHARS = 2000
 MAX_ANSWER_CHARS = 500
 
+#: SSE 事件队列的上限。R40 背压。取 2000 的依据：一次问诊的增量事件实测在
+#: 千条量级（`S3DeltaEmitter` 每积累到一定字数发一条），2000 给了一倍余量，
+#: 而每条事件的字典很小（几十到几百字节），2000 条 ≈ 几百 KB/流。
+#: 上限太小会让正常的快客户端也开始丢增量；太大就退化成无上限。
+SSE_QUEUE_MAXSIZE = int(os.environ.get("SSE_QUEUE_MAXSIZE", "2000"))
+
+#: 非增量事件最多等多久。超过就按"客户端不读了"收尾。
+#: 生成器每 50ms 轮询一次队列，正常情况下这个等待是微秒级；30 秒还塞不进去
+#: 说明连接真的死了（TCP 窗口关死、对端不再 ack）。
+SSE_PUT_TIMEOUT_SECONDS = float(os.environ.get("SSE_PUT_TIMEOUT_SECONDS", "30"))
+
+#: 队列满时**可以丢**的事件名。只有"同一段文字的逐步生成"属于这一类：
+#: 它们的终值由 `s3_done` / `done` 兜底，丢掉不影响结果的正确性。
+#: **这张表只许收窄，不许扩张**——把 `need_input` 或 `done` 放进来就等于
+#: 允许静默丢结果。
+SSE_DROPPABLE_EVENTS = frozenset({"s3_delta"})
+
 
 def _warmup() -> None:
-    """启动时预热检索器，把首请求那几十秒（加载模型 + 编码 839 条医案）
-    挪到启动阶段。失败不阻塞启动——没有 cases.json 时服务仍应能起来。"""
-    try:
-        from core.retrieval import get_retriever
+    """启动时预热，把首请求那几十秒挪到启动阶段。**两项并行**，每一项失败
+    都不阻塞启动——数据不全时服务仍应能起来，预热不是前置条件。
 
-        get_retriever()._ensure_encoded()
-    except Exception as e:  # noqa: BLE001 - 预热失败只是没有预热，服务照常起
-        print(f"[warmup] 检索器预热跳过：{e}", file=sys.stderr)
+    实现整个在 `api/warmup.py`（状态机 + 并行 + 进度快照），这里只是一层壳：
+    `/health` 要报进度，进度就得有个地方存，而那份状态跟"跑预热"是同一件事的
+    两面，分在两个模块里会各存一份（R40 之前 `/health` 根本报不出进度，
+    因为预热没有状态，只有 stderr 上两行 print）。
+
+    两项为什么无依赖、为什么并行省得下来：见 `api/warmup.py` 的模块文档
+    （实测本体层 2417 ms、检索器 8757 ms，串行 11174 ms）。
+    """
+    from api.warmup import run_warmup
+
+    run_warmup()
 
 
-# 预热最多等这么久，超过就先开始服务。真实冒烟里踩到的：有 cases.json 但连不上
-# huggingface 的机器，预热卡在模型下载的重试上，服务一分多钟都不监听端口，存活探针
-# 一直连不上——编排器会把它当成起不来。预热线程超时后不杀（也杀不了），在后台
-# 继续；首个问诊会在 _encode_lock 上等它，而 /health 这时已经能答。
+# 预热最多等这么久——**现在这个数只用于"等预热完成"的工具（压测、冒烟脚本）**，
+# 不再是"服务什么时候开始监听"的闸门：R40 起 startup 阶段立刻 yield，服务先
+# 监听、预热在后台跑、`/health` 在就绪前回 503 带进度。
+#
+# 旧行为踩到的坑留在这里当反面教材：有 cases.json 但连不上 huggingface 的机器，
+# 预热卡在模型下载的重试上，ASGI startup 走不完，uvicorn **端口开着但一个请求
+# 都不答**，存活探针连得上却等不到响应——编排器会把一个其实正常的进程判死。
 WARMUP_TIMEOUT_SECONDS = float(os.environ.get("WARMUP_TIMEOUT_SECONDS", "120"))
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI 已把 on_event 标成 deprecated，改成 lifespan。预热是同步的
-    重 IO（加载模型、编码语料），放在自己的线程里而不是直接在事件循环上跑——
-    直接阻塞循环会让 uvicorn 的信号处理一起卡住，这段时间 Ctrl-C 都停不下来。
-    不走线程池：anyio 的 to_thread 默认等不到就取消不了，有超时也没法真的
-    "先开始服务"。"""
+    """**先监听，再预热。** startup 阶段不等预热——ASGI 的 startup 没走完
+    uvicorn 就不会开始处理请求，等在这里等于"端口开着但不答"。
+
+    预热是同步的重 IO（加载模型、编码语料），放在自己的线程里而不是直接在
+    事件循环上跑：直接阻塞循环会让 uvicorn 的信号处理一起卡住，那段时间
+    Ctrl-C 都停不下来。不走 anyio 的线程池——那里的线程等不到就取消不了。
+    """
+    from api.warmup import TRACKER
+
+    # **同步登记再起线程**：lifespan 起完线程立刻 yield，第一个 readiness 探针
+    # 可能比线程的第一行还早。见 `WarmupTracker.begin` 的文档字符串。
+    TRACKER.begin()
     t = threading.Thread(target=_warmup, name="warmup", daemon=True)
     t.start()
-    deadline = time.monotonic() + WARMUP_TIMEOUT_SECONDS
-    while t.is_alive() and time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
-    if t.is_alive():
-        print(f"[warmup] 预热 {WARMUP_TIMEOUT_SECONDS:.0f} 秒还没完成，先开始服务；"
-              "预热在后台继续，首个问诊会等它", file=sys.stderr)
     yield
 
 
-app = FastAPI(title="名医辨证对照 demo", lifespan=_lifespan)
+# R47：标题从「名医辨证对照 demo」改成产品名 + 版本。**这不是措辞洁癖**：
+# 这个字符串会出现在 OpenAPI 文档、`/docs` 页面和将来给 HIS 的接口说明里，
+# 而"demo"两个字在三甲的采购语境里是一票否决的词（§8.2 第 16 条）。
+app = FastAPI(title=PRODUCT_NAME, version=VERSION, lifespan=_lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """请求体校验失败。
+
+    **两种情况分开**：
+      - 命中 §0.4 的输入侧护栏（图像/信号/检验数值）→ **400**，正文是那句
+        监管属性的中文说明。它不是"请求写错了"，是"这类输入本系统不收"，
+        而且使用者需要读到原因。
+      - 其余 → 照旧 422，但正文换成中文摘要，不把 pydantic 的英文结构
+        原样吐出去（§8.2 第 12 条：英文技术词与报错原文不上产品面）。
+    """
+    msgs = [str(e.get("msg", "")) for e in exc.errors()]
+    hit = next((m for m in msgs if "不接受「" in m), "")
+    if hit:
+        return JSONResponse(status_code=400, content={"detail": hit.replace("Value error, ", "")})
+    fields = "、".join(".".join(str(x) for x in e.get("loc", ())[1:]) for e in exc.errors())
+    return JSONResponse(status_code=422,
+                        content={"detail": f"请求内容不合要求：{fields or '请检查填写的字段'}。"})
+
+
+@app.exception_handler(InternalOnly)
+async def _internal_only_handler(request: Request, exc: InternalOnly) -> JSONResponse:
+    """内部功能在产品模式下被访问 → **404，不是 403**。
+
+    403 承认这个端点存在，404 连存在性都不暴露。响应体给的是使用者能看懂的
+    中文，不是异常类名——`InternalOnly` 这个词只留在服务端日志里。
+    """
+    logging.getLogger("tcm.product_mode").info(
+        "产品模式下访问了内部功能：feature=%s path=%s", exc.feature, request.url.path)
+    return JSONResponse(status_code=404, content={"detail": "没有这个功能。"})
+
+
+# ---------- R43：响应压缩（**选择性**，不是无脑全开） ----------
+#
+# 实测（R43 基线）：`/api/graph?limit=200` 的响应体 **352 KB，一个字节都没压**
+# ——这是点开「图谱」页签之后用户在等的那一段。三甲内网的带宽不是问题，但
+# 教材扩完之后这张图要翻几倍（证候 337 → 1444、症状 1282 → 约 7000），
+# 而 JSON 是压缩率最高的那一类数据。
+#
+# **两类必须跳过，无脑全开会出事：**
+#
+# 1. **SSE（`text/event-stream`）。** starlette 的 GZipMiddleware 对流式响应是
+#    逐块写进 gzip 缓冲再发，而 gzip 在攒够一个块之前不产出任何字节——于是
+#    "一边推理一边出字"会变成"憋一会儿吐一大段"。R36 花了一整轮把流式做出来，
+#    不能在这里被压缩缓冲抵消掉。
+# 2. **已经压过的二进制**（woff2 / png / 图片）。再压一遍省不下几个字节，
+#    却要为每个请求付一次 CPU；字体那 1.13 MB 是首屏的大头，白烧 CPU 会
+#    直接体现在首屏时间上。
+#
+# 判据按**路径**定而不是按 content-type：中间件在响应头出来之前就要决定走不走
+# 压缩，按路径是确定的、可测的；按 content-type 要先等响应开始、逻辑绕一圈，
+# 而这两条规则本来就跟路径一一对应。
+GZIP_MIN_BYTES = 1024
+#: 不压的路径前缀。SSE 那条见上；`/app/vendor/fonts` 与图片同理。
+GZIP_SKIP_PREFIXES = ("/api/consult/stream",)
+#: 不压的扩展名（已经是压缩格式）。
+GZIP_SKIP_SUFFIXES = (".woff2", ".woff", ".png", ".jpg", ".jpeg", ".webp", ".gz")
+
+
+def _gzip_skip(path: str) -> bool:
+    return (path.startswith(GZIP_SKIP_PREFIXES)
+            or path.endswith(GZIP_SKIP_SUFFIXES))
+
+
+class SelectiveGZipMiddleware:
+    """按路径决定要不要走 gzip。**压缩本身复用 starlette 的实现**，
+    这里只负责"走不走"——自己写一遍 gzip 响应器就是同一件事的第二处实现。"""
+
+    def __init__(self, app, minimum_size: int = GZIP_MIN_BYTES) -> None:
+        from starlette.middleware.gzip import GZipMiddleware
+
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or _gzip_skip(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+        await self.gzip(scope, receive, send)
+
+
+app.add_middleware(SelectiveGZipMiddleware)
 
 
 def _public_text(text: str) -> str:
@@ -128,7 +280,7 @@ def _public_error_detail(exc: Exception) -> str:
     return f"服务端处理失败（{type(exc).__name__}，错误编号 {error_id}），详细原因见服务端日志。"
 
 
-class ConsultRequest(BaseModel):
+class ConsultRequest(TextOnlyInput):
     complaint: str = Field(min_length=1, max_length=MAX_COMPLAINT_CHARS)
     # 逐请求的检索模式。**刻意不做成服务端的全局设置**：RETRIEVER_MODE 那个
     # 环境变量是进程级的，一个请求设了它，同一进程里并发的另一个请求就跟着变了。
@@ -144,7 +296,16 @@ class ConsultRequest(BaseModel):
     # core.chain.consult()——consult() 本身完全不知道 role 这个概念，
     # 字段裁剪只发生在 _consult_response() 这一层，role 传得太深只会让
     # consult() 背上一个它不需要关心的参数。
-    role: Role = "researcher"
+    # R47：**默认值改成 None，不再是字面量 `"researcher"`**。谁是默认角色由
+    # `core.product_mode.default_role()` 说了算（产品模式下是医师，内部模式
+    # 下仍是研究者）——把默认写死在 schema 里等于让产品形态有第二个决定点。
+    # 合法值仍由 Literal 卡，产品模式下研究者角色由 `resolve_role()` 拦。
+    role: Role | None = None
+    # R46 §7.1/§7.2：结构化四诊表单与「人」这一维。
+    # **两者都可空**：自由文本那条路一个字没变（`complaint` 仍是唯一必填项），
+    # 表单只是另一种录入方式，二者可互转（见 core/intake.py）。
+    intake: IntakeForm | None = None
+    patient_profile: PatientProfile | None = None
 
 
 def demo_mode_info() -> dict | None:
@@ -172,6 +333,18 @@ def demo_mode_info() -> dict | None:
     }
 
 
+def _knowledge_base_block() -> dict:
+    """本草/方剂本体在不在。**只看文件在不在、多大**，不装载。"""
+    from core.data_paths import pharmacology_read_path
+
+    out: dict[str, object] = {}
+    for kind, key in (("materia_medica", "materia_medica"), ("formulary", "formulary")):
+        path = pharmacology_read_path(kind)  # type: ignore[arg-type]
+        out[key] = bool(path and path.exists() and path.stat().st_size > 0)
+    out["available"] = bool(out["materia_medica"] or out["formulary"])
+    return out
+
+
 def _lambda1_note_or_none() -> str | None:
     """图谱没建过（这台机器上没有 data/graph.json）时返回 None 而不是抛：
     /health 是存活探针，不该因为一个可选的数据文件缺失就报 503。"""
@@ -181,11 +354,32 @@ def _lambda1_note_or_none() -> str | None:
     return lambda1_note(compute_stats(store))
 
 
+@app.get("/health/live")
+async def health_live() -> dict:
+    """**存活**探针：只要进程在跑就 200，预热到哪一步都不影响它。
+
+    跟 `/health`（就绪）分开，因为两个探针问的不是同一个问题——
+    存活答"要不要重启我"，就绪答"能不能把流量放进来"。合成一个的代价是
+    真实的：R40 之前只有一个端点，预热期间编排器分不清"还在热"和"已经死"，
+    只能靠调长探针超时来将就。
+    """
+    from api.warmup import TRACKER
+
+    return {"status": "alive", "warmup": TRACKER.snapshot()}
+
+
 @app.get("/health")
-async def health() -> dict:
-    """async def 而不是 def：同步端点跑在 anyio 的线程池里（默认 40 个槽），
+async def health(response: Response) -> dict:
+    """**就绪**探针 + 前端启动所需的那几份配置。
+
+    async def 而不是 def：同步端点跑在 anyio 的线程池里（默认 40 个槽），
     几十条并发问诊把槽占满时，存活探针也跟着排队、超时，编排器会把一个其实
-    还活着的进程重启掉。这个端点不做任何 IO，直接在事件循环上答。"""
+    还活着的进程重启掉。这个端点不做任何 IO，直接在事件循环上答。
+
+    **预热没完成时回 503**，响应体照样完整（外加 `warmup` 进度块）：
+    编排器看状态码，前端读响应体。只回一个空 503 的话前端在预热那几秒里
+    连医家身份色都拿不到，页面是一片没有颜色的骨架——比"晚几秒着色"更糟。
+    """
     # demo_mode 非 None = 这台服务在回放录制好的推理（LLM_MODE=replay）。
     # **放在 /health 而不是只放在问诊响应里**：前端一加载就该看到那行小字，
     # 不该等到跑完一次问诊才告诉访问者"刚才那个不是现场跑的"。
@@ -197,8 +391,15 @@ async def health() -> dict:
     # CSS 里不写死——写死的话注册表加第四位医家时那份副本不会跟着长出来，新医家在
     # 界面上就没有颜色（这个坑已经踩过一次）。
     # 放 /health 而不是等第一次问诊：三列的顶边和姓名行在**还没有结果时**就要着色。
+    from api.warmup import TRACKER
+
+    warmup_block = TRACKER.snapshot()
+    if not warmup_block["ready"]:
+        # 503 而不是 200+标记：编排器只看状态码，一个 200 会让流量在知识库
+        # 还没加载完时就被放进来，首个患者等的是那 11 秒。
+        response.status_code = 503
     return {
-        "status": "ok",
+        "status": "ok" if warmup_block["ready"] else "warming",
         "demo_mode": demo_mode_info(),
         "physicians": [
             {"id": pid, "name": info["name"], "years": info["years"],
@@ -227,6 +428,36 @@ async def health() -> dict:
         # 图谱本身，而且页面一加载就该能显示。图谱没建过时是 None，前端不显示
         # 这一行——不是显示一句"未知"。
         "lambda1_note": _lambda1_note_or_none(),
+        # R37：这台服务的 S3 形状（structured / legacy）。**前端要在问诊开始之前
+        # 就知道它**：structured 是单链九段、legacy 是三列集注，两种形态的骨架
+        # 完全不同。等到 done 事件里的 manifest 才知道的话，跑的那几十秒里只能
+        # 先摆一个可能是错的骨架，然后当场换掉——那一下闪烁正是"界面在猜"的表现。
+        #
+        # 这是**服务端配置的默认值**，不是某一次问诊的结果：`consult()` 支持
+        # 逐请求覆盖（`s3_mode_override`），但界面上没有这个开关，所以这里报
+        # 默认值是准确的。每次问诊结束仍然以 `manifest.s3_mode` 为准（那一份
+        # 记的是真的跑了哪一条），两处不一致时前端信 manifest。
+        "s3_mode": s3_mode(),
+        # R40：预热进度。`ready=false` 时上面那个 503 才有可读的原因，
+        # 前端据此显示"正在加载知识库（1/2）"而不是干等。
+        "warmup": warmup_block,
+        # R47：这台服务是正式版还是内部研究版，以及这一次能选哪几个角色。
+        # **前端不自己判断**——它读不到环境变量，也不该按 URL 猜。页面上
+        # 那十六处要藏的东西全部由这一个布尔值分派（core/product_mode.py）。
+        **product_flags(),
+        # 页脚那一行。产品名与版本只有 core/version.py 一处定义。
+        "version": VERSION,
+        "product_name": PRODUCT_NAME,
+        # R47：这台部署装没装本草/方剂本体。**产品面必须能分清**
+        # `herbs_grounded_ratio = 0` 的两种含义：「本体不在，无从核对」和
+        # 「本体在，但这一方的药味没查到出处」。此前只有 manifest 里的
+        # `knowledge_entries.available` 能分，而 manifest 只下发给研究者
+        # ——产品面（医师/学生/患者）恰恰看不到它。
+        #
+        # 放 /health 而不是问诊响应：它描述的是**这台部署**，不是这一次问诊。
+        # 只做 `stat`，不读文件——/health 不做 IO 那条纪律指的是"不读大文件、
+        # 不算图"，两次 stat 在同一个数量级上可以忽略。
+        "knowledge_base": _knowledge_base_block(),
     }
 
 
@@ -290,6 +521,30 @@ def _node_payload(node_id: str, data: dict,
     return {"data": node_data}
 
 
+def ambiguous_syndrome_pairs(pairs) -> set[tuple[str, str]]:
+    """哪些 `(证型名, 病名)` 组合在这一批里**不止一条**。
+
+    **两张图共用这一处**（R37）：图谱浏览器扫的是持久图的证型节点，问诊图扫的是
+    这一次几位医家给出的证型——问的是同一个问题（"这个标签在这张图上分得清吗"），
+    所以判断只有一处。摆成一行还是两行是排版，不是同一个问题，各图自己决定。
+    """
+    seen: dict[tuple[str, str], int] = {}
+    for name, disease in pairs:
+        key = (name or "", (disease or "").strip())
+        seen[key] = seen.get(key, 0) + 1
+    return {k for k, n in seen.items() if n > 1}
+
+
+def syndrome_code_suffix(*, ambiguous: bool, code: str | None) -> str:
+    """撞名时补的那截编码。**补不补这件事只有这一处判断。**
+
+    只在**确实还撞着**且**真有编码**时补：给每条都挂编码会让图上全是 TB-xxx
+    的噪音，而没有编码时补一个空括号比不补更糟（那是"查过了、没有"和"没查"
+    分不开的经典形状）。
+    """
+    return f"（{code}）" if (ambiguous and code) else ""
+
+
 def ambiguous_syndrome_keys(store) -> set[tuple[str, str]]:
     """哪些 (证型名, 病名) 组合在图里**不止一条**。
 
@@ -305,13 +560,10 @@ def ambiguous_syndrome_keys(store) -> set[tuple[str, str]]:
     是另一个根因（见 tests/test_syndrome_disease_label.py 最后那条判据）。
     显示层能做的是**不装作它们一样**：这几组再补一个 code。
     """
-    seen: dict[tuple[str, str], int] = {}
-    for _nid, d in store.g.nodes(data=True):
-        if d.get("node_type") != "syndrome":
-            continue
-        key = (d.get("name") or "", (d.get("disease") or "").strip())
-        seen[key] = seen.get(key, 0) + 1
-    return {k for k, n in seen.items() if n > 1}
+    return ambiguous_syndrome_pairs(
+        (d.get("name") or "", d.get("disease") or "")
+        for _nid, d in store.g.nodes(data=True)
+        if d.get("node_type") == "syndrome")
 
 
 def _display_label(node_id: str, data: dict,
@@ -341,7 +593,10 @@ def _display_label(node_id: str, data: dict,
     disease = (data.get("disease") or "").strip()
     # 病名 + 编码都齐时才补编码，而且只在这一组确实还撞着的时候补——
     # 给每条都挂编码会让图上全是 TB-xxx 的噪音。
-    if ambiguous and (name, disease) in ambiguous and data.get("code"):
+    suffix = syndrome_code_suffix(
+        ambiguous=bool(ambiguous and (name, disease) in ambiguous),
+        code=data.get("code"))
+    if suffix:
         inner = f"{disease} {data['code']}" if disease else str(data["code"])
         return f"{name}\n（{inner}）"
     return f"{name}\n（{disease}）" if disease else name
@@ -542,6 +797,43 @@ def api_graph_neighbors(node: str, limit: int = 200, node_types: str | None = No
         "page": {"limit": limit, "returned": len(picked), "total": total,
                  "truncated": len(picked) < total},
     }
+
+
+#: 节点释义接口的入参长度上限。**不是怕慢，是怕日志/错误信息里被塞长串**
+#: （同 MAX_COMPLAINT_CHARS 那条理由）。R42 之后节点 id 最长的形状是
+#: `herb::{方名}::{药名}`（去掉了医家段），200 字绰绰有余。
+MAX_NODE_ID_CHARS = 200
+
+#: 这个接口的耗时预算。**性能预算进测试**（总纲 §12）：R42 把四节扩成八节，
+#: 新增的三节要读方剂本体、功效同义表、规律层——都是惰性初始化的全量表，
+#: 第一次点开会把它们全加载一遍。预算按**热态**定（本体已加载），
+#: 判据在 tests/test_node_explain_perf.py：p95 ≤ 50 ms。
+NODE_EXPLAIN_BUDGET_MS = 50
+
+
+@app.get("/api/node_explain")
+def api_node_explain(node: str, name: str | None = None) -> dict:
+    """R37/R42：图上一个节点的**八节**释义。**零 LLM 调用**，
+    判据全在 core/node_explain.py。
+
+    八节：是什么 / 病机 / 药理 / 出处原文 / 名老中医经验 / 验证结果 / 循证对照 / 注意。
+    R42 新增的四节（病机、药理、验证结果、循证对照）对应九层图新增的节点类型
+    （病机、治则、治法）和"每个数字都要有对照基准"那条铁律。
+
+    `name` 是显示名覆盖：问诊图证型节点的 label 是「病名 · 证型」拼出来的，
+    而证候表里存的是证型名；节点 id 里那一段还可能带方名。所以前端把 label
+    一起传来。
+
+    取不到时返回 `available=False` + 一句 `note`，**HTTP 仍然是 200**：
+    "这个节点没有释义"不是错误，而 4xx 会让前端把它当故障弹红条。
+    前端据 `available` 整块隐藏这个面板，不显示"暂无信息"的空壳。
+    """
+    if len(node or "") > MAX_NODE_ID_CHARS or len(name or "") > MAX_NODE_ID_CHARS:
+        raise HTTPException(status_code=400,
+                            detail=f"node/name 超过 {MAX_NODE_ID_CHARS} 字")
+    from core.node_explain import explain_node
+
+    return explain_node(node, name=name)
 
 
 @app.get("/api/graph/search")
@@ -774,6 +1066,7 @@ def api_validate_key(x_llm_key: str | None = Header(default=None)) -> dict:
     没有这个端点的话，填错 key 的人只能靠跑一次问诊才知道——而那一次可能已经
     走完 S1/S2。返回里不回显 key。
     """
+    require_internal("byok")
     key = _byok_key(x_llm_key)
     if not key:
         raise HTTPException(status_code=400, detail="没有收到 key。")
@@ -819,6 +1112,7 @@ def _prefix_warmup_note() -> str:
 @app.get("/api/usage")
 def api_usage(request: Request, x_llm_key: str | None = Header(default=None)) -> dict:
     """用量看板。**不消耗任何额度**（decide 只读账本），前端可以随时轮询。"""
+    require_internal("usage_dashboard")
     ledger = usage_mod.get_ledger()
     decision = ledger.decide(
         ledger.bucket_for(_client_ip(request), MAX_TRACKED_IPS),
@@ -848,6 +1142,10 @@ def api_consult(
     response: Response,
     x_llm_key: str | None = Header(default=None),
 ) -> dict:
+    # R47：角色在**做任何事之前**解析。产品模式下请求了研究者角色时，
+    # 这里抛 InternalOnly → 404；放在最后解析的话，模型已经跑完、钱已经
+    # 花掉、审计记录已经写了，才发现这份结果不该给出去。
+    role = resolve_role(req.role)
     decision, backend, token = _gate(request, x_llm_key)
     try:
         slots = _acquire_consult_slot()
@@ -859,7 +1157,8 @@ def api_consult(
     outcome = None
     try:
         with use_llm(backend):
-            outcome = consult(req.complaint, retriever_mode=req.retriever_mode)
+            outcome = consult(_effective_complaint(req), retriever_mode=req.retriever_mode,
+                              patient_profile=req.patient_profile)
     except LLMAuthError as e:
         # 见 stream 里那条注释：这一类要说给访问者听。
         raise HTTPException(status_code=502, detail=str(e)) from e
@@ -875,10 +1174,62 @@ def api_consult(
     # （test_researcher_role_response_matches_pre_m6_shape_byte_for_byte），
     # 而且额度是"站点计量"、不是"这次问诊的结果"，混进结果体会让两件事纠缠。
     # 完整看板在 GET /api/usage。
+    _record_history(out := _consult_response(outcome, role=role), req)
     snap = _usage_block(request, decision)
     response.headers["X-Usage-Mode"] = decision.mode
     response.headers["X-Usage-Remaining-Calls"] = str(snap["remaining_calls"])
-    return _consult_response(outcome, role=req.role)
+    return out
+
+
+#: 记录编号用的字母表：**去掉 0/O/1/I/L**。使用者要在电话里把它念给运维，
+#: 而这五个字符是电话里最容易听错的。
+_RECORD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _record_history(response: dict, req: "ConsultRequest") -> None:
+    """把这一次问诊记进本医师的历史。**失败不影响问诊**——历史是管理功能，
+    磁盘只读或目录不可写时不该让一次已经跑完的问诊反而报错。"""
+    try:
+        from core import history
+
+        r = (response.get("results") or [{}])[0]
+        st = r.get("s3_structured") or r.get("s3") or {}
+        formula = st.get("formula") or {}
+        history.record_consult(
+            doctor_id=getattr(req, "doctor_id", "") or "",
+            record_id=response.get("record_id") or "",
+            complaint=req.complaint or "",
+            syndrome=st.get("syndrome") or "",
+            disease=st.get("disease") or "",
+            formula=(formula.get("name") if isinstance(formula, dict) else "") or "",
+            advice_kinds=[a.get("kind", "") for a in (r.get("advice") or [])],
+        )
+    except OSError:
+        logging.getLogger("tcm.history").warning("问诊历史写入失败，这次问诊不受影响")
+
+
+def _effective_complaint(req: "ConsultRequest") -> str:
+    """这一次真正送进 S1 的那段文本。
+
+    表单与自由文本**不是二选一**：填了表单就把表单铺成文本（`form_to_text`），
+    自由文本里的内容由表单的 `free_text` 带着；两边都有时以表单为准并把
+    `complaint` 并进去——**不丢任何一边**，丢掉的那一边恰好可能是主诉。
+    """
+    if req.intake is None:
+        return req.complaint
+    form = req.intake
+    if req.complaint and not form.chief_complaint:
+        form = form.model_copy(update={"chief_complaint": req.complaint})
+    elif req.complaint and req.complaint not in form_to_text(form):
+        form = form.model_copy(
+            update={"free_text": (form.free_text + "。" + req.complaint).strip("。")})
+    return form_to_text(form) or req.complaint
+
+
+def _record_id() -> str:
+    """本次问诊的记录编号（8 位）。`secrets` 而不是 `random`：编号会进审计
+    日志，可预测的编号等于可以伪造一条"我查过这个编号"。"""
+    return "".join(secrets.choice(_RECORD_ALPHABET) for _ in range(8))
 
 
 def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
@@ -912,6 +1263,10 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         "insufficient": False,
         "insufficient_reason": None,
         "coverage": outcome.get("coverage"),
+        # R44：这一次代理做过的决策（停/问/取证/验）。**给所有角色**——
+        # 患者最需要知道的正是"为什么让我去急诊"，而那句话就在这里。
+        # 规则表在 core/agent.py，这里只是原样下发。
+        "agent_trace": outcome.get("agent_trace") or [],
         "s2": outcome["s2"].model_dump() if outcome.get("s2") else None,
         "residual": _serialize_residual(outcome.get("residual")),
         # 拒绝也要带追问记录：被拦下来的原因可能正是追问问出来的，
@@ -924,6 +1279,21 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         # 非 None = 这次结果是回放的录制推理。跟 manifest 分开放：manifest 只
         # 给 researcher，而这行提示要给所有角色看（见 demo_mode_info 的注释）。
         "demo_mode": demo_mode_info(),
+        # R46：个体化调整与循证对照。**都给（除患者外，见角色裁剪）**——
+        # 医师要的正是"这张方对这位患者合不合适、跟教材差在哪"。
+        # 问诊历史在 `_record_history()` 里落盘，不在这里——这个函数只负责
+        # "怎么序列化"，写文件混进来会让它在测试里产生副作用。
+        "individualization": outcome.get("individualization"),
+        "guideline": outcome.get("guideline"),
+        # R47 §8.2 第 9 条：给所有角色一个**本次记录编号**，页脚一行小字，
+        # 供报障时报给运维。刻意不叫 trace_id、不在产品面上出现这个词——
+        # 使用者报障时要念得出来，所以是 8 位大写字母数字，不是 uuid。
+        #
+        # **这里生成而不是在 core.chain 里**：R45 会把贯穿全链的 trace_id
+        # 做进推理链与审计链，那时候这个编号改成从 trace_id 派生（取前 8 位
+        # 的 base32），产品面这一行的形状不变。现在先把产品面这一处补上，
+        # 不等 R45——录制视频时页脚不能是空的。
+        "record_id": _record_id(),
     }
 
     if outcome["rejected"]:
@@ -986,6 +1356,18 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
 
 ANSWER_TIMEOUT_SECONDS = 300  # 没人回答时的兜底：不能让后台线程无限期挂着
 _STREAM_POLL_SECONDS = 0.05  # 生成器轮询事件队列的间隔，见 _ConsultStream 文档
+#: R36：多久没有事件就发一帧心跳。
+#:
+#: 为什么要它：一次问诊里 S3 那一步要等几十秒，这期间**一个字节都不发**。
+#: nginx 的 `proxy_read_timeout` 默认 60 秒、多数 CDN / 反代在 30~120 秒之间掐
+#: 空闲连接——掐掉的表现是浏览器那边流突然结束、没有 error 事件、没有 done 事件，
+#: 前端只能显示"转圈转到底"。15 秒是最紧的那个默认值（30 秒）的一半，留一倍余量。
+#:
+#: 发的是**一个真事件**而不是 SSE 注释行（`: ping`）：注释行前端看不见，
+#: "还在跑"这件事就只能靠转圈暗示；而 heartbeat 事件带着已等待秒数，
+#: 界面能说"已等待 42 秒"。老前端不认这个事件名也无害
+#: （`describeProgressEvent` 对未知事件返回 null，不进日志、不报错）。
+_HEARTBEAT_SECONDS = 15.0
 
 
 class StreamClosed(Exception):
@@ -1019,7 +1401,14 @@ class _ConsultStream:
 
     def __init__(self, stream_id: str, slots: threading.BoundedSemaphore) -> None:
         self.stream_id = stream_id
-        self.events_q: queue.Queue = queue.Queue()
+        # R40 **背压**：有上限的队列。之前是 `queue.Queue()`（无上限）——
+        # 客户端读得慢或者卡住时，后台线程照样按 token 频率往里塞 `s3_delta`，
+        # 队列只涨不降。一条流的增量事件是**几千条**（每 N 个 token 一条），
+        # 几十条慢连接就能把进程的内存吃掉，而这中间没有任何一处会报错。
+        self.events_q: queue.Queue = queue.Queue(maxsize=SSE_QUEUE_MAXSIZE)
+        # 被丢掉的增量条数。**丢了必须数出来**，不能静默——前端据此显示
+        # "网络较慢，已跳过 N 条增量"，而不是让用户看到一段缺字的推理过程。
+        self.dropped_deltas = 0
         self.cancel = threading.Event()
         self._slots = slots
         self._pending: queue.Queue | None = None
@@ -1028,9 +1417,33 @@ class _ConsultStream:
     # ---- 后台线程侧（consult 的回调）----
 
     def emit(self, name: str, data: dict) -> None:
+        """往流里塞一个事件。**两类事件两种背压策略**，不能合并成一种：
+
+        · 增量事件（`SSE_DROPPABLE_EVENTS`）：队列满就**丢**，并计数。它们是
+          "同一段文字的逐步生成"，丢掉几条只是打字机效果卡一下，终值由
+          `s3_done` / `done` 兜底——而为它们阻塞后台线程，等于让一条慢连接
+          把这次问诊整体拖慢。
+        · 其余事件（阶段完成、需要追问、终值、错误）：**阻塞等**，让生产端
+          慢到消费端的速度上。这才是真正的背压。丢掉任何一条都会让前端
+          缺一段状态（`need_input` 丢了 = 追问永远等不到回答）。
+
+        阻塞不是无限等：`SSE_PUT_TIMEOUT_SECONDS` 之后按"客户端已经不读了"
+        处理，抛 `StreamClosed`——跟客户端断开走同一条收尾路径。
+        """
         if self.cancel.is_set():
             raise StreamClosed()
-        self.events_q.put((name, data))
+        if name in SSE_DROPPABLE_EVENTS:
+            try:
+                self.events_q.put_nowait((name, data))
+            except queue.Full:
+                self.dropped_deltas += 1
+            return
+        try:
+            self.events_q.put((name, data), timeout=SSE_PUT_TIMEOUT_SECONDS)
+        except queue.Full as e:
+            # 队列满了这么久 = 没人在读。跟客户端断开是同一件事，走同一条路。
+            self.cancel.set()
+            raise StreamClosed() from e
 
     def ask(self, question: str) -> str | None:
         answer_q: queue.Queue = queue.Queue(maxsize=1)
@@ -1086,7 +1499,16 @@ class _ConsultStream:
             return True
 
     def finish(self) -> None:
-        self.events_q.put((None, None))  # 哨兵：告诉生成器可以收工了
+        """收尾。哨兵告诉生成器可以退出了。
+
+        **有超时**：队列有上限之后，一个没人读的满队列会让这里永远阻塞，
+        后台线程于是永远不退出（daemon=True 只保证进程能退，不保证线程能回收
+        它占的内存和那个信号量槽）。塞不进去就说明没人读，哨兵本身也没意义。
+        """
+        try:
+            self.events_q.put((None, None), timeout=SSE_PUT_TIMEOUT_SECONDS)
+        except queue.Full:
+            pass
         self._slots.release()
         with _streams_lock:
             _streams.pop(self.stream_id, None)
@@ -1112,6 +1534,10 @@ def api_consult_stream(
     把同一个判断连同错误文案实现两遍。worker 里 consult() 抛的 ValueError 会
     被兜成 error 事件，消息跟 400 那条完全一样，前端的 error 分支照样能显示。
     """
+    # R47：角色在**开流之前**解析。产品模式下请求了研究者角色时，这里抛
+    # InternalOnly → 404，而不是先把流开起来、跑几十秒之后在 done 事件里
+    # 才发现给不了——半条流比一个干脆的 404 更像半成品。
+    _req_role = resolve_role(req.role)
     decision, backend, token = _gate(request, x_llm_key)
     usage_snapshot = _usage_block(request, decision)
     try:
@@ -1131,12 +1557,21 @@ def api_consult_stream(
             # BYOK 的 key 和超额降级都会静默失效。
             with use_llm(backend):
                 outcome = consult(
-                    req.complaint,
+                    _effective_complaint(req),
                     ask_fn=stream.ask,
                     on_step=stream.emit,
                     retriever_mode=req.retriever_mode,
+                    patient_profile=req.patient_profile,
                 )
-            stream.events_q.put(("done", _consult_response(outcome, role=req.role)))
+            # R40 背压：丢过增量就**说出来**，紧挨在 done 之前。
+            # 单独一个事件而不是塞进 done 的载荷：done 的形状跟 /api/consult
+            # 的响应体是同一份契约（`_consult_response` 是唯一实现），
+            # 往里加一个只有流式路径才有的键会让那份契约分叉。
+            if stream.dropped_deltas:
+                stream.emit("deltas_dropped", {"n": stream.dropped_deltas})
+            _done = _consult_response(outcome, role=_req_role)
+            _record_history(_done, req)
+            stream.events_q.put(("done", _done))
         except StreamClosed:
             pass  # 客户端已断开，没人读了，正常提前结束
         except LLMAuthError as e:
@@ -1165,14 +1600,23 @@ def api_consult_stream(
             # 发现对不上；而另起一帧会改事件顺序，那个顺序有契约测试守着
             # （test_stream_id_arrives_first_then_progress_then_done）。
             yield _sse("stream_id", {"stream_id": stream.stream_id, "usage": usage_snapshot})
+            t_open = time.monotonic()
+            last_sent = t_open
             while True:
                 try:
                     name, data = stream.events_q.get_nowait()
                 except queue.Empty:
+                    now = time.monotonic()
+                    if now - last_sent >= _HEARTBEAT_SECONDS:
+                        # 心跳只在**真的没别的东西可发**的时候发：它的作用是"别把
+                        # 这条连接当空闲连接掐掉"，不是定时汇报。
+                        last_sent = now
+                        yield _sse("heartbeat", {"elapsed_s": round(now - t_open, 1)})
                     await asyncio.sleep(_STREAM_POLL_SECONDS)
                     continue
                 if name is None:
                     return
+                last_sent = time.monotonic()
                 yield _sse(name, data)
         finally:
             # 正常收尾时后台线程早已结束，置位无害；客户端断开时 Starlette 取消
@@ -1199,7 +1643,23 @@ def api_consult_stream_answer(stream_id: str, req: ConsultStreamAnswer) -> dict:
 
 
 def _serialize_followup(followup) -> dict | None:
-    return followup.model_dump() if followup is not None else None
+    if followup is None:
+        return None
+    out = followup.model_dump()
+    # 中文名跟着结论一起下发（同 `VerificationResult.to_dict` 的 `status_label`）：
+    # 前端只负责显示，不再自己攒一张停因表。
+    out["stopped_by_label"] = stop_label(out.get("stopped_by", ""))
+    return out
+
+
+def _refs_block(r: dict) -> dict:
+    """`refs` + 三个对照数。抽成函数因为 `_serialize_result` 里那个字典字面量
+    已经很长，而这几个键必须**一起**出现——只有 refs 没有 refs_total 时，
+    前端会把"下发的条数"当成"语料的条数"，那是个假数。"""
+    cited = (r.get("s3").cited_case_ids if r.get("s3") is not None
+             and hasattr(r.get("s3"), "cited_case_ids") else ())
+    sent, counts = _cap_refs(list(r.get("refs") or []), cited)
+    return {"refs": sent, **counts}
 
 
 def _serialize_residual(residual: dict | None) -> dict | None:
@@ -1210,6 +1670,47 @@ def _serialize_residual(residual: dict | None) -> dict | None:
     return out
 
 
+#: 一次响应里最多下发多少条参考医案。R40 实测：`full_context` 模式下
+#: `refs` 是**整个语料**——一条问诊的响应体 2,848,127 字节，其中
+#: `results[0].refs` 占 1,252,722 字节 / 1060 条（98.9%）。
+#:
+#: 为什么这是个真问题而不是"多传一点没关系"：
+#:   · 前端要 JSON.parse 这 2.8 MB（主线程上一次长任务，R41 量到的 TBT 来源之一）
+#:   · 1060 条参考医案没有任何界面能有意义地展示
+#:   · 三甲内网的带宽不是本机回环
+#:
+#: 为什么**不是**在 `core/chain.py` 那一层砍：`refs` 在链内部还有别的用途
+#: （幻觉检查要拿全集比 `cited_case_ids`）。砍在序列化边界上，链的语义一个字不动。
+REFS_IN_RESPONSE = int(os.environ.get("REFS_IN_RESPONSE", "20"))
+
+
+def _cap_refs(refs: list[dict], cited_ids, cap: int = REFS_IN_RESPONSE) -> tuple[list[dict], dict]:
+    """下发的参考医案裁到 `cap` 条，**被引用的一条都不许丢**。
+
+    顺序上的取舍：先放这次真的被引用的（`cited_case_ids`），再按分数补满。
+    被引用的条目丢了的话前端的"点结论跳到依据"就会指向一条不存在的医案
+    ——那比传得多严重得多（可追溯是这个项目的卖点）。
+
+    `cap <= 0` 表示不裁（给需要全量的评测脚本留口）。
+
+    返回的第二项是**对照数**（CLAUDE.md「任何数字都必须带对照」）：
+    下发几条、这次引用了几条、语料里一共几条。前端显示"下发 20 / 共 1060"，
+    不显示成"共 20"——后者是个假数。
+    """
+    total = len(refs)
+    cited = set(cited_ids or ())
+    if cap <= 0 or total <= cap:
+        return refs, {"refs_total": total, "refs_sent": total,
+                      "refs_cited": sum(1 for x in refs if x.get("case_id") in cited),
+                      "refs_truncated": False}
+    must = [x for x in refs if x.get("case_id") in cited]
+    rest = [x for x in refs if x.get("case_id") not in cited]
+    rest.sort(key=lambda x: -(x.get("score") or 0))
+    sent = must + rest[:max(0, cap - len(must))]
+    return sent, {"refs_total": total, "refs_sent": len(sent),
+                  "refs_cited": len(must), "refs_truncated": True}
+
+
 def _serialize_result(r: dict) -> dict:
     # 按 id 查元数据（姓名/配色）用全表：结果里只会有 enabled 的医家，
     # 但这个函数也被「参考医家」引用区的序列化复用。
@@ -1217,7 +1718,7 @@ def _serialize_result(r: dict) -> dict:
     # （见 core/physicians.py::SYNTHESIS_DISPLAY 的注释——它不是一位医家）。
     # 查不到就退到那份展示元数据，而不是退到灰色兜底：灰色在前端表示"未知医家"。
     info = physicians_all(PHYSICIANS).get(r["physician"]) or (
-        SYNTHESIS_DISPLAY if r["physician"] == SYNTHESIS_PHYSICIAN_ID else {})
+        synthesis_display() if r["physician"] == SYNTHESIS_PHYSICIAN_ID else {})
     return {
         "physician": r["physician"],
         "physician_name": r["physician_name"],
@@ -1235,7 +1736,10 @@ def _serialize_result(r: dict) -> dict:
         # 规则倾向 Y"这种交叉校验，不是要替代模型的判断。
         "disease_candidates": r.get("disease_candidates", []),
         "no_reference_cases": r.get("no_reference_cases", False),
-        "refs": r["refs"],
+        # R40：下发的 refs 裁到 REFS_IN_RESPONSE 条，被引用的全留。
+        # `hallucinated` 是**服务端**用全集算完的结论，不受这里裁剪影响——
+        # 裁剪只改"下发多少"，不改"验了什么"。
+        **_refs_block(r),
         "hallucinated": r["hallucinated"],
         # X2 输出侧安全校验结果，前端据此挂红/黄标签
         "safety_output": r.get("safety_output"),
@@ -1390,6 +1894,12 @@ def _filter_response_by_role(response: dict, role: Role, results: list[dict]) ->
 
     # 走到这里说明 role 是 "patient" 或 "doctor"。
     response.pop("divergence", None)
+    if role == "patient":
+        # R46：个体化调整逐条点名药味（「附子：老年患者慎用」），跟
+        # `formula_candidates` 是同一条安全边界——患者角色下**键根本不存在**，
+        # 不是存在但为空。循证对照同理：它比的是方与治法。
+        response.pop("individualization", None)
+        response.pop("guideline", None)
 
     triage = _compute_triage(results)
     response["triage"] = triage
@@ -1421,46 +1931,117 @@ def _filter_response_by_role(response: dict, role: Role, results: list[dict]) ->
 # ---------- 图数据 ----------
 
 
+#: R42：**单一诊断链的九层。** 一张表定死层号、层的机器名、层的中文名。
+#:
+#: 层号是布局（第几列），`node_type` 是"这是什么东西"——两件事分开
+#: （R16 那条：混在一个字段上，样式表就只能有两份）。中文名由后端下发，
+#: 前端不写死：加层/改名时前端跟着长，不需要改两处。
+#:
+#: 为什么是九层而不是原来的五层：原来「治法」挂在 证型→方剂 那条边的 label 上、
+#: 「脏腑」和「病性」挤在一个「证素」层里、「病机」根本没有位置。那张图看得出
+#: "从症状到方"，看不出**为什么是这个证、为什么是这个治法**——而那正是辨证
+#: 这件事本身。九层把推理链的每一步摆成一层，图与 `S3Structured` 的九段一一对应。
+CHAIN_LAYERS: tuple[tuple[int, str, str], ...] = (
+    (0, "symptom", "症状"),
+    (1, "organ", "脏腑"),
+    (2, "nature", "病性"),
+    (3, "syndrome", "证型"),
+    (4, "pathogenesis", "病机"),
+    (5, "principle", "治则"),
+    (6, "method", "治法靶位"),
+    (7, "formula", "方剂"),
+    (8, "herb", "君臣佐使"),
+)
+
+#: 层号 → node_type / 中文名。从上面那张表派生，**不另写一份**。
+LAYER_NODE_TYPE: dict[int, str] = {n: t for n, t, _ in CHAIN_LAYERS}
+LAYER_LABEL: dict[int, str] = {n: z for n, _, z in CHAIN_LAYERS}
+
+#: 节点 id 的前缀 → 层号。前缀是 `core/node_explain.py::parse_node_id` 的输入，
+#: 两边必须说同一套词（那边有一张 `_PREFIX_KIND`，有测试比这两张表）。
+LAYER_PREFIX: dict[int, str] = {
+    0: "sym", 1: "organ", 2: "nature", 3: "syn",
+    4: "mech", 5: "principle", 6: "method", 7: "formula", 8: "herb",
+}
+
+
 def to_graph(
     s1: S1Normalize, results: list[dict], s2=None, residual: dict | None = None,
     role: Role = "researcher",
 ) -> dict:
-    """构造 Cytoscape 格式的图：{nodes: [{"data": {...}}], edges: [{"data": {...}}]}。
+    """构造 Cytoscape 格式的图：{nodes: [{"data": {...}}], edges: [...], ...}。
 
-    六层（M5）：症状(0) -> 证素(1) -> 病名·证型(2) -> 方剂(3) -> 药材(4)。
-    治法不单独成层，做成 layer2 -> layer3 边的 label（六层已经够宽，七层会挤到
-    看不清）。方剂(3)/药材(4) 是 compound 关系：药材节点的 `parent` 字段指向
-    它所属的方剂节点，父子关系由 cytoscape 内建机制表达，**不额外画一条
-    formula->herb 的边**——画了会在图上出现重复的连线。
+    **R42：九层单链，图上没有医家分带。**
 
-    节点去重用 seen 集合，同 id 只加一次。
+    症状(0) → 脏腑(1) → 病性(2) → 证型(3) → 病机(4) → 治则(5) → 治法靶位(6)
+    → 方剂(7) → 君臣佐使(8)
 
-    M6：role="patient" 时压根不产出方剂(3)/药材(4) 层——图节点本身就带着
-    真实药名（label/id 都是），如果先建出完整六层图、再在 `_consult_response`
-    那层把 `results[].s3.formula_candidates` 摘掉，图里这两层节点依然会把
-    同样的药名重新泄露给前端。跟"字段裁剪必须在后端做、不能指望前端藏起来"
-    是同一条安全边界：这里的做法是"根本不生成"，不是"生成了再删"。
+    第 6 层叫「治法靶位」而不是「治法」：它的内容是 `MethodStep.targets`，
+    schema 里写明那是"这个治法分别针对哪几条病机"——是**靶位**（肝、胃…），
+    不是治法本身（治法在第 5 层的 `principle` 里）。叫「治法」会让图上出现
+    一个写着「肝」的治法节点，那是错的。
+
+    ## 为什么去掉医家分带
+
+    改之前证型/方剂/药材的 node id 里带 physician（`syn::ye_tianshi`），于是
+    三位医家在图上是三条并行的带子。那张图回答的是"三个人各自怎么想"，而
+    产品要回答的是"**这一个**诊断是怎么推出来的"——分带把一条推理链切成三条，
+    每条都缺上游（症状与证素是共享的），读图的人得自己在脑子里把它们并起来。
+
+    改之后同名节点**合并成一个**，谁贡献的记在 `contributors` 里（节点属性，
+    不是空间位置）。legacy 三列模式下三位医家给出同一个证型时图上就是一个
+    证型节点、`contributors` 三个人；给出不同证型时是三个证型节点并列在
+    同一层——**并列不等于分带**：它们在同一列上，上游连回同一批证素。
+
+    ## 缺层如实报，不伪造
+
+    `病机(4)` 与 `治法靶位(6)` 只有结构化 S3（`S3Structured`）才有
+    （`organs[].pathogenesis` / `method.targets`）。legacy `S3Syndrome` 没有
+    这两样，**这时那两层就是空的**，链条直接从证型接到治则、从治则接到方剂，
+    并把层号记进 `missing_layers`。
+    从 `reasoning` 里切一句话当病机是**伪造**——那段文字是模型的自由叙述，
+    不是它标定的病机。
+
+    ## role=patient 的边界没变
+
+    仍然**压根不生成**方剂(7)/君臣佐使(8) 层，不是生成了再从响应里摘掉
+    （图节点的 label/id 本身就是真实药名）。
     """
     nodes: list[dict] = []
     edges: list[dict] = []
     seen: set[str] = set()
+    #: 已经出现过的层号——`missing_layers` 从它算，不另维护一份。
+    layers_present: set[int] = set()
 
-    # R16：**两张图共用一份 cytoscape 样式表**（问诊图 + 图谱浏览器），差异只在
-    # "是否按医家染色"这一个参数。共用的前提是两边说同一套词汇：持久图的节点
-    # 一直带 `node_type`（symptom / element / syndrome / case），问诊图只有
-    # `layer`。layer 是**布局**（第几列），node_type 是**这是什么东西**——
-    # 两件事，之前混在一个字段上，于是样式表也只能有两份。
-    LAYER_NODE_TYPE = {0: "symptom", 1: "element", 2: "syndrome",
-                       3: "formula", 4: "herb"}
-
-    def add_node(node_id: str, **data) -> None:
+    def add_node(node_id: str, layer: int, **data) -> None:
+        """同 id 只加一次。**重复时把 contributor 并进去**，不是丢掉——
+        三位医家给出同一个证型时，那个节点要记得是三个人给的。"""
+        layers_present.add(layer)
         if node_id in seen:
+            if data.get("contributor"):
+                for n in nodes:
+                    if n["data"]["id"] == node_id:
+                        who = n["data"].setdefault("contributors", [])
+                        if data["contributor"] not in who:
+                            who.append(data["contributor"])
+                        break
             return
         seen.add(node_id)
-        data.setdefault("node_type", LAYER_NODE_TYPE.get(data.get("layer")))
+        contributor = data.pop("contributor", None)
+        data["layer"] = layer
+        data["node_type"] = LAYER_NODE_TYPE[layer]
+        data["layer_label"] = LAYER_LABEL[layer]
+        if contributor:
+            data["contributors"] = [contributor]
         nodes.append({"data": {"id": node_id, **data}})
 
     dropped: list[tuple[str, str]] = []
+    seen_edges: set[tuple[str, str]] = set()
+
+    # 这一次几位医家的 (证型, 病名) 里哪些撞了。**先算好再进循环**：
+    # 边画边判会让第一个撞上的那位医家不带编码（它那时还不知道后面有人重名）。
+    ambiguous_syn = ambiguous_syndrome_pairs(
+        (r["s3"].syndrome, r["s3"].disease or "") for r in results)
 
     def add_edge(source: str, target: str, **data) -> None:
         # 已知易错点：只有两端节点都已存在才建边，否则前端渲染会指向空节点。
@@ -1470,16 +2051,22 @@ def to_graph(
         if source not in seen or target not in seen:
             dropped.append((source, target))
             return
-        edges.append({"data": {"source": source, "target": target, **data}})
+        # R42：去掉医家分带之后，同一条 (source, target) 会被几位医家各贡献一次。
+        # **在这里去重**，不是让前端按 (source,target) 去重——前端去重只画第一条，
+        # 而"第一条"取决于医家顺序，颜色/标签就成了随机的那一位（R16 踩过）。
+        key = (source, target)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append({"data": {"id": f"e::{source}>>{target}",
+                               "source": source, "target": target, **data}})
 
-    # layer 0 症状：「已解释」用 core.chain.explained_symptoms 这一处实现——S2 全局共享，
+    # ---- layer 0 症状 ----
+    # 「已解释」用 core.chain.explained_symptoms 这一处实现——S2 全局共享，
     # 各医家的 r["s2"] 是同一份，这里不再各自汇总一遍
     if s2 is None and results:
-        s2 = results[0]["s2"]  # S2 全局共享，各医家拿到的是同一份
+        s2 = results[0]["s2"]
     explained: set[str] = explained_symptoms(s1, s2) if s2 is not None else set()
-
-    # 「已解释」的判据只有 core.chain.explained_symptoms 一处（上面），这里不再
-    # 叠一层对 unexplained_symptoms 的处理——叠了就会跟 coverage、残差报的数打架。
     residual_explained = set((residual or {}).get("newly_explained") or [])
 
     for sym in s1.symptoms:
@@ -1489,98 +2076,205 @@ def to_graph(
             state = "residual"  # 初轮没解释，残差辨证补上了
         else:
             state = "unexplained"
-        add_node(f"sym::{sym}", label=sym, layer=0, state=state)
+        add_node(f"sym::{sym}", 0, label=sym, state=state)
 
-    # layer 1 证素与 症状->证素 边：S2 全局共享，只发一遍，不按医家重复。
-    # 原来每位医家各发一遍完全相同的边并打上 phys 标签，前端按 (source,target) 去重
-    # 只画第一条、颜色永远是第一位医家的——第三位医家加入后重复更多、含义更误导。
+    # ---- layer 1 脏腑 / layer 2 病性 ----
+    # 原来这两样挤在一个「证素」层里。它们回答的不是同一个问题：脏腑是
+    # **病位**（病在哪），病性是**病的性质**（寒热虚实）。摆成两层之后，
+    # 「脾 + 气虚 → 脾胃气虚证」这条推理在图上是两条边汇进一个节点，
+    # 而不是两个同色方块并排。
+    def _element_layer(kind: str) -> int:
+        return 1 if kind == "location" else 2
+
+    def _element_id(hit) -> str:
+        return f"{LAYER_PREFIX[_element_layer(hit.kind)]}::{hit.element}"
+
     if s2 is not None:
         for hit in s2.elements:
-            elem_id = f"elem::{hit.element}"
-            add_node(elem_id, label=hit.element, layer=1, kind=hit.kind)
+            layer = _element_layer(hit.kind)
+            add_node(_element_id(hit), layer, label=hit.element, kind=hit.kind)
             for sym in hit.supporting_symptoms:
-                add_edge(f"sym::{sym}", elem_id)
+                add_edge(f"sym::{sym}", _element_id(hit))
 
     # 残差辨证新推出的证素，单独标出来（兼夹证的证素）。必须在主证素之后加：
     # add_node 先到先得，先加残差会把主路径里同名的证素整个标成 residual=True。
     if residual:
         for hit in residual["s2"].elements:
-            elem_id = f"elem::{hit.element}"
-            add_node(elem_id, label=hit.element, layer=1, kind=hit.kind, residual=True)
+            layer = _element_layer(hit.kind)
+            add_node(_element_id(hit), layer, label=hit.element, kind=hit.kind,
+                     residual=True)
             for sym in hit.supporting_symptoms:
-                add_edge(f"sym::{sym}", elem_id, residual=True)
+                add_edge(f"sym::{sym}", _element_id(hit), residual=True)
 
     for r in results:
         physician = r["physician"]
         pname = r["physician_name"]
-
-        # layer 2 病名·证型（M4）。node id 不变——仍是 syn::{physician}，只改
-        # label：id 是前端证据链侧栏 buildEvidenceIndex() 反查的键，改了就断链，
-        # 跟 M 药名剥剂量那次「label 剥、id 保原样」是同一条理由。disease 为
-        # None（病名判断不了，S3 prompt 允许留空）时退回只显示证型，不显示
-        # 一个悬空的"· 证型"。
-        syn_id = f"syn::{physician}"
         s3 = r["s3"]
-        label = f"{s3.disease} · {s3.syndrome}" if s3.disease else s3.syndrome
-        add_node(syn_id, label=label, layer=2, phys=physician, pname=pname)
-
-        for hit in r["s2"].elements:
-            elem_id = f"elem::{hit.element}"
-            add_edge(elem_id, syn_id, phys=physician)
-
-        # layer 3 方剂 + layer 4 药材（M5）：每个候选方都出节点，不是只画
-        # selected 那一个——前端要能摆出 2-3 个方框各自装着自己的药，
-        # 「点哪个方剂看哪些药」是候选方对比的核心卖点，只画 selected 会把
-        # 另外 1-2 个候选方在图上变得不可见。
+        # **病机(4) 与治法(6) 的原件在 `s3_structured` 里，不在 `s3` 里。**
         #
+        # `consult()` 给下游的 `s3` 是 `to_s3_syndrome()` **扁平化之后**的那一份
+        # ——那次转换把 `organs[]`（病机）和 `method.targets`（治法）丢掉了，
+        # 只留下 `treatment_principle` 这一个字符串。所以只读 `s3` 的话，
+        # 这两层在生产里**永远**是空的，而 `missing_layers` 会如实把它们报成
+        # "本次没有"——看起来像"这一轮的模型没产出病机"，实际上是读错了字段。
+        # 这个 bug 只有把真 payload 喂进浏览器才看得见（Playwright 的
+        # `single_chain_graph` 第一次跑就红了：第 4 层一个节点都没有），
+        # 后端的 JSON 结构测试全绿——**又一次 CLAUDE.md 那条硬约定的例子**。
+        st = r.get("s3_structured") or s3
+
+        # ---- layer 3 证型（含病名） ----
+        # **id 按证型名，不按医家**（R42 去分带）。撞名补证候编码那一条不变。
+        label = f"{s3.disease} · {s3.syndrome}" if s3.disease else s3.syndrome
+        suffix = syndrome_code_suffix(
+            ambiguous=(s3.syndrome, (s3.disease or "").strip()) in ambiguous_syn,
+            code=(syndrome_row(s3.syndrome) or {}).get("code"))
+        syn_id = f"syn::{s3.syndrome}"
+        add_node(syn_id, 3, label=label + suffix, syndrome=s3.syndrome,
+                 disease=s3.disease, contributor=physician, pname=pname)
+
+        # 证素 → 证型。**只连这一位医家真的用到的证素**（r["s2"] 是全局共享的
+        # 那一份，所以实际上是全部证素——这跟改动前一致，不在这一轮改语义）。
+        for hit in r["s2"].elements:
+            add_edge(_element_id(hit), syn_id)
+
+        # ---- layer 4 病机（只有结构化 S3 有） ----
+        upstream_of_principle = [syn_id]
+        organs = list(getattr(st, "organs", ()) or ())
+        if organs:
+            upstream_of_principle = []
+            for o in organs:
+                organ_name = getattr(o, "organ", None)
+                mech = (getattr(o, "pathogenesis", "") or "").strip()
+                # 脏腑节点：结构化 S3 自己标了病位，它可能不在 S2 的证素表里
+                # （模型从症状直接判的）。**补进来而不是丢掉**：丢掉的话
+                # 病机会悬空，而"悬空"在图上看起来只是"这一段没画出来"。
+                if organ_name:
+                    add_node(f"organ::{organ_name}", 1, label=organ_name,
+                             kind="location")
+                    for sym in (getattr(o, "supporting_symptoms", ()) or ()):
+                        add_edge(f"sym::{sym}", f"organ::{organ_name}")
+                    add_edge(f"organ::{organ_name}", syn_id)
+                if not mech:
+                    continue
+                mech_id = f"mech::{mech}"
+                add_node(mech_id, 4, label=mech, organ=organ_name,
+                         contributor=physician)
+                add_edge(syn_id, mech_id)
+                upstream_of_principle.append(mech_id)
+            if not upstream_of_principle:
+                upstream_of_principle = [syn_id]
+
+        # ---- layer 5 治则 ----
+        # 结构化：`method.principle`；legacy：`treatment_principle`。
+        # 两处取值一个函数，不在这里 if/else 两遍（那是两处实现）。
+        principle = _s3_principle(st) or _s3_principle(s3)
+        principle_targets = list(getattr(getattr(st, "method", None), "targets", ()) or ())
+        upstream_of_formula: list[str] = []
+        if principle:
+            principle_id = f"principle::{principle}"
+            add_node(principle_id, 5, label=principle, contributor=physician)
+            for up in upstream_of_principle:
+                add_edge(up, principle_id)
+            upstream_of_formula = [principle_id]
+            # ---- layer 6 治法靶位（只有结构化 S3 有 targets） ----
+            method_ids = []
+            for t in principle_targets:
+                t = (t or "").strip()
+                if not t:
+                    continue
+                method_id = f"method::{t}"
+                add_node(method_id, 6, label=t, contributor=physician)
+                add_edge(principle_id, method_id)
+                method_ids.append(method_id)
+            if method_ids:
+                upstream_of_formula = method_ids
+        else:
+            upstream_of_formula = upstream_of_principle
+
         # M6：role="patient" 时整段跳过——不生成方剂/药材层，不是生成了再
         # 从响应里摘掉（见函数文档字符串）。
         if role == "patient":
             continue
+
+        # ---- layer 7 方剂 + layer 8 君臣佐使 ----
         for i, cand in enumerate(s3.formula_candidates):
-            # 同一位医家的多个候选方可能撞同一个方名（真实产出里少见，但不能假设
-            # 不会发生）——formula_id 只按 physician+name 拼，重名候选方会被
-            # add_node 的去重逻辑合并成一个节点，这是已知的、可接受的边界情况
-            # （见 tests/test_graph.py 的对应测试）：图上没有"同名候选方各画一份"
-            # 的必要，两个同名候选方本来就该被当成同一个方剂节点。
-            formula_id = f"formula::{physician}::{cand.name}"
+            formula_id = f"formula::{cand.name}"
             add_node(
-                formula_id, label=cand.name, layer=3, phys=physician,
+                formula_id, 7, label=cand.name,
                 # 前端按 source 区分边框（classic 实线/modified 虚线/composed
                 # 点线）、selected 高亮选中的那个、safety_blocking 为真时标红。
                 source=cand.source, confidence=cand.confidence,
                 selected=(i == s3.selected),
                 safety_blocking=cand.safety.blocking if cand.safety else False,
+                contributor=physician,
             )
-            # 边 label 用 treatment_principle：治法不单独成层，挂在这条边上。
-            add_edge(syn_id, formula_id, phys=physician, label=s3.treatment_principle)
+            for up in upstream_of_formula:
+                add_edge(up, formula_id)
 
             for item in cand.herb_items:
-                # herb_id 必须带方剂名：同一味药可能出现在这位医家的多个候选方里
-                # （比如"甘草"作为使药几乎每个方都有），不带方名会被 add_node 的
-                # 去重逻辑合并成一个节点、同时挂在两个 parent 上，cytoscape 会报错。
-                # id 用 item.name 原始写法（旧式合成路径下可能仍带剂量文本，见
-                # core.schemas._S3Base 的向后兼容合成），label 单独剥剂量——
-                # 跟"药名剥剂量"那次「label 剥、id 保原样」是同一条理由，前端
+                # herb_id 带方名：同一味药会出现在多个候选方里（"甘草"作为使药
+                # 几乎每个方都有），不带方名会被去重合并成一个节点、同时挂在
+                # 两个 parent 上，cytoscape 会报错。
+                # id 用 item.name 原始写法（旧式合成路径下可能仍带剂量文本），
+                # label 单独剥剂量——「label 剥、id 保原样」，前端
                 # buildEvidenceIndex() 用同一个拼法反查证据，id 一变就断链。
-                herb_id = f"herb::{physician}::{cand.name}::{item.name}"
-                label = strip_dose_and_parens(item.name) or item.name
+                herb_id = f"herb::{cand.name}::{item.name}"
                 add_node(
-                    herb_id, label=label, layer=4, phys=physician,
+                    herb_id, 8, label=strip_dose_and_parens(item.name) or item.name,
                     parent=formula_id,
                     dose=item.dose, unit=item.dose_unit,
                     processing=item.processing, decoction=item.decoction,
                     # 这里的 role（君/臣/佐/使）是 HerbItem 自己的字段，跟本函数
-                    # 参数 role（patient/doctor/...角色）只是同名，语义完全不同，
-                    # 不要看到 role= 就以为在传角色参数。
+                    # 参数 role（patient/doctor/...角色）只是同名，语义完全不同。
                     role=item.role, function_in_formula=item.function_in_formula,
                     is_western=is_western_drug(item.name),
+                    contributor=physician,
                 )
-                # 方剂 -> 药材的关系由上面的 parent 字段（compound node）表达，
-                # 这里不额外画边——画了会在图上出现重复的连线，这是这个模块
-                # 最容易漏改的一条。
+                # 方剂 → 药材的关系由 parent 字段（compound node）表达，
+                # 这里不额外画边——画了会在图上出现重复的连线。
 
-    return {"nodes": nodes, "edges": edges, "dropped_edges": len(dropped)}
+    # R42 收尾：把"谁贡献的"从列表压成两个可选择的标记。
+    #
+    # **为什么在这里算而不在前端按 contributors.length 现判**：这是同一个判断
+    # （"这个结论是一个人给的还是几个人给的"），放在两处就会在改一边时漏掉
+    # 另一边（CLAUDE.md 第 31 条）。cytoscape 的选择器也做不到按数组长度选，
+    # 前端真要判就得在 JS 里再遍历一遍节点——那正是第二处实现。
+    for n in nodes:
+        who = n["data"].get("contributors") or []
+        if len(who) == 1:
+            n["data"]["contributor_solo"] = who[0]
+        elif len(who) > 1:
+            n["data"]["multi_contributor"] = True
+
+    expected = {n for n, _, _ in CHAIN_LAYERS}
+    if role == "patient":
+        expected -= {7, 8}     # 这两层是刻意不生成的，不算"缺"
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "dropped_edges": len(dropped),
+        # R42：层的元信息**由后端下发**，前端不写死（加层时前端跟着长）。
+        "layers": [{"layer": n, "node_type": t, "label": z} for n, t, z in CHAIN_LAYERS],
+        # **缺哪一层要说出来。** 空层有两种来路：legacy S3 不产出病机/治法
+        # （合法），和上游数据出了问题（要看一眼）。前端照实显示"本次没有 X 层"，
+        # 不是悄悄把链条接过去。
+        "missing_layers": sorted(expected - layers_present),
+    }
+
+
+def _s3_principle(s3) -> str:
+    """治则。**结构化与 legacy 两种 S3 取同一个概念的唯一入口。**
+
+    结构化是 `method.principle`，legacy 是 `treatment_principle`。散在两处 if
+    的话，将来加第三种 S3 形状就会漏掉其中一处（而漏掉的表现是图上少一层，
+    不报错）。
+    """
+    method = getattr(s3, "method", None)
+    if method is not None:
+        p = (getattr(method, "principle", "") or "").strip()
+        if p:
+            return p
+    return (getattr(s3, "treatment_principle", "") or "").strip()
 
 
 def assert_graph_edges_valid(graph: dict) -> None:
@@ -1738,5 +2432,264 @@ def api_prescription_export(req: PrescriptionExportRequest) -> dict:
     return {"text": text, "audit_id": str(record.seq)}
 
 
+#: R41：静态资源的缓存策略。**两类资源两种，不能给同一个值。**
+#:
+#: | 类 | 谁 | 策略 | 为什么 |
+#: |---|---|---|---|
+#: | 不变的第三方产物 | `vendor/`（字体 1.13 MB + cytoscape 373 KB） | `max-age=1 年, immutable` | 内容跟文件名绑定（字体子集是 `scripts/subset_fonts.py` 的产物、cytoscape 带版本），换内容必然换文件名。二次访问一个字节都不用取——这 1.5 MB 是首屏字节数的 84% |
+#: | 会改的自家代码 | `index.html` / `app.js` / `app.css` / `graph.js` | `no-cache` | **必须每次问服务器**。`max-age` 一给，升级之后医生刷新页面还是旧的 JS 配新的后端，而那是一类最难查的故障（R45 的升级回滚要靠这条）。`no-cache` 不是"不缓存"，是"缓存但每次带 ETag 问一句"——304 只有几十字节 |
+#:
+#: 为什么不靠 StaticFiles 的默认值：它只给 ETag / Last-Modified，没有
+#: `Cache-Control`。浏览器于是按启发式自己猜一个新鲜期——猜多久取决于浏览器版本，
+#: 而"取决于浏览器版本"意味着现场表现不可复现。
+CACHE_IMMUTABLE_SECONDS = 31536000       # 1 年
+CACHE_IMMUTABLE_PREFIXES = ("vendor/",)
+
+
+class _CachingStatic(StaticFiles):
+    """给静态响应补 `Cache-Control`。**只补，不改别的**——ETag 与
+    Last-Modified 仍由 StaticFiles 处理，304 的逻辑一行没动。"""
+
+    async def get_response(self, path: str, scope):  # noqa: ANN001 - 跟基类签名一致
+        resp = await super().get_response(path, scope)
+        if resp.status_code in (200, 304):
+            if path.startswith(CACHE_IMMUTABLE_PREFIXES):
+                resp.headers["Cache-Control"] = (
+                    f"public, max-age={CACHE_IMMUTABLE_SECONDS}, immutable")
+            else:
+                resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 # 静态文件挂在 /app，不要挂在根路径——否则会遮蔽上面的 API 路由。
-app.mount("/app", StaticFiles(directory=str(WEB_ROOT), html=True), name="web")
+app.mount("/app", _CachingStatic(directory=str(WEB_ROOT), html=True), name="web")
+
+
+# ============================================================================
+# R46 §7：临床工作流闭环（采集 → 诊断 → 方案 → 检索 → 管理）
+# ============================================================================
+#
+# 这一段的端点**都不调模型**：结构化录入是文本互转，知识速查是查内存里的
+# 本体，病历文书是把已经算好的结果排版，历史与统计是读 JSONL。
+# 所以它们没有额度闸门、没有并发位——那两样守的是"别把钱花光/别把线程占满"，
+# 而这一段一次调用的代价是几毫秒。
+
+
+@app.get("/api/intake/form")
+def api_intake_form() -> dict:
+    """结构化四诊表单的字段表 + 常用词。**前端不写死字段**——写死的话
+    `core/intake.py` 里加一个字段，表单上不会长出来。"""
+    return {
+        "parts": form_fields_by_part(),
+        "regulatory_note": (
+            "只接受文字描述。舌象照片、脉诊仪信号、检验数值等客观数据不在本系统"
+            "的输入范围内（引入它们会改变产品的监管属性）。"),
+    }
+
+
+class IntakeParseRequest(TextOnlyInput):
+    text: str = ""
+    form: IntakeForm | None = None
+
+
+@app.post("/api/intake/parse")
+def api_intake_parse(req: IntakeParseRequest, request: Request) -> dict:
+    """自由文本 ↔ 表单互转。给 `text` 就拆成表单，给 `form` 就铺成文本。
+
+    §0.4 的输入侧护栏在这里拦一次：请求体里出现图像/信号/检验数值字段就 400，
+    并回那句监管属性的说明。
+    """
+    try:
+        check_input_kinds(req.model_dump())
+    except InputKindRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if req.form is not None:
+        return {"text": form_to_text(req.form), "form": req.form.model_dump()}
+    form = text_to_form(req.text)
+    return {"text": form_to_text(form), "form": form.model_dump()}
+
+
+@app.get("/api/knowledge/search")
+def api_knowledge_search(q: str = "", kind: str = "", physician: str = "",
+                         limit: int = 8) -> dict:
+    """诊中知识速查：本草 / 方剂 / 教材推荐方案 / 名老中医用药规律。
+
+    响应预算 200 ms（§7.5 第 13 条）。本体是惰性加载的——**第一次查会把它
+    装进来**（实测约 2.4 秒），之后每次查在个位数毫秒。生产部署由
+    `api/warmup.py` 在起服务时就装好，所以医师遇不到那一次冷启动。
+    """
+    return knowledge_search(q, kind=kind, limit=max(1, min(limit, 50)),
+                            physician=physician)
+
+
+@app.get("/api/guideline/coverage")
+def api_guideline_coverage() -> dict:
+    """循证对照层覆盖到什么程度。**产品面显示「未覆盖」时要能给出这个数**
+    ——否则读的人会以为是自己这一次特殊。"""
+    return coverage_stats()
+
+
+class EMRRequest(BaseModel):
+    record_id: str = ""
+    complaint: str = ""
+    intake: IntakeForm | None = None
+    patient_profile: PatientProfile | None = None
+    s2: dict | None = None
+    s3: dict | None = None
+    formula: dict | None = None
+    triage: dict | None = None
+    guideline: dict | None = None
+    doses: int | None = None
+    decoction: str = ""
+    doctor_id: str = ""
+    edits: dict[str, str] = Field(default_factory=dict)
+
+
+def _emr_from_request(req: EMRRequest):
+    ind = individualize(req.patient_profile, [
+        it.get("name", "") for it in ((req.formula or {}).get("herb_items") or [])
+    ], (req.s3 or {}).get("syndrome") or "") if req.patient_profile else None
+    return build_emr(
+        record_id=req.record_id, complaint=req.complaint, form=req.intake,
+        profile=req.patient_profile, s2=req.s2, s3=req.s3, formula=req.formula,
+        individualization=ind, triage=req.triage, guideline=req.guideline,
+        doses=req.doses, decoction=req.decoction,
+    )
+
+
+@app.post("/api/emr/draft")
+def api_emr_draft(req: EMRRequest) -> dict:
+    """生成病历文书草稿，并按 `record_id` 存一版。
+
+    医师的修改走 `edits`：**改前改后都进审计链**（只写改后的话，"医师把哪
+    一句删了"就查不出来，而那正是质控要看的）。
+    """
+    emr = _emr_from_request(req)
+    changes: list[dict] = []
+    if req.edits:
+        emr, changes = apply_edits(emr, req.edits)
+        record_edits(emr, changes, doctor_id=req.doctor_id)
+    if emr.record_id:
+        from core import history
+
+        history.save_emr(emr.record_id, emr.model_dump(), doctor_id=req.doctor_id)
+    return {"emr": emr.model_dump(), "changes": changes,
+            "text": render_emr_text(emr),
+            "prescription_sheet": render_prescription_sheet(emr)}
+
+
+@app.get("/api/emr/{record_id}")
+def api_emr_get(record_id: str) -> dict:
+    from core import history
+
+    row = history.get_emr(record_id)
+    if not row:
+        # 404 而不是一份空文书——空文书会被当成"这次问诊什么都没生成"
+        raise HTTPException(status_code=404, detail="没有这个编号的病历草稿。")
+    return {"record_id": record_id, "emr": row.get("draft") or {},
+            "versions": len(history.emr_versions(record_id))}
+
+
+@app.get("/api/history")
+def api_history(doctor_id: str = "", syndrome: str = "", formula: str = "",
+                since: str = "", limit: int = 50) -> dict:
+    from core import history
+
+    rows = history.list_consults(doctor_id=doctor_id, syndrome=syndrome,
+                                 formula=formula, since=since,
+                                 limit=max(1, min(limit, 200)))
+    return {"items": rows, "n": len(rows)}
+
+
+class FavoriteRequest(BaseModel):
+    doctor_id: str = ""
+    name: str = ""
+    herbs: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
+@app.post("/api/history/favorite")
+def api_add_favorite(req: FavoriteRequest) -> dict:
+    from core import history
+
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="收藏要有名字。")
+    row = history.add_favorite(doctor_id=req.doctor_id, name=req.name,
+                               herbs=req.herbs, note=req.note)
+    return {"saved": row}
+
+
+@app.get("/api/history/favorites")
+def api_list_favorites(doctor_id: str = "") -> dict:
+    from core import history
+
+    rows = history.list_favorites(doctor_id=doctor_id)
+    return {"items": rows, "n": len(rows)}
+
+
+@app.get("/api/history/stats")
+def api_history_stats(doctor_id: str = "", recent: int = 50) -> dict:
+    """近 N 次的证型分布、常用方、核查提示分布。
+
+    **每个数都带 `of`（这批一共几次）**：「肝胃不和证 3 次」在 5 次里和在
+    50 次里是两件完全不同的事。
+    """
+    from core import history
+
+    return history.stats(doctor_id=doctor_id, recent=max(1, min(recent, 500)))
+
+
+# ---------- §7.5 第 15 条：HIS 集成接口 ----------
+#
+# 鉴权 = API Key + IP 白名单（等保 2.0 三级的身份鉴别与访问控制）。
+# **默认拒绝**：没配 `HIS_API_KEYS` 时这两个端点一律 401。
+
+
+def _integration_guard(request: Request, x_api_key: str | None) -> None:
+    try:
+        integration_check(x_api_key, _client_ip(request))
+    except IntegrationDenied as e:
+        logging.getLogger("tcm.integration").warning("集成接口拒绝：%s", e.reason)
+        # 回给调用方的原因**统一**：「key 不对」和「IP 不在白名单」的区别
+        # 会告诉试探者下一步该试什么。
+        raise HTTPException(status_code=401, detail="鉴权失败。") from e
+
+
+class IntegrationConsultRequest(TextOnlyInput):
+    """HIS 传来的患者基本信息与主诉。字段命名对齐常用 HIS 术语。"""
+
+    patient_id: str = ""          # HIS 的患者主索引
+    visit_id: str = ""            # 就诊流水号
+    chief_complaint: str = ""
+    present_illness: str = ""
+    patient_profile: PatientProfile | None = None
+    intake: IntakeForm | None = None
+
+
+@app.post("/api/integration/consult")
+def api_integration_consult(req: IntegrationConsultRequest, request: Request,
+                            x_api_key: str | None = Header(default=None)) -> dict:
+    """HIS 调用入口：接受患者基本信息与主诉，返回结构化结果。
+
+    **这一条真的会调模型**（它就是一次问诊），所以照走额度闸门与并发位。
+    """
+    _integration_guard(request, x_api_key)
+    form = req.intake or IntakeForm()
+    if req.chief_complaint and not form.chief_complaint:
+        form = form.model_copy(update={"chief_complaint": req.chief_complaint})
+    if req.present_illness and not form.present_illness:
+        form = form.model_copy(update={"present_illness": req.present_illness})
+    inner = ConsultRequest(complaint=form_to_text(form) or req.chief_complaint,
+                           intake=form, patient_profile=req.patient_profile,
+                           role="doctor")
+    response = Response()
+    out = api_consult(inner, request, response, None)
+    return {"patient_id": req.patient_id, "visit_id": req.visit_id, "result": out}
+
+
+@app.get("/api/integration/emr/{record_id}")
+def api_integration_emr(record_id: str, request: Request,
+                        x_api_key: str | None = Header(default=None)) -> dict:
+    """按记录编号返回病历文书的结构化 JSON，供 HIS 导入。"""
+    _integration_guard(request, x_api_key)
+    return api_emr_get(record_id)

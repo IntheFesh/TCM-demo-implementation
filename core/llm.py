@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
@@ -271,9 +272,24 @@ class CallTimeouts:
         )
 
 
-# 云端 API（DeepSeek）：读 120 秒远超正常值（最慢的 S0 在 60 秒量级）、远低于
-# "挂死"；连接 15 秒、发请求 30 秒（prompt 最大几十 KB）；墙钟 180 秒。
-API_TIMEOUTS = CallTimeouts(connect=15.0, read=120.0, write=30.0, pool=15.0, deadline=180.0)
+# 云端 API（DeepSeek）：读 600 秒、墙钟 900 秒；连接 15 秒、发请求 30 秒
+# （prompt 最大几十 KB）。
+#
+# **R36 从 read=120/deadline=180 放到 600/900**，理由是实测条件变了，不是"随手调大"
+# （R9 定 120 时那条测试的注释写着"防止有人随手调成 600"，所以这里必须说清）：
+#   · R32 起 S3 的提示词里带了裁剪后的知识块，实测 11 千 ~ 3 万 token；
+#   · R33 起 S3 产出的是 `S3Structured`（五步链 + 五家影响 + 本体引用），
+#     输出比 `S3Syndrome` 长一倍以上；
+#   · 而 S3 这一步**开着思考**（`thinking_by_step`），`reasoning_effort` 在
+#     full_context 下是 `max`——推理 token 也算在这一次响应里。
+# 三件事叠起来，一次 S3 在 120 秒读超时下会被判成"网络故障"然后重试三次，
+# 每次都在同一个地方超时：**表现是"三倍的钱换一个超时错误"**，而不是"快速失败"。
+# 非流式调用整个响应是一次 socket 读，所以读超时必须盖住整代生成时间。
+#
+# 放宽不等于放弃兜底：`deadline` 仍然是墙钟上限（read 的 1.5 倍），
+# R8 段 6 那个"设了 timeout=120 还是卡 46 分钟"的洞照样堵着——它堵的是
+# "对方细水长流地吐字节"，跟这个数调多大无关。
+API_TIMEOUTS = CallTimeouts(connect=15.0, read=600.0, write=30.0, pool=15.0, deadline=900.0)
 # 本地 vLLM server：权重是 server 自己启动时加载的（scripts/start_vllm.sh），
 # 但**首个请求**要等它把 CUDA graph / 预热做完，实测几十秒到几分钟；排队时
 # 单个请求也可能等很久。读 600 秒、墙钟 900 秒。
@@ -331,6 +347,9 @@ REASONING_MODELS = frozenset({"deepseek-v4-pro"})
 STEP_THINKING: dict[str, str] = {
     "s1": "disabled",
     "s2": "disabled",
+    # R36 的合一步。跟 s1/s2 一样关思考——合的是两个结构化抽取，
+    # 两边原来都关着，合起来之后开思考等于偷偷换了实验条件。
+    "s1s2": "disabled",
     "followup": "disabled",
     "residual": "disabled",
     "react": "disabled",
@@ -419,11 +438,16 @@ def s3_reasoning_effort() -> str:
 
 # R22：S3 采样几次（best-of-N）。1 = 关掉（跟 R21 及之前逐字节同一条路径）。
 S3_BEST_OF_N_ENV = "S3_BEST_OF_N"
-S3_BEST_OF_N_DEFAULT = 3
+#: **R36 从 3 改成 1。** 不是否定 R22——R22 量的是"采三次挑最高分"能把不合规的方
+#: 挑掉，而那件事在 R34 之后由**符号验证器**做了：验证器拿本体原文判 veto/revise，
+#: 判据可核、反例可读，比"分最高的那一次"强。两者叠着用等于同一件事付两次钱：
+#: 一次问诊的 S3 调用从 1 次变 3 次，墙钟跟着三倍，而 R34 的闭环最多再开 3 次。
+#: 旋钮留着（`S3_BEST_OF_N=3` 原样可用），R38 的消融要拿它当对照组。
+S3_BEST_OF_N_DEFAULT = 1
 
 
 def s3_best_of_n() -> int:
-    """S3 采几次、挑分最高的那次。**默认 3。**
+    """S3 采几次、挑分最高的那次。**默认 1（R36 起；R22~R35 是 3）。**
 
     放在这个模块而不是 core/chain.py：它跟 `S3_THINKING` / `S3_REASONING_EFFORT`
     是同一族旋钮（都决定"S3 这一步怎么调模型"），而 `core/usage.py` 算
@@ -452,6 +476,57 @@ def s3_best_of_n() -> int:
               f"这次按默认 {S3_BEST_OF_N_DEFAULT} 处理", file=sys.stderr)
         return S3_BEST_OF_N_DEFAULT
     return n
+
+
+#: R36：S1（症状标准化）与 S2（证素推断）合成一次调用。
+#:
+#: 为什么可以合：S2 的输入**只有** S1 的输出（症状 + 舌 + 脉），没有第三方数据要
+#: 在两步之间取；而两步都是"照着给定词表做结构化抽取"，同一次调用里做完不改变
+#: 任何一步的判据。省下来的是一整次往返（实测 S1 与 S2 各 2~4 秒，还各带一次
+#: 排队与连接开销）。
+#:
+#: 为什么不是"顺手合"：CLAUDE.md 那条「S1 全局只跑一次，两位医家共用」仍然成立
+#: ——合一之后**更**成立（连 S2 都只跑一次了）。但追问之后要**只重跑 S2**
+#: （`infer_elements`），那条路径不合并：追问改变的是症状集合的后验，症状标准化
+#: 不必重做。所以两个函数都留着，合一只发生在链路开头那一次。
+#:
+#: **默认关。** 打开用 `S1S2_MERGED=1`。
+#:
+#: 关着的理由不是没做完，是次序（详见 `core.chain.normalize_and_infer_merged`
+#: 的文档）：CLAUDE.md 那条铁律要求**危重症状的拦截发生在证素推断之前**，
+#: 而合一之后证素推断跟症状标准化在同一次调用里完成——拦截最早只能早到
+#: "那一次调用之前"，S1 归一之后才露出来的危重词（原文「呕吐咖啡色物」→
+#: 归一「呕血」）就挡不住证素推断了。省的是一次 2~4 秒的调用，
+#: 换掉的是一条结构性保证。R36 的调用数验收（≤4 次）不靠它也达到
+#: （S1+S2+S3 = 3 次），所以这条路完整实现、有测试、随时可开，但默认不开。
+#:
+#: R38 的消融要拿 `S1S2_MERGED=1` 量"合一之后证素质量变没变"；
+#: 分开的那条路是 R1~R35 全部数字的产出路径，两条都得留着。
+S1S2_MERGED_ENV = "S1S2_MERGED"
+S1S2_MERGED_DEFAULT = False
+_TRUE_WORDS = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
+
+
+def s1s2_merged() -> bool:
+    """S1+S2 合成一次调用还是分两次。
+
+    认不出的值**只打一句 stderr 走默认**，不抛异常——跟 `S3_MODE` 分开对待是
+    有意的：这个旋钮不改下游拿到的形状（两条路都产出同一对
+    `(S1Normalize, S2Elements)`），只改调用次数；而 `S3_MODE` 改的是 schema，
+    拼错一档静默走默认的表现是"怎么又出了五份答案"。
+    """
+    raw = (os.environ.get(S1S2_MERGED_ENV) or "").strip().lower()
+    if not raw:
+        return S1S2_MERGED_DEFAULT
+    if raw in _TRUE_WORDS:
+        return True
+    if raw in _FALSE_WORDS:
+        return False
+    print(f"[llm] {S1S2_MERGED_ENV}={raw!r} 只认 "
+          f"{'/'.join(_TRUE_WORDS)} 或 {'/'.join(_FALSE_WORDS)}，"
+          f"这次按默认 {S1S2_MERGED_DEFAULT} 处理", file=sys.stderr)
+    return S1S2_MERGED_DEFAULT
 
 
 def thinking_for(step: str) -> dict[str, str | None]:
@@ -672,6 +747,17 @@ class LLMBackend(ABC):
     # 这个后端的超时。子类覆盖（本地模型要长得多）；`LLM_TIMEOUT_SECONDS`
     # （旧名 `LLM_TIMEOUT` 仍然认）覆盖所有后端。
     TIMEOUTS: CallTimeouts = API_TIMEOUTS
+    #: 这个后端能不能边生成边把片段吐出来（R36）。
+    #:
+    #: **默认 False，而且 `generate()` 只在 True 时才把 `on_delta` 往下传。**
+    #: 两条理由：一是别的后端（CLI 子进程、进程内 vLLM）拿不到增量，多传一个
+    #: 关键字参数只会变成 TypeError 或被 `**kwargs` 静默吞掉；二是"请求了流式"
+    #: 和"真的流式了"必须分得开——分不开的话前端转着圈等，而 manifest 里写着
+    #: streaming=True，没人能看出问题在哪。
+    SUPPORTS_STREAMING: bool = False
+    #: 流式是真的增量还是拿已有的整段文本切出来的（回放后端）。
+    #: 演示模式下切出来的"流式"看起来跟真的一样，所以必须有一个字段说清楚。
+    STREAMING_IS_SIMULATED: bool = False
     # 传输类错误（超时、429、连接断）两次重试之间的等待秒数，按重试序号取。
     # 只对传输错误退避：校验错误是模型输出格式不对，回灌错误信息立刻重问才有
     # 意义，等一秒不会让它答得更对。之前是零间隔立刻重试，429 会变成三个
@@ -861,6 +947,21 @@ class LLMBackend(ABC):
         """
         raise NotImplementedError
 
+    def streaming_note(self) -> str | None:
+        """这次为什么没有真流式 / 流式是模拟的。能真流式就返回 None。
+
+        写成一句人话而不是一个布尔：manifest 与前端都要能直接显示它，
+        而"这个后端不支持"和"支持但是模拟的"要修的东西完全不同。
+        """
+        if not self.SUPPORTS_STREAMING:
+            return (f"后端 {self.backend_id()} 不支持流式输出，"
+                    "这次是一次性返回（前端不会有增量，不是卡住了）")
+        if self.STREAMING_IS_SIMULATED:
+            return (f"后端 {self.backend_id()} 的"
+                    "流式是把已有的整段文本切开发的（模拟），不是模型边生成边吐——"
+                    "耗时与首字延迟都不反映真实推理")
+        return None
+
     @abstractmethod
     def model_name(self) -> str:
         """实际使用的模型名，写进 manifest。
@@ -919,9 +1020,19 @@ class LLMBackend(ABC):
         temperature: float = 0.0,
         max_tokens: int | None = None,
         physician: str | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
         **kwargs,
     ) -> T:
         """给定 system/user 提示与目标 pydantic 模型，返回校验通过的模型实例。
+
+        on_delta（R36）是流式增量回调，签名 `(文本片段, 种类) -> None`，
+        种类是 `"content"`（正式输出）或 `"reasoning"`（思考过程，推理模型才有）。
+        **两种分开报**：S3 开着思考，思考 token 先到、正式输出后到，合成一种的话
+        前端会把思考过程当成方药渲染出来。不传就是非流式，逐字节走原路径。
+
+        `SUPPORTS_STREAMING=False` 的后端**不会收到这个参数**（见那个类属性的注释）：
+        调用方照样可以传，只是不会发生流式——用 `streaming_note()` 问"这次为什么
+        没流式"，不要靠猜。
 
         physician 只在本地后端（vLLM + LoRA）下有意义：知道这一次是替哪位医家
         推理的调用点（run_physician / run_react）显式传医家 id，后端据此选
@@ -965,10 +1076,13 @@ class LLMBackend(ABC):
         last_raw = ""
         for attempt in range(self.MAX_ATTEMPTS):
             try:
+                # 不支持流式的后端一个多余的关键字都不给（见 SUPPORTS_STREAMING）
+                stream_kwargs = ({"on_delta": on_delta}
+                                 if on_delta is not None and self.SUPPORTS_STREAMING else {})
                 raw = self._complete_within_deadline(
                     messages, temperature, max_tokens=max_tokens,
                     schema=schema, physician=physician,
-                    deadline=self.timeouts().deadline, **kwargs,
+                    deadline=self.timeouts().deadline, **stream_kwargs, **kwargs,
                 )
             except Exception as e:  # noqa: BLE001 - 传输类错误：超时/非零退出/API 异常
                 # 401/402/422 这类确定性失败直接抛，不进重试（见 NON_RETRYABLE_STATUS
@@ -1121,6 +1235,9 @@ class OpenAICompatBackend(LLMBackend):
     def backend_id(self) -> str:
         return "api"
 
+    #: 云端 OpenAI 兼容 API 支持 SSE 流式（`stream=True`），而且是**真**增量。
+    SUPPORTS_STREAMING = True
+
     def _complete(
         self, messages: list[dict], temperature: float,
         max_tokens: int | None = None,
@@ -1128,6 +1245,7 @@ class OpenAICompatBackend(LLMBackend):
         physician: str | None = None,
         thinking: str | None = None,
         reasoning_effort: str | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
         **kwargs,
     ) -> str:
         # schema / physician 在这一层如实忽略：云端 API 既没有 guided_decoding
@@ -1153,6 +1271,12 @@ class OpenAICompatBackend(LLMBackend):
         # 而"同样输入不同输出"正是被这个误解坑过一次的地方。
         if thinking != "enabled":
             extra["temperature"] = temperature
+        if on_delta is not None:
+            # **`include_usage` 必须开**：流式响应的 usage 只在最后一个空 choices 的
+            # chunk 里，不开的话 `record_usage` 一次也收不到，manifest 的
+            # cache_hit_ratio 静默变 None——R21 那个坑的同一个形状，只是换到流式这条路。
+            extra["stream"] = True
+            extra["stream_options"] = {"include_usage": True}
         resp = self.client.chat.completions.create(
             model=self._request_model_name(),
             messages=messages,
@@ -1166,11 +1290,14 @@ class OpenAICompatBackend(LLMBackend):
                         else self._default_max_tokens(thinking, reasoning_effort)),
             **kwargs,
         )
-        # R21：缓存命中读数就在这里取。**取完立刻记**，不等 generate() 层——
-        # 一次 generate 可能重试多次，每次请求都有自己的 usage，漏掉重试那几次
-        # 会让命中率偏高（重试的请求前缀完全相同，几乎必定命中）。
-        record_usage(getattr(resp, "usage", None))
-        content = resp.choices[0].message.content or ""
+        if on_delta is not None:
+            content = self._drain_stream(resp, on_delta)
+        else:
+            # R21：缓存命中读数就在这里取。**取完立刻记**，不等 generate() 层——
+            # 一次 generate 可能重试多次，每次请求都有自己的 usage，漏掉重试那几次
+            # 会让命中率偏高（重试的请求前缀完全相同，几乎必定命中）。
+            record_usage(getattr(resp, "usage", None))
+            content = resp.choices[0].message.content or ""
         if not content.strip():
             # HTTP 200 + 空响应体 = **模型名很可能不存在/已下线**（2026-09-15 实测：
             # 用已下线的 deepseek-chat 请求就是这个表现，不是 404）。不专门报出来的话
@@ -1178,12 +1305,65 @@ class OpenAICompatBackend(LLMBackend):
             # 校验失败，看不出根因在模型名上。**照旧抛异常走重试**（网络抖动也可能
             # 返回空），但把这条线索写进错误里。
             raise LLMError(
-                f"后端返回了 HTTP 200 但响应体是空的（model={self._request_model_name()!r}）。"
+                f"后端返回了 HTTP {'200（流式）' if on_delta is not None else '200'} "
+                f"但一个字都没收到（model={self._request_model_name()!r}）。"
                 "最常见的原因是**模型名不存在或已下线**——2026-09-15 实测 deepseek-chat "
                 "已下线，拿它发请求就是这个表现（不是 404）。"
                 "用 `curl $LLM_BASE_URL/models` 看当前可用的模型名，再设 LLM_MODEL。"
             )
         return content
+
+    def _drain_stream(self, stream, on_delta: Callable[[str, str], None]) -> str:
+        """读完一个流式响应，边读边喂 `on_delta`，返回拼起来的**正式输出**。
+
+        三条不许省的：
+
+        1. **返回值里只有 content，不含 reasoning。** 下游是
+           `schema.model_validate_json()`，思考过程拼进去就没有一次能过校验。
+        2. **usage 从最后那个 chunk 取**（`include_usage`），不是从第一个。
+        3. **回调抛异常不能把这次调用变成"网络错误"。** 前端断开时
+           `on_step` 会抛 `StreamClosed`，那时应该原样冒泡让上层收工；
+           而把它裹进传输类错误会触发 `generate()` 的重试——客户端都走了还重试三次。
+        """
+        parts: list[str] = []
+        usage = None
+        for chunk in stream:
+            got = getattr(chunk, "usage", None)
+            if got is not None:
+                usage = got
+            for text, kind in _delta_texts(chunk):
+                if kind == "content":
+                    parts.append(text)
+                on_delta(text, kind)
+        record_usage(usage)
+        return "".join(parts)
+
+
+def _delta_texts(chunk) -> list[tuple[str, str]]:
+    """一个流式 chunk 里的 (文本, 种类)。**思考与正式输出分开**：推理模型把思考
+    放在 `delta.reasoning_content`（DeepSeek）或 `delta.reasoning`（部分兼容实现），
+    合成一种的话前端会把思考过程当方药渲染出来。
+
+    取不到就返回空列表——chunk 里没有 choices（最后那个只带 usage 的）是正常的，
+    不是错误。
+    """
+    out: list[tuple[str, str]] = []
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return out
+    delta = getattr(choices[0], "delta", None)
+    if delta is None:
+        return out
+    for attr, kind in (("content", "content"),
+                       ("reasoning_content", "reasoning"),
+                       ("reasoning", "reasoning")):
+        piece = getattr(delta, attr, None)
+        if piece:
+            out.append((str(piece), kind))
+            if kind == "reasoning":
+                # 两个别名只认先取到的那个，不然同一段思考会被发两遍
+                break
+    return out
 
 
 class ClaudeCLIBackend(LLMBackend):

@@ -28,7 +28,8 @@ python -m scripts.collect_results --check    # 核对 README.md 和 eval/RESULTS
 |---|---|---|
 | 系统构成 | 五层：知识图谱 / RAG / SRC 推理链 / ReAct / 安全双闸 | 下一节 |
 | 外部基准 | SDT Test：chain 23.173 vs baseline 22.068，关安全否决 27.729 | 「外部基准」一节 |
-| 四种模式 | patient / doctor / student / researcher。**patient 拿不到 `formula_candidates`——那是安全边界，不是功能裁剪**，裁剪在服务端做（键根本不存在，不是存在但为空） | 「四种模式」一节 |
+| 四种模式 | patient / doctor / student / researcher。**patient 拿不到 `formula_candidates`——那是安全边界，不是功能裁剪**，裁剪在服务端做（键根本不存在，不是存在但为空）。**产品模式（`PRODUCT_MODE=1`，默认）下只剩前三种**，研究者那一档连同其余十五处研究面内容一起藏起来，能力保留在 `PRODUCT_MODE=0` | 「四种模式」一节、「产品模式」一节 |
+| 产品模式 | `PRODUCT_MODE=1`（默认）= 交付给医院的正式形态；`=0` = 内部研究面。**唯一分派点在 `core/product_mode.py`** | 「产品模式」一节 |
 | 三种后端 | api（开发评测）/ local（自部署）/ replay（演示） | 「三种后端」一节 |
 | 已知混杂与局限 | 12 条，一条都不省 | 「已知混杂与局限」一节 |
 | 如何复现 | 数据管线的命令序列，含 `graph_stats` 那个坑 | 「如何复现」一节 |
@@ -84,6 +85,108 @@ python -m scripts.collect_results --check    # 核对 README.md 和 eval/RESULTS
 Validation 做中间验证（满分上限 **48.9998/50**，官方金标准带 BOM），细节见
 [`eval/sdt/README.md`](eval/sdt/README.md)。数据怎么拿、提交文件什么格式见下面
 「TCMEval-SDT 的数据获取与接法（细节）」一节。
+
+## 外部基准二：MTCMB · TCM-PR（方剂推荐，R38 接入）
+
+给一段患者描述，输出一张方，按**药味集合**打分（P/R/F1 + 完全命中）。
+接法跟 SDT 同一个形状：两个 solver（`baseline` 裸模型 / `chain` 注入 S1+S2 的
+证素分析）、**同一份提示词**、差值才是这条链的贡献。
+
+```bash
+python -m eval.mtcmb.run --dir <MTCMB>/TCM-PR --probe        # 上机第一步，零调用
+python -m eval.mtcmb.run --dir <MTCMB>/TCM-PR --solver baseline --out out/pr_baseline.json
+python -m eval.mtcmb.run --dir <MTCMB>/TCM-PR --solver chain    --out out/pr_chain.json
+python -m eval.mtcmb.run --compare out/pr_baseline.json out/pr_chain.json
+```
+
+⚠ **字段映射没有在这台机器上核过**（写这一轮的沙盒连不上数据源），所以
+`--probe` 不是可选步骤：跳过它的代价不是报错，是一份"所有人都得 0 分"的漂亮
+报告。探针会打印真实字段名并报三类"多半映射错了"的形状。细节与跟开源中医模型
+（BianCang / ShizhenGPT）比较的三条可比性前提，见
+[`eval/mtcmb/README.md`](eval/mtcmb/README.md)。
+
+## 四组消融（R38）
+
+每一组**只动一个开关**，其余全是产品默认——同时动两个就没法归因：
+
+| 组 | 开关 | 回答什么 | 沙盒实测调用数 |
+|---|---|---|---|
+| A | （默认） | 基线 | **3** |
+| B | `S3_MODE=legacy` | 五家融合 vs 三家并置 | **5** |
+| C | `S3_BEST_OF_N=3` | 采三次挑最好的，值不值三倍的钱 | **5** |
+| D | `S1S2_MERGED=1` | 省一次往返的代价（产品里默认关，见 SOURCES 第 93 条） | **2** |
+
+三指标沿用 R34 定的那三个（带本体出处的药味占比 / 验证器一次过率 / 本体对语料的
+覆盖率），**legacy 组的验证器一格是「不适用」不是 0**——把不适用写成 0，
+等于拿一个不存在的失败去抹黑对照组。
+
+```bash
+python -m eval.ablation --backend fake --limit 2   # 只验管道，内容指标不出数
+python -m eval.ablation --backend real --queries-path tests/queries.txt
+```
+
+**假后端的内容指标一律不出数**（`content_metrics_valid: false`，Markdown 里印 ⏳）：
+它的产出是固定假文本，算出来的"带本体出处占比"只反映假数据长什么样。
+
+## 临床工作流闭环（R46）
+
+「采集 → 诊断 → 方案 → 检索 → 管理」五段。此前只有中间两段。
+
+| 段 | 做什么 | 入口 |
+|---|---|---|
+| 采集 | 结构化四诊录入（望闻问切 13 字段 + 常用词一键选）+ 「人」这一维（年龄/性别/生理阶段/体质/基础病/过敏史/在服药物/肝肾功能）。**自由文本仍是主路径**，二者可互转 | 输入区的「结构化四诊录入」折叠块；`GET /api/intake/form`、`POST /api/intake/parse` |
+| 诊断与方案 | 在既有推导链上补「人」维核查：妊娠禁忌、毒峻药慎用、小儿剂量折算、肝肾功能不全、过敏史。**每条都指得出本草原文**，取不到依据的维度不提示但会说"已核查" | 结果区的个体化清单；`core/individualize.py` |
+| 循证对照 | 本次结论与**教材推荐方案**逐项比对：一致的部分、不一致的部分（教材说什么/本次是什么/差在哪）、未覆盖。**只呈现差异，不用于择优** | 方剂区下方一行；`core/guideline_compare.py`、`GET /api/guideline/coverage` |
+| 病历文书 | 按《中医病历书写基本规范》生成草稿，三种导出（病历文本 / A4 处方笺 / 结构化 JSON）。医师逐段可改，**改前改后进审计链** | 医师模式下的「病历文书草稿」；`POST /api/emr/draft` |
+| 检索与管理 | 诊中知识速查（本草/方剂/教材方案/名医用药规律，**Ctrl/⌘ + K**，实测热查 4 ms）；问诊历史、收藏与批注、用药习惯统计 | `GET /api/knowledge/search`、`/api/history*` |
+
+**循证对照的底本是《方剂学》，不是《中医药循证临床实践指南》**——后者的全文
+不在这个项目里，照抄一份等于编造出处。所以界面上如实叫「与教材推荐方案的对照」。
+覆盖 52/337 个证型（285 条），覆盖率照实报，没有为了把数字做大而放宽匹配。
+
+**HIS 集成**（对标电子病历分级 4/5 级）：`POST /api/integration/consult`、
+`GET /api/integration/emr/{record_id}`，OpenAPI 3 文档，鉴权 = API Key +
+IP 白名单，**没配 `HIS_API_KEYS` 时默认拒绝**。
+
+### 输入侧的合规边界（§0.4）
+
+**只接受主诉与病历的文字描述。** 舌象照片、脉诊仪信号、检验数值等客观数据
+不在输入范围内——引入它们会使产品从「不作为医疗器械管理」变为需按医疗器械注册
+（《人工智能医用软件产品分类界定指导原则》）。
+
+这条护栏有三层：表单上写着、请求边界拦（400 + 中文说明）、源码级测试
+（`core/intake.py`/`core/schemas.py` 里出现图像/信号/检验数值字段名即 CI 红）。
+
+## 产品模式（R47）
+
+**能力不删，产品面不露。** 研究与评测的代码、对照模式、分歧读数全部留在
+仓库里（它们是申报材料与后续研究的资产），由一个环境变量决定这一次运行
+要不要把它们摆出来。
+
+```bash
+# 正式版（默认）：交付给医院的形态
+uvicorn api.main:app
+
+# 内部研究面：额度看板、检索方式选择、运行清单、研究者角色全部回来
+PRODUCT_MODE=0 uvicorn api.main:app
+```
+
+| | `PRODUCT_MODE=1`（默认） | `PRODUCT_MODE=0` |
+|---|---|---|
+| 角色 | 医师 / 学生 / 患者 | 上述三种 + 研究者（完整信息） |
+| 默认角色 | 医师 | 研究者 |
+| `/api/usage`、`/api/usage/validate-key` | **404**（不是 403——403 承认这个端点存在） | 正常应答 |
+| 顶栏 BYOK、额度、检索方式 | 不出现 | 出现 |
+| 用药对照带 + 噪声地板、运行清单、上下文面板 | 不出现；对照带换成「本方的依据强度」一句话 | 出现 |
+| 页脚 | 免责声明 + 版本号 + 本次记录编号 | 同左 |
+
+分派点只有 `core/product_mode.py` 一处（`is_product_mode()` /
+`require_internal()` / `resolve_role()`），前端的应用点只有 `applyProductMode()`
+一处。**内部功能在产品模式下被调用即抛错，不静默返回空**——静默是"半成品"
+观感的主要来源。
+
+术语与合规措辞见 `docs/glossary.md`，面向使用者的更新日志见 `CHANGELOG.md`，
+版本号只在 `core/version.py` 定义一处。
 
 ## 三种后端
 
@@ -209,6 +312,7 @@ python -m offline.extract_case_triples         # 7. 医案 → 三元组（要�
 python -m offline.build_syndrome_textbook \
     --md-path /tmp/tcmds/十四五教材/中医内科学.md \
     --out data/standard/syndromes.jsonl --append   # 8. 教材证候扩表（零 LLM 调用）
+python -m offline.mine_prescribing_patterns    # 9. 名医用药规律（零 LLM 调用）
 ```
 
 > ⚠ **第 5 步 `graph_stats` 名字像只读统计，它实际会写 `weight_by_physician` 回图。**
@@ -258,7 +362,7 @@ cp .env.example .env
 | `LLM_BASE_URL` | 默认 `https://api.deepseek.com` |
 | `LLM_MODEL` | 默认 `deepseek-v4-pro`。**原来的默认值 `deepseek-chat` 已于 2026-09 下线**——拿它发请求得到的是 HTTP 200 + **空响应体**（不是 404），症状是每次调用返回空串、校验失败、重试三次后 `LLMError`，看不出根因在模型名上。段 0 现在会查 `$LLM_BASE_URL/models`把这种情况在花第一分钱之前挡掉。⚠ 换模型 = 本仓库所有既有数字（ε/E3/E4/E8/E9/SDT）都不可直接比较，见 `eval/RESULTS.md` |
 | `LLM_MODE` 取 `claude_cli` | 走本机 `claude` CLI，**仅用于没有 API 网络时的冒烟**：模型不是 deepseek-chat、单次约 $0.06（DeepSeek 约 $0.0007），跑出来的分数不可与他人比较。`manifest.comparability_warning` 会把这一点一路带进报告 |
-| `LLM_TIMEOUT_SECONDS` | 单次调用的读超时秒数（旧名 `LLM_TIMEOUT` 仍然认）。不设时按后端取默认值：云端 API 读 120 秒 / 墙钟 180 秒，本地 vLLM server 600/900，进程内 vLLM 1800（首次调用要加载权重）。四个 HTTP 相位（connect/read/write/pool）**分别设**，另有一层墙钟兜底——理由见下面「超时」一节。SDK 自带重试已关，重试统一由 `generate()` 负责 |
+| `LLM_TIMEOUT_SECONDS` | 单次调用的读超时秒数（旧名 `LLM_TIMEOUT` 仍然认）。不设时按后端取默认值：云端 API 读 **600** 秒 / 墙钟 **900** 秒（**R36 从 120/180 放宽**：R32 起 S3 的提示词带 1.1 万~3 万 token 知识块、R33 起输出的是 `S3Structured`、而 S3 开着思考且 effort 可到 max——非流式调用整个响应是一次 socket 读，读超时盖不住整代生成时间的表现是"三倍的钱换一个超时错误"），本地 vLLM server 600/900，进程内 vLLM 1800（首次调用要加载权重）。四个 HTTP 相位（connect/read/write/pool）**分别设**，另有一层墙钟兜底——理由见下面「超时」一节。SDK 自带重试已关，重试统一由 `generate()` 负责 |
 | `LLM_MAX_TOKENS` | 单次输出上限。不设时按模型分两档：非推理模型 **8192**（DeepSeek 默认 4096，S0 抽多病人粗段会被截断）、推理模型 **16384**。推理模型要更大是因为 **max_tokens 同时盖住不可见的 reasoning tokens**：deepseek-v4-pro 实测「你好」一句就花 45 个 token、其中 36 个是 reasoning，8192 下 S3 的可见输出在 2081 字符处被砍断。判据在 `core/llm.py` 的 `_default_max_tokens()`（`REASONING_MODELS` 列出已知的推理模型），不靠人记着在 `.env` 里设对 |
 | `CLAUDE_CLI_MODEL` / `CLAUDE_CLI_TIMEOUT` | `claude_cli` 模式下的模型名与超时，默认 `claude-sonnet-5` / 180 |
 | `USE_REACT` | `1` 打开 ReAct 取证（默认关，见「ReAct 取证模式」一节） |
@@ -269,7 +373,9 @@ cp .env.example .env
 | `LLM_MAX_INFLIGHT` | 进程内**同时在途**的 LLM 请求数上限，默认 6。**跟 `MAX_CONCURRENT_CONSULTS` 是两件事**：那个限"同时几次问诊"，这个限"同时几个请求打到模型"。R12 三位医家改成并发之后两者相乘——4 个问诊槽 × 3 位医家 = 12 路同时打 API，会撞 DeepSeek 的速率限制（429）。只留一个闸拦不住 |
 | `S3_THINKING` | S3（按医家开方）开不开思考模式，`enabled`（默认，配 `reasoning_effort=high`）/ `disabled`。S1/S2/追问/ReAct **一律关思考**（结构化抽取，思考无增益却慢几十倍），这张表在 `core/llm.py::STEP_THINKING`。⚠ **关掉 S3 思考跑出来的数字跟默认配置下的不可比**，`manifest.comparability_warning` 会带上这句话；另外**思考模式下 temperature 不生效**，所以 `manifest.temperature_effective` 按步分别记 |
 | `S3_REASONING_EFFORT` | S3 想多久，`low`/`medium`/`high`/`max`。**不设时按检索方式取默认**：`full_context`（默认）→ `max`、top3 系 → `high`。理由在 `core/llm.py::s3_reasoning_effort`——full_context 下输入已经十几万 token 且靠缓存便宜 30 倍，这时限推理深度是省小钱费大钱；top3 保持 `high` 是为了跟 R1~R21 的数字可比。`max` 那一档的 `max_tokens` 默认升到 65536（推理 token 也算在里面） |
-| `S3_BEST_OF_N` | S3 采几次、按分最高的那次出结果，默认 **3**。`1` = 关掉（逐字节走回 R21 及之前那条路径）。打分用 R23 的 `score_formula`，见下面「best-of-N」一节。**这个数直接决定钱**：一次问诊的调用数是 `2 + 医家数 × N`，默认配置下 11 次。`FAST_MODE=1` 时它降到 1 |
+| `S3_BEST_OF_N` | S3 采几次、按分最高的那次出结果，**R36 起默认 1**（R22~R35 是 3）。打分用 R23 的 `score_formula`，见下面「best-of-N」一节。**这个数直接决定钱**：structured 下调用数是 `S1/S2 段 + N`、legacy 下是 `S1/S2 段 + 医家数 × N`，当前默认 3 次。改回 3 是 R38 消融的对照组。`FAST_MODE=1` 时它也是 1 |
+| `S1S2_MERGED` | S1（症状标准化）与 S2（证素推断）合成一次调用，`1` 打开、**默认 0（关）**。省的是一次 2~4 秒的往返；不默认开的理由是**次序**：合一之后证素推断跟症状标准化在同一次调用里完成，而 CLAUDE.md 那条铁律要求危重症状的拦截发生在**证素推断之前**——合一之后拦截最早只能早到"那一次调用之前"（只能拿原始主诉的字面查），S1 归一之后才露出来的危重词（原文「呕吐咖啡色物」→ 归一「呕血」）就挡不住证素推断了。打开时命中安全否决的请求照样**丢掉已推出的证素、返回 `s2: null`**，对外行为不变，但"丢掉"是流程约定、"没算过"才是结构保证。R36 的调用数验收（≤4）不靠它也达到 |
+| `S3_STREAM`（无需设置） | 流式没有开关：**后端支持就流**（`LLMBackend.SUPPORTS_STREAMING`）。云端 OpenAI 兼容 API 支持真流式；回放后端把录好的整段切开发、标成 `simulated`；`claude_cli`/进程内 vLLM 不支持。三种"没流式"各自会在 `s3_done` 事件与 `manifest.streaming.notes` 里写出**为什么**——界面上转圈而说不出原因是这一轮专门要防的事 |
 | `EMBEDDING_CACHE` / `EMBEDDING_CACHE_DIR` | 语料向量的磁盘缓存：`0` 关掉，或指定目录（默认 `data/cache/`，已 gitignore）。命中判据是模型名 + 语料条数 + **被编码文本的 sha256** 三者全等；缓存省的是"给全部语料编码"那一段，模型本身不管命不命中都要加载（查询要用它） |
 | `LOW_DISCRIMINATION_CUTOFF` | `0` 关闭（默认开）：检索到的候选之间没有真实区分度（top-1 与 top-k 原始相似度差 < 0.03）时只保留 top-1，避免塞几条弱相关候选进 prompt 稀释信号。这条不确定是不是净收益，做成开关是为了能跑两遍对比（`consult()` 返回的每位医家结果带 `low_discrimination` 标记） |
 
@@ -464,8 +570,8 @@ curl -N -X POST http://127.0.0.1:8000/api/consult/stream \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `QUOTA_PER_IP_DAILY_CALLS` | `55`（= 5 次问诊 × 每次 11 调用） | 每个 IP 每天的**模型调用**上限。**R22 起这个默认值是算出来的**：`calls_per_consult() * 5`，而 `calls_per_consult()` = `2 + 医家数 × S3_BEST_OF_N` = 2 + 3×3 = 11。把 `S3_BEST_OF_N` 调回 1 时它自动变回 25 |
-| `QUOTA_GLOBAL_DAILY_CALLS` | `2200`（= 200 次问诊 × 每次 11 调用） | 全站每天的模型调用上限，防一个人换 IP 刷爆。同上，`calls_per_consult() * 200` |
+| `QUOTA_PER_IP_DAILY_CALLS` | `15`（= 5 次问诊 × 每次 3 调用） | 每个 IP 每天的**模型调用**上限。**R22 起这个默认值是算出来的**：`calls_per_consult() * 5`。**R36 起当前默认配置下 `calls_per_consult()` = 3**（structured 五家融合成一次 S3 + `S3_BEST_OF_N` 默认 1，即 S1 + S2 + S3）；R22~R35 是 11（legacy 三位医家 × N=3 + 2）。把 `S3_BEST_OF_N` 或 `S3_MODE` 调回去它自动跟着变——**这一行永远不要手抄一个数**，写死过一次就漂过一次 |
+| `QUOTA_GLOBAL_DAILY_CALLS` | `600`（= 200 次问诊 × 每次 3 调用） | 全站每天的模型调用上限，防一个人换 IP 刷爆。同上，`calls_per_consult() * 200` |
 | `QUOTA_MAX_TRACKED_IPS` | `5000` | 额度表里最多记多少个 IP。**这是内存保护**：不设上限的话，用海量伪造 IP 发请求能把进程内存撑爆 |
 | `TRUSTED_PROXY_HOPS` | `0` | **默认 0 = 完全不读 `X-Forwarded-For`。** 直接信任 XFF 等于把限额送人——任何人加一个头就换一个"IP"。只有部署在**自己的**反代后面时才设成反代跳数（nginx 一层就是 1），此时从右往左数第 N 跳才是真实客户端；**绝不取最左跳**，最左跳是客户端自己写的 |
 | `FORCE_REPLAY` | 未设 | `1` 强制全站走回放（演示日用）。零成本、断网可用、每次一致 |
@@ -532,7 +638,33 @@ TRUSTED_PROXY_HOPS=1 QUOTA_PER_IP_DAILY_CALLS=55 QUOTA_GLOBAL_DAILY_CALLS=2200 \
 | 7 | **两环图谱浏览器** | 收成正好两环（是枢纽 / 不是枢纽）。原来三档会出现三四个半径相近的环，而"在第几环"本来要一眼读出"离枢纽多远"。环的含义写在画布下方的图例里，不靠人猜 |
 | 8 | **顶栏折叠 + 建议层渲染 + token 面板** | 顶栏设置可折叠（**默认展开**）；R23 的建议按 severity 分三档颜色 + 没跑的规则如实列出；R21 的 token 面板（本次前缀各段 / 本次命中率 / 今日累计）挂在 manifest 旁边 |
 
-**验收**：`python -m scripts.screenshot_states` 20 种状态全过，其中 R24 四张
+### R37：structured 模式的结论是**一条九段的链**，不是"三列里只剩一列"
+
+R33 把五位医家融合成一份结论之后，`S3_MODE=structured` 下页面上就只有一列了。
+R37 把它改成一条链，段与段之间那条竖线就是 `S3Structured` 里的
+`from_organs` / `from_syndrome` / `from_method`（上一段的结论是下一段的输入）：
+
+```
+① 主诉与标准化症状  ② 证素  ③ 追问        ← S1 / S2
+④ 病变脏腑  ⑤ 证型  ⑥ 治法  ⑦ 方剂  ⑧ 药物组成  ⑨ 校验与出处   ← S3
+```
+
+- **两种形态互斥**：`S3_MODE=legacy` 仍然是三列集注（R38 的消融要用它当对照组），
+  structured 下三列**清空**而不是藏起来。判断走"这份响应有几条结论"这个事实，
+  不是"服务端默认哪种模式"这个可能回落的配置——一份多医家的响应永远不会被画成单链。
+- **点词看释义**：`GET /api/node_explain?node=...&name=...`，四节（是什么 / 出处原文 /
+  名医怎么用 / 注意），**零 LLM 调用**，全部来自已有的本草·方剂本体、证候表、
+  医案三元组。查不到就整块隐藏，不显示"暂无信息"的空壳。
+- **链顶写明"这是谁的结论"**，旁边那行「引用名老中医经验 N 家」按
+  `physicians_cited` 照实数，不拿"五家"这个名字当数。
+
+**验收**：`python -m scripts.screenshot_states` **29** 种状态全过，其中 R37 八张
+（三种分辨率的单链、跑到一半的骨架、取消按钮、节点释义、单链图）。
+这一轮 Playwright 抓到四件 Python 测试全绿的事——包括**单链区因为两个隐藏开关
+叠在一起而从没显示过**（四张截图全空白、判据全绿）。四件都记在
+`data/SOURCES.md` 第 94~98 条。
+
+**验收（R24 当轮的数）**：`python -m scripts.screenshot_states` 当时 20 种状态全过，其中 R24 四张
 （`r24_epigraph` / `r24_select_open` / `r24_advice_panel` / `r24_rings`）。
 这一轮 Playwright 抓到两件纯函数测试全绿的事：对照带换成 SVG 之后旧判据还在查
 `.rx-seg`（结构没了），以及 token 面板嵌在折叠区里时 `innerText` 读回空串
@@ -546,6 +678,7 @@ TRUSTED_PROXY_HOPS=1 QUOTA_PER_IP_DAILY_CALLS=55 QUOTA_GLOBAL_DAILY_CALLS=2200 \
 一句静态的"请耐心等待"；系统要追问时页面上直接弹输入框，答完流继续往下走。
 结果出来后是六层生长图（症状→证素→病名·证型→方剂→药材，方剂/药材是
 compound 父子节点）+ 各位医家的结论对照 + 分歧度（医家数取自 `core/physicians.py` 注册表，现在是三位）。
+`S3_MODE=structured` 下结论区换成上面那条九段链（见「R37」一节），图仍然照画。
 
 **图谱浏览器页**——浏览持久知识图谱（`data/graph.json` 的国标结构层）。
 R16 起**首屏铺的是证素**（20 个 `../data/graph.json:graph.n_elements=20`），
@@ -580,6 +713,18 @@ R17 把它们纳入了 `python -m scripts.collect_results --check`。
 剂量不进节点标签（"党参三钱"显示成"党参"），但节点 id 保留原始写法——
 侧栏证据链靠它反查。
 
+## 申报书补充：只增不改（R39）
+
+往一份已有的 docx 里补内容，**原有的黑色正文一个字不许变**，而这件事要能被机器
+核。`scripts/annotate_docx.py` 三个子命令：`fingerprint`（改之前拍指纹）、
+`annotate`（按清单补，新增内容一律红色 `E54C5E`）、`verify`（校验原文没被动过，
+**失败退出码非 0**）。
+
+校验口径在**文本层、按顺序比**：滤掉补充色之后，剩下那串文字的 sha 序列必须
+一字不差、一序不乱。不按 `(段落号, run 号)` 比——插一段会让后面所有下标后移，
+那种会误报的校验迟早被加白名单绕过去。锚点找不到或撞名时**直接报错、不猜位置**：
+补充内容放进错的章节比没加更糟。
+
 ## 离线脚本一览
 
 | 脚本 | 作用 |
@@ -589,6 +734,7 @@ R17 把它们纳入了 `python -m scripts.collect_results --check`。
 | `offline/export_sft.py` | 从 `cases.json` 派生 alpaca 格式的 SFT 训练样本 `sft.jsonl`（`python -m offline.export_sft`）。现在数据量不够训练，这一步只是把管道建好，并在代码层面强制过滤掉 `copyright_status == "copyrighted"` 的记录 |
 | `offline/build_graph.py` | 从 `data/standard/syndromes.jsonl` 建知识图谱骨架（symptom/element/syndrome 三类节点，`python -m offline.build_graph`），并打印语料库门类覆盖检查 |
 | `offline/graph_stats.py` | 给图里的 indicates 边算并写回医家级四层收缩权重，打印节点/边分布、λ1 分布等统计（`python -m offline.graph_stats`）——**λ 相关的数字务必看下面"知识图谱权重"一节的 λ2 说明再解读** |
+| `offline/mine_prescribing_patterns.py` | R35：从 `cases.json` 统计挖名医用药规律（高频药/药对/剂量/复诊加减），写 `data/standard/prescribing_patterns.jsonl`（`python -m offline.mine_prescribing_patterns`）。**零 LLM 调用**——「叶天士常用党参白术」让模型总结出来是生成、会编，数出来是计数、每条都能回指 `case_id`。剂量从原文抓（`herbs` 没有结构化剂量），**锚在这张方已知的药名上**而不是让正则猜药名（猜法只抓到 9% 的方，见 data/SOURCES.md 第 90 条）。定位外医案（`out_of_scope`）默认排除，`--include-out-of-scope` 才带上 |
 | `offline/build_jieba_dict.py` | K3a：生成 BM25 检索用的中医术语自定义词典 `data/jieba_dict.txt` |
 | `offline/estimate_epsilon.py` | E：估计噪声地板 ε（`epsilon_online`/`epsilon_core`/`epsilon_adjunct`/`epsilon_s2`/`epsilon_extract`），写 `eval/epsilon.json`，供前端"分歧度"和 V1 的显著性判断做对照基准。`epsilon_core`/`epsilon_adjunct` 是 R1 加的君臣/佐使分层地板（见「分歧度的三层」一节），跟 `epsilon_online` 是同一批调用切出来的，不额外花钱 |
 | `offline/extract_case_triples.py` | X3：从每一诊原文用真实 LLM 抽取三元组（`{case_id,physician,s,p,o,source_span}`），写 `data/case_triples.jsonl`，`core/tools.py` 的 `query_case_graph` 工具消费这份数据 |
@@ -1544,14 +1690,23 @@ N 张方之间挑一张（R22）。跨问诊比这个分没有意义——不同
 判据是 `api/main.py::_role_gets_advice` 一个函数，`/api/prescription/validate`
 和 `results[i]` 两处都问它。
 
-## best-of-N：同一位医家采 N 次，按分挑一张（R22，默认 N=3）
+## best-of-N：同一位医家采 N 次，按分挑一张（R22 加，**R36 起默认 N=1**）
 
-S3 不再只采一次：每位医家**并发**采 `S3_BEST_OF_N` 次（默认 3），用上面那把
-`score_formula` 给每次打分，挑分最高的一次出结果。
+S3 可以采 `S3_BEST_OF_N` 次、用上面那把 `score_formula` 给每次打分、挑分最高的
+一次出结果。**R36 把默认值从 3 改回 1**，理由不是否定 R22——R22 要的"把不合规的
+方挑掉"这件事在 R34 之后由**符号验证器**做了（拿本体原文判 veto/revise，判据可核、
+反例可读，比"分最高的那一次"强）。两者叠着用等于同一件事付两次钱：S3 调用数三倍、
+墙钟跟着三倍，而验证器的闭环最多还要再开 3 次。旋钮留着，R38 的消融要拿它当对照组。
 
 ```
-一次问诊的调用数 = 2 + 医家数 × N        ← core/usage.py::calls_per_consult()
-默认配置（3 位医家、N=3）= 2 + 9 = 11 次   （R21 及之前是 5 次）
+一次问诊的调用数：
+  structured（产品默认）  = S1/S2 段 + N              ← core/usage.py::calls_per_consult()
+  legacy（对照组）        = S1/S2 段 + 医家数 × N
+S1/S2 段 = 2（分两次，默认）或 1（S1S2_MERGED=1 合成一次，R36 加，默认关）
+
+R36 默认配置（structured、N=1、不合并）= 2 + 1 = 3 次
+R22~R35 默认（legacy、3 位医家、N=3）   = 2 + 9 = 11 次
+R21 及之前                              = 5 次
 ```
 
 这个折算系数**只有一处实现**：额度默认值、看板上的"约剩几次问诊"、

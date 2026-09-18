@@ -94,7 +94,11 @@ def test_the_quota_check_uses_the_computed_calls_per_consult(monkeypatch):
 
     monkeypatch.delenv("QUOTA_PER_IP_DAILY_CALLS", raising=False)
     assert str(calls_per_consult()) in dp.check_quota().detail
-    monkeypatch.setenv("QUOTA_PER_IP_DAILY_CALLS", "5")
+    # **坏值要从折算系数推，不能写死**（R36 修）：原来写死 `5`，而它能不能凑够
+    # 一次问诊取决于 `calls_per_consult()`——R22~R35 是 11（5 凑不够、fail），
+    # R36 起默认是 3（5 够一次、ok），于是这条测试红在跟它要测的东西无关的地方。
+    # 这是 SOURCES.md 第 33 条那个"动态化写死规模"的同一个形状。
+    monkeypatch.setenv("QUOTA_PER_IP_DAILY_CALLS", str(max(0, calls_per_consult() - 1)))
     bad = dp.check_quota()
     assert bad.status == "fail" and "0 次问诊" in bad.detail
     monkeypatch.setenv("QUOTA_PER_IP_DAILY_CALLS", str(calls_per_consult() * 5))
@@ -143,11 +147,22 @@ def test_the_missing_corpus_is_a_failure_with_the_command_to_fix_it(tmp_path):
 
 
 def test_the_physician_check_reports_enabled_versus_registered():
-    """启用几位 / 注册表共几位——两个数分开报。R18 之后注册表有五位、
-    启用三位，只报一个数说不清楚。"""
+    """**三个数**：本次模式参与几位 / 三列集注启用几位 / 注册表共几位。
+
+    R18 之后注册表五位、启用三位，只报一个数说不清楚；**R39 验收又加了一个**
+    ——产品默认是 structured（五位全参与综合分析，走 `in_synthesis` 而不是
+    `enabled`），只报"启用 3 位"会跟界面上的「五家综合」对不上，演示前当场解释不清。
+    """
+    from core.physicians import physicians_for_mode
+
     c = dp.check_physicians()
     assert c.status == "ok"
     assert "启用" in c.detail and "注册表共" in c.detail
+    assert "本次模式" in c.detail, "没报这次模式下到底几位参与"
+    # 数字从注册表现算，不写死——注册表加一位这条测试不该跟着改
+    from core.llm import s3_mode
+
+    assert f"参与 {len(physicians_for_mode(s3_mode()))} 位" in c.detail
 
 
 def test_the_credential_check_runs_the_same_checker_as_the_gate():

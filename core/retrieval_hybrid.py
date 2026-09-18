@@ -39,6 +39,7 @@ import os
 import threading
 from pathlib import Path
 
+from core.parallel import run_routes
 from core.retrieval import CASES_PATH, DenseRetriever, full_context_hits
 from core.retrieval_graph import ElementRetriever
 from core.schemas import CaseRecord
@@ -331,12 +332,25 @@ class HybridRetriever(DenseRetriever):
             # 条目照常返回、展示它真实的低分，不是把它藏起来。前端和 E3
             # 报告能看到"这条是 BM25 找到的、dense 分只有 0.5"，这比让它
             # 悄悄消失或悄悄显示成误导性的 0.0 更诚实。
-            dense_ranking = self._dense_ranking(query, idxs, min_score=0.0)
-            bm25_ranking = self._bm25_ranking(query, idxs)
+            # R40：三路**并行**算。三路之间没有依赖（各自从 idxs 独立打分），
+            # 串行跑纯粹是当初顺着写下来的。稠密路是 numpy 的矩阵乘——
+            # numpy 在算的时候放开 GIL，所以 BM25（纯 Python）能真的跟它重叠；
+            # 证素路是集合运算，短。
+            #
+            # **顺序必须一字不差地保住**：`rankings` 的顺序进 RRF，换了顺序
+            # 融合结果就变，那不是"更快"而是"不一样"。所以按固定的键取回，
+            # 不按 `as_completed` 的到达顺序。
+            routes = [("dense", lambda: self._dense_ranking(query, idxs, min_score=0.0)),
+                      ("bm25", lambda: self._bm25_ranking(query, idxs))]
+            if query_elements:
+                routes.append(("graph", lambda: self._graph_ranking(query_elements, idxs)))
+            done = run_routes(routes, thread_name_prefix="retrieve")
+            dense_ranking = done["dense"]
+            bm25_ranking = done["bm25"]
             dense_scores = dict(dense_ranking)
             rankings = [[i for i, _ in dense_ranking], [i for i, _ in bm25_ranking]]
             if query_elements:
-                rankings.append([i for i, _ in self._graph_ranking(query_elements, idxs)])
+                rankings.append([i for i, _ in done["graph"]])
             fused = _rrf_fuse(rankings)
             # bm25 保底：见 BM25_FLOOR_N 上面那段注释。floor_n 夹到
             # max(0, k-1)——k 很小时也要留至少 1 个名额给纯 RRF 排名，不然

@@ -606,8 +606,15 @@ def test_health_reports_demo_mode(monkeypatch, tmp_path):
     _record(tmp_path)
     monkeypatch.setattr(llm_mod, "_llm_singleton", ReplayBackend(tmp_path))
     with TestClient(app) as client:
-        body = client.get("/health").json()
-    assert body["status"] == "ok"
+        resp = client.get("/health")
+        body = resp.json()
+    # R40 起 `/health` 是**就绪**探针：预热还在跑时回 503，而响应体照样完整。
+    # 这条测试问的是"演示模式那行小字在页面一加载时拿不拿得到"，
+    # 答案必须在两种状态下都是"拿得到"——所以断言的是响应体，不是状态码。
+    # （把状态码断言成 200 的话，这条测试会因为"这台机器预热得慢"而红，
+    #  而那跟它要测的事情毫无关系。）
+    assert resp.status_code in (200, 503)
+    assert body["status"] in ("ok", "warming")
     assert "非实时调用" in body["demo_mode"]["notice"]
 
 

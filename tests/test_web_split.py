@@ -46,15 +46,135 @@ def test_index_html_has_no_inline_script_or_style():
     assert "<script>" not in html, "index.html 里又出现了内联脚本"
     assert "<style>" not in html, "index.html 里又出现了内联样式"
     for name in SCRIPT_FILES:
-        assert f'<script src="{name}"></script>' in html, f"index.html 没有引 {name}"
+        # R41：三个都带 `defer`。判据从"逐字匹配整个标签"改成"src 在且带 defer"
+        # ——前者会因为多一个属性就红，而那不是它要防的事（它防的是内联脚本
+        # 和漏引某个文件）。defer 本身由下面那条专门的测试钉。
+        assert f'<script src="{name}"' in html, f"index.html 没有引 {name}"
     assert '<link rel="stylesheet" href="app.css">' in html
 
 
+def test_every_script_is_deferred_so_html_parsing_and_downloading_overlap():
+    """R41：三个脚本都要带 `defer`。
+
+    它们在 `</body>` 之前，本来就不阻塞首次绘制——`defer` 买到的是**边解析
+    HTML 边并行下载**这三个文件（实测 157 + 89 + 10 KB），而不是解析到那一行
+    才开始取。
+
+    `defer` 而不是 `async`：`async` **不保证执行顺序**，而这三个有硬顺序
+    （app.js 用 graph.js 定义的 `formulaSourceLabel`，顺序反了是 ReferenceError）。
+    这条测试同时钉住"不许改成 async"。
+    """
+    html = load_html()
+    for name in SCRIPT_FILES:
+        i = html.index(f'<script src="{name}"')
+        tag = html[i:html.index(">", i) + 1]
+        assert " defer" in tag, f"{name} 没带 defer：{tag}"
+        assert " async" not in tag, f"{name} 用了 async——顺序就不保证了：{tag}"
+
+
+def test_the_head_no_longer_loads_cytoscape_synchronously():
+    """R41：`<head>` 里那个同步的 CDN `<script>` 已经去掉了。
+
+    实测它 `renderBlockingStatus: "blocking"`、240 ms，而那 373 KB 只有图谱页
+    要用。加上三甲内网取不到 cdnjs，那条请求会一直挂到超时——而"断网可用"
+    正是录制回放这条路线存在的理由。
+
+    唯一的加载路径现在是 `graph.js` 的 `ensureCytoscape()`（用时插入本地副本）。
+    """
+    html = load_html()
+    assert "cdnjs" not in html, "index.html 又从 CDN 取东西了"
+    # 判据是 `<head>` 里**一个 `<script` 标签都没有**，不是"没出现 cytoscape
+    # 这个词"——注释里提它是正常的（那正是解释为什么不在这里加载）。
+    head = html.split("<body")[0]
+    assert "<script" not in head, f"<head> 里又出现了 script 标签：{head[-300:]}"
+    graph_js = (WEB / "graph.js").read_text(encoding="utf-8")
+    # R42 把插 <script> 那几行抽成了 `_loadScript`（dagre 也要走同一条路），
+    # 所以判据从"有这一行赋值"改成"这个文件名被交给了 _loadScript"。
+    # **意图没变**：本地副本是唯一的加载路径，index.html 里不加载。
+    assert '_loadScript("vendor/cytoscape.min.js"' in graph_js, (
+        "本地副本那条加载路径没了——那 index.html 里也不加载的话图就永远画不出来")
+    assert "_loadScript(DAGRE_SRC" in graph_js, "dagre 没走同一条本地加载路径"
+    assert 'DAGRE_SRC = "vendor/dagre/dagre.min.js"' in graph_js
+
+
+#: 结构文件的行数上限。R13 定 250；**R41 提到 254**，多出来的四行是
+#: 两条 `<link rel="preload">`（首屏字体，见 test_the_first_screen_fonts_are_preloaded）
+#: 加一行解释性注释再加一行余量——它们都是结构，不是逻辑。
+#:
+#: **R42 提到 272**，多出来的 18 行逐项是：
+#:   +1  `#gb-breadcrumb`（图谱浏览器的聚焦路径）
+#:   +2  它的解释性注释
+#:   +1  余量
+#:   （以下 14 行是同一轮问诊图那一侧的）
+#:   +1  `#png-btn`（导出 PNG 按钮）
+#:   +1  `#graph-layers`（九层的层名列头容器）
+#:   +2  `#cy` 加 tabindex/role/aria-label（无障碍，属性太长只能折行）
+#:   +2  `#graph-tooltip` 加 role/aria-live/aria-hidden（同上）
+#:   +8  上述四处各自的解释性注释（为什么导出要 2 倍白底、为什么缺层也要出列头、
+#:       为什么画布要能聚焦、为什么是 polite 而不是 assertive）
+#: 都是结构与无障碍属性，**一行逻辑都没有**。
+#:
+#: 这个数的用途是防"HTML 又长回 3574 行、改版面得在里面找 DOM"，不是卡到个位数。
+#: 每次提它都要在这里写明多出来的是什么，否则它会一轮一轮地被磨掉。
+#:
+#: R47 从 272 提到 **362**（实际 358 行 + 4 行余量）。净增 89 行，其中 43 行是
+#: 注释，46 行是结构。逐块交代：
+#:   +8   `<html data-product-mode="1">` 与它的注释（为什么默认值站在正式版这边）
+#:   +9   顶栏三组内部控件各自的 `internal-only` 标记与注释（额度/BYOK/检索模式）
+#:   +3   研究者 option 的 `data-internal-role` 与注释（为什么要摘掉而不是 CSS 藏）
+#:   +13  题记的产品面/研究面两套措辞 + `#how-to-use` 三行（§8.4 第 25 条空状态）
+#:   +5   `#evidence-strength`（产品面替代用药对照带的那一句）与注释
+#:   +19  `#chain-skeleton` 骨架屏 + `#eta-note` 预计剩余（§8.4 第 26 条加载态）
+#:   +3   `#empty-result`（§8.4 第 28 条空结果不静默）
+#:   +14  `<footer id="app-footer">`：免责声明 + 版本 + 本次记录编号 + 引导入口
+#:   +20  `#onboarding` 三步引导对话框（§8.4 第 34 条）
+#:   +6   `#help-pop` 与两个 `?` 帮助按钮（§8.4 第 35 条）
+#: 全部是结构与文案，**一行逻辑都没有**——产品模式的分派在 core/product_mode.py，
+#: 应用到 DOM 上的那一处在 app.js 的 `applyProductMode()`。
+#: R46 从 362 提到 **436**（实际 432 行 + 4 行余量）。净增 74 行，逐块交代：
+#:   +42  `#intake-box`：结构化四诊录入（望闻问切四组 + 患者概况 9 个字段
+#:        + 两个互转按钮）与它的注释。字段**行**是后端下发后由 JS 渲染的，
+#:        这 42 行只是容器与患者概况那一张固定表。
+#:   +5   `#guideline-box` / `#individualization-box` 两个容器与注释
+#:   +14  `#emr-box`：病历文书草稿容器 + 三个导出按钮 + 注释
+#:   +13  `#kp-overlay`：知识速查浮层（输入框 + 结果区）与注释
+#: 仍然是结构与文案，**一行逻辑都没有**。
+INDEX_HTML_MAX_LINES = 436
+
+
 def test_index_html_is_structure_only():
-    """结构文件要短到能一眼读完——R13 的判据是 ≤ 250 行。拆分的全部意义就是
-    "改版面时不用在 3574 行里找 DOM"。"""
+    """结构文件要短到能一眼读完。拆分的全部意义就是
+    "改版面时不用在 3574 行里找 DOM"。上限见 `INDEX_HTML_MAX_LINES`。"""
     lines = load_html().splitlines()
-    assert len(lines) <= 250, f"index.html 有 {len(lines)} 行，结构文件不该这么长"
+    assert len(lines) <= INDEX_HTML_MAX_LINES, (
+        f"index.html 有 {len(lines)} 行，上限 {INDEX_HTML_MAX_LINES}"
+        "——结构文件不该这么长")
+
+
+def test_the_first_screen_fonts_are_preloaded():
+    """R41：首屏那两个字重要 `preload`。
+
+    不 preload 时它们要等 CSS 解析完、布局判定"这一段确实用到这个字重"之后
+    才开始下载，而 CJK 子集是 246–320 KB/个——那段等待就是 FOUT（先系统字体、
+    再换成 Noto）的长度。
+
+    **另外两个字重刻意不 preload**：serif 600 / sans 500 在首屏之下，
+    preload 它们会把带宽从真正要用的那两个身上抢走（preload 是"现在就下"，
+    不是"提前知道"）。这条测试同时钉住这个边界——四个全 preload 跟一个都不
+    preload 一样是错的。
+    """
+    html = load_html()
+    preloaded = [ln for ln in html.splitlines() if 'rel="preload"' in ln]
+    assert len(preloaded) == 2, f"preload 的字体不是两个：{preloaded}"
+    for want in ("noto-serif-sc-400-subset.woff2", "noto-sans-sc-400-subset.woff2"):
+        assert any(want in ln for ln in preloaded), f"没 preload {want}"
+    for dont in ("noto-serif-sc-600", "noto-sans-sc-500"):
+        assert not any(dont in ln for ln in preloaded), f"{dont} 不该 preload"
+    for ln in preloaded:
+        # 字体的 preload **必须带 crossorigin**，否则浏览器会再下一遍
+        # （字体请求本身是匿名 CORS 模式，两个请求的缓存键不一样）。
+        assert "crossorigin" in ln, f"字体 preload 少了 crossorigin：{ln}"
+        assert 'as="font"' in ln, f"preload 少了 as=font：{ln}"
 
 
 def test_the_scripts_load_in_the_same_order_the_tests_concatenate_them():
@@ -62,7 +182,7 @@ def test_the_scripts_load_in_the_same_order_the_tests_concatenate_them():
     的代码可能因为初始化顺序在浏览器里炸。**graph.js 在前、app.js 在后**：app.js
     末尾有一批加载时就执行的初始化，它必须排在所有函数定义之后。"""
     html = load_html()
-    positions = [html.index(f'<script src="{name}"></script>') for name in SCRIPT_FILES]
+    positions = [html.index(f'<script src="{name}"') for name in SCRIPT_FILES]
     assert positions == sorted(positions), f"HTML 里的顺序跟 SCRIPT_FILES 不一致：{SCRIPT_FILES}"
 
 
@@ -96,11 +216,21 @@ def test_the_graph_code_went_to_graph_js_and_the_rest_to_app_js():
 
 
 def _defs(text: str) -> set[str]:
-    return set(re.findall(r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", text, re.M))
+    """顶层定义的名字。**函数与常量对象都算**：R42 起 graph.js 还导出一个
+    `NODE_ID`（节点 id 的构造表），app.js 通过 `NODE_ID.syndrome(...)` 用它
+    ——只认 `function` 的话这类导出会被判成"清单里有、实际没人用"。"""
+    fns = re.findall(r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", text, re.M)
+    # 顶层 `const X = {` / `const X = new ...`：只取**大写开头或全大写**的，
+    # 那是这个项目里"导出用的常量表"的写法；小写的局部常量不算导出候选。
+    consts = re.findall(r"^const ([A-Z][\w$]*)\s*=", text, re.M)
+    return set(fns) | set(consts)
 
 
 def _calls(text: str) -> set[str]:
-    return set(re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", text))
+    """被调用/被取属性的名字。`foo(` 与 `Foo.bar` 都算——后者是常量表的用法。"""
+    called = re.findall(r"\b([A-Za-z_$][\w$]*)\s*\(", text)
+    dotted = re.findall(r"\b([A-Z][\w$]*)\.[A-Za-z_$]", text)
+    return set(called) | set(dotted)
 
 
 def _tcm_list(text: str) -> set[str]:

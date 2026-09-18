@@ -70,14 +70,23 @@ def test_call_timeouts_maps_each_phase_separately_not_one_number():
     httpx = pytest.importorskip("httpx")
     t = API_TIMEOUTS.httpx_timeout()
     assert isinstance(t, httpx.Timeout)
-    assert (t.connect, t.read, t.write, t.pool) == (15.0, 120.0, 30.0, 15.0)
+    assert (t.connect, t.read, t.write, t.pool) == (15.0, 600.0, 30.0, 15.0)
     assert t.connect != t.read, "连接和读的上限不该是同一个数"
 
 
 def test_api_read_timeout_is_far_above_normal_and_far_below_hung():
-    """值的依据：单次 S3 调用实测 6~8 秒、ReAct 单步 2~3 秒、S0 最慢 60 秒量级。
-    120 秒远超正常值、远低于"挂死"。这条钉住那个区间，防止有人随手调成 600。"""
-    assert 100 <= API_TIMEOUTS.read <= 180
+    """**R36 把这个区间从 100~180 挪到 500~900，这条断言的历史要留着。**
+
+    R9 定 120 秒时的依据是：单次 S3 调用实测 6~8 秒、ReAct 单步 2~3 秒、
+    S0 最慢 60 秒量级——那时这条测试的注释写着"防止有人随手调成 600"。
+    R36 真的调成了 600，因为实测条件变了（见 core/llm.py 那段注释）：R32 起 S3
+    的提示词带 1.1 万~3 万 token 知识块、R33 起输出的是 S3Structured、而 S3
+    这一步开着思考且 effort 可到 max。非流式调用整个响应是**一次** socket 读，
+    读超时必须盖住整代生成时间，否则表现是"三倍的钱换一个超时错误"。
+
+    区间仍然要钉：600 秒远超正常值、远低于"挂死"（R8 段 6 那次是 46 分钟）。
+    """
+    assert 500 <= API_TIMEOUTS.read <= 900
     assert API_TIMEOUTS.deadline > API_TIMEOUTS.read, "墙钟必须比单次读长，否则读超时没机会触发"
 
 
@@ -127,7 +136,10 @@ def test_timeouts_differ_per_backend(backend_cls, expected):
 def test_local_backends_allow_much_longer_than_the_cloud_api():
     """本地模型首次调用要加载权重 / 做预热，几分钟是正常的——拿云端那套 120 秒
     去卡它会把正常启动判成故障。进程内模式最长（权重在进程里加载）。"""
-    assert API_TIMEOUTS.deadline < LOCAL_SERVER_TIMEOUTS.deadline < INPROC_TIMEOUTS.deadline
+    # **R36 起云端跟本地 server 是同一个量级（都是 600/900），所以这里是 ≤ 而不是 <。**
+    # 两边要等的东西不同但时长收敛了：本地等的是首个请求加载权重/预热，
+    # 云端等的是开着思考的一次长生成。进程内模式仍然严格最长（权重在进程里加载）。
+    assert API_TIMEOUTS.deadline <= LOCAL_SERVER_TIMEOUTS.deadline < INPROC_TIMEOUTS.deadline
     assert INPROC_TIMEOUTS.deadline >= 1800
     # CLI 后端的墙钟要比它自己的 subprocess 超时长，好让更具体的那条错误先抛出来
     assert ClaudeCLIBackend.TIMEOUTS.deadline > ClaudeCLIBackend.DEFAULT_TIMEOUT

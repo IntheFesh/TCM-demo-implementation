@@ -7,6 +7,7 @@ Playwright 验证的是"真实渲染出来看起来对不对"（模块报告里�
 验证的是算法本身对不同形状的输入（候选方数量、每个候选方的药材数量）给出
 的坐标是不是真的不重叠，覆盖 Playwright 那一份 fixture 之外的形状。
 """
+import re
 import json
 import subprocess
 
@@ -159,11 +160,16 @@ def test_there_is_only_one_stylesheet_builder():
 
 def test_the_browser_gets_the_same_stylesheet_without_physician_colours():
     """浏览器调的是同一个函数、不传 physicianColors。传了的话国标证型会被
-    染成某位医家的颜色——那是在说"这个国标证型是叶天士的"，而它不是。"""
+    染成某位医家的颜色——那是在说"这个国标证型是叶天士的"，而它不是。
+
+    R37 起这个调用多带一个 `slot: "browser"`（label 宽度与字号按槽位取），
+    **判据跟着改，问的还是同一件事**：同一个 builder + 不传医家色。
+    写死 `buildStylesheet()` 那种"一个字都不许多"的断言会把"加一个跟染色
+    无关的参数"也判成违规，而那不是这条要防的事。"""
     src = _graph_js()
     body = src[src.index("function ensureGraphBrowserCanvas"):]
     body = body[:body.index("function gbBuildIndex")]
-    assert "style: buildStylesheet()," in body
+    assert "style: buildStylesheet({ slot: \"browser\" })," in body
     # 只看代码行：注释里提到 physicianColors 是在解释"为什么不传"，
     # 不该让这条断言反过来劝人别写注释。
     code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("//"))
@@ -197,13 +203,29 @@ def test_formula_border_encodes_the_three_sources():
 
 def test_elements_are_typographically_the_hub():
     """§3.2 规格 11：节点 label 13px 黑体，证素 15px 宋体 600。证素比别的节点
-    大一号，因为**它是图谱浏览器的枢纽**，在问诊图上也是"症状收敛到哪里"那一层。"""
+    大一号，因为**它是图谱浏览器的枢纽**，在问诊图上也是"症状收敛到哪里"那一层。
+
+    R37 把字号绑到槽位（`nodeFontFor` / `elementFontFor` 读 CSS 令牌），所以
+    这里不再查那两个常量名出现在样式块里，而是**查真正在用的那几个值**：
+    两张图各自的证素字号都要严格大于它自己的节点字号。常量只剩兜底作用
+    （令牌取不到时），那一层也一起查。"""
+    import re
     src = _graph_js()
     assert "const NODE_FONT_SIZE = 13;" in src
     assert "const ELEMENT_FONT_SIZE = 15;" in src
     block = src[src.index('node[node_type = "element"]'):]
     block = block[:block.index("},")]
-    assert "ELEMENT_FONT_SIZE" in block and '"font-weight": 600' in block
+    assert "elementFontFor(slot)" in block and '"font-weight": 600' in block
+    # 令牌层：两张图各自都要"证素大一号"。这是规格说的那件事，
+    # 而它现在写在 app.css 里，不在 graph.js 里。
+    css = (Path(__file__).resolve().parent.parent / "web" / "app.css").read_text(encoding="utf-8")
+    def token(name: str) -> float:
+        m = re.search(rf"{name}:\s*([0-9.]+)px", css)
+        assert m, f"app.css 里没有 {name}"
+        return float(m.group(1))
+    for slot in ("consult", "browser"):
+        assert token(f"--element-font-{slot}") > token(f"--node-font-{slot}"), \
+            f"{slot} 这张图上证素没有比别的节点大"
 
 
 def test_the_lambda1_note_text_has_exactly_one_source():
@@ -221,14 +243,25 @@ def test_the_lambda1_note_text_has_exactly_one_source():
     assert "health.lambda1_note" in app
 
 
-def test_the_formula_margin_says_why_it_is_sixty():
-    """§3.2 规格 3：60px 不是随手定的。compound 的 padding 是**固定屏幕像素**
-    （不随缩放变化），所以"药材中心间距够了"不等于"方框边缘不重叠"——
-    第一版用 20，Playwright 截图里相邻候选方的框依然互相压住。"""
+def test_dagre_reserves_at_least_as_much_compound_padding_as_cytoscape_draws():
+    """R42：`FORMULA_MARGIN = 60` 那个常量随手写布局一起退役了，但它防的那件事
+    没有退役——**compound 的 padding 是固定屏幕像素**（不随缩放变化），
+    所以"药材中心间距够了"不等于"方框边缘不重叠"。
+
+    现在的形式是两个常量的不等式：dagre 按 `COMPOUND_PAD` 留位、cytoscape 按
+    `COMPOUND_RENDER_PAD` 画框，**留得比画得少就会压住相邻的候选方**。
+    这条比原来那条强：原来只查"注释里提到了 20 和 60"，改个数照样绿。"""
     src = _graph_js()
-    block = src[:src.index("const FORMULA_MARGIN = 60;")]
-    tail = block[-1200:]
-    assert "compound" in tail and "20" in tail and "60" in tail
+    render = int(re.search(r"const COMPOUND_RENDER_PAD = (\d+);", src).group(1))
+    reserve_expr = re.search(r"const COMPOUND_PAD = (.+?);", src).group(1)
+    # 表达式必须是"从渲染内边距推出来的"，不是又写一个字面量
+    assert "COMPOUND_RENDER_PAD" in reserve_expr, (
+        f"COMPOUND_PAD 又写成了字面量（{reserve_expr}）——两个数会漂")
+    reserve = eval(reserve_expr.replace("COMPOUND_RENDER_PAD", str(render)))  # noqa: S307
+    assert reserve >= render, f"dagre 留 {reserve}px、cytoscape 画 {render}px，方框会压住"
+    # 样式表那边也必须引用同一个常量，不是再写一个 14px
+    assert 'padding: `${COMPOUND_RENDER_PAD}px`' in src, (
+        "node:parent 的 padding 又写成了字面量")
 
 
 def _graph_js():

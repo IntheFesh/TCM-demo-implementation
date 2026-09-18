@@ -356,6 +356,42 @@ class S2Elements(BaseModel):
     unexplained_symptoms: list[str] = Field(default_factory=list)
 
 
+class S1S2Merged(BaseModel):
+    """R36：S1（症状标准化）+ S2（证素推断）合成一次调用的产出。
+
+    **只是形状合一，语义一字未改**：`to_s1()` / `to_s2()` 拆出来的两个对象跟分两次
+    调用拿到的逐字段同型，下游（残差、检索、S3、构图、前端）一行都不用改。
+
+    为什么不是"把 S2Elements 塞成 S1Normalize 的一个子字段"：那样 `S1Normalize`
+    这个类型就跟"这次合没合"耦合了，而它是全项目最上游的形状，改它会波及所有把
+    S1 当参数的函数签名。新建一个只在边界上活的 schema，拆完就扔。
+
+    **刻意不校验 `supporting_symptoms ⊆ symptoms`。** 分两次调用的那条路也不校验：
+    模型经常把症状名改写（「胃脘胀痛」→「脘腹胀痛」），那件事由
+    `core.chain.explained_symptoms()` 一处处理（见它的文档）。在这里加一条只在新路
+    上生效的更严校验，会让两条路的证素质量不可比——而"合一之后证素质量变没变"
+    正是 R38 要量的东西，不能先被一条校验改掉一次。
+    """
+
+    # 以下四个字段跟 S1Normalize 逐字段同型
+    symptoms: list[str] = Field(default_factory=list)
+    tongue: str | None = None
+    pulse: str | None = None
+    unmapped: list[str] = Field(default_factory=list)
+    # 以下两个跟 S2Elements 逐字段同型（ElementHit.supporting_symptoms 的
+    # min_length=1 防幻觉约束照旧生效——合并不放松任何约束）
+    elements: list[ElementHit] = Field(default_factory=list)
+    unexplained_symptoms: list[str] = Field(default_factory=list)
+
+    def to_s1(self) -> S1Normalize:
+        return S1Normalize(symptoms=list(self.symptoms), tongue=self.tongue,
+                           pulse=self.pulse, unmapped=list(self.unmapped))
+
+    def to_s2(self) -> S2Elements:
+        return S2Elements(elements=list(self.elements),
+                          unexplained_symptoms=list(self.unexplained_symptoms))
+
+
 # ---------- 在线：病名层（M4） ----------
 
 
@@ -1174,3 +1210,169 @@ class S3StructuredUnreferenced(_S3StructuredBase):
     def physician_influences(self) -> list["PhysicianInfluence"]:
         """同上，永远是空——说不出医案的"影响"这个 schema 不收。"""
         return []
+
+
+# ---------- R35：名医用药规律（确定性统计，不是 LLM 输出） ----------
+#
+# 跟 `RationaleRecord` 同一类：产出文件落 `data/standard/` 要进版本控制，
+# 所以必须是任何人在任何机器上重跑都字字相同的确定性转换。这一层**零 LLM 调用**
+# ——它是对 `cases.json` 的计数与统计，没有任何生成环节，也就没有幻觉风险。
+#
+# **但它有另一类风险：把统计巧合说成"名医经验"。** 两味药在 3 张方里一起出现过，
+# 不构成"某位医家习惯用这个药对"。所以每一条都必须带：
+#   `support`（几张方支持它）和 `case_ids`（**具体是哪几张**）
+# 缺了 `case_ids` 的规律无法回查，等于一句没有出处的话——跟 `cited_case_ids`
+# 是同一条防幻觉纪律，所以同样是 `Field(min_length=1)`。
+
+PatternKind = Literal["herb", "herb_pair", "dose", "modification"]
+
+#: 规律按什么分组。
+#:   physician            这位医家的总体习惯（`group_value` 为空串）
+#:   physician_syndrome   这位医家在某个证下的习惯（`group_value` 是证型名）
+#: **两档都要有**：`cases.json` 里 1075 诊次只有 116 条标了证型（10.8%），
+#: 只按证型分组的话绝大多数医案的信息进不了规律层；只按医家分组则丢掉了
+#: "他在这个证下怎么用药"这个更有用的粒度。
+PatternGroupBy = Literal["physician", "physician_syndrome"]
+
+
+class PrescribingPattern(BaseModel):
+    """写进 `data/standard/prescribing_patterns.jsonl` 的一条用药规律。
+
+    字段形状对齐 `core/context_prefix.py::_focused_pattern_block` 读的那几个键
+    ——知识块要把它渲染给模型看，两处对不上的话规律会渲染成一行空白。
+
+    `dose_*` 三个字段只有 `kind="dose"` 时才有值：`cases.json` 的 `herbs` 是**药名
+    列表**，没有结构化剂量，剂量要从 `raw` 原文里按"药名 + 数字 + 单位"抓
+    （见 `offline/mine_prescribing_patterns.py`）。抓不到就是 None，**不猜**。
+
+    `has_incompatible_pair`：这条规律涉及的药里有没有十八反十九畏的一对。
+    **不是过滤掉而是标出来**——古籍医案里真的有这种配伍（那是历史事实），
+    删掉等于篡改语料；标出来才能让下游（知识块、SFT 导出）决定怎么处理。
+    判据复用 `core.safety_output.INCOMPATIBLE_PAIRS`，说明文本复用
+    `INCOMPATIBLE_TRAINING_NOTE`，不另写一套。
+    """
+
+    pattern_id: str = Field(min_length=1)
+    kind: PatternKind
+    physician: str = Field(min_length=1)
+    physician_name: str = Field(min_length=1)
+    group_by: PatternGroupBy
+    #: 允许空串：`group_by="physician"` 时它就是空的（这位医家的总体习惯）。
+    #: 不设 `min_length=1` 是**刻意的**，不是放松约束——它承载的是"分组的值"，
+    #: 而"按医家分组"这个分法本来就没有第二层值。
+    group_value: str = ""
+    #: min_length=1：一条规律至少牵涉一味药。
+    herbs: list[str] = Field(min_length=1)
+    #: 几张方支持它。**下游引用这条规律时必须同时引这个数**——
+    #: 「叶天士常用党参」和「叶天士在 3 张方里用过党参」是两句不同的话。
+    support: int = Field(ge=1)
+    #: min_length=1：说不出是哪几张方的规律无法回查，等于一句没有出处的话。
+    case_ids: list[str] = Field(min_length=1)
+    dose_median_g: float | None = None
+    dose_min_g: float | None = None
+    dose_max_g: float | None = None
+    note: str | None = None
+    has_incompatible_pair: bool = False
+
+    @model_validator(mode="after")
+    def _support_matches_case_ids(self) -> "PrescribingPattern":
+        if self.support != len(self.case_ids):
+            raise ValueError(
+                f"support={self.support} 跟 case_ids 的条数 {len(self.case_ids)} 不一致"
+                "——support 就是「有几张方支持它」，两个数对不上说明统计过程里丢了东西"
+            )
+        if self.kind == "dose" and self.dose_median_g is None:
+            raise ValueError(
+                'kind="dose" 的规律必须有 dose_median_g，否则它不是一条剂量规律'
+            )
+        if self.kind == "herb_pair" and len(self.herbs) != 2:
+            raise ValueError(
+                f'kind="herb_pair" 必须恰好两味药，实际 {len(self.herbs)} 味'
+            )
+        return self
+
+
+# ---------- R46 §7.2：「人」这一维 ----------
+#
+# 对标黄煌的「方—病—人」模式：同一个证，老人/小儿/孕妇/肝肾功能不全者的用药
+# 不是同一张方。此前这条链上完全没有"人"——只有症状、证素、证型、方。
+#
+# **新增 schema，不动既有的任何一个字段**（CLAUDE.md 那条铁律：防幻觉约束不
+# 许放松，某个新场景要不同的形状就新建一个 schema，不是把旧的改松）。
+
+#: 体质倾向。**不是自由文本**：九种体质是《中医体质分类与判定》的固定分类，
+#: 留成字符串的话模型会写出"偏寒"这种不在任何表里的词，而下游要拿它去查规则。
+Constitution = Literal[
+    "平和质", "气虚质", "阳虚质", "阴虚质", "痰湿质",
+    "湿热质", "血瘀质", "气郁质", "特禀质",
+]
+
+#: 生理阶段。剂量折算与禁忌规则按这个分派（儿童折算、妊娠禁忌、老年慎峻药）。
+LifeStage = Literal["婴幼儿", "儿童", "青少年", "成人", "老年", "妊娠期", "哺乳期"]
+
+
+class PatientProfile(BaseModel):
+    """患者的「人」维。**全部字段可空**——门诊现场未必问得全，
+    而一个"必须填满才能辨证"的表单在诊室里会被绕过去（写个假年龄），
+    那比留空更糟。
+
+    这里没有一个 `Field(min_length=1)`：**它不是模型的输出**，是人填的表单，
+    防幻觉约束管的是"模型说的话要有出处"，跟这张表无关。
+    """
+
+    age_years: int | None = Field(default=None, ge=0, le=130)
+    sex: Literal["男", "女"] | None = None
+    life_stage: LifeStage | None = None
+    constitution: Constitution | None = None
+    #: 基础病、过敏史、在服药物：自由文本列表，医师现场写什么就是什么。
+    comorbidities: list[str] = Field(default_factory=list)
+    allergies: list[str] = Field(default_factory=list)
+    current_medications: list[str] = Field(default_factory=list)
+    #: 肝肾功能不全：只收「有/无/不详」三态，不收检验数值。
+    #: **这是 §0.4 的输入侧边界**——一旦收 ALT/肌酐这类客观数据，
+    #: 产品性质从"对患者主诉与病历文本推理"变成"分析客观数据"，
+    #: 监管属性随之改变，要按医疗器械注册。
+    hepatic_impairment: Literal["有", "无", "不详"] = "不详"
+    renal_impairment: Literal["有", "无", "不详"] = "不详"
+
+    def is_empty(self) -> bool:
+        """一个字段都没填。调用方据此决定"这一次有没有人维可用"——
+        跟"填了但都是不详"是两件事。"""
+        return not any([
+            self.age_years is not None, self.sex, self.life_stage,
+            self.constitution, self.comorbidities, self.allergies,
+            self.current_medications,
+        ]) and self.hepatic_impairment == "不详" and self.renal_impairment == "不详"
+
+
+#: 个体化调整的类别。**`Literal` 而不是自由字符串**：下游要按类别分组显示，
+#: 也要按类别查"这一类调整有没有本体依据"。
+AdjustmentKind = Literal["剂量", "去药", "加药", "换药", "煎服法", "慎用提示"]
+
+
+class IndividualizationItem(BaseModel):
+    """一条针对这位患者的调整。
+
+    **`basis` 是 `Field(min_length=1)`**——跟 `cited_case_ids` 同一条防幻觉纪律：
+    一条"孕妇应当减量"的调整，说不出依据就是模型自己想的。取不到依据时正确的
+    做法是**不产出这一条**，不是产出一条依据为空的。
+    """
+
+    kind: AdjustmentKind
+    target: str = Field(min_length=1)          # 哪一味药 / 哪一项
+    adjustment: str = Field(min_length=1)      # 怎么调
+    reason: str = Field(min_length=1)          # 为什么（针对这位患者的哪一点）
+    basis: str = Field(min_length=1)           # 依据（本体条目、药典、教材原文）
+
+
+class Individualization(BaseModel):
+    """一次问诊的全部个体化调整。
+
+    `items` **可以为空**：这位患者没有需要调整的地方，是一个合法且常见的结论，
+    强制 `min_length=1` 会逼模型编一条出来。
+    `considered` 记的是"看了哪几个维度"——空的 `items` 配上非空的 `considered`
+    才说得清"查过了，没有需要调的"，而不是"没查"。
+    """
+
+    items: list[IndividualizationItem] = Field(default_factory=list)
+    considered: list[str] = Field(default_factory=list)

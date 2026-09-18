@@ -56,6 +56,12 @@ CASE_TRIPLES_PATH = ROOT / "data" / "case_triples.jsonl"
 # 模块文档字符串）；旧位置 data/materia_medica.jsonl 仍然可读，因为 AutoDL 上
 # 那台机器已经有一份。路径解析不在这里写死，走 core.data_paths 那一处。
 MATERIA_MEDICA_PATH = pharmacology_read_path_or_canonical("materia_medica")
+#: import 时算出来的那个值。**用来判断 `MATERIA_MEDICA_PATH` 有没有被覆盖过**
+#: ——见 `_materia_medica_path()`：覆盖了就绝对尊重覆盖（哪怕那个文件不存在），
+#: 没覆盖才允许回退去重新找（文件可能在 import 之后才生成）。
+#: 不留这个"原值"的话，"覆盖成一个不存在的路径"跟"没覆盖且文件没生成"
+#: 在代码里长得一模一样，于是回退会把覆盖悄悄吃掉。
+_MATERIA_MEDICA_PATH_AT_IMPORT = MATERIA_MEDICA_PATH
 
 
 # ---------- 惰性单例（模块顶层不加载任何文件） ----------
@@ -156,20 +162,22 @@ def _materia_medica_path() -> Path | None:
         只用 import 时算好的常量会永远读不到新文件。
     回退顺序本身仍然只有一处实现（core.data_paths），这里只加"覆盖优先"。
 
-    **回退只在没人覆盖过的时候发生。** 早先的写法是"覆盖的文件存在就用它、
-    否则回退"，于是覆盖指向一个**还不存在**的文件时会被静默忽略——正是这段
-    docstring 自己警告的那种失效。2026-09-17 药理层入版本控制后立刻暴露：
-    测试把路径指到 tmp_path/nope.jsonl，函数回退去读了仓库里真实的 9776 条，
-    "文件缺失时报 unavailable" 那条判据于是从来没有被真正验证过（沙盒里
-    文件本来就不存在，它一直绿，但绿的原因不是覆盖生效）。
+    **R34 修的坑**：原来的写法是「常量指的文件存在就用它，否则回退去找」。
+    覆盖成一个**不存在**的路径时（测试模拟"数据还没生成"正是这么做的），
+    它会走进回退分支、找到真实的那份文件，于是**覆盖被静默吃掉**
+    ——这个函数自己的文档字符串上一段警告的恰好就是这件事。
+    药理层数据进版本控制（R34）之前这条路走不到（真实文件本来就不在），
+    数据一进来那条测试就红了，而红的原因跟数据入库毫无关系。
+
+    判据改成「覆盖过就绝对尊重，没覆盖才回退」：
+      - `MATERIA_MEDICA_PATH` 跟 import 时的值不同 = 有人显式覆盖了 → 只认它，
+        不存在就返回 None（"这份数据不在"，调用方据此报 available:false）
+      - 相同 = 没人覆盖 → 存在就用，不存在就回退重找（文件可能刚生成）
     """
-    default = pharmacology_read_path_or_canonical("materia_medica")
-    if MATERIA_MEDICA_PATH != default:
-        # 有人显式覆盖过：以覆盖为准，文件不存在就是"没有数据"，不偷偷回退。
+    if MATERIA_MEDICA_PATH != _MATERIA_MEDICA_PATH_AT_IMPORT:
         return MATERIA_MEDICA_PATH if MATERIA_MEDICA_PATH.exists() else None
     if MATERIA_MEDICA_PATH.exists():
         return MATERIA_MEDICA_PATH
-    # 没覆盖过：文件可能在 import 之后才生成，重新按回退顺序找一次。
     return pharmacology_read_path("materia_medica")
 
 

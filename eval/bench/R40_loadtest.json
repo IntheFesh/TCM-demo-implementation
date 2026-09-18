@@ -1,0 +1,124 @@
+{
+  "kind": "loadtest",
+  "generated_at": "2026-09-18T04:07:13Z",
+  "backend": {
+    "id": "fake",
+    "model": "fake-bench(latency=0.0s)"
+  },
+  "backend_caveat": "fake 后端：量到的是「除模型之外这套东西能扛多少」，不是真实 LLM 下的延迟——两种口径不许并进一张表",
+  "max_concurrent_consults": 4,
+  "levels": [
+    {
+      "concurrency": 1,
+      "n_requests": 3,
+      "wall_s": 0.607,
+      "rss_before_mb": 150.4,
+      "rss_after_mb": 179.5,
+      "rss_delta_mb": 29.1,
+      "throughput_rps": 4.942,
+      "kinds": {
+        "ok": 3
+      },
+      "n_ok": 3,
+      "p50_ms": 130.8,
+      "p90_ms": 350.7,
+      "p95_ms": 350.7,
+      "p99_ms": 350.7,
+      "max_ms": 350.7,
+      "mean_ms": 201.7,
+      "response_bytes": 83729,
+      "gate_503_without_retry_after": 0,
+      "errors": []
+    },
+    {
+      "concurrency": 2,
+      "n_requests": 6,
+      "wall_s": 0.896,
+      "rss_before_mb": 179.5,
+      "rss_after_mb": 595.2,
+      "rss_delta_mb": 415.7,
+      "throughput_rps": 6.699,
+      "kinds": {
+        "ok": 6
+      },
+      "n_ok": 6,
+      "p50_ms": 176.2,
+      "p90_ms": 440.5,
+      "p95_ms": 556.9,
+      "p99_ms": 556.9,
+      "max_ms": 556.9,
+      "mean_ms": 286.5,
+      "response_bytes": 83729,
+      "gate_503_without_retry_after": 0,
+      "errors": []
+    },
+    {
+      "concurrency": 4,
+      "n_requests": 12,
+      "wall_s": 1.33,
+      "rss_before_mb": 595.2,
+      "rss_after_mb": 646.9,
+      "rss_delta_mb": 51.7,
+      "throughput_rps": 9.026,
+      "kinds": {
+        "ok": 12
+      },
+      "n_ok": 12,
+      "p50_ms": 422.8,
+      "p90_ms": 477.3,
+      "p95_ms": 477.3,
+      "p99_ms": 483.8,
+      "max_ms": 483.8,
+      "mean_ms": 424.3,
+      "response_bytes": 83729,
+      "gate_503_without_retry_after": 0,
+      "errors": []
+    },
+    {
+      "concurrency": 8,
+      "n_requests": 24,
+      "wall_s": 2.003,
+      "rss_before_mb": 647.0,
+      "rss_after_mb": 689.9,
+      "rss_delta_mb": 42.9,
+      "throughput_rps": 8.987,
+      "kinds": {
+        "gate_503": 6,
+        "ok": 18
+      },
+      "n_ok": 18,
+      "p50_ms": 643.0,
+      "p90_ms": 860.2,
+      "p95_ms": 922.3,
+      "p99_ms": 1096.8,
+      "max_ms": 1096.8,
+      "mean_ms": 656.3,
+      "response_bytes": 83729,
+      "gate_503_without_retry_after": 0,
+      "errors": []
+    },
+    {
+      "concurrency": 16,
+      "n_requests": 48,
+      "wall_s": 4.332,
+      "rss_before_mb": 689.9,
+      "rss_after_mb": 785.5,
+      "rss_delta_mb": 95.6,
+      "throughput_rps": 5.309,
+      "kinds": {
+        "gate_503": 25,
+        "ok": 23
+      },
+      "n_ok": 23,
+      "p50_ms": 1508.3,
+      "p90_ms": 2181.2,
+      "p95_ms": 2203.7,
+      "p99_ms": 2309.6,
+      "max_ms": 2309.6,
+      "mean_ms": 1582.8,
+      "response_bytes": 83729,
+      "gate_503_without_retry_after": 0,
+      "errors": []
+    }
+  ]
+}

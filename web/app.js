@@ -17,23 +17,14 @@ let REFERENCE_PHYSICIANS = [];
 // 首屏三条示例主诉。同样从 /health 下发（core/examples.py），不写死在这里——
 // DEMO.md 和录制清单里已经各有一份，第三份副本漂一个标点就是演示当场 LLMError。
 let EXAMPLE_COMPLAINTS = [];
-// layer 4（药材）跟 layer 3（方剂）的 x 只差一小段——compound 子节点要贴着
-// 父节点画，隔太远 cytoscape 算出来的方剂包围盒会变成横跨整个画布的细长条，
-// 不会像"一个方框里装着自己的药"。
-const LAYER_X = { 0: 60, 1: 260, 2: 460, 3: 640, 4: 730 };
-// M7：Y_MAX 从 460 提到 620——只调这一个数救不了拥挤（cy.fit() 最后会把全部
-// 内容按同一个缩放系数塞进 #cy 容器，光把逻辑坐标范围拉大、节点本身的像素
-// 尺寸不变的话，摆放间距和节点尺寸的"比例"没变，缩放后看起来还是一样挤）。
-// 真正起作用的是这个比例本身：药材间距（下面 HERB_GAP）从 16 提到 26，
-// 明显大于药材节点自身高度（字号 11 + 上下 padding 6，约 23 个逻辑单位），
-// 26 提供的间隙足够放开重叠；Y_MAX 一起加大只是给"医家带"之间、方剂与方剂
-// 之间腾出更多空间，配合 #cy 容器本身的高度（也在这轮从 460px 提到 540px）
-// 一起用，两处缺一处都解决不了 M5 报告标注的"药材纵向堆叠间距小"。
-const Y_MIN = 60, Y_MAX = 620;
-// 单味药材之间的目标纵向间距（逻辑单位，不是像素——最终经 cy.fit() 统一缩放）。
-const HERB_GAP = 26;
 
-let cy = null;
+// R42：`let cy` 搬到 graph.js 去了。**这是 R41 那条反向依赖的第二例**：
+// 问诊图的 cytoscape 实例只有 graph.js 在用（app.js 从声明它的那天起一次都
+// 没读过），而声明在这里意味着 graph.js 单独被加载时 `cy` 不存在。
+// 浏览器里两个 script 共享全局作用域，所以从来没报错过——是 R42 给
+// `exportGraphPng` 写只加载 graph.js 的 node 测试时，第一次跑就
+// `ReferenceError: cy is not defined`。跟 `LAYER_X` 那四个常量同一个形状、
+// 同一个修法（搬到被依赖的那一侧）。
 
 // ---------- D1：BYOK + 共享额度 + 用量看板 ----------
 //
@@ -293,7 +284,7 @@ function buildEvidenceIndex(data) {
     const s2 = r.s2 || {};
     const s3 = r.s3 || {};
 
-    put(`syn::${r.physician}`, {
+    put(NODE_ID.syndrome(s3.syndrome || ""), {
       title: `${s3.syndrome || "证型"}　·　${r.physician_name}`,
       physician_name: r.physician_name,
       color: r.color,
@@ -311,7 +302,7 @@ function buildEvidenceIndex(data) {
     });
 
     for (const hit of s2.elements || []) {
-      put(`elem::${hit.element}`, {
+      put(NODE_ID.element(hit.element, hit.kind), {
         title: `证素　${hit.element}`,
         physician_name: r.physician_name,
         color: r.color,
@@ -320,7 +311,7 @@ function buildEvidenceIndex(data) {
         supporting: hit.supporting_symptoms || [],
       });
       for (const sym of hit.supporting_symptoms || []) {
-        put(`sym::${sym}`, {
+        put(NODE_ID.symptom(sym), {
           title: `症状　${sym}`,
           physician_name: r.physician_name,
           color: r.color,
@@ -336,7 +327,7 @@ function buildEvidenceIndex(data) {
     // 候选方都建索引（不是只建 selected 那个），否则点未选中的候选方节点
     // 侧栏是空的。
     (s3.formula_candidates || []).forEach((cand, i) => {
-      put(`formula::${r.physician}::${cand.name}`, {
+      put(NODE_ID.formula(cand.name), {
         title: `${cand.name}　·　${r.physician_name}`,
         physician_name: r.physician_name,
         color: r.color,
@@ -350,7 +341,7 @@ function buildEvidenceIndex(data) {
         safety: cand.safety || null,
       });
       for (const item of cand.herb_items || []) {
-        put(`herb::${r.physician}::${cand.name}::${item.name}`, {
+        put(NODE_ID.herb(cand.name, item.name), {
           title: `${item.name}　·　${cand.name}`,
           physician_name: r.physician_name,
           color: r.color,
@@ -368,10 +359,22 @@ function buildEvidenceIndex(data) {
   }
 }
 
+// 置信度三档的中文名，**只有这一处**。
+// 它跟 `URGENCY_LABEL` 的键长得一样（high/medium/low），但回答的**不是同一个
+// 问题**——那张回答"这次要不要催病人马上就医"（导诊分级），这张回答"这条证素
+// 推得有多稳"（模型自评）。合并成一张，以后改一边会连带动另一边，而两边的
+// 阈值语义根本不同（CLAUDE.md 那条例外：不同问题就该是两张表，并写清区别）。
+//
+// 方剂来源那张（经典方/加减方/自拟方）在 graph.js：两张图都要用，而**依赖方向
+// 只能 app.js → graph.js**（R13/R14 断开的那个循环），所以共用的东西放那边。
+const CONFIDENCE_LABEL = { high: "高", medium: "中", low: "低" };
+
+function confidenceLabel(v) { return CONFIDENCE_LABEL[v] || v || ""; }
+
 function evidenceSectionHtml(s) {
   const rows = [];
-  if (s.element_kind) rows.push(`<div class="meta">${s.element_kind}　置信度 ${s.confidence}</div>`);
-  if (s.explained_by) rows.push(`<div class="meta">由证素「${escapeHtml(s.explained_by)}」解释　置信度 ${s.confidence}</div>`);
+  if (s.element_kind) rows.push(`<div class="meta">${s.element_kind}　置信度 ${escapeHtml(confidenceLabel(s.confidence))}</div>`);
+  if (s.explained_by) rows.push(`<div class="meta">由证素「${escapeHtml(s.explained_by)}」解释　置信度 ${escapeHtml(confidenceLabel(s.confidence))}</div>`);
   if (s.supporting && s.supporting.length) {
     rows.push(`<div class="label">支撑症状</div><div>${escapeHtml(s.supporting.join("、"))}</div>`);
   }
@@ -382,11 +385,11 @@ function evidenceSectionHtml(s) {
   // formula:: 节点的 payload 才会带 source 字段，症状/证素/证型的 payload
   // 里没有这个键，条件判断天然把两类节点分开，不用额外传节点类型标记。
   if (s.source) {
-    const srcLabel = { classic: "经典方", modified: "加减方", composed: "自拟方" }[s.source] || s.source;
+    const srcLabel = formulaSourceLabel(s.source);
     const metaParts = [
       escapeHtml(srcLabel),
       s.base_formula ? "原方：" + escapeHtml(s.base_formula) : "",
-      "置信度 " + escapeHtml(s.confidence || ""),
+      "置信度 " + escapeHtml(confidenceLabel(s.confidence)),
       s.selected ? "★已选" : "",
     ].filter(Boolean);
     rows.push(`<div class="meta">${metaParts.join("　")}</div>`);
@@ -663,17 +666,92 @@ function injectPhysicianColors(physicians) {
   }
 }
 
+// R40：预热进度条。后端改成「先监听再预热」之后，`/health` 在知识库加载完
+// 之前回 **503 带进度**——503 不是"后端不在"，响应体是完整的。
+//
+// 这块横幅是动态建的、不写进 index.html：它是**瞬时状态**，不是页面结构，
+// 而 index.html 那份契约（≤250 行）守的是结构文件不该越长。
+function renderWarmupBanner(warmup) {
+  let el = document.getElementById("warmup-banner");
+  if (!warmup || warmup.ready) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "warmup-banner";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.className = "show";
+    const anchor = document.getElementById("offline-banner");
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(el, anchor);
+    else document.body.prepend(el);
+  }
+  // 逐项列出来而不是只给一个百分比：哪一项还没好决定了现在能做什么
+  // （本体层没好 → 符号验证判不了；检索器没好 → 医案检索是空的）。
+  const pending = (warmup.steps || [])
+    .filter((s) => s.status === "pending" || s.status === "running")
+    .map((s) => s.label || s.step);
+  el.textContent = `正在加载知识库（${warmup.progress}）：${pending.join("、")}` +
+    "——现在可以浏览页面，点「辨证」会等它加载完。";
+}
+
+// 预热还没完就隔一会儿再问一次。**不轮询到永远**：到了上限就停下并如实说
+// 「预热没能在 N 秒内完成」，而不是让一个转圈的横幅永远挂着。
+const WARMUP_POLL_MS = 1000;
+const WARMUP_POLL_MAX = 180;
+let warmupPolls = 0;
+
+function scheduleWarmupRecheck() {
+  if (warmupPolls >= WARMUP_POLL_MAX) {
+    const el = document.getElementById("warmup-banner");
+    if (el) el.textContent = `知识库预热超过 ${WARMUP_POLL_MAX} 秒还没完成，` +
+      "服务仍可用但首次辨证会更慢；请查看服务端日志。";
+    return;
+  }
+  warmupPolls += 1;
+  setTimeout(pollWarmupOnly, WARMUP_POLL_MS);
+}
+
+// R41：轮询**只更新那条横幅**，不再走整个 initDemoModeBanner()。
+// 后者会把身份色重新注一遍 CSS 变量、把三条示例主诉重新 innerHTML 一遍、
+// 把 λ₁ 说明重新渲染一遍——每秒一次、最多 180 次，全是白做的 DOM 工作
+// （身份色、示例、s3_mode 在预热期间不会变）。这是 R40 加轮询时引入的浪费，
+// R41 的前端 profile 才把它显出来。
+async function pollWarmupOnly() {
+  try {
+    const resp = await fetch("/health");
+    if (!resp.ok && resp.status !== 503) return;
+    const health = await resp.json();
+    renderWarmupBanner(health.warmup);
+    if (health.warmup && !health.warmup.ready) scheduleWarmupRecheck();
+  } catch (e) {
+    // 预热期间后端被重启之类：停止轮询，横幅留在最后一次的状态。
+  }
+}
+
 async function initDemoModeBanner() {
   try {
     const resp = await fetch("/health");
-    if (!resp.ok) { renderOfflineBanner(false); return; }
+    // **503 要放过**：那是"预热中"，响应体完整。当成 !ok 处理的话预热那十几秒
+    // 里页面会说"服务未连接"，而服务其实在正常应答——比晚几秒着色糟得多。
+    if (!resp.ok && resp.status !== 503) { renderOfflineBanner(false); return; }
     const health = await resp.json();
+    renderWarmupBanner(health.warmup);
+    if (health.warmup && !health.warmup.ready) scheduleWarmupRecheck();
     renderDemoMode(health.demo_mode);
     injectPhysicianColors(health.physicians);
     // 示例主诉和身份色同一趟拿：两者都要在"点第一次辨证之前"就到位。
     EXAMPLE_COMPLAINTS = health.example_complaints || [];
     renderExamples(EXAMPLE_COMPLAINTS);
     renderConsultLambda1Note(health.lambda1_note);
+    // R37：这台服务的 S3 形状。**在点「辨证」之前就要到位**——它决定骨架是
+    // 单链九段还是三列集注。拿不到（老服务、/health 失败）时保持 null，
+    // isSingleChain() 会回落到 legacy 三列，跟 R36 及以前的行为一致。
+    SERVER_S3_MODE = health.s3_mode || null;
+    // R47：产品形态、版本、本体可用性。**先于渲染任何结果**——产品模式要藏的
+    // 十六处必须在访问者看到页面之前就定下来。
+    applyProductMode(health);
+    renderFooterVersion(health);
+    KNOWLEDGE_BASE_AVAILABLE = !(health.knowledge_base
+      && health.knowledge_base.available === false);
     renderOfflineBanner(true);
   } catch (e) {
     // 网络不通时 fetch 会抛。身份色有 CSS 兜底、示例主诉不显示——都不致命，
@@ -784,14 +862,101 @@ function refListHtml(refs) {
 
 // R14 §3.1 第九条：引用收成一行「引自 N 条医案 ▾」，展开后才是原文块。
 // N 从 refs.length 现算，不另存一个计数——两处各存一份必然有一处忘了更新。
-function refFoldHtml(refs) {
+//
+// R40：后端只下发前 REFS_IN_RESPONSE 条（实测 1060 条 = 1.25 MB / 响应体的
+// 98.9%）。这时 `refs.length` 是**下发的条数**，不是语料里检索到的条数——
+// 光显示它就是个假数。所以有 `refs_total` 时两个数一起显示：
+// 「引自 20 条医案（本次检索到 1060 条，下发前 20 条）」。
+// 项目规则「任何数字都必须带对照」在界面上的落点。
+function refFoldHtml(refs, counts) {
   const n = (refs || []).length;
   if (!n) {
     return '<div class="col-refs col-refs-empty">无相关医案（相似度均低于阈值）</div>';
   }
-  return `<details class="col-refs"><summary>引自 ${n} 条医案</summary>
-    <div class="detail-block">${refListHtml(refs)}</div>
+  const total = counts && counts.refs_total;
+  const note = (counts && counts.refs_truncated && total > n)
+    ? `（本次检索到 ${total} 条，按相似度下发前 ${n} 条；被结论引用的一条不漏）`
+    : "";
+  // R41：超过阈值才开窗口化渲染（见 VIRTUAL_LIST_THRESHOLD 那一段）。
+  // 默认 REFS_IN_RESPONSE=20，所以默认这条分支**不会走**——DOM 一个字节没变。
+  const body = n > VIRTUAL_LIST_THRESHOLD
+    ? virtualRefsHtml(refs)
+    : refListHtml(refs);
+  return `<details class="col-refs"><summary>引自 ${n} 条医案${escapeHtml(note)}</summary>
+    <div class="detail-block">${body}</div>
   </details>`;
+}
+
+// ---------- R41：窗口化渲染（虚拟滚动） ----------
+//
+// ## 先说清楚这一项在当前配置下不生效，以及为什么还要有
+//
+// R41 实测的 DOM 规模：整页 154~297 个节点，**最长的列表 14 个子节点**。
+// 参考医案列表在默认配置下是 20 条（`REFS_IN_RESPONSE`）。这个量级上做虚拟
+// 滚动是纯亏：多 80 行代码、多一个剪裁/滚动跳动的失败模式，换 0 收益。
+//
+// 但 `REFS_IN_RESPONSE` 是**环境变量**。医院把它调到 500 是完全合法的配置
+// （"我们要看全部候选"），那时 500 个 `.ref-item`（每个 4~5 个子节点 =
+// 2000+ 节点）会让展开那一下变成一个长任务。所以机制建好、按阈值启用：
+// 默认那条路径的 DOM 逐字节不变，超过阈值才换。
+//
+// ## 为什么是"固定行高 + 只渲染可见窗口"，不是"滚到底再追加"
+//
+// 追加式（分块渲染）DOM 会随滚动一直长，滚到底跟一次全渲染一样——**它解决的
+// 是首次渲染，不是 DOM 规模**。真正的窗口化要求行高可预测，所以这条路径下
+// 每行收成**一行**（`.ref-row`，CSS 定死高度、超出省略号），完整内容点开进
+// 证据侧栏看。这是一个**取舍**：>阈值时列表从"每条三行摘要"变成"每条一行"。
+// 阈值以下不受影响，所以默认界面一个像素都没动。
+const VIRTUAL_LIST_THRESHOLD = 50;
+//: 一行的高度（px）。**必须跟 app.css 里 .ref-row 的 height 一致**——
+//: 两处不一致时滚动位置会越滚越偏。有一条测试比这两个数。
+const VIRTUAL_ROW_HEIGHT = 26;
+//: 窗口外上下各多渲染几行，避免快速滚动时露白。
+const VIRTUAL_OVERSCAN = 6;
+
+function virtualRowText(r) {
+  const sym = (r.symptoms || []).slice(0, 3).join("；");
+  return `${r.case_id}　${r.visit_label || ""}　相似度 ${r.score}`
+    + (r.syndrome ? `　证：${r.syndrome}` : "") + (sym ? `　${sym}` : "");
+}
+
+function virtualRefsHtml(refs) {
+  const n = refs.length;
+  // 外层固定高度 + 内层撑满总高：滚动条的长度必须跟"全部 n 行"一致，
+  // 否则用户看到的滚动比例是假的。
+  return `<div class="virtual-list" data-count="${n}" style="height:${
+    Math.min(12, n) * VIRTUAL_ROW_HEIGHT}px">`
+    + `<div class="virtual-spacer" style="height:${n * VIRTUAL_ROW_HEIGHT}px">`
+    + `<div class="virtual-window"></div></div></div>`;
+}
+
+// 把 refs 挂到 DOM 上并接上滚动。**分两步**（先出 HTML 再挂数据）是因为
+// 上层 `columnHtml` 是纯字符串拼接的（有一批纯函数测试靠这个性质），
+// 数据不能塞进字符串里。
+function mountVirtualLists(root, refsByIndex) {
+  const lists = (root || document).querySelectorAll(".virtual-list");
+  lists.forEach((el, i) => {
+    const refs = refsByIndex[i] || [];
+    if (!refs.length) return;
+    const win = el.querySelector(".virtual-window");
+    const draw = () => {
+      const first = Math.max(0, Math.floor(el.scrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_OVERSCAN);
+      const visible = Math.ceil(el.clientHeight / VIRTUAL_ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
+      const rows = refs.slice(first, first + visible);
+      win.style.transform = `translateY(${first * VIRTUAL_ROW_HEIGHT}px)`;
+      win.innerHTML = rows.map((r) => `<div class="ref-row" title="${
+        escapeHtml(virtualRowText(r))}">${escapeHtml(virtualRowText(r))}</div>`).join("");
+    };
+    // 滚动回调走 rAF 合并：scroll 事件一秒能来上百次，每次都重排一遍 DOM
+    // 就是自己造抖动（R41 的"消除布局抖动"那一条）。
+    let queued = false;
+    el.addEventListener("scroll", () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; draw(); });
+    });
+    draw();
+  });
 }
 
 // ---------- M7：君臣佐使分组 ----------
@@ -1024,7 +1189,7 @@ function doctorSectionHtml(physician, mode) {
   // 实现」，这次撞的是文案而不是逻辑，但道理一样），这里改成调用它。
   return `
     <div class="doctor-disclaimer">${escapeHtml(describeDisclaimer("doctor"))}</div>
-    <div class="label rx-section-title">医生编辑处方——${escapeHtml(state.name)}</div>
+    <div class="label rx-section-title">医师编辑处方——${escapeHtml(state.name)}</div>
     <div class="rx-formula-fields">
       <label>剂数　<input type="number" class="rx-doses" data-rx-phys="${physician}" data-rx-field="doses_count" value="${state.doses_count != null ? state.doses_count : ""}" /></label>
       <label>用法　<input type="text" class="rx-usage" data-rx-phys="${physician}" data-rx-field="usage" value="${escapeHtml(state.usage || "")}" /></label>
@@ -1138,7 +1303,7 @@ async function runExport(physician) {
   const doctorIdInput = document.getElementById("doctor-id-input");
   const doctorId = (doctorIdInput ? doctorIdInput.value : "").trim();
   if (!doctorId) {
-    state.exportError = { message: "请先在上方填写医生标识再导出处方。" };
+    state.exportError = { message: "请先在上方填写医师标识再导出处方。" };
     state.exportResult = null;
     renderDoctorExportPanel(physician);
     return;
@@ -1242,10 +1407,15 @@ document.getElementById("columns").addEventListener("click", (e) => {
 
 function describeDisclaimer(mode) {
   if (mode === "doctor") {
-    return "医生模式：处方辅助工具。系统提供的方剂与剂量为建议，最终处方由执业医师" +
-      "审核、修改并签发，医师承担全部临床责任。所有导出操作均记录审计日志。";
+    // R47 §0.4 第 2 条：输出侧的措辞决定这个产品算不算"辅助决策"。
+    // 「系统提供的方剂与剂量为建议」是指向具体患者的诊疗建议式措辞；
+    // 改成客观陈述——系统陈述的是**教材与医案里的记载**，用不用、怎么用
+    // 是医师的判断。这不是文字游戏，是产品定位（不作为医疗器械管理的前提）。
+    return "医师模式：知识辅助工具。系统列出的方剂与剂量出自教材与医案记载，" +
+      "不构成对该患者的用药建议；处方由执业医师审核、修改并签发，" +
+      "医师承担全部临床责任。所有导出操作均记录审计日志。";
   }
-  return "教学与研究用途，非诊断工具，不能替代执业医师";
+  return "中医知识辅助与教学工具，不作为医疗器械管理，不提供诊断结论";
 }
 
 function updateDisclaimer() {
@@ -1276,6 +1446,8 @@ function updateDoctorFieldsVisibility() {
 // ——切换后页面立刻进 running 状态、进度条走起来、取消按钮出现，跟手动点
 // 「辨证」看到的完全一样。replay 模式下这一次是命中 fixture、零调用。
 let LAST_COMPLAINT = "";
+//: R46：最近一次问诊的完整响应。病历文书按它排版（`buildEmrFromLastResult`）。
+let LAST_RESULT = null;
 
 document.getElementById("role-select").addEventListener("change", () => {
   updateDisclaimer();
@@ -1307,6 +1479,14 @@ function setConsultState(state) {
   if (!page) return;
   for (const s of CONSULT_STATES) page.classList.remove(`state-${s}`);
   page.classList.add(`state-${state}`);
+  // R47 §8.4 第 26 条：预计剩余时间的采样点挂在**状态机这一处**，不散到
+  // 各个调用点——"这一次跑了多久"的起止就是 running → done 这两次转移，
+  // 在别处计时早晚会漏掉某条分支（追问、信息不足、被拦截）。
+  if (typeof startEta !== "function") return;
+  if (state === "running") startEta();
+  // done 才计入样本：追问/信息不足/被拦截都没跑完整条链，把它们的历时
+  // 混进中位数会让预计时间越来越短，而那不是它变快了。
+  else stopEta(state === "done");
 }
 
 // 安全拦截：整页替换。**不是隐藏，是清空**——被拦截的请求不产出任何方药，
@@ -1394,16 +1574,34 @@ function exampleListHtml(examples) {
   return `<div class="ex-title">或从这三条开始</div><div class="ex-list">${items}</div>`;
 }
 
+// R41 事件委托：**一次绑在容器上**，不随每次渲染逐个按钮重绑。
+// 三个按钮的绑定本身很便宜，改它是为了两件别的事：
+//   · `renderExamples` 可能被调多次（重连、角色切换），逐个重绑的写法要靠
+//     "innerHTML 换了节点、旧监听器跟着走"这个副作用才不泄漏——依赖副作用的
+//     正确性是看不出来的正确性；
+//   · 委托之后 `renderExamples` 变成纯粹的"填 HTML"，没有副作用，
+//     `tests/test_consult_layout.py` 那类纯函数测试能直接用。
+let _examplesDelegated = false;
+
+function delegateExamples() {
+  if (_examplesDelegated) return;
+  const el = document.getElementById("examples");
+  if (!el) return;
+  _examplesDelegated = true;
+  el.addEventListener("click", (e) => {
+    const btn = e.target.closest(".example");
+    if (!btn || !el.contains(btn)) return;
+    const box = document.getElementById("complaint");
+    box.value = btn.dataset.complaint;
+    box.focus();
+  });
+}
+
 function renderExamples(examples) {
   const el = document.getElementById("examples");
   if (!el) return;
   el.innerHTML = exampleListHtml(examples);
-  for (const btn of el.querySelectorAll(".example")) {
-    btn.addEventListener("click", () => {
-      document.getElementById("complaint").value = btn.dataset.complaint;
-      document.getElementById("complaint").focus();
-    });
-  }
+  delegateExamples();
 }
 
 // ---------- 用药对照带（§3.1 第三条：页面的主角） ----------
@@ -1491,7 +1689,7 @@ function rxCompareHtml(divergence, results) {
   const parts = [`<span class="rx-group"><span class="rx-tag">共用 ${shared.length}</span>${dotsHtml(shared.length, "dot-shared")}</span>`];
   for (const pid of order) {
     const own = unique[pid] || [];
-    const name = PHYSICIAN_NAMES[pid] || pid;
+    const name = physicianName(pid);
     parts.push(`<span class="rx-group" data-physician="${escapeHtml(pid)}">`
       + `<span class="rx-tag">${escapeHtml(name)}独有 ${own.length}</span>`
       + dotsHtml(own.length, "dot-own", `var(--phys-${pid}, var(--ink))`)
@@ -1533,6 +1731,20 @@ function renderRxCompare(divergence, results) {
 // Playwright 实测就是这么发现的：running/insufficient/followup 三个状态的
 // 「不是三列，是 5」。纯函数测试测不出来——它们要么不调这个函数，要么自己喂
 // 一份三人的 PHYSICIAN_META。
+// 展示层只认中文名，id 只在数据层出现（CLAUDE.md「标识符只有一种规范形式」）。
+// **一处解析**：先看这次问诊的结果（`physician_name`），再回落到 /health 那份
+// 注册表，最后才是 id 本身。为什么必须有第二级：`renderConsultResult()` 每次
+// 都把 `PHYSICIAN_NAMES` 清空重填，而 structured 模式下 `results` 只有
+// 「五家综合」一条——§⑧ 的用药归属和 §⑨ 的「引到的医家」要显示叶天士、李可，
+// 只查那份映射就会把 `ye_tianshi` 这个 id 直接印到界面上（R37 实测截图上
+// 就是这么印的）。这是 SOURCES.md 第 31 条那件事的显示层版本。
+function physicianName(pid) {
+  if (!pid) return "";
+  return PHYSICIAN_NAMES[pid]
+    || (PHYSICIAN_META[pid] && PHYSICIAN_META[pid].name)
+    || pid;
+}
+
 function physicianOrder() {
   return Object.keys(PHYSICIAN_META).filter((pid) => !REFERENCE_PHYSICIANS.includes(pid));
 }
@@ -1556,7 +1768,7 @@ function columnStepsHtml(reached) {
 
 function columnRunningHtml(physician, reached) {
   const meta = PHYSICIAN_META[physician] || {};
-  return columnShellHtml(physician, meta.name || PHYSICIAN_NAMES[physician] || physician,
+  return columnShellHtml(physician, meta.name || physicianName(physician),
                          meta, "running", columnStepsHtml(reached));
 }
 
@@ -1593,6 +1805,404 @@ function clearColumns() {
   const el = document.getElementById("columns");
   if (el) el.innerHTML = "";
 }
+
+// ---------- R37：单链问诊流程（九段） ----------
+//
+// **结构化模式只有一份结论，三列等宽的版面在这里没有意义**（空着两列比摆一列
+// 更像"坏了"）。九段是一条链，纵向排、段号显式——链条这件事在 schema 层就是
+// 真的（`from_organs` / `from_syndrome` / `from_method` 逐字校验，见
+// core/schemas.py::_S3StructuredBase），界面只是把它显示出来。
+//
+// 九段的顺序 = 申报书 2.1 的五步链 + 它前面的三步（主诉/证素/追问）
+// + 后面的一步（校验与出处）。**不许重排**：顺序本身是"先说依据、再说结论"。
+const CHAIN_SECTIONS = [
+  { key: "complaint", no: "①", title: "主诉与标准化症状", step: "s1" },
+  { key: "elements", no: "②", title: "证素", step: "s2" },
+  { key: "followup", no: "③", title: "追问", step: "s2" },
+  { key: "organs", no: "④", title: "病变脏腑", step: "s3" },
+  { key: "syndrome", no: "⑤", title: "证型", step: "s3" },
+  { key: "method", no: "⑥", title: "治法", step: "s3" },
+  { key: "formula", no: "⑦", title: "方剂", step: "s3" },
+  { key: "herbs", no: "⑧", title: "药物组成", step: "s3" },
+  { key: "checks", no: "⑨", title: "校验与出处", step: "s3" },
+];
+
+// 这台服务的 S3 形状。**问诊开始之前就要知道**（/health 下发），
+// 否则跑的那几十秒里只能先摆一个可能是错的骨架、再当场换掉。
+// 一次问诊结束后以 manifest.s3_mode 为准（那份记的是真的跑了哪一条）。
+let SERVER_S3_MODE = null;
+
+function isSingleChain(manifest) {
+  if (manifest && manifest.s3_mode) return manifest.s3_mode === "structured";
+  return SERVER_S3_MODE === "structured";
+}
+
+// 这一份**响应**该不该画成单链。跟 `isSingleChain()` 分开是因为两者回答的不是
+// 同一个问题：那个回答"这台服务/这次问诊跑的是哪条链"（模式），这个回答"眼前这
+// 份数据能不能按一条链画"（形状）。`renderChainFlow()` 只读 `results[0]`，所以
+// 一份多医家的响应走进单链分支 = 另外几位医家的结论被静默丢掉——而模式在
+// manifest 缺 `s3_mode` 时（回放的老响应、fixture）是**回落猜的**，结论条数是
+// 事实。事实优先于猜测。
+function isSingleChainResult(data) {
+  if (((data || {}).results || []).length > 1) return false;
+  return isSingleChain((data || {}).manifest);
+}
+
+// 「某位医家影响了哪一步」里那个 step 的中文名。**复用九段自己的段名**，
+// 不另建一张表——影响的就是这几段，页面上两处出现同一个概念时必须同名
+// （`PhysicianInfluence.step` 的枚举是 organ/syndrome/method/formula/herbs，
+// 而段的 key 是 `organs`——schema 用单数，这一处是唯一要照顾的差别）。
+function influenceStepLabel(step) {
+  const key = step === "organ" ? "organs" : step;
+  const sec = CHAIN_SECTIONS.find((x) => x.key === key);
+  return sec ? sec.title : (step || "");
+}
+
+function chainLine(key, value) {
+  if (value === null || value === undefined || value === "") return "";
+  return `<div class="chain-line"><span class="chain-key">${escapeHtml(key)}</span>${value}</div>`;
+}
+
+// 可点开释义的词。`data-node` 是节点 id、`data-name` 是显示名——
+// 证型节点的 id 是 `syn::{physician}`（那个 id 是证据链反查的键，改不得），
+// 名字只在 label 里，所以两个都带上（见 core/node_explain.explain_node 的文档）。
+function explainable(nodeId, text, name) {
+  return `<span class="explainable" data-node="${escapeHtml(nodeId)}"`
+    + ` data-name="${escapeHtml(name || text)}" role="button" tabindex="0">`
+    + `${escapeHtml(text)}</span>`;
+}
+
+function chainSectionHtml(sec, state, body) {
+  return `<section class="chain-sec" data-key="${sec.key}" data-state="${state}">
+    <h3><span class="chain-no">${sec.no}</span>${escapeHtml(sec.title)}</h3>
+    <div class="chain-body">${body || ""}</div>
+  </section>`;
+}
+
+// 跑到哪一步了 → 九段各自的状态。step 的取值跟 COLUMN_STEPS 同一套
+// （s1/s2/s3），**复用那套而不是另编一套**：两套的话进度会各走各的。
+function chainStateFor(sec, reached) {
+  const order = COLUMN_STEPS.map((x) => x.key);
+  const at = order.indexOf(reached);
+  const mine = order.indexOf(sec.step);
+  if (mine < at) return "done";
+  if (mine === at) return "active";
+  return "todo";
+}
+
+function renderChainSkeleton(reached) {
+  const el = document.getElementById("chain-flow");
+  if (!el) return;
+  el.innerHTML = CHAIN_SECTIONS.map((sec) => chainSectionHtml(
+    sec, chainStateFor(sec, reached),
+    chainStateFor(sec, reached) === "todo" ? "" : "<span class=\"chain-key\">推理中…</span>",
+  )).join("");
+  showChainFlow();
+}
+
+function showChainFlow() {
+  const flow = document.getElementById("chain-flow");
+  const cols = document.getElementById("columns");
+  if (flow) flow.classList.add("show");
+  // **三列不是藏起来，是清空**：留在 DOM 里的话"这次跑的是哪一条"看不出来，
+  // 而且上一次 legacy 的三列会被滚出来（同 showSafetyBlock 那条理由）。
+  if (cols) cols.innerHTML = "";
+}
+
+function hideChainFlow() {
+  const flow = document.getElementById("chain-flow");
+  if (flow) { flow.classList.remove("show"); flow.innerHTML = ""; }
+  closeNodeExplain();
+}
+
+function chainHerbRow(choice, pid) {
+  const item = (choice && choice.item) || {};
+  const nodeId = `herb::${pid}::x::${item.name || ""}`;
+  const dose = item.dose ? `${item.dose}${item.dose_unit || "g"}` : "";
+  const bits = [
+    explainable(nodeId, stripDose(item.name || ""), stripDose(item.name || "")),
+    item.role ? `<span class="chain-key">${escapeHtml(item.role)}</span>` : "",
+    dose ? escapeHtml(dose) : "",
+    choice.for_element ? `→ ${escapeHtml(choice.for_element)}` : "",
+    choice.effect_cited ? `（${escapeHtml(choice.effect_cited)}）` : "",
+    choice.physician_source
+      ? `【${escapeHtml(physicianName(choice.physician_source))}】` : "",
+  ].filter(Boolean);
+  return `<div class="chain-line">${bits.join(" ")}</div>`;
+}
+
+function stripDose(name) {
+  // 药名剥剂量：跟后端 label 的做法对齐（id 保原样、label 剥）。
+  return String(name || "").replace(/[（(][^）)]*[）)]/g, "").replace(/\d+(\.\d+)?\s*[gG克钱两]/g, "").trim();
+}
+
+// 九段的填充。**每一段的数据来源写在对应分支的注释里**——一段填不出来时
+// 显示的是"这一步没有产出"而不是空白（空白看起来像坏了）。
+//: 代理决策的一行。**`why` 是制度、`detail` 是这一次的证据，两行分开**
+//: ——合成一句的话，读者分不清"系统一向这么做"和"这次是因为你说了这句话"。
+function agentTraceHtml(trace) {
+  const rows = (trace || []).filter((d) => d && d.capability);
+  if (!rows.length) return "";
+  const items = rows.map((d) => {
+    const kind = d.stop_kind_label
+      ? `<span class="agent-kind">${escapeHtml(d.stop_kind_label)}</span>` : "";
+    return `<li class="agent-step" data-capability="${escapeHtml(d.capability)}">
+      <span class="agent-cap">${escapeHtml(d.capability_label || d.capability)}</span>${kind}
+      <span class="agent-why">${escapeHtml(d.why || "")}</span>
+      ${d.detail ? `<span class="agent-detail">${escapeHtml(d.detail)}</span>` : ""}
+    </li>`;
+  }).join("");
+  return `<section class="agent-trace" aria-label="本次辨证的处理决策">
+      <div class="agent-trace-title">本次处理经过</div>
+      <ol class="agent-steps">${items}</ol>
+    </section>`;
+}
+
+function renderChainFlow(data) {
+  const el = document.getElementById("chain-flow");
+  if (!el) return;
+  const r = (data.results || [])[0] || {};
+  const st = r.s3_structured || null;
+  const s3 = r.s3 || {};
+  const pid = r.physician || "synthesis";
+  const s1 = data.s1 || {};
+  const s2 = data.s2 || {};
+  const parts = [];
+
+  // **这条链是谁的**：三列有列头，单链没有——名字要是不写在链顶上，页面上就只有
+  // §⑨ 的归因里能翻出来。而「本次辨证」（structured：融合出的一份结论）和
+  // 「叶天士一家」（legacy：单跑一家）是两种完全不同的结论，读的人必须一眼看见
+  // 自己在看哪一种。引用了几家的经验照实数（`physicians_cited`），
+  // 不拿配置里的家数当数——名字是配置，数是这次真跑出来的。
+  const cited = new Set([...(r.physicians_cited || []),
+                         ...(r.physician_influences || []).map((x) => x.physician)]);
+  parts.push(`<header class="chain-head">`
+    + `<span class="chain-who">${escapeHtml(r.physician_name || pid)}</span>`
+    + (r.school ? `<span class="chain-school">${escapeHtml(r.school)}</span>` : "")
+    + (cited.size
+        // R44：措辞从「引到 N 位医家」改成「引用名老中医经验 N 家」。
+        // 前者读起来像"有 N 个人参与了这次判断"（投票），后者说的是
+        // "这一份判断引用了 N 家的经验"（依据）。同一个数、同一份数据，
+        // 改的是它在产品面上表达的关系。
+        ? `<span class="chain-note">引用名老中医经验 ${cited.size} 家</span>` : "")
+    + `</header>`);
+  // R44：代理这一次做过的决策（停/问/取证/验）。**摆在链顶下面、九段上面**：
+  // 它回答的是"系统在这一步做了什么、凭什么"，而三甲的主治医师问的正是这个。
+  // 中文名由后端下发（`capability_label` / `stop_kind_label`），前端不写死。
+  parts.push(agentTraceHtml(data.agent_trace));
+
+  for (const sec of CHAIN_SECTIONS) {
+    let body = "";
+    if (sec.key === "complaint") {
+      body = chainLine("主诉", escapeHtml(LAST_COMPLAINT || ""))
+        + chainLine("症状", (s1.symptoms || []).map((x) =>
+            explainable(`sym::${x}`, x)).join("、"))
+        + chainLine("舌", escapeHtml(s1.tongue || "未记"))
+        + chainLine("脉", escapeHtml(s1.pulse || "未记"))
+        + ((s1.unmapped || []).length
+            ? chainLine("未归类表述", escapeHtml((s1.unmapped || []).join("、"))) : "");
+    } else if (sec.key === "elements") {
+      const hits = (s2.elements || []).map((h) =>
+        `${explainable(`elem::${h.element}`, h.element)}`
+        + `<span class="chain-key">${escapeHtml(h.kind === "location" ? "病位" : "病性")}</span>`
+        + `${escapeHtml(confidenceLabel(h.confidence))}`
+        + `（依据：${escapeHtml((h.supporting_symptoms || []).join("、"))}）`);
+      body = hits.length ? hits.map((x) => `<div class="chain-line">${x}</div>`).join("")
+                         : chainLine("证素", "（这一步没有推出证素）");
+      if ((s2.unexplained_symptoms || []).length) {
+        body += chainLine("未被解释的症状",
+          escapeHtml((s2.unexplained_symptoms || []).join("、")));
+      }
+    } else if (sec.key === "followup") {
+      const f = data.followup;
+      body = f
+        ? chainLine("轮数", `${escapeHtml(String(f.rounds))}`
+            + `（${escapeHtml(f.stopped_by_label || f.stopped_by || "")}）`)
+          + ((f.asserted || []).length ? chainLine("问出的症状",
+              escapeHtml((f.asserted || []).join("、"))) : "")
+          + ((f.denied || []).length ? chainLine("已排除",
+              escapeHtml((f.denied || []).join("、"))) : "")
+        : chainLine("追问", "（这一次没有追问：没有提问渠道或 FAST_MODE）");
+    } else if (sec.key === "organs") {
+      body = st && (st.organs || []).length
+        ? (st.organs || []).map((o) => `<div class="chain-line">`
+            + `${explainable(`elem::${o.organ}`, o.organ)} `
+            + `${escapeHtml(o.pathogenesis || "")}`
+            + `（依据：${escapeHtml((o.supporting_symptoms || []).join("、"))}）</div>`).join("")
+        : chainLine("病变脏腑", "（legacy 模式不产出这一步，见第⑤段的证型推理）");
+    } else if (sec.key === "syndrome") {
+      const name = st ? st.syndrome.name : s3.syndrome;
+      const disease = st ? st.syndrome.disease : s3.disease;
+      body = chainLine("证型", explainable(`syn::${pid}`,
+                disease ? `${disease} · ${name}` : (name || ""), name || ""))
+        + (st ? chainLine("从哪些脏腑推出",
+              escapeHtml((st.syndrome.from_organs || []).join("、"))) : "")
+        + chainLine("推理", escapeHtml((st ? st.syndrome.reasoning : s3.reasoning) || ""))
+        + (st && st.syndrome.reasoning_plain
+            ? chainLine("白话", escapeHtml(st.syndrome.reasoning_plain)) : "");
+    } else if (sec.key === "method") {
+      body = chainLine("治法", escapeHtml((st ? st.method.principle : s3.treatment_principle) || ""))
+        + (st ? chainLine("接住的证型", escapeHtml(st.method.from_syndrome || "")) : "")
+        + (st ? chainLine("针对", escapeHtml((st.method.targets || []).join("、"))) : "");
+    } else if (sec.key === "formula") {
+      const cand = st ? st.formula.candidate
+                      : ((s3.formula_candidates || [])[s3.selected || 0] || {});
+      body = chainLine("方剂", explainable(`formula::${pid}::${cand.name || ""}`, cand.name || ""))
+        + (st ? chainLine("接住的治法", escapeHtml(st.formula.from_method || "")) : "")
+        + chainLine("来源", escapeHtml(formulaSourceLabel(cand.source)))
+        + chainLine("理由", escapeHtml(cand.rationale || ""))
+        + (st && (st.formula.ontology_refs || []).length
+            ? chainLine("本体出处", (st.formula.ontology_refs || []).map((x) =>
+                escapeHtml(`${x.predicate}：${x.span}`)).join("；")) : "");
+    } else if (sec.key === "herbs") {
+      const choices = st ? (st.herb_choices || []) : [];
+      if (choices.length) {
+        body = choices.map((c) => chainHerbRow(c, pid)).join("");
+      } else {
+        const cand = (s3.formula_candidates || [])[s3.selected || 0] || {};
+        body = (cand.herb_items || []).map((it) =>
+          chainHerbRow({ item: it }, pid)).join("")
+          || chainLine("药物组成", "（这一步没有产出）");
+      }
+    } else if (sec.key === "checks") {
+      const v = r.verification || null;
+      const m = r.verifier_metrics || null;
+      body = v
+        // 中文名由后端随结论一起下发（`core/formula_verifier.RULE_LABELS`），
+        // 前端只负责显示、并在拿不到时回落到 id——不在这里再建一张表。
+        ? chainLine("符号验证", escapeHtml(v.status_label || v.status || ""))
+          + chainLine("违规", `veto ${escapeHtml(String(v.n_veto || 0))}`
+              + ` / revise ${escapeHtml(String(v.n_revise || 0))}`)
+          // **判不了的那几条要显示出来**：查不到依据 ≠ 查到了且通过（R34a）。
+          + chainLine("判不了", escapeHtml(String(v.n_unverifiable || 0))
+              + ((v.unverifiable || []).length
+                  ? `（${(v.unverifiable || []).map((u) =>
+                      escapeHtml(`${u.rule_label || u.rule}缺${u.missing_predicate}`))
+                      .join("；")}）` : ""))
+        : chainLine("符号验证", "（legacy 模式不跑符号验证器）");
+      if (m && m.revise_rounds !== undefined) {
+        body += chainLine("重开轮数", escapeHtml(String(m.revise_rounds)));
+      }
+      if (r.herbs_grounded_ratio !== null && r.herbs_grounded_ratio !== undefined) {
+        // 这个数必须带口径：分母是**这一方的药味数**，不是本体总药味
+        // （R34b 那两个分母）。少了这句话它会被当成"本体覆盖率"。
+        body += chainLine("带本体出处的药味占比",
+          `${Math.round(r.herbs_grounded_ratio * 100)}%`
+          + `<span class="chain-key">分母＝本方药味数</span>`);
+      }
+      if ((r.physicians_cited || []).length) {
+        body += chainLine("引用的名老中医经验", (r.physicians_cited || []).map((x) =>
+          escapeHtml(physicianName(x))).join("、"));
+      }
+      for (const inf of (r.physician_influences || [])) {
+        body += chainLine(`${physicianName(inf.physician)}·${influenceStepLabel(inf.step)}`,
+          `${escapeHtml(inf.contribution || "")}`
+          + `（医案 ${escapeHtml((inf.cited_case_ids || []).join("、"))}）`);
+      }
+      if ((r.hallucinated || []).length) {
+        body += chainLine("⚠ 编造的医案号", escapeHtml((r.hallucinated || []).join("、")));
+      }
+    }
+    parts.push(chainSectionHtml(sec, "done", body));
+  }
+  el.innerHTML = parts.join("");
+  showChainFlow();
+}
+
+// ---------- R37/R42：节点释义面板（零 LLM，八节，取不到就整块隐藏） ----------
+//
+// R42：八节（是什么/病机/药理/出处原文/名老中医经验/验证结果/循证对照/注意）。
+// **这一层不写死节的清单**——标题与顺序全由后端下发，前端只负责按顺序渲染。
+// 写死一份的话，后端加一节前端不显示，而"不显示"看起来跟"这一节没内容"一样。
+
+let NODE_EXPLAIN_SEQ = 0;
+
+async function openNodeExplain(nodeId, name) {
+  const el = document.getElementById("node-explain");
+  if (!el) return;
+  const seq = ++NODE_EXPLAIN_SEQ;
+  // R43：**点下去立刻有反馈。** 改之前面板要等响应回来才出现——点一个节点之后
+  // 屏幕上什么都不变，人会以为"点了没反应"再点一下（于是又发一次请求）。
+  // 先摆一个带节点名的骨架，拿到内容再替换；`available=false` 时整块隐藏的
+  // 语义没变（那一条在下面）。
+  showNodeExplainPending(name || nodeId);
+  try {
+    const qs = `node=${encodeURIComponent(nodeId)}`
+      + (name ? `&name=${encodeURIComponent(name)}` : "");
+    const resp = await fetch(`/api/node_explain?${qs}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    // **过期响应不渲染**：连点两个节点时先回来的那个不该覆盖后点的那个。
+    if (seq !== NODE_EXPLAIN_SEQ) return;
+    if (!data.available) { closeNodeExplain(); return; }
+    renderNodeExplain(data);
+  } catch (err) {
+    // 释义取不到不该弹红条打断问诊——它是附加信息。整块隐藏即可。
+    if (seq === NODE_EXPLAIN_SEQ) closeNodeExplain();
+  }
+}
+
+//: 等待态的骨架。**不是一个转圈图标**：这里能立刻说出"正在查哪个节点"，
+//: 那比一个匿名的加载动画有用得多（人据此确认自己点对了）。
+//: `aria-busy` 让读屏软件知道这一块还在变。
+function showNodeExplainPending(title) {
+  const el = document.getElementById("node-explain");
+  if (!el) return;
+  el.innerHTML = `<div><span class="ne-close" data-ne-close="1">×</span>
+      <span class="ne-title">${escapeHtml(String(title || ""))}</span>
+      <span class="ne-kind">查询中…</span></div>`;
+  el.setAttribute("aria-busy", "true");
+  el.classList.add("show");
+}
+
+function renderNodeExplain(data) {
+  const el = document.getElementById("node-explain");
+  if (!el) return;
+  const secs = (data.sections || []).map((s) => `<div class="ne-sec">
+      <div class="ne-head">${escapeHtml(s.heading)}</div>
+      ${(s.lines || []).map((ln) => `<div class="ne-line">${escapeHtml(ln)}</div>`).join("")}
+      ${s.source ? `<div class="ne-src">出处：${escapeHtml(s.source)}</div>` : ""}
+    </div>`).join("");
+  el.innerHTML = `<div><span class="ne-close" data-ne-close="1">×</span>
+      <span class="ne-title">${escapeHtml(data.title || "")}</span>
+      <span class="ne-kind">${escapeHtml(NODE_KIND_LABEL[data.kind] || data.kind || "")}</span>
+    </div>${secs}`;
+  el.setAttribute("aria-busy", "false");
+  el.classList.add("show");
+}
+
+//: 节点种类的中文名。**R42 补齐三类新节点**（病机/治则/治法）——漏一个的
+//: 表现是面板标题旁边冒出一个英文 id（`pathogenesis`），跟 R37 截图上那个
+//: 「meridian_coverage缺归经」是同一类事故。
+const NODE_KIND_LABEL = {
+  symptom: "症状", element: "证素", syndrome: "证型",
+  pathogenesis: "病机", principle: "治则", method: "治法",
+  formula: "方剂", herb: "药材", case: "医案",
+};
+
+function closeNodeExplain() {
+  const el = document.getElementById("node-explain");
+  if (el) {
+    el.classList.remove("show");
+    el.innerHTML = "";
+    el.setAttribute("aria-busy", "false");
+  }
+}
+
+// 事件委托挂在 document 上一次，不给每个 .explainable 各挂一个——
+// 九段每次重渲染都会换掉所有节点，逐个挂等于每次泄一批监听器
+// （同 #columns 那处 delegation 的理由）。
+document.addEventListener("click", (e) => {
+  const closer = e.target.closest("[data-ne-close]");
+  if (closer) { closeNodeExplain(); return; }
+  const hit = e.target.closest(".explainable");
+  if (hit) openNodeExplain(hit.dataset.node, hit.dataset.name);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const hit = e.target.closest && e.target.closest(".explainable");
+  if (hit) { e.preventDefault(); openNodeExplain(hit.dataset.node, hit.dataset.name); }
+});
 
 function renderColumnsPlaceholder(builder) {
   const el = document.getElementById("columns");
@@ -1779,7 +2389,10 @@ function adviceBlockHtml(result) {
   const emptyHtml = (advice && advice.length) ? "" :
     `<div class="adv-none">规则层没有发现问题</div>`;
   return `<div class="advice-block">`
-    + `<div class="advice-head"><span class="advice-title">方剂建议</span>${scoreHtml}</div>`
+    // R47 §0.4：区块名从「方剂建议」改成「方剂核查」。这一层给的是对**方子
+    // 本身**的核查结论（配伍禁忌、剂量上限、归经覆盖），不是对这位患者的
+    // 用药建议——名字叫「建议」会把一层客观校验说成一条诊疗意见。
+    + `<div class="advice-head"><span class="advice-title">方剂核查</span>${scoreHtml}</div>`
     + bodyHtml + emptyHtml + `</div>`;
 }
 
@@ -1837,7 +2450,7 @@ function columnHtml(result, mode = "researcher") {
       ${hallucinationHtml}
       ${adviceBlockHtml(result)}
       ${doctorSectionHtml(result.physician, mode)}
-      ${refFoldHtml(result.refs)}
+      ${refFoldHtml(result.refs, result)}
       <details class="col-reasoning" ${openAttr}>
         <summary>推理过程</summary>
         <div class="detail-block">
@@ -1904,7 +2517,7 @@ function referenceCaseHtml(c) {
 
 function referenceBlockHtml(pid, data) {
   const meta = (data && data.physician) || {};
-  const name = meta.name || PHYSICIAN_NAMES[pid] || pid;
+  const name = meta.name || physicianName(pid);
   // 身份色走 CSS 变量，不把 /api 返回的色值直接写进 style——变量由
   // injectPhysicianColors 从同一份注册表注入，两条路会漂。
   const head = `<div class="ref-head" style="border-left-color: var(--phys-${pid})">`
@@ -1963,6 +2576,12 @@ async function renderReferencePhysicians(complaint, role) {
 
 function renderColumns(results, mode = "researcher") {
   document.getElementById("columns").innerHTML = results.map((r) => columnHtml(r, mode)).join("");
+  // R41：窗口化列表要在 HTML 落进 DOM 之后挂数据与滚动（`columnHtml` 是纯字符串
+  // 拼接，数据塞不进字符串里）。顺序跟 `results` 一致——`.virtual-list` 出现的
+  // 顺序就是列的顺序，第 i 个列表拿第 i 列的 refs。
+  // 条数没超阈值时页面里一个 `.virtual-list` 都没有，这一行是空转。
+  mountVirtualLists(document.getElementById("columns"),
+                    results.map((r) => r.refs || []));
 }
 
 // role-select 的当前取值。跟 retriever-mode 一样"逐请求参数、不落进程状态"，
@@ -2037,7 +2656,11 @@ function describeSafetyFlag(flag) {
   // 打开"，可是之前页面上完全看不出来它开着——结果照常显示、方药照常开。
   // 返回 null 表示不需要横幅。
   if (!flag) return null;
-  return `⚠ 评测模式（EVAL_MODE）已开启：这条主诉命中了安全否决（${flag}），正常情况下会在辨证前被拦截、不产出任何方药。下面的结果只用于评测，不要用于演示或作为参考。`;
+  // R47 §8.2 第 15 条：这一行**不在 internal-only 块里**（它是安全警告，
+  // 任何模式下都必须显示），所以它的措辞也必须过产品面那关——原话里的
+  // 「评测模式（EVAL_MODE）」把一个内部开关名摆在了使用者面前。
+  // 换成说人话的同一件事：不中止的诊断配置。要拦的行为一个字没变。
+  return `⚠ 当前服务运行在一种「命中安全规则也不中止」的诊断配置下：这条主诉命中了安全否决（${flag}），正常配置下会在辨证开始前被拦截、不产出任何方药。下面的结果不可用于临床参考。`;
 }
 
 function renderSafetyFlag(flag) {
@@ -2069,12 +2692,20 @@ function buildConsultRequestBody(complaint) {
   // 永远有一个合法选中值（默认 researcher），没有"不传等于用服务端默认"这种
   // 需要区分的场景。
   body.role = getSelectedRole();
+  // R46：结构化四诊与「人」维**只在填了的时候带**。带一份全空的表单会让
+  // 后端把"没填"当成"填了但都是空的"，而这两者在个体化那一层是不同的结论
+  // （见 core/individualize.py 对 `profile.is_empty()` 的处理）。
+  const intake = collectIntake();
+  if (Object.keys(intake).length) body.intake = intake;
+  const profile = collectProfile();
+  if (profile) body.patient_profile = profile;
   return body;
 }
 
 function renderConsultResult(data) {
   resetSecondaryPanels();
   hidePatientView();
+  hideChainFlow();
   if (data.rejected) {
     // 安全拦截：**整页替换**（§3.1）。不是在三列上面加个红横幅——总纲的原话是
     // "什么都标红会训练用户忽略标红"，这个系统只在真危重时打断，所以打断必须
@@ -2108,6 +2739,28 @@ function renderConsultResult(data) {
     return;
   }
   renderSafetyFlag(data.safety_flag);
+  // R47：产品面的三件——依据强度（替代用药对照带）、本次记录编号、空结果。
+  // 三个函数各自判断该不该显示，这里不加 if：判据散到调用点就是十六处
+  // 零散判断的开头。
+  renderEvidenceStrength(data);
+  renderRecordId(data);
+  renderEmptyResult(data);
+  // R46：循证对照、个体化调整、病历文书草稿。三块都各自判断该不该显示。
+  // `LAST_RESULT` 给病历文书用——它是"把这一次的结果排成一份文书"，
+  // 所以要拿得到这一次的结果。
+  LAST_RESULT = data;
+  renderGuideline(data.guideline);
+  renderIndividualization(data.individualization);
+  // R46 §7.4：医师模式下把病历文书草稿也生成出来。**这一趟不调模型**
+  // （把已经算好的结果排版而已），所以可以跟结果一起出来，不用让医师再点一次
+  // ——"生成病历"如果要额外一次点击，它就还是一件额外的事，而这一层的全部
+  // 意义正是"病历书写不该再是一件额外的事"。
+  if (getSelectedRole() === "doctor" && (data.results || []).length) {
+    buildEmrFromLastResult(data).then((out) => { if (out) renderEMR(out.emr); })
+      .catch(() => { /* 生成失败不影响结果页；按钮上还能再试一次 */ });
+  } else {
+    renderEMR(null);
+  }
   PHYSICIAN_COLORS = {};
   PHYSICIAN_NAMES = {};
   for (const r of data.results) {
@@ -2163,9 +2816,16 @@ function renderConsultResult(data) {
   // 前端再把裁剪过的空壳摆出来只会让人以为"这次没开出方"。
   if (getSelectedRole() === "patient") {
     document.getElementById("columns").innerHTML = "";
+    hideChainFlow();
     renderPatientView(data);
+  } else if (isSingleChainResult(data)) {
+    // R37：结构化模式 = 单链九段。**patient 角色仍然走患者视图**（那是另一种
+    // 形态，不是这条链的裁剪版），所以这个分支在它后面。
+    hidePatientView();
+    renderChainFlow(data);
   } else {
     hidePatientView();
+    hideChainFlow();
     renderColumns(data.results, getSelectedRole());
   }
   // R18-I：参考医家那一栏不等三列、也不阻塞后面的渲染——它自己 fetch，
@@ -2188,6 +2848,70 @@ function clearProgress() {
   const log = document.getElementById("progress-log");
   log.textContent = "";
   log.classList.remove("show");
+  clearS3Stream();
+}
+
+// ---------- R36：S3 流式增量 ----------
+//
+// 服务端已经把增量合并过了（core/chain.py 的 S3DeltaEmitter，80 字或 120ms 一帧），
+// 所以这里**不需要再攒一层**；要做的是限制重排频率。
+//
+// **R37 把节流从 requestAnimationFrame（≈16ms）改成 ≥50ms 的时间闸。** rAF 的
+// 节奏跟屏幕刷新率绑，60Hz 下是 16ms、120Hz 的屏上是 8ms——这个区域的内容是
+// 模型吐的 JSON，人眼在 50ms 和 8ms 之间分辨不出差别，而每次重排都要把这一大段
+// 文本重新排版。50ms（20 次/秒）是"看起来连续"的下限，再快只是白烧 CPU；
+// 而 1280×800 的投影仪那台机器上，白烧的那部分会让整页跟着掉帧。
+const S3_STREAM_RENDER_MS = 50;
+const s3Stream = { text: new Map(), pending: false, order: [], lastRender: 0 };
+
+function clearS3Stream() {
+  s3Stream.text.clear();
+  s3Stream.order.length = 0;
+  s3Stream.lastRender = 0;
+  const box = document.getElementById("s3-stream");
+  if (box) { box.textContent = ""; box.classList.remove("show"); }
+}
+
+function onS3Delta(data) {
+  const who = data.physician_name || data.physician || "";
+  const kind = data.kind === "reasoning" ? "reasoning" : "content";
+  const key = `${data.physician || ""}:${kind}`;
+  if (!s3Stream.text.has(key)) {
+    s3Stream.order.push({ key, who, kind });
+    s3Stream.text.set(key, "");
+  }
+  s3Stream.text.set(key, s3Stream.text.get(key) + (data.text || ""));
+  if (s3Stream.pending) return;
+  s3Stream.pending = true;
+  const since = Date.now() - (s3Stream.lastRender || 0);
+  // 距上次渲染够久就立刻画（第一帧不该等 50ms），否则排到 50ms 边界上。
+  const wait = since >= S3_STREAM_RENDER_MS ? 0 : S3_STREAM_RENDER_MS - since;
+  setTimeout(renderS3Stream, wait);
+}
+
+function renderS3Stream() {
+  s3Stream.pending = false;
+  s3Stream.lastRender = Date.now();
+  const box = document.getElementById("s3-stream");
+  if (!box) return;
+  box.classList.add("show");
+  // **只留尾部 1200 字**：模型吐的是几千字的 JSON，全留着 DOM 越来越大而人
+  // 只看得见最后几行。截断这件事要让人看出来（前面加省略号），不能悄悄丢。
+  box.textContent = "";
+  for (const { key, who, kind } of s3Stream.order) {
+    const full = s3Stream.text.get(key) || "";
+    const tail = full.length > 1200 ? "…" + full.slice(-1200) : full;
+    const head = document.createElement("span");
+    head.className = "s3-who";
+    head.textContent = `${who}${kind === "reasoning" ? "（思考）" : ""}：`;
+    const body = document.createElement("span");
+    if (kind === "reasoning") body.className = "s3-reasoning";
+    // textContent 而不是 innerHTML：这段文本直接来自模型输出
+    body.textContent = tail + "\n";
+    box.appendChild(head);
+    box.appendChild(body);
+  }
+  box.scrollTop = box.scrollHeight;
 }
 
 let currentStreamId = null;
@@ -2277,6 +3001,10 @@ function columnStepForEvent(name, data) {
     case "physician_start":
     case "react_step":
     case "s3_start":
+    // R36：增量与 s3 结束都仍然属于"这一列在跑 S3"这一步——
+    // 漏了它们的话，流式期间那一列的进度指示会退回上一步。
+    case "s3_delta":
+    case "s3_done":
       return { physician: data.physician, step: "s3" };
     default:
       return null;
@@ -2293,7 +3021,8 @@ function describeProgressEvent(name, data) {
     case "followup_done":
       if (data.stopped_by === "no_answer") return "③ 追问：无提问渠道，跳过";
       if (data.stopped_by === "fast_mode") return "③ 追问：FAST_MODE 已跳过";
-      return `③ 追问结束（${data.rounds} 轮，${data.stopped_by}）`;
+      return `③ 追问结束（${data.rounds} 轮，`
+        + `${data.stopped_by_label || data.stopped_by}）`;
     case "residual_done":
       return `④ 残差辨证：补充解释「${(data.newly_explained || []).join("、") || "无"}」`;
     case "physician_start":
@@ -2302,6 +3031,16 @@ function describeProgressEvent(name, data) {
       return `　${data.physician_name} 取证第 ${data.step} 步：${data.action}`;
     case "s3_start":
       return `　${data.physician_name} 正在拟定证型与方药…`;
+    case "s3_done": {
+      // 没流式的时候**把原因说出来**（后端不支持 / 是模拟的 / best-of-N），
+      // 不然界面上只是"没有增量"，看不出是不是卡了。
+      if (!data.events) {
+        return `　${data.physician_name} 输出完成（无增量${data.streaming_note ? "：" + data.streaming_note : ""}）`;
+      }
+      const first = data.first_delta_s == null ? "—" : `${data.first_delta_s}s`;
+      return `　${data.physician_name} 输出完成：${data.events} 帧流式，首字 ${first}，` +
+        `正文 ${data.chars_content} 字${data.chars_reasoning ? `，思考 ${data.chars_reasoning} 字` : ""}`;
+    }
     case "physician_done":
       return `✓ ${data.physician_name} 完成：${data.syndrome}`;
     case "followup_answered":
@@ -2390,7 +3129,14 @@ async function submitConsult() {
   renderComplaintBody(complaint);
   setConsultState("running");
   resetColumnProgress();
-  renderColumnsPlaceholder((pid) => columnRunningHtml(pid, "s1"));
+  if (isSingleChain(null)) {
+    // R37：structured 下**问诊一开始就摆九段骨架**。/health 已经告诉了前端
+    // 这台服务的形状，所以不必先摆三列再当场换掉——那一下闪烁正是"界面在猜"。
+    renderChainSkeleton("s1");
+  } else {
+    hideChainFlow();
+    renderColumnsPlaceholder((pid) => columnRunningHtml(pid, "s1"));
+  }
   currentStreamId = null;
 
   currentAbort = new AbortController();
@@ -2443,6 +3189,18 @@ async function submitConsult() {
         errorDetail = data.detail;
       } else if (name === "done") {
         doneData = data;
+      } else if (name === "s3_delta") {
+        // R36：增量**不进日志**（几十帧会把日志顶得看不见），只刷流式区。
+        onS3Delta(data);
+      } else if (name === "deltas_dropped") {
+        // R40 背压：后端因为 SSE 队列满丢了 N 条逐字增量。**要说出来**——
+        // 打字机效果中间缺一段而界面一声不响，会被读成"模型就是这么写的"。
+        // 终值不受影响（s3_done / done 兜底），所以这是一条说明，不是错误。
+        appendProgress(`网络较慢，已跳过 ${data.n} 条逐字增量（最终结果不受影响）`);
+      } else if (name === "heartbeat") {
+        // 心跳的全部作用是"别把这条连接当空闲连接掐掉"（见 api/main.py
+        // _HEARTBEAT_SECONDS）。armWatchdog() 上面已经调过了，这里什么都不做
+        // ——写进日志会每 15 秒刷一行噪音。
       } else {
         const line = describeProgressEvent(name, data);
         if (line) appendProgress(line);
@@ -2450,7 +3208,10 @@ async function submitConsult() {
         // R12 之后三位医家是并发跑的，叶天士的 done 完全可能排在张锡纯的
         // start 后面（docs/DESIGN.md §4.7 的订正）。
         const step = columnStepForEvent(name, data);
-        if (step) setColumnStep(step.physician, step.step);
+        if (step) {
+          if (isSingleChain(null)) renderChainSkeleton(step.step);
+          else setColumnStep(step.physician, step.step);
+        }
         if (name === "followup_answered") hideNeedInput();
       }
     });
@@ -2544,21 +3305,29 @@ document.getElementById("need-input-submit").addEventListener("click", submitNee
 document.getElementById("need-input-answer").addEventListener("keydown", (e) => {
   if (e.key === "Enter") submitNeedInputAnswer();
 });
-// 没有图时这两个按钮点了什么都不会发生（lastGraph 为 null），原来仍然是
+// 没有图时这三个按钮点了什么都不会发生（lastGraph 为 null），原来仍然是
 // 可点的实心按钮，看起来像坏了。
 function updateGraphToolbar() {
-  for (const id of ["skip-btn", "replay-btn"]) {
+  for (const id of ["skip-btn", "replay-btn", "png-btn"]) {
     const b = document.getElementById(id);
     if (b) b.disabled = !lastGraph;
   }
 }
 document.getElementById("skip-btn").addEventListener("click", skipAnimation);
 document.getElementById("replay-btn").addEventListener("click", replayGraph);
+// R42：导出 PNG。文件名带当前主诉的前几个字——连导三张图在下载目录里
+// 要能分清哪张是哪张（文件名的拼装在 graph.js 那一侧，这里只给"提示"）。
+document.getElementById("png-btn").addEventListener("click", () => {
+  TCM.exportGraphPng(null, (document.getElementById("complaint") || {}).value || "");
+});
 updateGraphToolbar();
 // 保险起见运行时把面板挂到 body 末尾：只要祖先里有任何 transform/filter，
 // position:fixed 就会相对该祖先定位而不是视口，面板会跑到页面中间去。
-{
-  const _p = document.getElementById("evidence-panel");
+// R42：**释义面板也要**——它在窄屏（≤768px）下是底部抽屉（position: fixed），
+// 挂在 main 里时实测贴不到屏底（差 8px，正好是祖先那一层的偏移）。
+// 同一个理由、同一处修法，所以放在同一个块里。
+for (const _id of ["evidence-panel", "node-explain"]) {
+  const _p = document.getElementById(_id);
   if (_p && _p.parentElement !== document.body) document.body.appendChild(_p);
 }
 document.getElementById("evidence-close").addEventListener("click", closeEvidence);
@@ -2593,4 +3362,683 @@ enhanceAllSelects();
   const _tb = document.getElementById("topbar-toggle");
   if (_tb) _tb.addEventListener("click", toggleTopbar);
   applyTopbarCollapsed(topbarCollapsed());
+}
+
+
+// ============================================================================
+// R47 产品化收口
+// ============================================================================
+//
+// **能力不删，产品面不露。** 这一段不删任何既有渲染函数——它只决定"这一次
+// 运行要不要把它们摆出来"，以及产品面用什么替代物。分派点在后端
+// （core/product_mode.py → /health），这里是唯一的应用点。
+//
+// 为什么应用点只能有一个：要藏的东西有十六条，散着判断的话以后加第十七条
+// 会漏掉其中几处，而漏掉的那几处恰恰是没人盯着的角落（顶栏折叠起来的那一块、
+// 某个角色下才出现的面板）。跟 CLAUDE.md「同一概念的匹配逻辑只能有一处实现」
+// 是同一条。
+
+//: /health 下发的那一份。默认按产品模式算——拿不到 /health 时（后端不在）
+//: 页面应该是正式版形态，而不是把内部面板露出来。
+let PRODUCT_FLAGS = { product_mode: true, roles: null, default_role: null };
+
+function isProductMode() {
+  return document.documentElement.dataset.productMode !== "0";
+}
+
+function applyProductMode(health) {
+  PRODUCT_FLAGS = {
+    product_mode: health.product_mode !== false,
+    roles: health.roles || null,
+    default_role: health.default_role || null,
+  };
+  document.documentElement.dataset.productMode = PRODUCT_FLAGS.product_mode ? "1" : "0";
+  const sel = document.getElementById("role-select");
+  if (!sel) return;
+  // **研究者这一档从 DOM 里摘掉，不是用 CSS 藏。** 一个被 CSS 藏起来的
+  // `<option>` 仍然是 select 的 value：页面一加载就会以研究者身份去请求，
+  // 而后端在产品模式下对这个角色回 404——界面看起来好好的，一点就报错。
+  const allowed = PRODUCT_FLAGS.roles
+    ? new Set(PRODUCT_FLAGS.roles.map((r) => r.id)) : null;
+  if (allowed) {
+    for (const opt of [...sel.options]) {
+      if (opt.dataset.internalRole && !allowed.has(opt.value)) opt.remove();
+    }
+  }
+  const want = PRODUCT_FLAGS.default_role;
+  if (want && [...sel.options].some((o) => o.value === want)) sel.value = want;
+  // 自绘下拉的按钮文字要跟着换：只改原生 select 的 value 的话，按钮上留着
+  // 上一个选项的名字（R24 那层包装记的是自己渲染过的文本）。
+  if (typeof refreshSelect === "function") refreshSelect(sel);
+  updateDisclaimer();
+  updateDoctorFieldsVisibility();
+}
+
+// ---------- §8.2 第 7 条：产品面的「本方的依据强度」 ----------
+//
+// 用药对照带与噪声地板是**研究指标**：它们回答"几家之间差多少"，而主治医师
+// 要的是"这一条结论我能不能核对"。同一份数据，换一个问题来问。
+//
+// **一个字的研究词都不许出现**（ε、Jaccard、噪声地板、分歧度）：
+// tests/test_no_demo_artifacts.py 扫源码钉这一条。
+
+//: 药味可核对比例的三档。分档不是为了给一个分数，是为了让"要不要逐味核对"
+//: 这个决定有个起点——高档可以抽查，低档必须逐味看。
+const GROUNDED_STRONG = 0.8;
+const GROUNDED_MEDIUM = 0.5;
+
+function groundedLabel(ratio) {
+  if (ratio >= GROUNDED_STRONG) return "强";
+  if (ratio >= GROUNDED_MEDIUM) return "中";
+  return "弱";
+}
+
+function evidenceStrengthHtml(data) {
+  const r = (data.results || [])[0];
+  if (!r) return "";
+  const cited = new Set([...(r.physicians_cited || []),
+                         ...(r.physician_influences || []).map((x) => x.physician)]);
+  const nRefs = (r.refs || []).length;
+  const ratio = r.herbs_grounded_ratio;
+  const parts = [];
+  if (ratio === null || ratio === undefined) {
+    // **不编**：这一次没有算出这个比例（legacy 路径、参考医家引用区），
+    // 就说没算，不拿 0 充数——0 在这里意味着"一味都没查到"，是另一回事。
+    parts.push("本次未统计药味出处覆盖。");
+  } else if (!KNOWLEDGE_BASE_AVAILABLE) {
+    // 0 的两种含义必须分清（见 /health 的 knowledge_base 注释）
+    parts.push("这台部署未装载本草与方剂本体，药味出处无从核对——"
+      + "这不是「查不到出处」，是没有可查的底本。");
+  } else {
+    const pct = Math.round(ratio * 100);
+    parts.push(`依据强度<b>${groundedLabel(ratio)}</b>：本方 ${pct}% 的药味`
+      + "可在本草与方剂本体中查到性味归经与功效的原文出处。");
+  }
+  if (nRefs) parts.push(`另引医案原文 ${nRefs} 条`);
+  if (cited.size) parts.push(`名老中医经验 ${cited.size} 家`);
+  return parts.join("，").replace(/，$/, "") + "。逐条出处见下方推导链，点任一节点展开。";
+}
+
+//: /health 下发的本体可用性。默认 true——拿不到 /health 时不该反过来
+//: 断言"本体不在"，那是把一个不知道说成了一个结论。
+let KNOWLEDGE_BASE_AVAILABLE = true;
+
+function renderEvidenceStrength(data) {
+  const el = document.getElementById("evidence-strength");
+  if (!el) return;
+  const html = data && (data.results || []).length ? evidenceStrengthHtml(data) : "";
+  el.innerHTML = html;
+  el.classList.toggle("show", !!html);
+}
+
+// ---------- §8.4 第 31 条：页脚的版本与本次记录编号 ----------
+
+function renderFooterVersion(health) {
+  const el = document.getElementById("footer-version");
+  if (!el) return;
+  const name = health.product_name || "";
+  const ver = health.version || "";
+  el.textContent = name && ver ? `${name} ${ver}` : "";
+}
+
+function renderRecordId(data) {
+  const el = document.getElementById("footer-record");
+  if (!el) return;
+  // §8.2 第 9 条：叫「本次记录编号」，不叫 trace_id，也不解释它是什么技术。
+  el.textContent = data && data.record_id ? `本次记录编号 ${data.record_id}` : "";
+}
+
+// ---------- §8.4 第 28 条：空结果 ----------
+
+function renderEmptyResult(data) {
+  const el = document.getElementById("empty-result");
+  if (!el) return;
+  const s1 = data && data.s1;
+  const unmapped = (s1 && s1.unmapped) || [];
+  const symptoms = (s1 && s1.symptoms) || [];
+  // 判据是"一个症状都没归类出来"，不是"结果为空"——后者还可能是被安全层
+  // 拦下、或者信息不足，那两种各有各的界面，不该被这一块盖住。
+  const show = !!s1 && symptoms.length === 0 && !data.rejected && !data.insufficient;
+  if (!show) { el.classList.remove("show"); el.innerHTML = ""; return; }
+  el.innerHTML = "<b>这段描述没有落进本系统的语料范围。</b>"
+    + "<div>当前覆盖：内科杂病为主的教材证候与历代医案，"
+    + "输入需要是症状与病史的<b>文字描述</b>（含舌象脉象的文字记录）。</div>"
+    + (unmapped.length
+        ? `<div>未能归类的表述：${escapeHtml(unmapped.join("、"))}</div>` : "")
+    + "<div class=\"er-retry\">建议：按病历原文补充主诉、现病史与舌脉描述后重试；"
+    + "若属外科、骨伤、儿科专科病证，本系统当前语料未覆盖。</div>";
+  el.classList.add("show");
+}
+
+// ---------- §8.4 第 26 条：基于实测 p50 的预计剩余时间 ----------
+//
+// **为什么不写死一个秒数**：这台部署用的是哪个后端、哪块卡、开不开 ReAct，
+// 决定了一次问诊是十几秒还是几分钟。写死的数在另一台机器上就是错的，
+// 而一个错的倒计时比没有倒计时更伤信任。
+//
+// **为什么不取 R40 压测里的 p50**：那一组是 `--backend fake` 跑出来的，
+// 量的是服务框架的开销，不是真实推理的历时。拿它当预计等于用一个不相干的
+// 数冒充实测（「任何数字都必须带对照」那条铁律的反面用法）。
+//
+// 所以：**这台部署自己跑过的历时**，取中位数。样本不足时如实说没有。
+const DURATION_KEY = "tcm.consultDurations";
+const DURATION_KEEP = 20;
+const DURATION_MIN_SAMPLES = 3;
+let etaStartedAt = 0;
+let etaTimer = null;
+
+function readDurations() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DURATION_KEY) || "[]");
+    return Array.isArray(raw) ? raw.filter((n) => typeof n === "number" && n > 0) : [];
+  } catch (e) { return []; }
+}
+
+function recordDuration(ms) {
+  if (!(ms > 0)) return;
+  const next = [...readDurations(), ms].slice(-DURATION_KEEP);
+  try { localStorage.setItem(DURATION_KEY, JSON.stringify(next)); } catch (e) { /* 隐私模式 */ }
+}
+
+function durationP50() {
+  const xs = readDurations().slice().sort((a, b) => a - b);
+  if (xs.length < DURATION_MIN_SAMPLES) return null;
+  const mid = Math.floor(xs.length / 2);
+  return xs.length % 2 ? xs[mid] : Math.round((xs[mid - 1] + xs[mid]) / 2);
+}
+
+function etaText(elapsedMs) {
+  const p50 = durationP50();
+  if (p50 === null) {
+    const n = readDurations().length;
+    return `已用 ${Math.round(elapsedMs / 1000)} 秒。这台服务还没有足够的历时样本`
+      + `（${n}/${DURATION_MIN_SAMPLES}），走完这一次之后就能给出预计时间。`;
+  }
+  const left = Math.round((p50 - elapsedMs) / 1000);
+  if (left > 0) {
+    return `已用 ${Math.round(elapsedMs / 1000)} 秒，预计还需约 ${left} 秒`
+      + `（按本机近 ${readDurations().length} 次的中位数）。`;
+  }
+  return `已用 ${Math.round(elapsedMs / 1000)} 秒，已超过本机中位数`
+    + `（${Math.round(p50 / 1000)} 秒）；复杂主诉会更久，可随时取消。`;
+}
+
+function tickEta() {
+  const el = document.getElementById("eta-note");
+  if (!el || !etaStartedAt) return;
+  el.textContent = etaText(Date.now() - etaStartedAt);
+}
+
+function startEta() {
+  etaStartedAt = Date.now();
+  tickEta();
+  if (etaTimer) clearInterval(etaTimer);
+  etaTimer = setInterval(tickEta, 1000);
+}
+
+function stopEta(completed) {
+  if (etaTimer) { clearInterval(etaTimer); etaTimer = null; }
+  if (completed && etaStartedAt) recordDuration(Date.now() - etaStartedAt);
+  etaStartedAt = 0;
+}
+
+// ---------- §8.4 第 35 条：帮助入口 ----------
+//
+// 一处 DOM、一张文案表。每条是"一句话说明 + 一个例子"——没有例子的说明
+// 等于把术语换了一个说法。
+const HELP_TEXT = {
+  complaint: {
+    title: "该输入什么",
+    body: "患者的主诉与四诊文字描述，越接近病历原文越好。",
+    eg: "例：胃脘胀痛三月，食后加重，嗳气泛酸，纳差，舌淡红苔薄白，脉弦。",
+  },
+  "detail-zone": {
+    title: "这一区是什么",
+    body: "本次推导的完整过程：症状如何归类、证素如何推出、查了哪些医案与本草、"
+      + "验证器改过什么。图上每个节点都可点开看它的依据原文。",
+    eg: "例：点「肝郁气滞」可以看到它由哪几个症状支持、出自哪一条教材证候定义。",
+  },
+};
+
+function hideHelp() {
+  const pop = document.getElementById("help-pop");
+  if (pop) pop.hidden = true;
+}
+
+function showHelp(btn) {
+  const pop = document.getElementById("help-pop");
+  const item = HELP_TEXT[btn.dataset.help];
+  if (!pop || !item) return;
+  pop.innerHTML = `<b>${escapeHtml(item.title)}</b><div>${escapeHtml(item.body)}</div>`
+    + `<span class="hp-eg">${escapeHtml(item.eg)}</span>`;
+  pop.hidden = false;
+  // 定位在按钮下方，右侧不出屏。`pageYOffset` 而不是 `getBoundingClientRect`
+  // 的裸值：气泡是 absolute（跟着文档走），滚动之后裸值会偏。
+  const box = btn.getBoundingClientRect();
+  const w = pop.getBoundingClientRect().width;
+  const left = Math.max(8, Math.min(box.left + window.pageXOffset,
+                                    document.documentElement.clientWidth - w - 8));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${box.bottom + window.pageYOffset + 4}px`;
+}
+
+document.addEventListener("click", (evt) => {
+  const btn = evt.target.closest && evt.target.closest(".help-btn");
+  if (btn) {
+    evt.preventDefault();
+    // `<summary>` 里那个按钮：点它不该把折叠区一起展开/收起
+    evt.stopPropagation();
+    const pop = document.getElementById("help-pop");
+    if (pop && !pop.hidden && pop.dataset.forKey === btn.dataset.help) { hideHelp(); return; }
+    if (pop) pop.dataset.forKey = btn.dataset.help;
+    showHelp(btn);
+    return;
+  }
+  if (!(evt.target.closest && evt.target.closest("#help-pop"))) hideHelp();
+});
+document.addEventListener("keydown", (evt) => { if (evt.key === "Escape") hideHelp(); });
+
+// ---------- §8.4 第 34 条：三步引导 ----------
+//
+// **只在首次进入时自动弹一次**。每次都弹的引导是最快被训练成"闭眼点掉"的
+// 东西——弹第三次的时候没有人还在读它。看过就记在 localStorage，
+// 页脚留一个「使用引导」随时可以再开。
+const ONBOARDING_KEY = "tcm.onboardingSeen";
+
+function onboardingSeen() {
+  try { return localStorage.getItem(ONBOARDING_KEY) === "1"; } catch (e) { return true; }
+}
+
+function openOnboarding() {
+  const el = document.getElementById("onboarding");
+  if (el) el.hidden = false;
+}
+
+function closeOnboarding() {
+  const el = document.getElementById("onboarding");
+  if (el) el.hidden = true;
+  try { localStorage.setItem(ONBOARDING_KEY, "1"); } catch (e) { /* 隐私模式 */ }
+}
+
+{
+  const ob = document.getElementById("onboarding");
+  if (ob) {
+    for (const id of ["ob-skip", "ob-done"]) {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener("click", closeOnboarding);
+    }
+    // 遮罩点击也关：一个只能靠按钮关的对话框在平板上很容易变成死路
+    ob.addEventListener("click", (e) => { if (e.target === ob) closeOnboarding(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !ob.hidden) closeOnboarding();
+    });
+    if (!onboardingSeen()) openOnboarding();
+  }
+  const g = document.getElementById("guide-open-btn");
+  if (g) g.addEventListener("click", openOnboarding);
+}
+
+
+// ============================================================================
+// R46 临床工作流闭环：采集 → 诊断 → 方案 → 检索 → 管理
+// ============================================================================
+
+// ---------- §7.1 结构化四诊录入 ----------
+//
+// **字段表由后端下发**（`/api/intake/form`），前端不写死。写死的话
+// core/intake.py 加一个字段，表单上不会长出来——跟示例主诉、身份色、
+// 九层层名是同一条（"写死的常量也算一处实现"）。
+
+let INTAKE_FIELDS = null;
+
+const LIFE_STAGES = ["", "婴幼儿", "儿童", "青少年", "成人", "老年", "妊娠期", "哺乳期"];
+const CONSTITUTIONS = ["", "平和质", "气虚质", "阳虚质", "阴虚质", "痰湿质",
+                       "湿热质", "血瘀质", "气郁质", "特禀质"];
+
+function fillSelect(id, values) {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  sel.innerHTML = values.map((v) =>
+    `<option value="${escapeHtml(v)}">${escapeHtml(v || "—")}</option>`).join("");
+}
+
+function intakeFieldHtml(f) {
+  const picks = (f.quick_picks || []).map((p) =>
+    `<button type="button" class="qp" data-field="${escapeHtml(f.name)}"`
+    + ` data-value="${escapeHtml(p)}">${escapeHtml(p)}</button>`).join("");
+  return `<div class="intake-field">`
+    + `<label for="if-${escapeHtml(f.name)}">${escapeHtml(f.label)}</label>`
+    + `<input type="text" id="if-${escapeHtml(f.name)}" class="text-field" data-intake="${escapeHtml(f.name)}" />`
+    + (picks ? `<div class="qp-row">${picks}</div>` : "")
+    + `</div>`;
+}
+
+function renderIntakeForm(data) {
+  const box = document.getElementById("intake-fields");
+  if (!box) return;
+  INTAKE_FIELDS = data.parts || {};
+  box.innerHTML = Object.entries(INTAKE_FIELDS).map(([part, fields]) =>
+    `<fieldset class="intake-part"><legend>${escapeHtml(part)}</legend>`
+    + fields.map(intakeFieldHtml).join("") + `</fieldset>`).join("");
+  const note = document.getElementById("intake-note");
+  // §0.4 的输入侧边界**摆在表单上**，不只写在文档里：填表的人要在填之前
+  // 就知道这个系统不收照片和检验数值。
+  if (note) note.textContent = data.regulatory_note || "";
+  // 常用词一键选：点一下填进对应字段（已有内容就追加，不覆盖——
+  // 覆盖会把医师刚打的那句话吃掉）
+  box.addEventListener("click", (e) => {
+    const b = e.target.closest && e.target.closest(".qp");
+    if (!b) return;
+    const input = box.querySelector(`[data-intake="${b.dataset.field}"]`);
+    if (!input) return;
+    input.value = input.value ? `${input.value}；${b.dataset.value}` : b.dataset.value;
+  });
+}
+
+function collectIntake() {
+  const form = {};
+  // **页面上没有这张表单时返回空对象，不抛。** 跟 `getSelectedRole()` 的
+  // `sel ? sel.value : ...` 是同一条兜底：一个精简页面（或还没加载完的
+  // 页面）缺了这一块，不该让整个提交流程断在这里。
+  const all = document.querySelectorAll ? document.querySelectorAll("[data-intake]") : [];
+  Array.prototype.forEach.call(all, (el) => {
+    if (el.value && el.value.trim()) form[el.dataset.intake] = el.value.trim();
+  });
+  return form;
+}
+
+function splitList(v) {
+  return (v || "").split(/[、,，;；]/).map((x) => x.trim()).filter(Boolean);
+}
+
+function collectProfile() {
+  const val = (id) => (document.getElementById(id) || {}).value || "";
+  const age = val("pf-age");
+  const p = {
+    age_years: age === "" ? null : Number(age),
+    sex: val("pf-sex") || null,
+    life_stage: val("pf-stage") || null,
+    constitution: val("pf-const") || null,
+    comorbidities: splitList(val("pf-comorb")),
+    allergies: splitList(val("pf-allergy")),
+    current_medications: splitList(val("pf-meds")),
+    hepatic_impairment: val("pf-hep") || "不详",
+    renal_impairment: val("pf-ren") || "不详",
+  };
+  const empty = p.age_years === null && !p.sex && !p.life_stage && !p.constitution
+    && !p.comorbidities.length && !p.allergies.length && !p.current_medications.length
+    && p.hepatic_impairment === "不详" && p.renal_impairment === "不详";
+  // **一个字段都没填就不传**：传一份全空的 profile 会让后端把"没填"
+  // 当成"填了但都是不详"，两者在个体化那一层是不同的结论。
+  return empty ? null : p;
+}
+
+async function intakeToText() {
+  const resp = await fetch("/api/intake/parse", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ form: collectIntake() }),
+  });
+  if (!resp.ok) return;
+  const data = await resp.json();
+  const ta = document.getElementById("complaint");
+  if (ta) ta.value = data.text || "";
+}
+
+async function intakeFromText() {
+  const ta = document.getElementById("complaint");
+  const resp = await fetch("/api/intake/parse", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: (ta && ta.value) || "" }),
+  });
+  if (!resp.ok) return;
+  const data = await resp.json();
+  for (const [k, v] of Object.entries(data.form || {})) {
+    const el = document.querySelector(`[data-intake="${k}"]`);
+    if (el && typeof v === "string") el.value = v;
+  }
+}
+
+// ---------- §7.3 循证对照 ----------
+//
+// **这一层只呈现差异，不参与选择。** 没有分数、没有排序、不回答"哪个更好"
+// ——那会把它变成另一种投票。文案里的口径名（「教材推荐方案」）由后端下发，
+// 前端不写死"指南"两个字：底本是什么，说的就是什么。
+
+function guidelineHtml(g) {
+  if (!g) return "";
+  const label = g.basis_label || "";
+  if (!g.covered) {
+    return `<div class="gl-line gl-none">${escapeHtml(g.summary || "")}`
+      + `<div class="gl-why">${escapeHtml(g.not_covered || "")}</div></div>`;
+  }
+  const rows = [];
+  for (const a of g.aligned || []) {
+    rows.push(`<li class="gl-ok"><b>${escapeHtml(a.what)}</b>${escapeHtml(a.detail)}`
+      + `<span class="gl-src">出处：《${escapeHtml(a.source || "")}》${escapeHtml(a.span || "")}</span></li>`);
+  }
+  for (const d of g.deviations || []) {
+    rows.push(`<li class="gl-diff"><b>${escapeHtml(d.what)}</b>`
+      + `${escapeHtml(label)}为「${escapeHtml(d.recommended || "")}」，`
+      + `本次为「${escapeHtml(d.ours || "")}」`
+      + `<div class="gl-note">${escapeHtml(d.note || "")}</div>`
+      + `<span class="gl-src">出处：《${escapeHtml(d.source || "")}》${escapeHtml(d.span || "")}</span></li>`);
+  }
+  return `<details class="gl-box"><summary>${escapeHtml(g.summary || "")}（点击查看）</summary>`
+    + `<ul class="gl-list">${rows.join("")}</ul>`
+    + `<div class="gl-why">这一层只摆出异同供医师判断，不用于择优。</div></details>`;
+}
+
+function renderGuideline(g) {
+  const el = document.getElementById("guideline-box");
+  if (!el) return;
+  el.innerHTML = guidelineHtml(g);
+  el.classList.toggle("show", !!(g && (g.covered || g.summary)));
+}
+
+// ---------- §7.2 个体化调整 ----------
+
+function individualizationHtml(ind) {
+  if (!ind) return "";
+  const items = (ind.items || []).map((it) =>
+    `<li class="iv-item" data-kind="${escapeHtml(it.kind)}">`
+    + `<span class="iv-kind">${escapeHtml(it.kind)}</span>`
+    + `<b>${escapeHtml(it.target)}</b>${escapeHtml(it.adjustment)}`
+    + `<div class="iv-why">${escapeHtml(it.reason)}</div>`
+    + `<div class="iv-basis">依据：${escapeHtml(it.basis)}</div></li>`).join("");
+  const considered = (ind.considered || []).map((c) =>
+    `<li>${escapeHtml(c)}</li>`).join("");
+  // **空的 items 配非空的 considered** 才说得清"查过了，没有需要调的"，
+  // 而不是"没查"。所以两块都渲染，不因为 items 是空就整块不出现。
+  const head = items
+    ? `按患者情况需要注意 ${(ind.items || []).length} 处`
+    : "按患者情况核查完毕，没有需要调整的地方";
+  return `<details class="iv-box"${items ? " open" : ""}>`
+    + `<summary>${escapeHtml(head)}</summary>`
+    + (items ? `<ul class="iv-list">${items}</ul>` : "")
+    + (considered ? `<div class="iv-considered">已核查：<ul>${considered}</ul></div>` : "")
+    + `</details>`;
+}
+
+function renderIndividualization(ind) {
+  const el = document.getElementById("individualization-box");
+  if (!el) return;
+  el.innerHTML = individualizationHtml(ind);
+  el.classList.toggle("show", !!ind);
+}
+
+// ---------- §7.4 病历文书 ----------
+
+let LAST_EMR = null;
+
+function emrSectionHtml(s) {
+  const body = s.editable
+    ? `<textarea class="emr-input" data-emr="${escapeHtml(s.key)}"`
+      + ` rows="${Math.max(2, (s.body || "").split("\n").length)}">${escapeHtml(s.body || "")}</textarea>`
+    : `<div class="emr-ro">${escapeHtml(s.body || "＿＿＿＿＿＿")}</div>`;
+  return `<div class="emr-sec"><label>${escapeHtml(s.title)}</label>${body}</div>`;
+}
+
+function renderEMR(emr) {
+  const box = document.getElementById("emr-box");
+  if (!box) return;
+  LAST_EMR = emr;
+  const show = !!emr && getSelectedRole() === "doctor";
+  box.hidden = !show;
+  if (!show) return;
+  const notice = document.getElementById("emr-notice");
+  if (notice) notice.textContent = emr.draft_notice || "";
+  const secs = document.getElementById("emr-sections");
+  if (secs) secs.innerHTML = (emr.sections || []).map(emrSectionHtml).join("");
+}
+
+function collectEmrEdits() {
+  const edits = {};
+  document.querySelectorAll("[data-emr]").forEach((el) => {
+    const sec = (LAST_EMR && (LAST_EMR.sections || []).find((s) => s.key === el.dataset.emr));
+    if (sec && sec.body !== el.value) edits[el.dataset.emr] = el.value;
+  });
+  return edits;
+}
+
+async function buildEmrFromLastResult(data) {
+  const r = (data.results || [])[0] || {};
+  const st = r.s3_structured || r.s3 || {};
+  const formula = st.formula || (st.formula_candidates || [])[0] || null;
+  const resp = await fetch("/api/emr/draft", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      record_id: data.record_id || "",
+      complaint: LAST_COMPLAINT || "",
+      intake: collectIntake(),
+      patient_profile: collectProfile(),
+      s2: data.s2 || null,
+      s3: st,
+      formula,
+      triage: data.triage || null,
+      guideline: data.guideline || null,
+      doctor_id: (document.getElementById("doctor-id-input") || {}).value || "",
+      edits: collectEmrEdits(),
+    }),
+  });
+  if (!resp.ok) return null;
+  return resp.json();
+}
+
+function emrStatus(text) {
+  const el = document.getElementById("emr-status");
+  if (el) el.textContent = text;
+}
+
+async function copyText(text, okMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    emrStatus(okMsg);
+  } catch (e) {
+    // 剪贴板在非安全上下文里不可用（内网 http 就是这种情况）：
+    // **说出来并给出路**，不是静默失败
+    emrStatus("这个浏览器不允许自动复制，请手动选中下方文本复制。");
+  }
+}
+
+// ---------- §7.5 知识速查（Ctrl/⌘ + K） ----------
+
+let kpSeq = 0;
+
+function kpResultHtml(groups) {
+  return (groups || []).map((g) => {
+    if (!g.n) return "";
+    const items = g.items.map((it) =>
+      `<li><b>${escapeHtml(it.title)}</b><div class="kp-sum">${escapeHtml(it.summary || "")}</div>`
+      + (it.source ? `<div class="kp-src">出处：《${escapeHtml(it.source)}》${escapeHtml((it.span || "").slice(0, 60))}</div>` : "")
+      + `</li>`).join("");
+    return `<section class="kp-group"><h3>${escapeHtml(g.label)}（${g.n}）</h3><ul>${items}</ul></section>`;
+  }).join("");
+}
+
+async function kpSearch(q) {
+  const seq = ++kpSeq;
+  const status = document.getElementById("kp-status");
+  const out = document.getElementById("kp-results");
+  if (!q.trim()) { if (out) out.innerHTML = ""; if (status) status.textContent = ""; return; }
+  if (status) status.textContent = "查询中…";
+  const t0 = performance.now();
+  const resp = await fetch(`/api/knowledge/search?q=${encodeURIComponent(q)}`);
+  // 输入框打字快过网络时会有多个在飞：**只认最后一次**，否则前一次的结果
+  // 会盖住后一次的（R43 那条 `gbFetchSeq` 是同一个形状）
+  if (seq !== kpSeq) return;
+  if (!resp.ok) { if (status) status.textContent = "查询失败"; return; }
+  const data = await resp.json();
+  const ms = Math.round(performance.now() - t0);
+  if (out) out.innerHTML = kpResultHtml(data.groups) || `<div class="kp-none">${escapeHtml(data.note || "")}</div>`;
+  if (status) status.textContent = `${ms} ms`;
+}
+
+function kpOpen() {
+  const el = document.getElementById("kp-overlay");
+  if (!el) return;
+  el.hidden = false;
+  const input = document.getElementById("kp-input");
+  if (input) { input.focus(); input.select(); }
+}
+
+function kpClose() {
+  const el = document.getElementById("kp-overlay");
+  if (el) el.hidden = true;
+}
+
+// ---------- 接线 ----------
+
+{
+  const to = document.getElementById("intake-to-text");
+  if (to) to.addEventListener("click", intakeToText);
+  const from = document.getElementById("intake-from-text");
+  if (from) from.addEventListener("click", intakeFromText);
+  fillSelect("pf-stage", LIFE_STAGES);
+  fillSelect("pf-const", CONSTITUTIONS);
+  fetch("/api/intake/form").then((r) => (r.ok ? r.json() : null))
+    .then((d) => { if (d) renderIntakeForm(d); })
+    .catch(() => { /* 后端不在：表单空着，自由文本那条路照走 */ });
+
+  const kpIn = document.getElementById("kp-input");
+  if (kpIn) {
+    let timer = null;
+    kpIn.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => kpSearch(kpIn.value), 120);
+    });
+  }
+  const kpX = document.getElementById("kp-close");
+  if (kpX) kpX.addEventListener("click", kpClose);
+  const kpOv = document.getElementById("kp-overlay");
+  if (kpOv) kpOv.addEventListener("click", (e) => { if (e.target === kpOv) kpClose(); });
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) {
+      e.preventDefault();
+      kpOpen();
+      return;
+    }
+    if (e.key === "Escape" && kpOv && !kpOv.hidden) kpClose();
+  });
+
+  const copyBtn = document.getElementById("emr-copy-text");
+  if (copyBtn) copyBtn.addEventListener("click", async () => {
+    const out = await buildEmrFromLastResult(LAST_RESULT || {});
+    if (!out) { emrStatus("生成失败"); return; }
+    renderEMR(out.emr);
+    await copyText(out.text, "病历文本已复制，粘进病历编辑器后请逐段核对。");
+  });
+  const jsonBtn = document.getElementById("emr-copy-json");
+  if (jsonBtn) jsonBtn.addEventListener("click", async () => {
+    const out = await buildEmrFromLastResult(LAST_RESULT || {});
+    if (!out) { emrStatus("生成失败"); return; }
+    await copyText(JSON.stringify(out.emr, null, 2), "结构化 JSON 已复制。");
+  });
+  const printBtn = document.getElementById("emr-print");
+  if (printBtn) printBtn.addEventListener("click", async () => {
+    const out = await buildEmrFromLastResult(LAST_RESULT || {});
+    if (!out) { emrStatus("生成失败"); return; }
+    renderEMR(out.emr);
+    emrStatus("已生成处方笺，使用浏览器打印（A4 纵向）。");
+    window.print();
+  });
 }

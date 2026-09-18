@@ -33,7 +33,14 @@
   文件不改就会一直在正确路径外静默进不了版本控制。人工整理的静态参考表
   （不是 `cases.json` 派生的生成物）都归这一类。
 - **涉及图层结构变更（layer 编号、新增/合并层、compound 节点）时，
-  Playwright 真实浏览器渲染是必需的验收环节，不是可选的加分项。** M5 的
+  Playwright 真实浏览器渲染是必需的验收环节，不是可选的加分项。**
+  **这条已经有两个实例了，两次都是"后端 JSON 测试全绿、浏览器里是错的"：**
+  R42 把层数从 5 改成 9 时，`to_graph` 读的是**扁平化之后**的 `s3`
+  （`to_s3_syndrome()` 把 `organs[]` 与 `method.targets` 丢了），于是病机层与
+  治法靶位层在生产里恒空——而 `missing_layers` 会如实把它们报成"本次没有"，
+  看起来像"这一轮模型没产出病机"。fixture 用的正好是 legacy S3，所以后端测试
+  一条都不红；Playwright 的 `single_chain_graph` 第一次跑就红了
+  （见 SOURCES 第 125 条）。第一个实例是 M5 的
   教训：`to_graph()` 的 Python 单测（六层节点/边的 JSON 结构断言）全部
   通过，但前端 `growGraph()` 的 `nodesByLayer` 初始化漏了新加的 layer 4
   这个 key——数据是对的，是渲染层的初始化没跟上，JSON 结构测试测不出这
@@ -105,7 +112,13 @@ X3 那轮把 `CaseTripleItem.p`/`CaseTripleRecord.p` 的 `str = Field(min_length
 之后，总纲阶段二的药理层加了 14 处：`MateriaMedicaItem`/`MateriaMedicaRecord`/
 `FormularyItem`/`FormularyRecord` 四个 schema 的 `s`/`o`/`source_span`（+`book`）
 全部 `Field(min_length=1)`，谓词是 `Literal`——跟 X3 医案三元组同一套防幻觉
-约束，纯新增，没有动任何既有字段。**当前基线：31 处。**
+约束，纯新增，没有动任何既有字段。**31 处（截至 `2f0d174` 之后的药理层那一轮）。**
+再之后 M 系列与 R33/R34 的新 schema 继续纯新增：`S3Structured` 的五步链
+（`organs`/`syndrome`/`method`/`formula`/`herb_choices` 各自的必填字段）、
+符号验证器的 `Violation`/`Unverifiable`（`rule` 是 `Literal`、`reason`/
+`counterexample` 是 `Field(min_length=1)`）、R35 的 `PrescribingPattern`、
+R36 的 `S1S2Merged`——**当前基线：72 处（截至 `931cdc7`）。**
+R36~R39 四轮一处未动，每一轮的报告自查里都报了这个数。
 
 这条铁律里的数字**允许合法下降**——用更强约束（`Literal`、枚举、更具体的
 子类型）替换 `Field(min_length=1)` 属于收紧，不违反"不许放松"；只有改成

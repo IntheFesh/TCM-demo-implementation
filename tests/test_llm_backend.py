@@ -440,6 +440,10 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         "s0_extract_case": {"raw_text", "follow_hints"},
         "s1_normalize": {"complaint"},
         "s2_elements": {"elements", "symptoms", "tongue", "pulse"},
+        # R36：S1+S2 合一的那份（`S1S2_MERGED=1` 走它）。占位符是两份的并集减去
+        # 中间那一层——S2 那份要 symptoms/tongue/pulse 是因为它们来自上一次调用的
+        # 输出；合一之后那三样在同一次调用里产生，所以只剩 complaint + elements。
+        "s1s2_merged": {"complaint", "elements"},
         "s3_syndrome": {"name", "elements_summary", "symptoms", "refs"},
         # R33：结构化模式的第二份 s3 prompt（`S3_MODE=structured` 走它）。
         # 没有 `name`——它不模拟某一位医家，而是把五家融合成一份结论，
@@ -458,6 +462,10 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
         # 总纲 2.2/2.3：药理层的两份抽取 prompt（offline/extract_reference_triples.py 调用）
         "s6_extract_materia_medica": {"raw_text"},
         "s7_extract_formulary": {"raw_text"},
+        # R38：MTCMB TCM-PR 的开方提示词。**两个 solver 共用这一份**，
+        # 区别只在 `$extra` 里塞不塞证素分析——所以它只有这一个占位符，
+        # 多一个就说明有人给某个 solver 开了小灶（那量到的就不是链的贡献了）。
+        "mtcmb_prescribe": {"extra"},
     }
     for path in (PROMPTS_ROOT / "v1").glob("*.yaml"):
         found = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?", load_prompt(path.stem)["system"]))

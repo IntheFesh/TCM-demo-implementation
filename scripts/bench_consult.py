@@ -141,6 +141,14 @@ def build_fake_backend(latency: float, simulate_cache: bool = False):
     from core.context_prefix import count_tokens
 
     class FakeBenchBackend(LLMBackend):
+        #: R36：假后端也"流式"——把要返回的那段 JSON 切开发。
+        #: **标成 simulated**：这条路能验通"链路→SSE→前端"整条增量通道
+        #: （沙盒里没有网络，真流式验不了），但首字延迟不反映任何真实推理。
+        #: 不给它这个能力的话，流式这件事在沙盒里只能靠读代码确认。
+        SUPPORTS_STREAMING = True
+        STREAMING_IS_SIMULATED = True
+        CHUNK_CHARS = 40
+
         def __init__(self) -> None:
             self.n_calls = 0
             self._seen: list[str] = []
@@ -176,7 +184,7 @@ def build_fake_backend(latency: float, simulate_cache: bool = False):
                     "链路自身的开销和人为设定的 latency，**不可用于报告里的任何数字**。")
 
         def _complete(self, messages, temperature, max_tokens=None, schema=None,
-                      physician=None, **kwargs) -> str:
+                      physician=None, on_delta=None, **kwargs) -> str:
             self.n_calls += 1
             if latency > 0:
                 time.sleep(latency)
@@ -187,7 +195,13 @@ def build_fake_backend(latency: float, simulate_cache: bool = False):
                 record_usage(self._simulated_usage(prompt))
             if schema is None:
                 return FAKE_TEXT
-            return json.dumps(minimal_payload(schema), ensure_ascii=False)
+            out = json.dumps(minimal_payload(schema), ensure_ascii=False)
+            if on_delta is not None:
+                # 切片之间**不 sleep**：拿睡眠假装"生成得慢"会让这份基准里的
+                # 耗时变成编的（这个脚本存在的全部理由是量真实开销）。
+                for i in range(0, len(out), self.CHUNK_CHARS):
+                    on_delta(out[i:i + self.CHUNK_CHARS], "content")
+            return out
 
     return FakeBenchBackend()
 
@@ -339,6 +353,15 @@ class StepTimer:
         # 之和，并发时等于最慢的那一位——R12 三医家并发的验收判据就是这两个数的比。
         self._s3_first_start: float | None = None
         self._s3_last_done: float | None = None
+        # R36：首 token 延迟。**两个口径都要**：
+        #   `ttft_from_open`  = 这次问诊开始到第一帧增量（人等待的那个数，验收项）
+        #   `ttft_from_s3`    = S3 那一次调用开始到第一帧增量（模型本身的首字延迟）
+        # 只报前者会把 S1/S2/检索的时间算进"模型首字"，只报后者会让人以为
+        # 界面 3 秒就有字了。
+        self.ttft_from_open: float | None = None
+        self.ttft_from_s3: float | None = None
+        self.n_deltas = 0
+        self.streaming_notes: list[str] = []
 
     def __call__(self, event: str, data: dict) -> None:
         now = time.perf_counter()
@@ -347,6 +370,17 @@ class StepTimer:
             self._physician_start[physician] = now
             if self._s3_first_start is None:
                 self._s3_first_start = now
+        elif event == "s3_delta":
+            self.n_deltas += 1
+            if self.ttft_from_open is None:
+                self.ttft_from_open = round(now - self.t0, 4)
+                started = self._physician_start.get(physician)
+                if started is not None:
+                    self.ttft_from_s3 = round(now - started, 4)
+        elif event == "s3_done":
+            note = data.get("streaming_note")
+            if note and note not in self.streaming_notes:
+                self.streaming_notes.append(note)
         elif event == "physician_done" and physician:
             started = self._physician_start.pop(physician, None)
             if started is not None:
@@ -378,6 +412,16 @@ class StepTimer:
                 out["s3_wall"] = round(self._s3_last_done - self._s3_first_start, 4)
         return out
 
+    def streaming(self) -> dict:
+        """R36 的流式观测。**没流式时不填 0**：`ttft` 为 None 表示"这次没有增量"，
+        填 0 会被读成"0 秒就出字了"。`notes` 说的是为什么没有。"""
+        return {
+            "n_deltas": self.n_deltas,
+            "ttft_from_open_s": self.ttft_from_open,
+            "ttft_from_s3_s": self.ttft_from_s3,
+            "notes": list(self.streaming_notes),
+        }
+
 
 # ---------- 主流程 ----------
 
@@ -401,17 +445,29 @@ def invalid_reason(result: dict | None) -> str | None:
         return f"被安全否决，不产生方药，不能当性能基准：{result.get('reject_reason')}"
     if result.get("insufficient"):
         return f"信息不足，没跑到 S3：{result.get('insufficient_reason')}"
-    from core.physicians import PHYSICIANS, physicians_enabled
 
+    # **期望几条结果要按 S3 模式问，不能写死"医家数"**（R36 修）：
+    # R33 起产品默认是 structured——五家融合成**一份**结论，`results` 恰好一个
+    # 元素。这里原来拿 `len(physicians_enabled())` 当期望值，于是默认配置下
+    # 每一次跑都被判成"只有 1/3 位医家跑出了结果"，基准脚本自 R33 起在默认
+    # 配置下从未跑通过一次（实测 `--backend fake` 0/1 成功）。
+    # 判据来源只能有一处：`core.physicians.physicians_for_mode(mode)` 回答
+    # "这个模式下应该有几条结果"，跟 `core.usage.calls_per_consult` 问的是同一处。
+    from core.physicians import physicians_for_mode
+
+    mode = (result.get("manifest") or {}).get("s3_mode")
+    if mode == "structured":
+        n, unit = 1, "份融合结论"
+    else:
+        n, unit = len(physicians_for_mode(mode or "legacy")), "位医家"
     got = len(result.get("results") or [])
-    n = len(physicians_enabled(PHYSICIANS))
     if got != n:
-        return f"只有 {got}/{n} 位医家跑出了结果"
+        return f"只有 {got}/{n} {unit}跑出了结果（s3_mode={mode}）"
     return None
 
 
 def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
-             backend) -> dict:
+             backend, *, keep_result: bool = False) -> dict:
     from core.chain import consult
     from core.llm import use_llm
 
@@ -433,12 +489,23 @@ def run_once(complaint: str, use_react: bool, retriever_mode: str | None,
         error = invalid_reason(result)
     manifest = (result or {}).get("manifest") or {}
     return {
+        # R38：消融要按同一次问诊算三指标（带本体出处的药味占比、验证器一次过、
+        # 幻觉），而那几项的原料在 `results` 里。**默认不带**：这份 dict 会被
+        # 原样写进 bench 的 json，塞进整份 consult 结果会让文件涨几十倍，
+        # 而 bench 自己一个字段都用不上。
+        **({"result": result} if keep_result else {}),
         "ok": error is None,
         "error": error,
         "elapsed_s": round(elapsed, 4),
         "llm_calls": manifest.get("llm_calls", len(recorder.calls)),
         "n_raw_calls": len(recorder.calls),
         "by_step": timer.by_step(),
+        "streaming": timer.streaming(),
+        # R36：manifest 那一侧也记了流式（core/chain.py::_aggregate_streaming）。
+        # 两侧都留着是有意的：这里是**从事件流观测到的**，那里是链路自己报的，
+        # 两个数不一致就说明有一侧漏了（事件没发出来 / 计数没加）。
+        "streaming_manifest": manifest.get("streaming"),
+        "s1s2_merged": manifest.get("s1s2_merged"),
         "events": timer.events,
         "calls": recorder.calls,
         "usage_available": recorder.usage_available,
@@ -496,6 +563,20 @@ def summarize(runs: list[dict]) -> dict:
         "knowledge_in_prompt": (ok[-1].get("knowledge_in_prompt") if ok else None),
         "knowledge_tokens": (ok[-1].get("knowledge_tokens") if ok else None),
         "knowledge_entries": (ok[-1].get("knowledge_entries") if ok else None),
+        # R36：首 token 延迟。**逐次列出 + 只对有增量的那几次求统计**：
+        # 把没流式的那几次当 0 混进均值，会让"首字 ≤3 秒"这条验收看起来通过了。
+        "ttft_from_open_s_by_run": [(r.get("streaming") or {}).get("ttft_from_open_s")
+                                    for r in ok],
+        "ttft_from_open_s": stat([v for v in
+                                  ((r.get("streaming") or {}).get("ttft_from_open_s")
+                                   for r in ok) if v is not None]),
+        "ttft_from_s3_s": stat([v for v in
+                                ((r.get("streaming") or {}).get("ttft_from_s3_s")
+                                 for r in ok) if v is not None]),
+        "n_deltas_total": sum((r.get("streaming") or {}).get("n_deltas") or 0 for r in ok),
+        "streaming_notes": list(dict.fromkeys(
+            n for r in ok for n in ((r.get("streaming") or {}).get("notes") or []))),
+        "s1s2_merged": (ok[-1].get("s1s2_merged") if ok else None),
     }
 
 

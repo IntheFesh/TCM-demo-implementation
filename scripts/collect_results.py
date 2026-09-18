@@ -117,6 +117,8 @@ ROUND_METRIC_KEYS = ("pytest_passed", "pytest_skipped", "pytest_failed",
 EPSILON_S3_DISABLED_JSON = "epsilon_s3_disabled.json"
 MATERIA_MEDICA_JSONL = "../data/standard/materia_medica.jsonl"
 FORMULARY_JSONL = "../data/standard/formulary.jsonl"
+#: R35 的用药规律层。跟上面两份同一个形状：来源是数据文件本身。
+PRESCRIBING_PATTERNS_JSONL = "../data/standard/prescribing_patterns.jsonl"
 
 
 def _load_json(path: Path):
@@ -301,6 +303,19 @@ EVIDENCE: dict[str, tuple[str, object]] = {
     # 它们跟 graph.json 同一个形状：来源是数据文件本身，不是 eval/ 下的 report。
     "pharmacology.n_materia_medica": (MATERIA_MEDICA_JSONL, len),
     "pharmacology.n_formulary": (FORMULARY_JSONL, len),
+    #
+    # R35：用药规律层。这一份**从第一天就进版本控制**，所以它的数从来不需要手抄
+    # ——上面那两行的 472/553 条漂移（SOURCES.md 第 89 条）就是手抄来的。
+    # 四个键各回答一个问题：总量、剂量档（本轮命中率从 9% 提到 87% 的那一档）、
+    # 证型档（只有 55 条，是"两档必须都产出"的证据）、support 上限。
+    "patterns.n_patterns": (PRESCRIBING_PATTERNS_JSONL, len),
+    "patterns.n_dose": (PRESCRIBING_PATTERNS_JSONL,
+                        lambda d: sum(1 for r in d if r.get("kind") == "dose")),
+    "patterns.n_physician_syndrome": (
+        PRESCRIBING_PATTERNS_JSONL,
+        lambda d: sum(1 for r in d if r.get("group_by") == "physician_syndrome")),
+    "patterns.max_support": (PRESCRIBING_PATTERNS_JSONL,
+                             lambda d: max((r.get("support") or 0) for r in d)),
     #
     # R19：思考设置这一维。`epsilon.json` 里新增的 `s3_thinking` 也进注册表——
     # 「这个 ε 是哪套设置跑的」跟 ε 本身一样需要凭据，只写在正文里会跟数字脱钩。

@@ -148,11 +148,6 @@ system: |
     "note": null
   }
 
-  证素分析：
-  $elements_summary
-
-  患者症状：$symptoms
-
   参考医案与知识块（五位医家的医案按相关度排序；知识块在医案之前）：
   $refs
 
@@ -168,7 +163,26 @@ system: |
   也不要因为参考不相关就干脆不引用任何 id。
 
   只输出符合 schema 的 JSON，不要输出解释或 markdown 围栏。
-notes: "R33 新建，喂给 core.schemas.S3Structured。**不是 s3_syndrome.yaml 的改版**，
+
+  ## 本次问诊
+
+  证素分析：
+  $elements_summary
+
+  患者症状：$symptoms
+notes: "R40：**「## 本次问诊」这一段刻意排在最后，不许往前挪。** 它上面的全部内容
+  在同一台服务上逐次问诊之间逐字节相同（指令、schema 示例、$refs 的五家医案全量与
+  知识块），因此是**稳定前缀**，能命中模型侧的前缀缓存；而 $elements_summary /
+  $symptoms 每次都变。前缀缓存按公共前缀命中，变化段一出现，它后面的内容就都掉出
+  公共前缀——R40 之前这两行排在 93% 处而 $refs 排在 94%，于是 full_context 模式下那
+  1060 条 / 1.25 MB 的医案文本每次问诊都要重新处理一遍，缓存在最大的那一块上命中率
+  为 0。R21 的 core/context_prefix.assemble() 已经为 legacy 那条路做对过这件事（实测
+  前缀缓存命中率 0.989），R33 新建这份模板时没有把那个次序带过来。判据在
+  tests/test_prefix_cache_order.py，挪一下就红。
+  理由写在 notes 而不是写进 system：它是给改这份文件的人看的，送给模型只是白花
+  input token，而且会让模型去揣测我们的工程约束。
+
+  R33 新建，喂给 core.schemas.S3Structured。**不是 s3_syndrome.yaml 的改版**，
   是并列的第二份 prompt：`S3_MODE=legacy` 仍然逐字走 s3_syndrome.yaml（那份一个字
   没动），`S3_MODE=structured` 走这一份。两份并存的理由跟 schema 那边一样——
   R1~R32 的全部数字都是在 legacy 下跑出来的，改掉那份 prompt 等于让那些数失去基线。

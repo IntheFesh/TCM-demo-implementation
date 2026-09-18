@@ -9,13 +9,11 @@ consult() 会怎么用这两个参数，而不是只返回一个静态字典—�
 """
 import json
 import queue
-import socket
 import threading
 import time
 
 import httpx
 import pytest
-import uvicorn
 from fastapi.testclient import TestClient
 
 import api.main as api_main
@@ -46,19 +44,20 @@ def _read_stream_into(client: TestClient, complaint: str, out_q: queue.Queue) ->
 
 
 def _live_server_health_check_budget() -> float:
-    """等待 /health 的预算：`/health` 在 api.main._lifespan 的 startup 阶段
-    跑完之前不会应答（ASGI lifespan 没完成，uvicorn 不会真正开始处理请求），
-    而那个阶段自己最多等 api_main.WARMUP_TIMEOUT_SECONDS 就放弃、开始服务
-    ——这条测试的等待预算必须不小于它，否则两个数字各自维护、迟早再次
-    错位。**旧代码就是这样错位的**：硬编码 60 秒，而服务器自己的预热上限
-    是 120 秒（默认），AutoDL 上真实预热耗时落在 60~120 秒之间时测试永远
-    等不到 /health、稳定超时——不是"改大一个数字蒙过去"，是这个预算原本
-    就该跟着 WARMUP_TIMEOUT_SECONDS 走。抽成函数是为了能在不真的起服务器、
-    不真的等 120+ 秒的前提下单独测这个关系本身（tests/ 要秒级跑完）。
-    额外的 30 秒缓冲量的是"预热之外"的开销（Python import、uvicorn/socket
-    起停、CI 机器繁忙时的调度延迟），不是给预热本身留的——预热的时间预算
-    已经全部算在 WARMUP_TIMEOUT_SECONDS 里了。"""
-    return api_main.WARMUP_TIMEOUT_SECONDS + 30
+    """等待 /health 的预算。**实现在 `scripts/live_server.py`，这里只是转发。**
+
+    R40 起这套"起一个真 uvicorn"的机制由 `scripts/live_server.py` 唯一实现
+    ——profiler 的 `--stream`、`scripts/loadtest.py`、这条测试三个消费方共用
+    （CLAUDE.md 第 31 条）。留这个函数名不动，是因为下面那条关系式测试
+    （预算必须随 WARMUP_TIMEOUT_SECONDS 联动）钉的就是它。
+
+    预算本身为什么这么定，见 `scripts.live_server.health_check_budget` 的
+    文档字符串（核心：不能是另一个独立维护的硬编码数字，AutoDL 上就这么
+    错位过——硬编码 60 秒 vs 服务端 120 秒上限）。
+    """
+    from scripts.live_server import health_check_budget
+
+    return health_check_budget()
 
 
 def test_live_server_health_check_budget_tracks_server_warmup_ceiling(monkeypatch):
@@ -73,49 +72,24 @@ def test_live_server_health_check_budget_tracks_server_warmup_ceiling(monkeypatc
 
 @pytest.fixture
 def live_server():
-    """`fastapi.testclient.TestClient` 底下的 httpx ASGITransport 会把整个
-    ASGI app 跑完（`await self.app(scope, receive, send)`）才把 Response 交还
-    给调用方——读过它的源码（httpx/_transports/asgi.py）能确认这一点：body
-    是先整段收集进 `body_parts` 再一次性交出去的，`client.stream()` 看着像
+    """一个真的监听 127.0.0.1 的服务。**机制在 `scripts/live_server.py`。**
+
+    为什么必须是真服务器而不是 TestClient：`fastapi.testclient.TestClient`
+    底下的 httpx ASGITransport 会把整个 ASGI app 跑完（`await self.app(...)`）
+    才把 Response 交还给调用方——读过源码（httpx/_transports/asgi.py）能确认：
+    body 是先整段收进 `body_parts` 再一次性交出去的，`client.stream()` 看着像
     真流式，实际上第一个字节都要等整条 SSE 流跑完才能读到。need_input 这条
-    路径要测的正是"流还没跑完、中途另开一个请求把它接着推下去"，TestClient
-    这种全缓冲的传输层测不出来——不是随便下的结论，是看了源码之后确认的。
+    路径要测的正是"流还没跑完、中途另开一个请求把它接着推下去"，全缓冲的
+    传输层测不出来——不是随便下的结论，是看了源码之后确认的。
 
-    所以这条测试要一个真的监听 127.0.0.1 的服务：本地回环，不需要外网、
-    不需要 API key，一两百毫秒内就能起停，没有违反 CLAUDE.md 对 tests/
-    "不需要网络、秒级跑完"的要求（那条要求防的是打真实外部服务/真实 LLM，
-    不是防本机回环 socket）。
+    本地回环，不需要外网、不需要 API key，一两百毫秒内就能起停，没有违反
+    CLAUDE.md 对 tests/ "不需要网络、秒级跑完"的要求（那条防的是打真实外部
+    服务/真实 LLM，不是防本机回环 socket）。
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
+    from scripts.live_server import live_server as _live
 
-    config = uvicorn.Config(api_main.app, host="127.0.0.1", port=port, log_level="error")
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-
-    base_url = f"http://127.0.0.1:{port}"
-    # 这台沙箱没有 cases.json，预热几毫秒就跳过了，等待预算基本不会真的等满；
-    # 预算本身为什么这么定见 _live_server_health_check_budget 的文档字符串
-    # （核心：必须跟着 api.main.WARMUP_TIMEOUT_SECONDS 走，不能是另一个独立
-    # 维护的硬编码数字，AutoDL 上就是这么错位过的）。
-    health_check_budget = _live_server_health_check_budget()
-    deadline = time.time() + health_check_budget
-    while time.time() < deadline:
-        try:
-            httpx.get(f"{base_url}/health", timeout=1.0)
-            break
-        except httpx.TransportError:
-            time.sleep(0.05)
-    else:
-        raise RuntimeError(f"uvicorn 没能在 {health_check_budget:.0f} 秒内起来")
-
-    yield base_url
-
-    server.should_exit = True
-    thread.join(timeout=5)
+    with _live() as base_url:
+        yield base_url
 
 
 # ---------- 基本事件顺序：stream_id 先到，done 最后 ----------
@@ -165,6 +139,9 @@ def test_done_event_payload_matches_consult_response_shape(monkeypatch):
         events.append(out_q.get())
     done_data = next(d for name, d in events if name == "done")
 
+    # R47：`record_id` 标识"这一次问诊"，两次请求本来就是两个编号——
+    # 它是唯一一个按设计不该相等的键，摘出来单独比"两边都有、格式一样"。
+    assert len(done_data.pop("record_id")) == len(expected.pop("record_id")) == 8
     assert done_data == expected
 
 
@@ -206,6 +183,9 @@ def test_stream_role_reaches_done_event_same_as_post_consult(monkeypatch):
     done_data = next(d for name, d in events if name == "done")
 
     assert "formula_candidates" not in done_data["results"][0]["s3"]
+    # R47：`record_id` 标识"这一次问诊"，两次请求本来就是两个编号——
+    # 它是唯一一个按设计不该相等的键，摘出来单独比"两边都有、格式一样"。
+    assert len(done_data.pop("record_id")) == len(expected.pop("record_id")) == 8
     assert done_data == expected
 
 

@@ -55,15 +55,28 @@ GRAPH = {
 G = json.dumps(GRAPH, ensure_ascii=False)
 
 
-def test_the_highlight_reaches_the_formula_layer_in_exactly_three_hops():
-    """**三跳**：症状 → 证素 → 证型 → 方剂。到方剂层为止——再多一跳就把药材
-    也拉进来，而这个交互要说明的是"这个症状把三家推到了哪几个方子上"，
-    不是"这个症状连着哪些药"。"""
+def test_the_highlight_stops_at_the_formula_layer_however_long_the_chain_is():
+    """**到方剂层为止**——这个交互要说明的是"这个症状把几家推到了哪几个方子上"，
+    不是"这个症状连着哪些药"。
+
+    R42 把判据从"三跳"改成"到这个 node_type 为止"：原来写死 `hop < 3`，
+    那正好是五层时代的 症状→证素→证型→方剂；九层之后同一条链多了治则（和
+    结构化 S3 才有的病机/治法靶位），三跳只到治则，**方剂反而被淡掉**，
+    表现是"点了症状，方子暗了"。层号会变，`node_type` 不会。"""
     out = json.loads(_run(
         f'const r = computeHighlightPath({G}.nodes, {G}.edges, "sym::胃脘胀痛");'
         'process.stdout.write(JSON.stringify([...r.nodeIds].sort()));'))
-    assert out == sorted(["sym::胃脘胀痛", "el::肝郁", "syn::ye", "formula::ye::柴胡疏肝散"])
-    assert "herb::ye::柴胡" not in out, "第四跳到药材层了"
+    assert out == sorted(["sym::胃脘胀痛", "el::肝郁", "syn::ye",
+                          "formula::ye::柴胡疏肝散", "herb::ye::柴胡"])
+    # 方剂**进**集合但不再往下展开：这份 fixture 里方剂→药材是一条真边
+    # （R42 的真实图里药材是 compound 子节点、没有这条边），所以药材会被这一跳
+    # 带进来，但它不会成为下一跳的起点——链条到此为止。
+    body = _graph_js()
+    assert "HIGHLIGHT_STOP_TYPES" in body
+    # **只看代码行**：注释里必须能提到 `hop < 3`，那正是在解释为什么不该那么写
+    # （同 CLAUDE.md 那条数 Field(min_length=1) 的规矩）。
+    code = "\n".join(ln.split("//")[0] for ln in body.split("\n"))
+    assert "hop < 3" not in code, "又写死跳数了"
 
 
 def test_the_other_chain_stays_out_of_the_highlight():
@@ -84,6 +97,7 @@ def test_only_edges_with_both_ends_lit_stay_lit():
         'process.stdout.write(JSON.stringify([...r.edgeIds].sort()));'))
     assert out == sorted([
         "sym::胃脘胀痛::el::肝郁", "el::肝郁::syn::ye", "syn::ye::formula::ye::柴胡疏肝散",
+        "formula::ye::柴胡疏肝散::herb::ye::柴胡",
     ])
 
 
@@ -141,3 +155,10 @@ def test_jun_herbs_stay_bold_in_their_own_class():
     block = css[css.index(".herb-jun {"):]
     block = block[:block.index("}")]
     assert "font-weight" in block
+
+
+def _graph_js() -> str:
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parent.parent
+            / "web" / "graph.js").read_text(encoding="utf-8")

@@ -238,7 +238,8 @@ def test_structured_consult_returns_exactly_one_result(structured, monkeypatch):
     assert len(out["results"]) == 1, "五家融合只出一份答案"
     r = out["results"][0]
     assert r["physician"] == chain.SYNTHESIS_PHYSICIAN_ID == "synthesis"
-    assert r["physician_name"] == "五家综合"
+    from core.chain import SYNTHESIS_PHYSICIAN_NAME
+    assert r["physician_name"] == SYNTHESIS_PHYSICIAN_NAME
     assert r["s3"].syndrome == "脾胃气虚证"
     assert len(r["s3"].formula_candidates) == 1
 
@@ -396,7 +397,9 @@ def test_the_result_dict_has_the_same_keys_as_the_legacy_path(structured, monkey
     assert legacy - got == set(), f"structured 少了这些键：{legacy - got}"
     assert got - legacy == {"s3_structured", "physician_influences",
                             "physicians_cited", "herbs_grounded_ratio",
-                            "n_ontology_refs"}
+                            "n_ontology_refs",
+                            # R34 加的两个：符号验证的最终结论 + 三指标
+                            "verification", "verifier_metrics"}
 
 
 def test_stream_events_still_route_by_physician_field(structured):

@@ -117,9 +117,17 @@ def test_health_is_async_so_it_never_queues_behind_the_threadpool():
     assert inspect.iscoroutinefunction(api_main.health)
 
 
-def test_lifespan_stops_waiting_for_a_stuck_warmup_and_serves(monkeypatch):
-    """预热卡住（模型下载重试）时服务不能跟着卡：超过 WARMUP_TIMEOUT_SECONDS 就
-    先开始监听，/health 能答；预热线程留在后台。"""
+def test_lifespan_does_not_wait_for_warmup_at_all(monkeypatch):
+    """R40：**先监听，再预热。** 预热卡住（模型下载重试）时 startup 阶段
+    不能跟着卡——ASGI 的 startup 没走完 uvicorn 就不会处理请求，等在那里
+    等于"端口开着但一个请求都不答"，而编排器的存活探针连得上却等不到响应，
+    会把一个正常的进程判死。
+
+    比旧契约强的地方：旧版是"最多等 WARMUP_TIMEOUT_SECONDS 再放行"，
+    这条要的是**一点都不等**。所以断言用的是墙钟（< 2 秒）而不是"小于超时值"。
+    """
+    from api.warmup import TRACKER
+
     gate = threading.Event()
     started = threading.Event()
 
@@ -128,23 +136,43 @@ def test_lifespan_stops_waiting_for_a_stuck_warmup_and_serves(monkeypatch):
         gate.wait(timeout=10)
 
     monkeypatch.setattr(api_main, "_warmup", stuck_warmup)
-    monkeypatch.setattr(api_main, "WARMUP_TIMEOUT_SECONDS", 0.2)
+    TRACKER.reset()
     t0 = time.monotonic()
     try:
         with TestClient(api_main.app) as client:
+            # 一点都没等：预热还卡着，服务已经在答了
+            assert time.monotonic() - t0 < 2, "lifespan 还在等预热"
             assert started.is_set()
-            assert client.get("/health").json()["status"] == "ok"
-        assert time.monotonic() - t0 < 5, "lifespan 没有在超时后放行"
+            # 存活探针：永远 200
+            live = client.get("/health/live")
+            assert live.status_code == 200 and live.json()["status"] == "alive"
+            # 就绪探针：503 + 进度，**响应体照样完整**（前端要拿身份色）
+            ready = client.get("/health")
+            assert ready.status_code == 503, "预热没完成却报就绪"
+            body = ready.json()
+            assert body["status"] == "warming"
+            assert body["warmup"]["started"] is True
+            assert body["warmup"]["ready"] is False
+            assert body["warmup"]["progress"] == "0/2"
+            assert body["physicians"], "503 的响应体里少了前端要的配置"
     finally:
         gate.set()
+        TRACKER.reset()
 
 
 def test_lifespan_runs_warmup_exactly_once(monkeypatch):
     calls = []
     monkeypatch.setattr(api_main, "_warmup", lambda: calls.append(1))
-    with TestClient(api_main.app) as client:
-        assert client.get("/health").json()["status"] == "ok"
-    assert calls == [1]
+    from api.warmup import TRACKER
+
+    TRACKER.reset()
+    try:
+        with TestClient(api_main.app) as client:
+            # 预热被换成了一个什么都不做的函数，两项都停在 pending → 仍未就绪
+            assert client.get("/health/live").status_code == 200
+        assert calls == [1]
+    finally:
+        TRACKER.reset()
 
 
 # ---------- 对外文字不带绝对路径 ----------

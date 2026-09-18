@@ -61,7 +61,7 @@ def _make_results() -> list[dict]:
             "physician_name": "叶天士",
             "s2": s2_ye,
             "s3": s3_ye,
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         },
         {
@@ -69,7 +69,7 @@ def _make_results() -> list[dict]:
             "physician_name": "吴鞠通",
             "s2": s2_wu,
             "s3": s3_wu,
-            "refs": [("wu_jutong-001", 0.8)],
+            "refs": [{"case_id": "wu_jutong-001", "score": 0.8}],
             "hallucinated": [],
         },
     ]
@@ -118,7 +118,7 @@ def test_element_nodes_deduplicated_across_physicians():
                 syndrome="脾虚", reasoning="...", treatment_principle="健脾",
                 herbs=["党参"], cited_case_ids=["ye_tianshi-001"],
             ),
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         },
         {
@@ -133,12 +133,12 @@ def test_element_nodes_deduplicated_across_physicians():
                 syndrome="脾虚", reasoning="...", treatment_principle="健脾",
                 herbs=["白术"], cited_case_ids=["wu_jutong-001"],
             ),
-            "refs": [("wu_jutong-001", 0.9)],
+            "refs": [{"case_id": "wu_jutong-001", "score": 0.9}],
             "hallucinated": [],
         },
     ]
     graph = to_graph(s1, results)
-    elem_nodes = [n for n in graph["nodes"] if n["data"]["id"] == "elem::脾"]
+    elem_nodes = [n for n in graph["nodes"] if n["data"]["id"] == "organ::脾"]
     assert len(elem_nodes) == 1
 
 
@@ -163,12 +163,12 @@ def test_m5_no_longer_truncates_herbs_per_physician():
                 )],
                 cited_case_ids=["ye_tianshi-001"],
             ),
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         }
     ]
     graph = to_graph(s1, results)
-    herb_nodes = [n for n in graph["nodes"] if n["data"].get("layer") == 4]
+    herb_nodes = [n for n in graph["nodes"] if n["data"].get("layer") == 8]
     assert len(herb_nodes) == 10
 
 
@@ -189,7 +189,7 @@ def _single_physician_result(herbs: list[str], formula: str = "调补方") -> li
                 )],
                 cited_case_ids=["ye_tianshi-001"],
             ),
-            "refs": [("ye_tianshi-001", 0.9)],
+            "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
             "hallucinated": [],
         }
     ]
@@ -212,16 +212,16 @@ def test_herb_node_label_strips_dose_but_id_keeps_original_spelling():
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, _single_physician_result(["党参三钱", "黄芪一两二钱", "生石膏"]))
     herb_nodes = {n["data"]["id"]: n["data"]["label"]
-                  for n in graph["nodes"] if n["data"].get("layer") == 4}
+                  for n in graph["nodes"] if n["data"].get("layer") == 8}
 
-    assert herb_nodes["herb::ye_tianshi::调补方::党参三钱"] == "党参"
-    assert herb_nodes["herb::ye_tianshi::调补方::黄芪一两二钱"] == "黄芪"
+    assert herb_nodes["herb::调补方::党参三钱"] == "党参"
+    assert herb_nodes["herb::调补方::黄芪一两二钱"] == "黄芪"
     # 本来就没剂量的药名原样保留，不因为过了一遍剥离函数而被改写
-    assert herb_nodes["herb::ye_tianshi::调补方::生石膏"] == "生石膏"
+    assert herb_nodes["herb::调补方::生石膏"] == "生石膏"
     # id 端到端保留原始写法（含剂量），前端反查证据靠的就是这个原始拼法不变
-    assert set(herb_nodes.keys()) == {"herb::ye_tianshi::调补方::党参三钱",
-                                       "herb::ye_tianshi::调补方::黄芪一两二钱",
-                                       "herb::ye_tianshi::调补方::生石膏"}
+    assert set(herb_nodes.keys()) == {"herb::调补方::党参三钱",
+                                       "herb::调补方::黄芪一两二钱",
+                                       "herb::调补方::生石膏"}
 
 
 def test_herb_node_label_falls_back_to_raw_when_stripping_empties_it():
@@ -230,7 +230,7 @@ def test_herb_node_label_falls_back_to_raw_when_stripping_empties_it():
     比显示空白节点更诚实——至少看得出这条数据有问题。"""
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, _single_physician_result(["三钱"]))
-    herb_nodes = [n for n in graph["nodes"] if n["data"].get("layer") == 4]
+    herb_nodes = [n for n in graph["nodes"] if n["data"].get("layer") == 8]
     assert len(herb_nodes) == 1
     assert herb_nodes[0]["data"]["label"] == "三钱"
 
@@ -277,8 +277,8 @@ def test_frontend_evidence_index_key_matches_backend_herb_and_formula_node_id():
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     results = _single_physician_result(["党参三钱"])
     graph = to_graph(s1, results)
-    backend_herb_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"].get("layer") == 4}
-    backend_formula_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"].get("layer") == 3}
+    backend_herb_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"].get("layer") == 8}
+    backend_formula_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"].get("layer") == 7}
 
     r = results[0]
     s3 = r["s3"]
@@ -292,8 +292,8 @@ def test_frontend_evidence_index_key_matches_backend_herb_and_formula_node_id():
     }
     frontend_keys = set(_build_evidence_index(frontend_data))
 
-    assert backend_herb_ids == {"herb::ye_tianshi::调补方::党参三钱"}
-    assert backend_formula_ids == {"formula::ye_tianshi::调补方"}
+    assert backend_herb_ids == {"herb::调补方::党参三钱"}
+    assert backend_formula_ids == {"formula::调补方"}
     assert backend_herb_ids <= frontend_keys, (
         f"后端药材节点 id {backend_herb_ids} 在前端 EVIDENCE 索引 {frontend_keys} 里找不到——"
         "点击这个节点会打开空白侧栏"
@@ -304,7 +304,7 @@ def test_frontend_evidence_index_key_matches_backend_herb_and_formula_node_id():
     )
 
 
-# ---------- M4：layer 2 label 改成「病名 · 证型」，node id 不变 ----------
+# ---------- M4：证型层 label 是「病名 · 证型」（R42：层号 2 → 3，id 按证型名） ----------
 
 
 def test_layer2_label_is_disease_dot_syndrome_when_disease_present():
@@ -312,7 +312,7 @@ def test_layer2_label_is_disease_dot_syndrome_when_disease_present():
     results = _make_results()
     results[0]["s3"].disease = "胃痛"
     graph = to_graph(s1, results)
-    syn_node = next(n for n in graph["nodes"] if n["data"]["id"] == "syn::ye_tianshi")
+    syn_node = next(n for n in graph["nodes"] if n["data"]["id"] == "syn::脾胃气虚")
     assert syn_node["data"]["label"] == "胃痛 · 脾胃气虚"
 
 
@@ -323,20 +323,24 @@ def test_layer2_label_falls_back_to_syndrome_when_disease_is_none():
     results = _make_results()
     assert results[0]["s3"].disease is None  # 前提：_make_results() 没有设置 disease
     graph = to_graph(s1, results)
-    syn_node = next(n for n in graph["nodes"] if n["data"]["id"] == "syn::ye_tianshi")
+    syn_node = next(n for n in graph["nodes"] if n["data"]["id"] == "syn::脾胃气虚")
     assert syn_node["data"]["label"] == "脾胃气虚"
 
 
 def test_layer2_node_id_unchanged_by_disease_label():
-    # id 是前端证据链侧栏反查的键，M4 只改 label、不能碰 id——跟 M 药名剥剂量
-    # 那次「label 剥、id 保原样」是同一条约束。
+    """id 是前端证据链侧栏反查的键，改 label 不能碰 id——跟药名剥剂量那次
+    「label 剥、id 保原样」是同一条约束。
+
+    **R42 起 id 按证型名而不是按医家**（去掉医家分带）：两位医家给出不同证型
+    时是两个节点并列在同一层，给出同一个证型时合并成一个、`contributors`
+    记两个人。"""
     s1 = S1Normalize(symptoms=["纳差", "乏力", "口苦"], tongue="淡红", pulse="细弱", unmapped=[])
     results = _make_results()
     results[0]["s3"].disease = "胃痛"
     results[1]["s3"].disease = "胃热"  # 表外病名，label 该照样拼（label 不做校验，note 才做）
     graph = to_graph(s1, results)
-    node_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 2}
-    assert node_ids == {"syn::ye_tianshi", "syn::wu_jutong"}
+    node_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 3}
+    assert node_ids == {"syn::脾胃气虚", "syn::胃热"}
 
 
 # ---------- M5：六层图（症状/证素/病名·证型/方剂/药材，方剂-药材是 compound 关系）----------
@@ -375,17 +379,25 @@ def _multi_candidate_result(physician: str = "ye_tianshi", physician_name: str =
             ],
             cited_case_ids=["ye_tianshi-001"],
         ),
-        "refs": [("ye_tianshi-001", 0.9)],
+        "refs": [{"case_id": "ye_tianshi-001", "score": 0.9}],
         "hallucinated": [],
     }
 
 
-def test_six_layers_all_produced_with_correct_layer_numbers():
+def test_nine_layers_are_declared_and_the_missing_ones_are_reported():
+    """R42：九层单链。legacy `S3Syndrome` 没有 `organs[].pathogenesis` 与
+    `method.targets`，所以**病机(4) 与治法(6) 这两层是空的**——
+    要出现在 `missing_layers` 里，不是从 `reasoning` 里切一句话伪造出来。"""
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, [_multi_candidate_result()])
     layers = {n["data"]["layer"] for n in graph["nodes"]}
-    # layer 5 不存在——六层的编号是 0-4（第 5 层是"药材"本身，不是再加一层）
-    assert layers == {0, 1, 2, 3, 4}
+    # 这份 fixture 的 S2 只有病位证素（脾），所以病性(2) 也没有内容
+    assert layers == {0, 1, 3, 5, 7, 8}
+    assert graph["missing_layers"] == [2, 4, 6]
+    # 层的元信息由后端下发，九层齐全
+    assert [row["layer"] for row in graph["layers"]] == list(range(9))
+    assert [row["label"] for row in graph["layers"]] == [
+        "症状", "脏腑", "病性", "证型", "病机", "治则", "治法靶位", "方剂", "君臣佐使"]
 
 
 def test_all_three_candidates_produce_formula_nodes_not_just_selected():
@@ -393,19 +405,19 @@ def test_all_three_candidates_produce_formula_nodes_not_just_selected():
     只画 selected 的话另外 1-2 个候选方在图上永远不可见，候选方对比就没了。"""
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, [_multi_candidate_result()])
-    formula_nodes = {n["data"]["id"]: n["data"] for n in graph["nodes"] if n["data"]["layer"] == 3}
+    formula_nodes = {n["data"]["id"]: n["data"] for n in graph["nodes"] if n["data"]["layer"] == 7}
     assert set(formula_nodes) == {
-        "formula::ye_tianshi::四君子汤",
-        "formula::ye_tianshi::四君子汤加减",
-        "formula::ye_tianshi::自拟健脾方",
+        "formula::四君子汤",
+        "formula::四君子汤加减",
+        "formula::自拟健脾方",
     }
-    assert formula_nodes["formula::ye_tianshi::四君子汤"]["selected"] is True
-    assert formula_nodes["formula::ye_tianshi::四君子汤加减"]["selected"] is False
-    assert formula_nodes["formula::ye_tianshi::自拟健脾方"]["selected"] is False
+    assert formula_nodes["formula::四君子汤"]["selected"] is True
+    assert formula_nodes["formula::四君子汤加减"]["selected"] is False
+    assert formula_nodes["formula::自拟健脾方"]["selected"] is False
     # source 三档如实带出来，前端靠这个字段区分边框
-    assert formula_nodes["formula::ye_tianshi::四君子汤"]["source"] == "classic"
-    assert formula_nodes["formula::ye_tianshi::四君子汤加减"]["source"] == "modified"
-    assert formula_nodes["formula::ye_tianshi::自拟健脾方"]["source"] == "composed"
+    assert formula_nodes["formula::四君子汤"]["source"] == "classic"
+    assert formula_nodes["formula::四君子汤加减"]["source"] == "modified"
+    assert formula_nodes["formula::自拟健脾方"]["source"] == "composed"
 
 
 def test_same_herb_in_two_candidates_gets_two_different_ids_with_different_parents():
@@ -415,12 +427,12 @@ def test_same_herb_in_two_candidates_gets_two_different_ids_with_different_paren
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, [_multi_candidate_result()])
     gancao_nodes = [n["data"] for n in graph["nodes"]
-                    if n["data"]["layer"] == 4 and n["data"]["id"].endswith("::甘草")]
+                    if n["data"]["layer"] == 8 and n["data"]["id"].endswith("::甘草")]
     assert len(gancao_nodes) == 2
     ids = {n["id"] for n in gancao_nodes}
-    assert ids == {"herb::ye_tianshi::四君子汤::甘草", "herb::ye_tianshi::四君子汤加减::甘草"}
+    assert ids == {"herb::四君子汤::甘草", "herb::四君子汤加减::甘草"}
     parents = {n["parent"] for n in gancao_nodes}
-    assert parents == {"formula::ye_tianshi::四君子汤", "formula::ye_tianshi::四君子汤加减"}
+    assert parents == {"formula::四君子汤", "formula::四君子汤加减"}
 
 
 def test_herb_parent_always_points_to_an_existing_formula_node():
@@ -429,8 +441,8 @@ def test_herb_parent_always_points_to_an_existing_formula_node():
     这里额外显式断言一次，把"孤儿 parent"这个失败模式钉在测试名字上。"""
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, [_multi_candidate_result()])
-    formula_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 3}
-    herb_parents = {n["data"]["parent"] for n in graph["nodes"] if n["data"]["layer"] == 4}
+    formula_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 7}
+    herb_parents = {n["data"]["parent"] for n in graph["nodes"] if n["data"]["layer"] == 8}
     assert herb_parents <= formula_ids
     assert_graph_edges_valid(graph)  # 不抛异常即通过（parent 校验也在这里面）
 
@@ -440,25 +452,37 @@ def test_no_explicit_formula_to_herb_edge_exists():
     ——画了会在图上出现重复的连线，这是 M5 spec 原文明确警告的一条。"""
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, [_multi_candidate_result()])
-    formula_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 3}
-    herb_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 4}
+    formula_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 7}
+    herb_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["layer"] == 8}
     for e in graph["edges"]:
         assert not (e["data"]["source"] in formula_ids and e["data"]["target"] in herb_ids), (
             f"发现一条方剂->药材的显式边，应该只靠 parent 表达 compound 关系：{e}"
         )
 
 
-def test_syndrome_to_formula_edge_label_is_treatment_principle():
-    """治法不单独成层，挂在 layer2->layer3 这条边的 label 上。"""
+def test_the_treatment_principle_is_its_own_layer_now_not_an_edge_label():
+    """**R42 把治则从边的 label 提成第 5 层。**
+
+    改之前治法/治则挂在 证型→方剂 那条边的 label 上——投影、打印、导出 PNG
+    之后边上的小字基本读不出来，而"为什么是这个治法"是辨证的核心一步。
+    现在它是一个节点：证型 → 治则 → 方剂，链条在图上看得见。
+    """
     s1 = S1Normalize(symptoms=["纳差"], tongue=None, pulse=None, unmapped=[])
     graph = to_graph(s1, [_multi_candidate_result()])
-    syn_to_formula = [
-        e["data"] for e in graph["edges"]
-        if e["data"]["source"] == "syn::ye_tianshi"
-        and e["data"]["target"].startswith("formula::")
-    ]
-    assert len(syn_to_formula) == 3  # 三个候选方各一条边
-    assert all(e["label"] == "健脾益气" for e in syn_to_formula)
+    principle_nodes = [n["data"] for n in graph["nodes"] if n["data"]["layer"] == 5]
+    assert [n["label"] for n in principle_nodes] == ["健脾益气"]
+    pid = principle_nodes[0]["id"]
+    assert pid == "principle::健脾益气"
+    # 证型 → 治则
+    assert any(e["data"]["source"] == "syn::脾胃气虚" and e["data"]["target"] == pid
+               for e in graph["edges"])
+    # 治则 → 三个候选方各一条
+    to_formula = [e["data"] for e in graph["edges"]
+                  if e["data"]["source"] == pid
+                  and e["data"]["target"].startswith("formula::")]
+    assert len(to_formula) == 3
+    # 边上不再挂治法 label（它现在是节点）
+    assert all("label" not in e for e in to_formula)
 
 
 def test_safety_blocking_flag_passed_through_when_candidate_has_safety():
@@ -473,11 +497,11 @@ def test_safety_blocking_flag_passed_through_when_candidate_has_safety():
     )
     result["s3"].formula_candidates[1].safety = FormulaSafety()  # 无问题，blocking=False
     graph = to_graph(s1, [result])
-    formula_nodes = {n["data"]["id"]: n["data"] for n in graph["nodes"] if n["data"]["layer"] == 3}
-    assert formula_nodes["formula::ye_tianshi::四君子汤"]["safety_blocking"] is True
-    assert formula_nodes["formula::ye_tianshi::四君子汤加减"]["safety_blocking"] is False
+    formula_nodes = {n["data"]["id"]: n["data"] for n in graph["nodes"] if n["data"]["layer"] == 7}
+    assert formula_nodes["formula::四君子汤"]["safety_blocking"] is True
+    assert formula_nodes["formula::四君子汤加减"]["safety_blocking"] is False
     # 没算过 safety（safety is None）的候选方要如实报 False，不能报 None 或崩
-    assert formula_nodes["formula::ye_tianshi::自拟健脾方"]["safety_blocking"] is False
+    assert formula_nodes["formula::自拟健脾方"]["safety_blocking"] is False
 
 
 def test_western_drug_herb_item_flagged_is_western():
@@ -492,6 +516,6 @@ def test_western_drug_herb_item_flagged_is_western():
     )
     result["s3"].selected = 0
     graph = to_graph(s1, [result])
-    herb_by_id = {n["data"]["id"]: n["data"] for n in graph["nodes"] if n["data"]["layer"] == 4}
-    assert herb_by_id["herb::ye_tianshi::中西合方::党参"]["is_western"] is False
-    assert herb_by_id["herb::ye_tianshi::中西合方::阿斯匹林"]["is_western"] is True
+    herb_by_id = {n["data"]["id"]: n["data"] for n in graph["nodes"] if n["data"]["layer"] == 8}
+    assert herb_by_id["herb::中西合方::党参"]["is_western"] is False
+    assert herb_by_id["herb::中西合方::阿斯匹林"]["is_western"] is True

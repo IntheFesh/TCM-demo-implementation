@@ -86,6 +86,14 @@ def test_the_three_physicians_really_run_at_the_same_time(monkeypatch):
     llm = SlowLLM({info["name"]: _s3(pid) for pid, info in chain.PHYSICIANS.items()},
                   delay=0.3)
     _setup(monkeypatch, llm)
+    # **先把本体预热掉再开始计时。** 这条测的是"医家之间并发不并发"，
+    # 而本体首次加载实测 2057 ms（1232 味，药理层数据 R34 进版本控制之后）
+    # ——它由 R32 的知识块在第一个 worker 里惰性触发，会把 0.3s 级的计时冲掉。
+    # 生产里这一项由 `api/main.py::_warmup` 在启动时预热，请求路径上不会付这笔。
+    # 放宽时限来"修"这条测试是错的：那会把真实的冷启动开销藏起来。
+    from core.ontology import get_ontology
+
+    get_ontology()
     t0 = time.perf_counter()
     outcome = chain.consult("纳差乏力")
     elapsed = time.perf_counter() - t0

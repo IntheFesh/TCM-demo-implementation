@@ -21,6 +21,7 @@ import sys
 import threading
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
@@ -47,6 +48,7 @@ from core.llm import (
     S3_MODES,
     s3_best_of_n,
     s3_mode,
+    s1s2_merged,
     s3_reasoning_effort,
     s3_thinking,
     thinking_by_step,
@@ -54,6 +56,7 @@ from core.llm import (
 )
 from core.followup import (
     AskFn, fast_mode_enabled, format_followup_for_s3, parse_answer, run_followup,
+    stop_label,
 )
 from core.physicians import (
     PHYSICIANS,
@@ -69,15 +72,24 @@ from core.retrieval_hybrid import (
     RETRIEVER_MODE_ENV,
     effective_mode,
 )
+from core.agent import AgentTrace, decide
 from core.safety import check_safety, danger_confirmed_by_answer, safety_bypassed
 from core.formula_check import advice_dicts, check_formula
+from core.formula_verifier import (
+    format_violations_for_revise,
+    max_revise_rounds,
+    verifier_metrics,
+    verify_formula,
+)
 from core.safety_output import assess_formula_safety, format_blocking_issues
 from core.schemas import (
     S3_CHAIN_STEPS,
     CaseRecord,
     FollowupResult,
+    HerbItem,
     ReActTrace,
     S1Normalize,
+    S1S2Merged,
     S2Elements,
     S3Structured,
     S3StructuredUnreferenced,
@@ -391,6 +403,40 @@ def infer_elements(s1: S1Normalize) -> S2Elements:
                               **thinking_for("s2"))
 
 
+def normalize_and_infer_merged(complaint: str) -> tuple[S1Normalize, S2Elements]:
+    """R36：S1 + S2 **一次调用**。返回拆好的 `(s1, s2)`，跟分两次拿到的同型。
+
+    ## 这条路默认关着，而且关着是有理由的
+
+    `S1S2_MERGED` 默认 **0**。省下的是一次 2~4 秒的调用，代价是次序：
+    CLAUDE.md 那条铁律要求**危重症状的拦截发生在证素推断之前**，而合一之后
+    证素推断与症状标准化在同一次调用里完成——拦截最早也只能早到"那一次调用
+    之前"，也就是只能拿**原始主诉的字面**去查。S1 归一之后才露出来的危重词
+    （原文「呕吐咖啡色物」经 S1 归一成「呕血」）就挡不住证素推断了。
+
+    调用方（`consult`）在合一模式下命中安全否决时**把已经推出来的证素丢掉、
+    返回 `s2: None`**，所以对外可见的行为跟分两次那条路逐字段一致（不产出证素、
+    不产出方药）。但"丢掉"是流程约定，"没算过"才是结构保证——把一条结构保证换成
+    一条流程约定，不该由一个性能开关顺手做掉。
+
+    R36 的调用数验收（一次问诊 ≤4 次）不靠它也达到：S1 + S2 + S3 = 3 次。
+    所以这条路完整实现、有测试、`S1S2_MERGED=1` 随时可开（R38 的消融要拿它
+    量"合一之后证素质量变没变"），但默认不开。
+    """
+    prompt = load_prompt("s1s2_merged")
+    system = render(
+        prompt["system"],
+        complaint=complaint,
+        elements=(
+            f"病位证素（kind 填 location）：{'、'.join(LOCATIONS)}\n"
+            f"  病性证素（kind 填 nature）：{'、'.join(NATURES)}"
+        ),
+    )
+    merged = get_llm().generate(system=system, user="", schema=S1S2Merged,
+                                **thinking_for("s1s2"))
+    return merged.to_s1(), merged.to_s2()
+
+
 def _search_cases(
     query: str, physician: str, s2: S2Elements, retriever_mode: str | None
 ) -> tuple[list[tuple[CaseRecord, float]], bool]:
@@ -627,8 +673,217 @@ def _score_candidate(s3) -> tuple[float, dict]:
     }
 
 
-def _best_of_n_s3(s3_system: str, s3_schema, physician: str):
+def _streaming_note(n_samples: int) -> str | None:
+    """这次 S3 为什么没有增量。能流式就返回 None。
+
+    **三种"没流式"要分开**（后端不支持 / 是模拟的 / best-of-N 这一路不流式），
+    合成一句"未启用"的话，前端转着圈等的时候没人知道该修哪儿。
+    后端那两种由 `LLMBackend.streaming_note()` 回答（判据在后端自己身上，
+    不在这里抄一份）。
+    """
+    if n_samples > 1:
+        return (f"这次 S3 采了 {n_samples} 次（best-of-N），几路同时在飞，"
+                "增量混在一条流里没法用，所以这一路不流式。设 S3_BEST_OF_N=1 可开")
+    llm = get_llm()
+    note = getattr(llm, "streaming_note", None)
+    if callable(note):
+        return note()
+    # 鸭子类型的后端（测试替身、第三方实现）没有这个方法。**不抛异常**——
+    # manifest 的一个统计项取不到不该让整次问诊失败（同 `_prefix_tokens_or_none`
+    # 那条），而"这个后端没报"跟"报了说不支持"要能分开。
+    backend_id = getattr(llm, "backend_id", None)
+    who = backend_id() if callable(backend_id) else type(llm).__name__
+    return f"后端 {who} 没有实现 streaming_note()，这次有没有流式无从判断"
+
+
+#: 流式中途从半截 JSON 里扒药名用的。**只扫 `herb_items` 之后那一段**：
+#: `"name"` 这个键在方名（`candidate.name`）上也有，整段扫会把方名当药名。
+_PARTIAL_ITEMS_ANCHOR = '"herb_items"'
+_PARTIAL_NAME_RE = re.compile(r'"name"\s*:\s*"([^"\\]{1,16})"')
+_PARTIAL_DOSE_RE = re.compile(r'"dose"\s*:\s*(null|[0-9]+(?:\.[0-9]+)?)')
+
+
+def scan_partial_herb_items(text: str) -> list[HerbItem]:
+    """从**还没输出完**的 S3 JSON 里扒出已经成型的药名与剂量。
+
+    R40 投机执行用。**这是个尽力而为的扫描，不是解析器**：
+      · 只取 `"herb_items"` 之后的部分（方名也叫 `name`，见上面那条注释）
+      · 每个 `"name"` 往后找到下一个 `"name"` 之前的 `"dose"` 配对，
+        找不到就 dose=None（`dose_exceeds` 会把"有上限可比但没写剂量"
+        记成 unverifiable，这正是想要的语义）
+      · 最后一条可能是半截的（引号还没闭合）→ 正则匹配不上，自然被跳过
+
+    扒错的后果由调用方兜：只有**veto 级**结论才发提示，且措辞写明"初步"，
+    最终以完整验证为准。宁可晚报，不可错报——这是临床产品，不是日志。
+    """
+    if not text:
+        return []
+    pos = text.find(_PARTIAL_ITEMS_ANCHOR)
+    if pos < 0:
+        return []
+    seg = text[pos + len(_PARTIAL_ITEMS_ANCHOR):]
+    out: list[HerbItem] = []
+    names = list(_PARTIAL_NAME_RE.finditer(seg))
+    for i, m in enumerate(names):
+        end = names[i + 1].start() if i + 1 < len(names) else len(seg)
+        dm = _PARTIAL_DOSE_RE.search(seg, m.end(), end)
+        dose: float | None = None
+        if dm and dm.group(1) != "null":
+            try:
+                dose = float(dm.group(1))
+            except ValueError:
+                dose = None
+        try:
+            out.append(HerbItem(name=m.group(1), dose=dose))
+        except Exception:  # noqa: BLE001 - 半截的名字过不了 schema 校验，跳过就是
+            continue
+    return out
+
+
+class S3DeltaEmitter:
+    """R36：把 S3 的流式增量合并成 `s3_delta` 事件。
+
+    **必须合并。** 一个 token 一帧的话，一次 S3 输出几千帧 SSE，前端每帧都要
+    JSON.parse + 重排一次；而人眼分辨不出 30ms 和 120ms 的差别。合并判据是
+    "攒够 80 字 或 距上次 ≥120ms"，收尾无条件冲一次——不冲的话最后一段永远发不出。
+
+    **思考与正式输出分两路累积。** 合成一路会把思考过程拼进方药文本里
+    （`core.llm._delta_texts` 那一层已经把两者分开了，这里不许合回去）。
+
+    计数（`chars` / `events` / `first_delta_s`）是给 bench 与 manifest 用的：
+    "首字延迟"这个验收项没有计数就只能靠掐表。
+    """
+
+    FLUSH_CHARS = 80
+    FLUSH_SECONDS = 0.12
+
+    #: R40 投机执行：正式输出每多这么多字，就拿半截 JSON 里已成型的药名
+    #: 跑一次"只看药名"的两条 veto 规则。不是每帧都跑——`verify_incremental`
+    #: 本身只要 0.1 ms 级，但正则扫的是**累积全文**，每帧扫一遍是 O(n²)。
+    SPECULATIVE_EVERY_CHARS = 400
+
+    def __init__(self, on_step: StepFn | None, physician: str, physician_name: str,
+                 *, speculative: bool = True) -> None:
+        self._on_step = on_step
+        self._physician = physician
+        self._physician_name = physician_name
+        self._buf: dict[str, str] = {"content": "", "reasoning": ""}
+        self._last_flush: dict[str, float] = {"content": 0.0, "reasoning": 0.0}
+        self._t0 = time.monotonic()
+        self.chars: dict[str, int] = {"content": 0, "reasoning": 0}
+        self.events = 0
+        self.first_delta_s: float | None = None
+        # 投机执行的状态。`_full` 留累积的正式输出（扫描要全文，增量帧不够）。
+        self._speculative = speculative
+        self._full = ""
+        self._next_scan_at = self.SPECULATIVE_EVERY_CHARS
+        #: 已经报过的（规则, 药名元组）——**同一条 veto 只报一次**，
+        #: 后面每次扫描都会再看见它，重复报会把提示区刷满。
+        self._early_reported: set[tuple] = set()
+        self.early_vetoes: list[dict] = []
+
+    def __call__(self, text: str, kind: str) -> None:
+        if not text:
+            return
+        if kind not in self._buf:
+            # 认不出的种类**当正式输出处理并计数**，不静默丢：丢掉的表现是
+            # "前端少了一段"，而那时没人知道少了什么。
+            kind = "content"
+        if self.first_delta_s is None:
+            self.first_delta_s = round(time.monotonic() - self._t0, 4)
+        self.chars[kind] += len(text)
+        self._buf[kind] += text
+        if self._speculative and kind == "content":
+            self._full += text
+            if self.chars["content"] >= self._next_scan_at:
+                self._next_scan_at = self.chars["content"] + self.SPECULATIVE_EVERY_CHARS
+                self._speculate()
+        now = time.monotonic()
+        if (len(self._buf[kind]) >= self.FLUSH_CHARS
+                or now - self._last_flush[kind] >= self.FLUSH_SECONDS):
+            self._emit(kind)
+
+    def flush(self) -> None:
+        for kind in list(self._buf):
+            if self._buf[kind]:
+                self._emit(kind)
+
+    def _emit(self, kind: str) -> None:
+        text, self._buf[kind] = self._buf[kind], ""
+        self._last_flush[kind] = time.monotonic()
+        if not text:
+            return
+        self.events += 1
+        if self._on_step is not None:
+            self._on_step("s3_delta", {
+                "physician": self._physician,
+                "physician_name": self._physician_name,
+                "kind": kind,
+                "text": text,
+                # 到这一帧为止这一路累计多少字：前端要能判断自己有没有漏帧，
+                # 而只发增量的话漏了一帧没人看得出来。
+                "chars": self.chars[kind],
+                "seq": self.events,
+            })
+
+    def _speculate(self) -> None:
+        """拿半截输出里已成型的药名跑两条 veto 规则，**命中就当场报一条提示**。
+
+        为什么值得：配伍禁忌和超药典上限是 veto 级——命中这张方根本不会下发。
+        真实后端上 S3 要几十秒到几分钟，等输出完再说"这张方作废了"，
+        那几十秒白等。药名一出来就能判。
+
+        **一次扫描失败不能影响这次问诊**：这是个尽力而为的旁路，扒错、
+        本体不在、schema 拒了半截的名字——任何异常都只意味着"这一次没提示"。
+        """
+        try:
+            items = scan_partial_herb_items(self._full)
+            if len(items) < 2:      # 一味药谈不上配伍；剂量那条也要有名字才查得到
+                return
+            from core.formula_verifier import rule_label, verify_incremental
+
+            result = verify_incremental(items)
+            for v in result.vetoes:
+                key = (v.rule, v.herbs)
+                if key in self._early_reported:
+                    return
+                self._early_reported.add(key)
+                row = {"rule": v.rule, "rule_label": rule_label(v.rule),
+                       "herbs": list(v.herbs), "reason": v.reason,
+                       "n_herbs_scanned": len(items),
+                       # **措辞是这条提示的一半**：半截输出上的结论可能作废，
+                       # 说成定论就是在临床界面上撒谎。
+                       "note": "初步提示：基于尚未输出完的药味清单，"
+                               "最终以完整符号验证为准"}
+                self.early_vetoes.append(row)
+                if self._on_step is not None:
+                    self._on_step("early_veto", {
+                        "physician": self._physician,
+                        "physician_name": self._physician_name, **row})
+        except Exception:  # noqa: BLE001 - 旁路，见文档字符串
+            return
+
+    def summary(self) -> dict:
+        """写进 `s3_done` 与 manifest 的那几个数。"""
+        return {
+            "events": self.events,
+            "chars_content": self.chars["content"],
+            "chars_reasoning": self.chars["reasoning"],
+            "first_delta_s": self.first_delta_s,
+            # 投机执行提前报了几条。**0 和"没开"要分得开**：`speculative`
+            # 一起下发，否则读数的人分不清"没命中"和"没跑"。
+            "speculative": self._speculative,
+            "n_early_vetoes": len(self.early_vetoes),
+        }
+
+
+def _best_of_n_s3(s3_system: str, s3_schema, physician: str, *, on_delta=None):
     """采 N 次 S3，按 `score_formula` 挑分最高的一次。返回 (s3, candidates_scored)。
+
+    `on_delta`（R36）**只在 N=1 时往下传**。N>1 时几路采样同时在飞，
+    把它们的增量混在一条流里发出去，前端拼出来的是几张方交错的乱码——
+    与其发一堆没法用的帧，不如这一路不流式（`streaming_skipped_reason`
+    会如实说出原因，不让人以为是后端不支持）。
 
     **N=1 时逐字节走回 R21 及之前的那条路径**（一次 generate、不建线程池、
     candidates_scored 只有一条）——把"关掉 best-of-N"做成一条独立代码路径会让
@@ -647,14 +902,15 @@ def _best_of_n_s3(s3_system: str, s3_schema, physician: str):
     n = s3_best_of_n()
     thinking = thinking_for("s3")
 
-    def one():
+    def one(stream=False):
+        extra = {"on_delta": on_delta} if (stream and on_delta is not None) else {}
         return get_llm().generate(
             system=s3_system, user="", schema=s3_schema, physician=physician,
-            **thinking,
+            **extra, **thinking,
         )
 
     if n == 1:
-        s3 = one()
+        s3 = one(stream=True)
         score, row = _score_candidate(s3)
         return s3, [{**row, "index": 0, "chosen": True}]
 
@@ -816,6 +1072,9 @@ def run_physician(
         # 没开 ReAct 时这是这位医家唯一一次要等的 LLM 调用；开了 ReAct 也要报——
         # 取证结束不代表马上有结果，S3 本身也要等一次真实调用。
         on_step("s3_start", {"physician": physician, "physician_name": physician_name})
+    # R36：流式。`emitter` 在没有 on_step 时也建（它自己判 None），这样
+    # `s3_done` 里的计数在 CLI / eval 那条路上照样是真的。
+    emitter = S3DeltaEmitter(on_step, physician, physician_name)
     # 混进 herbs 的西药（模型没照 prompt 的要求分开写）在 schema 构造时就已经被
     # core.schemas._S3Base 的 model_validator 挑到 western_drugs 了，这里不用
     # 再包一层 _split_western_into_s3——这一步以前是代码层面的兜底，现在兜底
@@ -827,7 +1086,13 @@ def run_physician(
     # （DeepSeek）如实忽略它，见 core/llm.py::LLMBackend._complete 的文档。
     # S3 是这条链上唯一真正需要推理的一步，默认开思考（S3_THINKING 可整体关掉，
     # 关掉之后跑出来的数字跟默认配置不可比——manifest 会带上这句话）。
-    s3, candidates_scored = _best_of_n_s3(s3_system, s3_schema, physician)
+    s3, candidates_scored = _best_of_n_s3(s3_system, s3_schema, physician,
+                                          on_delta=emitter)
+    emitter.flush()
+    if on_step is not None:
+        on_step("s3_done", {"physician": physician, "physician_name": physician_name,
+                            **emitter.summary(),
+                            "streaming_note": _streaming_note(len(candidates_scored))})
 
     # X2 输出侧安全（M2 起覆盖五条规则，见 core/safety_output.assess_formula_safety
     # 的文档字符串）：给每个候选方都算一份 FormulaSafety，不是只算 selected 那个——
@@ -895,6 +1160,11 @@ def run_physician(
         # **记在结果里而不是只记 manifest**：知识块是按医家的 hits 裁剪的，
         # 整次问诊一个数说不清楚谁看到了什么——跟 lora 字段同一个理由。
         "knowledge": {"mode": knowledge_mode, **knowledge_stats},
+        # R36：这次 S3 有没有真的流式、发了多少帧、首字多久。
+        # **记在结果里而不是只记 manifest**：理由同 knowledge——manifest 一个数
+        # 说不清楚哪位医家那一路流了、哪一路没流。
+        "streaming": {**emitter.summary(),
+                      "note": _streaming_note(len(candidates_scored))},
         "disease_candidates": disease_candidates,
         "refs": refs,
         # E3/E4 消融要按 (主诉, 医家) 配对比较不同 refs_mode 的结果；结果自带
@@ -993,14 +1263,121 @@ def _run_react_round(
     return s3_system + format_trace_for_s3(trace), trace, react_safety_flag
 
 
-#: 结构化模式下这份"综合诊断"在 `results` 里的身份。
+def _verify_and_revise(raw, s3_system: str, s3_schema, *, on_step: StepFn | None = None):
+    """R34 闭环：验 → 有问题就带着**本体原文反例**重开 → 再验，最多
+    `max_revise_rounds()` 轮。返回 `(最终 raw, 最终 s3, 每轮的验证结果, 重开次数)`。
+
+    ## 三条设计决定
+
+    **一、重开时关思考**（`thinking="disabled"`）。这一步不是"再想一遍怎么辨证"
+    ——证型、治法、五步链都已经定了，要改的是"把这味药换成归肝经的"这种
+    照着反例改的局部修补。开思考在这一步是纯浪费（实测数据见 §0.4：单次 S3
+    开思考 260–479 秒），而且**反而更容易把已经对的部分重新想一遍想坏**。
+
+    **二、veto 残余不下发。** 轮数用完还有 veto 级违规就抛 `SymbolicVeto`，
+    整次问诊不产出方药——跟安全否决同一条语义（被拦截的请求不产出任何方药），
+    但是两个不同的异常（见 `SymbolicVeto` 的文档字符串）。
+    revise 级残余**照常下发**并如实标在 `verification` 里：那些是"拟得不够好"，
+    不是"不能用"，压着不发等于因为一条归经覆盖建议就不给患者任何东西。
+
+    **三、每一轮的结果都留着。** `verify_rounds` 是 list 而不是只留最后一个：
+    `verifier_first_pass_rate` 要的是**第一轮**的状态，而"改了三轮才过"和
+    "一次就过"在最终态上看起来一模一样。
+
+    ## unverifiable 不进回灌
+
+    本体缺数据时那条规则判不了（归经缺 49%、用量缺 55%）。把这些写进回灌文本
+    只会让模型以为自己错了、去改一个本来可能对的地方——它改方也改不出数据来。
+    它们的去处是 `verification` 字段与 manifest（如实显示"这几条判不了"）。
+    """
+    rounds: list = []
+    revise_calls = 0
+    s3 = _as_s3_syndrome(raw)
+    limit = max_revise_rounds()
+    while True:
+        result = verify_formula(raw)
+        rounds.append(result)
+        if not result.violations or revise_calls >= limit:
+            break
+        feedback = format_violations_for_revise(result)
+        if not feedback:            # 理论上不会到：violations 非空时它必非空
+            break
+        if on_step is not None:
+            on_step("verify_revise", {
+                "round": revise_calls + 1, "status": result.status,
+                "n_veto": len(result.vetoes), "n_revise": len(result.revisables),
+                "rules": sorted({v.rule for v in result.violations}),
+            })
+        raw = get_llm().generate(
+            system=s3_system + feedback, user="", schema=s3_schema,
+            physician=SYNTHESIS_PHYSICIAN_ID,
+            # 关思考：这一步是照着反例做局部修补，不是重新辨一遍证（见上面第一条）。
+            thinking="disabled", reasoning_effort=None,
+        )
+        s3 = _as_s3_syndrome(raw)
+        revise_calls += 1
+    if rounds[-1].vetoes:
+        raise SymbolicVeto(rounds[-1].vetoes, llm_calls=revise_calls,
+                           rounds=revise_calls)
+    return raw, s3, rounds, revise_calls
+
+
+class SymbolicVeto(Exception):
+    """R34：符号验证器的 veto 级违规在 `MAX_REVISE_ROUNDS` 轮之后仍未消除。
+
+    **跟 `SafetyVeto` 是两件不同的事**，所以是两个异常而不是复用一个：
+      - `SafetyVeto`：**输入侧**——主诉或追问的回答里有危重症状，整个请求不该辨证
+      - 本异常：**输出侧**——辨完了、方也开了，但方本身有配伍禁忌/超量/编造出处，
+        改了三轮还在，这张方不下发
+    合并成一个异常的话，前端会把"你的症状需要立刻就医"和"系统改不出一张合规的方"
+    显示成同一句话，而这两件事患者该做的完全不同。
+
+    `violations` 带上，好让响应里能如实说出是哪几条——不是一句"验证失败"。
+    """
+
+    def __init__(self, violations, llm_calls: int = 0, rounds: int = 0):
+        self.violations = tuple(violations)
+        self.llm_calls = llm_calls
+        self.rounds = rounds
+        detail = "；".join(f"[{v.rule}] {v.reason}" for v in self.violations)
+        super().__init__(f"符号验证有 {len(self.violations)} 条不可下发的问题"
+                        f"（已重开 {rounds} 轮）：{detail}")
+
+    @property
+    def reason(self) -> str:
+        """给响应用的一句人话。**不含本体原文**——那是给模型看的反例，
+        对患者来说是噪音；界面要看细节时读 `verification` 字段。"""
+        rules = "、".join(dict.fromkeys(v.rule for v in self.violations))
+        return (f"这张方在符号验证中有不可下发的问题（{rules}），"
+                f"系统已按本体原文重开 {self.rounds} 轮仍未消除，因此不给出方药。"
+                "请换用人工复核，或补充更多症状信息后重试。")
+
+
+#: 结构化模式下这份结论在 `results` 里的身份。
 #:
 #: `results` 的元素结构是既有契约（前端、分歧度、eval 收集器都按它读），
 #: structured 模式只有**一个**元素，但它仍然需要一个 `physician` 值。
 #: 用一个**不在注册表里**的保留 id 而不是随便挑一位医家的 id：挑一位的话
 #: 「这份结论是叶天士给的」这句话就是假的，而前端会照着把它显示成叶天士的方。
 SYNTHESIS_PHYSICIAN_ID = "synthesis"
-SYNTHESIS_PHYSICIAN_NAME = "五家综合"
+
+#: **R44：显示名从「五家综合」改成「本次辨证」。**
+#:
+#: 「五家综合」把这份结论说成"几个人拼出来的"——那是**内部机制**，不是产品形态。
+#: 总纲 §12 的原话是「能力不删，产品面不露」：五家各出一份再融合这件事照旧
+#: 在跑（`run_synthesis` 一行没改），研究面（researcher 角色）照旧拿到三列与
+#: 分歧读数；变的是**结论顶上那句话**。
+#:
+#: 为什么是「本次辨证」而不是某个人名或者某个产品名：
+#:   - 人名是假的（这份结论不是哪一位医家给的）；
+#:   - 产品名会让这句话变成广告；
+#:   - 「本次辨证」如实说出这是什么——**这一次问诊的辨证结论**，
+#:     而名老中医经验是它引用的依据（`physician_influences` 逐条标着谁、哪一步）。
+#:
+#: 这不是把能力藏起来：谁贡献了哪一步仍然在 `physician_influences` 里逐条可查，
+#: 九段界面照样显示「叶天士·取象」这种归属。改的是**框架**——从"几个人投票"
+#: 改成"一位医师引用了几家的经验"。
+SYNTHESIS_PHYSICIAN_NAME = "本次辨证"
 
 
 def run_synthesis(
@@ -1101,28 +1478,33 @@ def run_synthesis(
             bypass_safety=bypass_safety, on_step=on_step,
         )
 
-    raw, candidates_scored = _best_of_n_s3(s3_system, s3_schema, SYNTHESIS_PHYSICIAN_ID)
-    s3 = _as_s3_syndrome(raw)
-
+    if on_step is not None:
+        on_step("s3_start", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                             "physician_name": SYNTHESIS_PHYSICIAN_NAME})
+    emitter = S3DeltaEmitter(on_step, SYNTHESIS_PHYSICIAN_ID, SYNTHESIS_PHYSICIAN_NAME)
+    raw, candidates_scored = _best_of_n_s3(s3_system, s3_schema, SYNTHESIS_PHYSICIAN_ID,
+                                           on_delta=emitter)
+    emitter.flush()
+    if on_step is not None:
+        on_step("s3_done", {"physician": SYNTHESIS_PHYSICIAN_ID,
+                            "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+                            **emitter.summary(),
+                            "streaming_note": _streaming_note(len(candidates_scored))})
+    # R34：符号验证闭环。**这一层取代了 legacy 那条"安全层拦截 → 重开一次"**
+    # ——不是两个循环并存：那两条判据（配伍禁忌、超量）现在由验证器的
+    # `incompatible_pair` / `dose_exceeds` 两条规则**委托给同一个 safety_output**
+    # 去查（见 core/formula_verifier.py 那两条规则的文档字符串）。
+    # 两个循环各自决定"要不要重开"的话，同一张方可能被改两遍、llm_calls 不可预测，
+    # 而 manifest 里那个数是额度结算与成本比较的依据。
+    raw, s3, verify_rounds, revise_calls = _verify_and_revise(
+        raw, s3_system, s3_schema, on_step=on_step,
+    )
+    # `cand.safety` 仍然要填：前端按它挂红/黄标签，M2 那套字段一个没变。
+    # 填它跟"要不要重开"是两件事——重开只由验证器决定。
     for cand in s3.formula_candidates:
         cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
     selected_safety = s3.formula_candidates[s3.selected].safety
-    revised = False
-    if selected_safety.blocking:
-        retry_system = s3_system + (
-            f"\n\n【安全问题】上一次拟的方存在以下必须修正的问题："
-            f"{format_blocking_issues(selected_safety)}。请重新拟方解决这些问题，"
-            "其余要求不变（五步链与引用要求一条都不许省）。"
-        )
-        raw = get_llm().generate(
-            system=retry_system, user="", schema=s3_schema,
-            physician=SYNTHESIS_PHYSICIAN_ID, **thinking_for("s3"),
-        )
-        s3 = _as_s3_syndrome(raw)
-        for cand in s3.formula_candidates:
-            cand.safety = assess_formula_safety(s3.syndrome, cand.herb_items)
-        revised = True
-        selected_safety = s3.formula_candidates[s3.selected].safety
+    revised = len(verify_rounds) > 1
 
     ref_ids = {r["case_id"] for r in refs}
     if trace is not None:
@@ -1159,10 +1541,18 @@ def run_synthesis(
         "physicians_cited": raw.physicians_cited,
         "herbs_grounded_ratio": raw.herbs_grounded_ratio(),
         "n_ontology_refs": len(raw.ontology_refs),
+        # R34：符号验证的最终结论 + 三指标。**最后一轮的结果**，不是第一轮——
+        # 前端要显示的是"这张方现在的状态"。第一轮的状态在 metrics 里
+        # （`verifier_first_pass` / `first_pass_status`），两者都要有：
+        # 只报最终态会让"改了三轮才过"和"一次就过"看起来一样。
+        "verification": verify_rounds[-1].to_dict(),
+        "verifier_metrics": verifier_metrics(verify_rounds, raw),
         "knowledge": {"mode": knowledge_mode, **knowledge_stats,
                       # structured 不走 assemble()，所以没有稳定前缀可缓存。
                       # 如实记一条，别让人看到 mode="full" 就以为缓存命中了。
                       "prefix_assembled": False},
+        "streaming": {**emitter.summary(),
+                      "note": _streaming_note(len(candidates_scored))},
         "disease_candidates": disease_candidates,
         "refs": refs,
         "refs_mode": refs_mode,
@@ -1244,6 +1634,84 @@ def _aggregate_knowledge(results: list[dict] | None) -> dict | None:
     }
 
 
+def _aggregate_streaming(results: list[dict] | None) -> dict | None:
+    """把各路 S3 的流式情况汇成一份给 manifest。
+
+    `streamed` 是"**有没有任何一路真的流了**"：一路流了一路没流时，写 True 会
+    让人以为整次都是流式的，所以同时报 `n_streamed / n_total`。
+    首字延迟取**最大值**——验收要问的是"最慢那一路多久才有字"，取最小值等于
+    拿最好看的那个数当结论。`note` 收集所有不同的原因（去重保序），
+    一路一个原因合成一句会丢掉信息。
+    """
+    rows = [r.get("streaming") for r in (results or []) if isinstance(r.get("streaming"), dict)]
+    if not rows:
+        return None
+    streamed = [r for r in rows if (r.get("events") or 0) > 0]
+    firsts = [r.get("first_delta_s") for r in streamed if r.get("first_delta_s") is not None]
+    notes = list(dict.fromkeys(r.get("note") for r in rows if r.get("note")))
+    return {
+        "streamed": bool(streamed),
+        "n_streamed": len(streamed),
+        "n_total": len(rows),
+        "events": sum(r.get("events") or 0 for r in rows),
+        "chars_content": sum(r.get("chars_content") or 0 for r in rows),
+        "chars_reasoning": sum(r.get("chars_reasoning") or 0 for r in rows),
+        "first_delta_s_max": max(firsts) if firsts else None,
+        "notes": notes,
+    }
+
+
+def _reopen_calls(results: list[dict]) -> int:
+    """重开一共花了几次调用。**只此一处实现**——`consult()` 有两处在算 llm_calls
+    （安全否决那条早返回路径、正常返回路径），两处各写一遍必然有一处忘了改。
+
+    两种模式的重开次数来源不同：
+      - legacy：安全层最多重开**一次**，`safety_output.revised` 是个布尔值，
+        计 1 次就是对的；
+      - structured（R34）：符号验证闭环最多重开 `MAX_REVISE_ROUNDS` 轮，
+        布尔值会把 3 次算成 1 次。
+
+    R34 实测撞到过：加了闭环之后这里仍然按布尔算，manifest 报 4 次而实际花了 6 次
+    ——而 manifest 里那个数是额度结算与成本比较的依据，少算不会报错。
+    """
+    total = 0
+    for r in results:
+        m = r.get("verifier_metrics")
+        if m is not None:
+            total += int(m.get("revise_rounds") or 0)
+        elif r.get("safety_output", {}).get("revised"):
+            total += 1
+    return total
+
+
+def _ontology_manifest() -> dict:
+    """本体的规模、缺谓词分布、对医案语料的覆盖率。写进 manifest。
+
+    **为什么要进 manifest 而不是只写在报告里**：引用"符号验证通过"这句话的人
+    必须能同时看到"验证依据的那份本体缺了多少"。归经缺 49%、用量缺 55% 的情况下，
+    七条规则里有两条在大多数药上判不了——这件事不在同一个地方出现，
+    那句话就会被当成"全验过了"。
+
+    本体不可用时只报 `available: False`，不编数。
+    """
+    from core.formula_verifier import ontology_coverage_of_corpus
+    from core.ontology import get_ontology
+
+    ont = get_ontology()
+    if not ont.available:
+        return {"available": False}
+    s = ont.stats()
+    return {
+        "available": True,
+        "n_herbs": s["n_herbs"],
+        "n_formulas": s["n_formulas"],
+        "n_patterns": s["n_patterns"],
+        "missing_predicate_counts": s["missing_predicate_counts"],
+        "empty_span_refs": s["empty_span_refs"],
+        "corpus_coverage": ontology_coverage_of_corpus(ontology=ont),
+    }
+
+
 def _synthesis_summary(results: list[dict] | None, mode: str) -> dict | None:
     """结构化模式下这一次融合的可核数据。legacy 下返回 **None**。
 
@@ -1262,10 +1730,17 @@ def _synthesis_summary(results: list[dict] | None, mode: str) -> dict | None:
         "physicians_available": len(physicians_for_synthesis(PHYSICIANS)),
         "physicians_cited": r.get("physicians_cited") or [],
         "n_physicians_cited": len(r.get("physicians_cited") or []),
+        # R34b：**分母说清楚是哪一层。** 这个比率的分母是**这张方**的药味数，
+        # 不是本体总药味数（1232）——两个集合完全不同。数据质量那个比率在
+        # `ontology_coverage` 里单独报，见 formula_verifier 那两个函数的文档。
         "herbs_grounded_ratio": r.get("herbs_grounded_ratio"),
+        "herbs_grounded_denominator": "本次方的药味数",
         "n_ontology_refs": r.get("n_ontology_refs"),
         "n_herbs": len(r["s3"].herbs),
         "chain_steps": list(S3_CHAIN_STEPS),
+        # R34：符号验证的三指标 + 最终状态。
+        "verification": r.get("verification"),
+        "verifier_metrics": r.get("verifier_metrics"),
     }
 
 
@@ -1273,7 +1748,8 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
                     retriever_mode: str | None = None,
                     knowledge: dict | None = None,
                     s3_mode_used: str | None = None,
-                    synthesis: dict | None = None) -> dict:
+                    synthesis: dict | None = None,
+                    streaming: dict | None = None) -> dict:
     """跑这一次用的是什么模型、什么 prompt 版本、几次调用。
     竞赛材料里写"我们的结果"时，这几行元数据就是全部的可信度来源。"""
     cases_sha = cases_sha256()
@@ -1357,6 +1833,21 @@ def _build_manifest(elapsed_ms: int, llm_calls: int, use_react: bool = False,
             "formulas": (knowledge or {}).get("n_formulas", 0),
             "patterns": (knowledge or {}).get("n_patterns", 0),
         },
+        # R34b：本体这份数据本身的质量。**跟 `synthesis.herbs_grounded_ratio`
+        # 是两个不同的分母**，放在两处、各自注明，就是为了它们不会被混用：
+        #   这里：分母 = 医案语料里出现过的药名种数（数据指标）
+        #   那里：分母 = 本次方的药味数（模型指标）
+        # 缺谓词计数一起记：归经缺一半的本体上，"归经覆盖规则通过了"这句话
+        # 要能被读者自己打折扣。
+        "ontology": _ontology_manifest(),
+        # R36：这次 S3 有没有真的边生成边吐、首字多久、发了多少帧。
+        # None = 这条路径没跑到 S3（被拦截 / 信息不足）——**跟"跑了但没流式"
+        # 是两件事**，后者是 `{"streamed": false, "notes": [原因]}`。
+        # 首字延迟是 R36 的验收项之一（≤3 秒），没有这个字段就只能掐表。
+        "streaming": streaming,
+        # 这次 S1/S2 是合成一次调用还是分两次（R36）。它直接改 llm_calls，
+        # 不记的话两份 manifest 放一起比时，调用数差 1 看不出是配置还是代码。
+        "s1s2_merged": s1s2_merged(),
     }
 
 
@@ -1630,6 +2121,7 @@ def consult(
     retriever_mode: str | None = None,
     refs_mode: str = "own",
     s3_mode_override: str | None = None,
+    patient_profile=None,
 ) -> dict:
     """use_react=None 时读环境变量 USE_REACT（默认关）。显式传布尔值优先，
     测试和 A/B 脚本靠它固定条件，不受环境影响。
@@ -1712,7 +2204,58 @@ def consult(
     # demo 模式下这次请求会被拦截的原因（最早触发的那个）。EVAL_MODE 打开时
     # 链路继续往下走，但这个字段仍然如实记着"本来会被拦"，两种模式同一套语义。
     safety_flag: str | None = None
-    s1 = normalize(complaint)
+    # R44：这一次代理做过的决策（停/问/取证/验）。规则表在 core/agent.py，
+    # 这里只记录——判断仍然在各自的模块里。
+    trace = AgentTrace()
+
+    def _stopped(decision, **state) -> dict:
+        """**一份**"停下来"的返回值。
+
+        R44 之前这个 dict 在 `consult()` 里有四份拷贝（危重主诉 / 追问命中 /
+        追问确认命中 / 证素为空），而且已经开始漂——其中一份带 `"coverage": None`、
+        另一份没有，键的顺序也各不相同。前端按同一份契约读，缺一个键就是 KeyError。
+
+        键集跟正常路径保持一致；`state` 里给什么就覆盖什么（被拦时 s2/residual
+        有没有值随触发点而定）。
+        """
+        base = {
+            "s1": s1,
+            "results": [],
+            "divergence": None,
+            "rejected": decision.stop_kind == "safety",
+            "reject_reason": decision.detail,
+            "safety_flag": safety_flag,
+            "retrieval_error": None,
+            "s2": None,
+            "residual": None,
+            "followup": None,
+            "insufficient": decision.stop_kind == "evidence",
+            "insufficient_reason": None,
+            "coverage": None,
+            "agent_trace": trace.to_list(),
+            # R46：**中止的分支也要有这两个键。** 七个返回点守着同一套键这条
+            # 纪律不是形式——缺键在前端读到的是 undefined，会悄悄进渲染。
+            # 被拦下来的这一次没有方可比、也没有人维可核，所以是 None
+            # （"没有可算的"），不是 `{}`（"算了，结果是空的"）。
+            "individualization": None,
+            "guideline": None,
+            "manifest": _build_manifest(
+                int((time.time() - _t0) * 1000), state.pop("_calls", 1), use_react,
+                retriever_mode=retriever_mode, s3_mode_used=mode),
+        }
+        base.update(state)
+        return base
+    # R36：S1+S2 合不合**一次 consult 只判一次**（同 use_react / bypass / mode 那条
+    # 纪律）：中途有人改环境变量时，同一个请求的调用数结算和实际发生的次数不会错位。
+    merged_s1s2 = s1s2_merged()
+    if merged_s1s2:
+        s1, s2_pending = normalize_and_infer_merged(complaint)
+    else:
+        s1, s2_pending = normalize(complaint), None
+    # 这一段实际花了几次调用。**不问 `core.usage.fixed_steps_per_consult()`**——
+    # 那个函数会再读一次环境变量，而本次请求的判断已经落在 merged_s1s2 上了；
+    # 两处各读一次就可能一处 1 一处 2，账本跟实际发生的次数错位。
+    s1s2_calls = 1 if merged_s1s2 else 2
     emit("s1_done", symptoms=s1.symptoms, tongue=s1.tongue, pulse=s1.pulse, unmapped=s1.unmapped)
 
     # 安全否决必须在这里、S2 开始之前——命中就直接返回，S2/S3 一次都不调用，
@@ -1721,22 +2264,17 @@ def consult(
     # （s1_normalize.yaml 明确要求含糊的病史表述放 unmapped），只查 symptoms 会漏。
     reject_reason = check_safety([complaint] + s1.symptoms + s1.unmapped)
     safety_flag = safety_flag or reject_reason
-    if reject_reason is not None and not bypass:
-        # 键集跟正常路径保持一致：api/前端按同一份契约读，缺键就是 KeyError。
-        return {
-            "s1": s1,
-            "results": [],
-            "divergence": None,
-            "rejected": True,
-            "reject_reason": reject_reason,
-            "safety_flag": safety_flag, "retrieval_error": None,
-            "s2": None, "residual": None, "followup": None,
-            "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), 1, use_react,
-                                        retriever_mode=retriever_mode, s3_mode_used=mode),
-        }
+    stop = decide("danger_in_complaint", reject_reason, bypass=bypass)
+    if stop is not None:
+        trace.decisions.append(stop)
+        # **合一模式下 `s2_pending` 里已经有证素了，这里把它丢掉、照旧返回
+        # `s2: None`。** 对外可见的行为跟分两次那条路逐字段一致（被拦截的请求
+        # 不产出证素、不产出方药）。这也正是 `normalize_and_infer_merged` 默认
+        # 关着的理由：丢掉是流程约定，没算过才是结构保证。
+        return _stopped(stop, _calls=1)
 
-    s2 = infer_elements(s1)
+    # 合一模式下这一步不再调模型（证素跟症状是同一次调用的产出）。
+    s2 = s2_pending if s2_pending is not None else infer_elements(s1)
     emit("s2_done", elements=[
         {"element": h.element, "kind": h.kind, "confidence": h.confidence} for h in s2.elements
     ], unexplained_symptoms=s2.unexplained_symptoms)
@@ -1749,44 +2287,36 @@ def consult(
     followup = run_followup(
         s1.symptoms, [h.element for h in s2.elements], ask_fn
     )
-    emit("followup_done", stopped_by=followup.stopped_by, rounds=followup.rounds,
+    # 中文名跟事件一起发：进度日志是给人读的，`max_rounds` 这种 id 印在那里
+    # 跟印在结论里一样不可读（`stop_label` 是停因的唯一一张表）。
+    emit("followup_done", stopped_by=followup.stopped_by,
+         stopped_by_label=stop_label(followup.stopped_by), rounds=followup.rounds,
          asserted=followup.asserted, denied=followup.denied)
+    # R44：**问过就记一笔**（问了 0 轮不记——那时这个能力没上场）。
+    if followup.rounds:
+        trace.record("ask_for_missing_symptoms",
+                     f"问了 {followup.rounds} 轮，确认 {len(followup.asserted)} 条、"
+                     f"否认 {len(followup.denied)} 条；停因：{stop_label(followup.stopped_by)}")
     extra_calls = 0
     if followup.stopped_by == "safety":
         # 追问问出危重症状 = 跟初始主诉命中同一道否决，同样不产出任何方药。
         # CLAUDE.md：追问是安全否决层的后门，这里堵上。
         safety_flag = safety_flag or followup.reject_reason
-    if followup.stopped_by == "safety" and not bypass:
-        return {
-            "s1": s1,
-            "results": [],
-            "divergence": None,
-            "rejected": True,
-            "reject_reason": followup.reject_reason,
-            "safety_flag": safety_flag, "retrieval_error": None,
-            "s2": s2,
-            "followup": followup,
-            "residual": None, "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000), 2, use_react,
-                retriever_mode=retriever_mode, s3_mode_used=mode,
-            ),
-        }
+    stop = decide("danger_in_followup_answer",
+                  followup.reject_reason if followup.stopped_by == "safety" else None,
+                  bypass=bypass)
+    if stop is not None:
+        trace.decisions.append(stop)
+        return _stopped(stop, s2=s2, followup=followup, _calls=s1s2_calls)
     if followup.asserted:
         # 双保险：run_followup 已经把危重症状挡在 asserted 之外，这里再查一次是防
         # 将来有人改了 followup 的判据却没意识到这条症状会一路进 S2/S3。
         reject = check_safety(followup.asserted)
         safety_flag = safety_flag or reject
-        if reject is not None and not bypass:
-            return {
-                "s1": s1, "results": [], "divergence": None,
-                "rejected": True, "reject_reason": reject,
-                "safety_flag": safety_flag, "retrieval_error": None,
-                "s2": s2, "followup": followup, "residual": None,
-                "insufficient": False, "insufficient_reason": None, "coverage": None,
-                "manifest": _build_manifest(int((time.time() - _t0) * 1000), 2, use_react,
-                                        retriever_mode=retriever_mode, s3_mode_used=mode),
-            }
+        stop = decide("danger_in_asserted", reject, bypass=bypass)
+        if stop is not None:
+            trace.decisions.append(stop)
+            return _stopped(stop, s2=s2, followup=followup, _calls=s1s2_calls)
         # 追问确认的是国标症状名（来自图谱节点），本身已经是标准表述，不需要再过
         # S1——这不违反"S1 全局只跑一次"，S1 一次也没有多跑。
         s1 = S1Normalize(
@@ -1812,30 +2342,19 @@ def consult(
     # 而且输出的方药没有任何可追溯的依据。宁可如实说信息不足。
     coverage = len(explained_symptoms(s1, s2, residual)) / (len(s1.symptoms) or 1)
 
-    if not s2.elements and not (residual and residual["s2"].elements):
-        return {
-            "s1": s1,
-            "results": [],
-            "divergence": None,
-            "rejected": False,
-            "reject_reason": None,
-            "s2": s2,
-            "residual": residual,
-            "followup": followup,
-            "insufficient": True,
-            "insufficient_reason": (
+    stop = decide("no_elements", not s2.elements and not (residual and residual["s2"].elements))
+    if stop is not None:
+        trace.decisions.append(stop)
+        return _stopped(
+            stop, s2=s2, residual=residual, followup=followup,
+            insufficient_reason=(
                 "现有症状不足以推断证素，无法进行有依据的辨证。"
                 "请补充更多信息：起病与加重缓解的诱因、疼痛或不适的性质与部位、"
                 "饮食与二便情况、寒热喜恶、舌象与脉象。"
             ),
-            "coverage": round(coverage, 3),
-            "safety_flag": safety_flag, "retrieval_error": None,
-            "manifest": _build_manifest(
-                int((time.time() - _t0) * 1000),
-                2 + extra_calls + (1 if residual else 0), use_react,
-                retriever_mode=retriever_mode, s3_mode_used=mode,
-            ),
-        }
+            coverage=round(coverage, 3),
+            _calls=s1s2_calls + extra_calls + (1 if residual else 0),
+        )
     results = []
     try:
         _run_physicians_into(
@@ -1847,7 +2366,7 @@ def consult(
         # ReAct 追问问出了危重症状：跟初始主诉命中同一道否决，已经跑完的医家结果
         # 也不返回——被拦截的请求不产出任何方药。
         calls = (
-            2 + extra_calls + (1 if residual else 0) + veto.llm_calls
+            s1s2_calls + extra_calls + (1 if residual else 0) + veto.llm_calls
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
             # R22：**不是 len(results)**。每位医家的 S3 采了 N 次（best-of-N），
             # 按医家数计等于漏掉 N−1 次真实调用——manifest 的调用数是额度结算的
@@ -1856,18 +2375,49 @@ def consult(
             # 不是全局 s3_best_of_n()：中途改环境变量、或某位医家采样部分失败时，
             # 全局那个数跟实际发生的次数会不一致。
             + sum(len(r["candidates_scored"]) for r in results)
-            + sum(1 for r in results if r["safety_output"]["revised"])
+            + _reopen_calls(results)
         )
-        return {
-            "s1": s1, "results": [], "divergence": None,
-            "rejected": True, "reject_reason": veto.reason,
-            "safety_flag": safety_flag or veto.reason, "retrieval_error": None,
-            "s2": s2, "followup": followup, "residual": residual,
-            "insufficient": False, "insufficient_reason": None, "coverage": None,
-            "manifest": _build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
-                                        retriever_mode=retriever_mode, s3_mode_used=mode,
-                                        knowledge=_aggregate_knowledge(results)),
-        }
+        safety_flag = safety_flag or veto.reason
+        stop = trace.record("danger_in_react_answer", veto.reason)
+        return _stopped(
+            stop, s2=s2, followup=followup, residual=residual,
+            reject_reason=veto.reason, safety_flag=safety_flag,
+            manifest=_build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
+                                     retriever_mode=retriever_mode, s3_mode_used=mode,
+                                     knowledge=_aggregate_knowledge(results),
+                                     streaming=_aggregate_streaming(results)),
+        )
+    except SymbolicVeto as veto:
+        # R34：符号验证的 veto 级违规改了 MAX_REVISE_ROUNDS 轮还在——这张方不下发。
+        # **跟 SafetyVeto 分两个分支而不是合成一个**：两者该对用户说的话不同
+        # （见 SymbolicVeto 的文档字符串），而合并之后响应里只能说一句
+        # "被拦截了"，患者分不出是"你该立刻就医"还是"系统改不出合规的方"。
+        calls = (
+            s1s2_calls + extra_calls + (1 if residual else 0)
+            + sum(len(r["candidates_scored"]) for r in results)
+            + veto.llm_calls
+            + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
+        )
+        stop = trace.record("symbolic_veto", veto.reason)
+        return _stopped(
+            stop, s2=s2, followup=followup, residual=residual,
+            # **`rejected` 仍然是 True**：方不下发这件事对调用方来说跟安全拦截
+            # 一样是"这次没有方"。区别在 `safety_flag`（留给安全层，不复用——
+            # 它的语义是"危重症状"，而这里的原因是"方不合规"）与
+            # `verification_veto`（只有这一条路径有），前端按这两个字段走
+            # 不同的提示文案。
+            rejected=True,
+            reject_reason=veto.reason,
+            safety_flag=safety_flag,
+            verification_veto=[
+                {"rule": v.rule, "herbs": list(v.herbs), "reason": v.reason,
+                 "counterexample": v.counterexample} for v in veto.violations
+            ],
+            manifest=_build_manifest(int((time.time() - _t0) * 1000), calls, use_react,
+                                     retriever_mode=retriever_mode, s3_mode_used=mode,
+                                     knowledge=_aggregate_knowledge(results),
+                                     streaming=_aggregate_streaming(results)),
+        )
     except RetrievalUnavailable as e:
         # 选的检索模式这台机器上没有对应数据（graph 缺 element_index.json 之类）。
         # 已经跑完的医家结果也不返回：一半医家用了这个模式、另一半没有的话，
@@ -1878,6 +2428,9 @@ def consult(
             "s1": s1, "results": [], "divergence": None,
             "rejected": False, "reject_reason": None,
             "safety_flag": safety_flag,
+            # 键集跟其余返回点一致（这一条不是"代理的决策"，是环境缺数据，
+            # 所以 agent_trace 里照实是这一次已经发生过的那些决策，可能为空）。
+            "agent_trace": trace.to_list(),
             "retrieval_error": (
                 f"检索模式「{e.mode}」在这台机器上不可用：{e.detail} "
                 # 真实冒烟里踩到的：默认模式本身跑不了（没有 cases.json）时还建议
@@ -1888,9 +2441,12 @@ def consult(
             ),
             "s2": s2, "followup": followup, "residual": residual,
             "insufficient": False, "insufficient_reason": None, "coverage": None,
+            # R46：同上——检索跑不起来时没有结论可比对。
+            "individualization": None,
+            "guideline": None,
             "manifest": _build_manifest(
                 int((time.time() - _t0) * 1000),
-                2 + extra_calls + (1 if residual else 0), use_react,
+                s1s2_calls + extra_calls + (1 if residual else 0), use_react,
                 retriever_mode=retriever_mode, s3_mode_used=mode,
             ),
         }
@@ -2031,6 +2587,30 @@ def consult(
         "epsilon_for_query": load_epsilon_for_query(complaint),
     }
 
+    # R44：**取证与自验这两条能力发生过就记一笔。** 从 results 里现算，
+    # 不在各处埋点——埋点必然漏一处，而漏掉的表现是"那一步好像没做"。
+    n_react = sum(1 for r in results if r.get("react_trace"))
+    if n_react:
+        steps = sum(len(r["react_trace"].steps) for r in results if r.get("react_trace"))
+        trace.record("gather_evidence", f"取证 {steps} 步（{n_react} 条推理链）")
+    n_verified = sum(1 for r in results if r.get("verification"))
+    if n_verified:
+        reopened = _reopen_calls(results)
+        trace.record("verify_and_revise",
+                     f"验了 {n_verified} 份处方" + (f"，重开 {reopened} 次" if reopened else "，一次通过"))
+
+    # R46 §7.2/§7.3：「人」维核查与循证对照。**两者都是确定性计算，零 LLM 调用**
+    # ——个体化的每一条要指得出本草原文（`basis` 是 `Field(min_length=1)`），
+    # 让模型生成的话那个字段只能是编的；循证对照比的是教材条目，更没有理由
+    # 去问模型。所以它们放在这里而不是进 prompt：**算得出来的东西不问模型。**
+    individualization, guideline = _patient_and_guideline(results, patient_profile)
+    if individualization is not None:
+        trace.record(
+            "verify_patient_fit",
+            (f"按「人」维核出 {len(individualization.items)} 条调整提示"
+             if individualization.items
+             else f"按「人」维查了 {len(individualization.considered)} 项，没有需要调整的"))
+
     return {
         "s1": s1,
         "results": results,
@@ -2044,17 +2624,23 @@ def consult(
         "insufficient": False,
         "insufficient_reason": None,
         "coverage": round(coverage, 3),
-        # S1 一次 + S2 一次 + 每位医家 S3 一次 + 残差一次 + 配伍禁忌重开若干次。
-        # 重开必须计进来：漏算的话 manifest 报的调用数会低于实际花费，
-        # 拿它算成本或比配置就都是错的。
+        "agent_trace": trace.to_list(),
+        # R46：个体化调整与循证对照。None = 这一次没有可算的（没填人维 /
+        # 没有证型），**跟"算了但是空的"是两件事**，前端据此显示不同的话。
+        "individualization": (individualization.model_dump()
+                              if individualization is not None else None),
+        "guideline": guideline,
+        # S1/S2 这一段（合一 1 次、分开 2 次，见 s1s2_calls）+ 每位医家 S3 一次
+        # + 残差一次 + 配伍禁忌重开若干次。重开必须计进来：漏算的话 manifest 报的
+        # 调用数会低于实际花费，拿它算成本或比配置就都是错的。
         "manifest": _build_manifest(
             int((time.time() - _t0) * 1000),
-            2
+            s1s2_calls
             + extra_calls
             # R22：每位医家采了 N 次 S3，见上面 SafetyVeto 分支里那段注释。
             + sum(len(r["candidates_scored"]) for r in results)
             + (1 if residual else 0)
-            + sum(1 for r in results if r["safety_output"]["revised"])
+            + _reopen_calls(results)
             # ReAct 的每一步都是一次真实调用，必须计进来：漏算的话 manifest 报的
             # 调用数会低于实际花费，拿它算成本或比 use_react 开关的代价就都是错的。
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"]),
@@ -2062,9 +2648,63 @@ def consult(
             retriever_mode=retriever_mode,
             s3_mode_used=mode,
             knowledge=_aggregate_knowledge(results),
+            streaming=_aggregate_streaming(results),
             synthesis=_synthesis_summary(results, mode),
         ),
     }
+
+
+def _step_name(step) -> str:
+    """五步链的一步 → 它的名字。裸字符串原样返回，对象取 `name`，
+    其余（None、数字）返回空串。**一处实现**：证型、治法、方名三处都走它。"""
+    if isinstance(step, str):
+        return step.strip()
+    if hasattr(step, "model_dump"):
+        step = step.model_dump()
+    if isinstance(step, dict):
+        return str(step.get("name") or step.get("principle") or "").strip()
+    return ""
+
+
+def _patient_and_guideline(results: list[dict], patient_profile):
+    """「人」维核查 + 循证对照。两者都从**第一条结论**取方与证型。
+
+    为什么只看第一条：structured 模式下 `results` 恰好一条（那是融合出的
+    结论）；legacy 三列模式下三条方各不相同，对每一条各算一份会在界面上摆出
+    三份对照——而 R44 刚把"几份并列"从产品面上消除。legacy 是研究面，
+    那里看的是三列本身，不需要这一层。
+    """
+    from core.guideline_compare import compare
+    from core.individualize import individualize
+
+    r = (results or [{}])[0]
+    st = r.get("s3_structured")
+    st = st.model_dump() if hasattr(st, "model_dump") else (st or {})
+    flat = r.get("s3")
+    flat = flat.model_dump() if hasattr(flat, "model_dump") else (flat or {})
+    # **五步链里每一步都是一个对象**（`{"name": ..., "from_...": ...}`），
+    # 扁平的那份 `s3` 才是裸字符串。两种形状都要认——只按其中一种写，
+    # 另一种走到这里是 `AttributeError: 'dict' object has no attribute 'strip'`，
+    # 而那会把一次本来跑成了的问诊整个打断。
+    syndrome = _step_name(st.get("syndrome")) or _step_name(flat.get("syndrome"))
+    method = _step_name(st.get("method")) or _step_name(flat.get("method"))
+    formula = st.get("formula") or {}
+    if not isinstance(formula, dict):
+        formula = formula.model_dump() if hasattr(formula, "model_dump") else {}
+    # 五步链的 `formula` 是 `{"candidate": {...}, "from_method": ...}`，
+    # 扁平那份是 `{"name": ..., "herb_items": [...]}`——同样两种形状都认。
+    cand = formula.get("candidate") if isinstance(formula.get("candidate"), dict) else formula
+    fname = (cand or {}).get("name") or formula.get("name") or ""
+    herbs = [it.get("name", "") for it in ((cand or {}).get("herb_items") or [])
+             if isinstance(it, dict)]
+    if not herbs:
+        herbs = [h for h in (flat.get("herbs") or []) if isinstance(h, str)]
+
+    individualization = None
+    if patient_profile is not None:
+        individualization = individualize(patient_profile, herbs, syndrome)
+    guideline = compare(syndrome, str(method), fname, herbs) if syndrome else None
+    return individualization, guideline
 
 
 def consult_many(queries: list[str], consult_fn=None) -> tuple[list[dict | None], list[dict]]:
@@ -2076,23 +2716,39 @@ def consult_many(queries: list[str], consult_fn=None) -> tuple[list[dict | None]
     run_batch 的文档记过同一个坑（insufficient 分支 AttributeError 整批挂掉），
     教训没有传到后来的两个批处理入口——所以抽成一处，两边都调它。
     """
+    from core.parallel import run_indexed, worker_count
     from core.progress import Progress
 
     fn = consult_fn or consult
-    results: list[dict | None] = []
     failures: list[dict] = []
-    # 一条主诉十几次 LLM 调用、几十秒；这个循环是 E1/E2 和 MES 导出的主干，
-    # 原来从头到尾只在失败时才出声（R9：静默和卡死不能长得一样）。
-    bar = Progress(total=len(queries), label="consult 批量", unit="条")
-    for i, complaint in enumerate(queries, 1):
-        try:
-            results.append(fn(complaint))
-            bar.advance(note=f"第 {i} 条「{complaint[:12]}」")
-        except Exception as e:  # noqa: BLE001 - 一条主诉的失败不能把整批已完成的结果一起丢掉
-            print(f"[consult_many] 第 {i} 条失败：{type(e).__name__}: {e}", file=sys.stderr)
-            bar.note(f"第 {i} 条失败：{type(e).__name__}")
-            results.append(None)
-            failures.append({"index": i, "query": complaint, "error": f"{type(e).__name__}: {e}"})
+    # R40：**并发跑**。一条主诉十几次 LLM 调用、几十秒到几分钟，其中绝大部分
+    # 时间在等 socket——串行跑 10 条 = 10 倍的等待。E1/E2 与 MES 导出是这个
+    # 函数的主干，它们批量跑几十条，省下的是小时级的墙钟。
+    #
+    # 默认并发度 `CONSULT_MANY_WORKERS`（默认 4）而不是"能开多少开多少"：
+    #   · 上游 API 有速率限制，一次把 50 条打出去会整批 429；
+    #   · 本地 vLLM 后端的显存是硬上限，并发过高直接 OOM；
+    #   · 4 是"明显比 1 快、又不至于触发限流"的保守值，现场可调。
+    # 串行（=1）时的顺序、异常路径与并发路径完全一致（见 `run_indexed`）。
+    workers = worker_count("CONSULT_MANY_WORKERS", 4)
+    bar = Progress(total=len(queries), label=f"consult 批量（并发 {workers}）", unit="条")
+
+    def _done(i: int, _result) -> None:
+        bar.advance(note=f"第 {i + 1} 条「{queries[i][:12]}」")
+
+    def _failed(i: int, e: BaseException) -> None:
+        # 一条主诉的失败不能把整批已完成的结果一起丢掉。
+        print(f"[consult_many] 第 {i + 1} 条失败：{type(e).__name__}: {e}", file=sys.stderr)
+        bar.note(f"第 {i + 1} 条失败：{type(e).__name__}")
+        failures.append({"index": i + 1, "query": queries[i],
+                         "error": f"{type(e).__name__}: {e}"})
+
+    results = run_indexed(list(queries), fn, workers=workers,
+                          on_done=_done, on_error=_failed,
+                          thread_name_prefix="consult")
+    # 失败记录按 index 排序：并发下回调的到达顺序不确定，而 failures 是要写进
+    # 报告的——同一批输入必须给出同一份报告，不能因为线程调度而变。
+    failures.sort(key=lambda f: f["index"])
     bar.close(f"{len(queries) - len(failures)} 条成功，{len(failures)} 条失败")
     return results, failures
 

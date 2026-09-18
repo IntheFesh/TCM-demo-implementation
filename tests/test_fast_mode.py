@@ -149,18 +149,22 @@ def test_fast_mode_integration_cuts_llm_calls(monkeypatch):
     """一次完整 consult（开 ReAct + 有提问渠道）两种模式的调用数对比。
 
     实测（manifest.llm_calls 与真实 generate 次数完全一致，没有漏算）：
-      正常模式 20 次 = S1 1 + S2 1 + 追问后重跑 S2 1 + 残差 S2 1
-                       + 两位医家各 (ReAct 5 步 + S3 **3 次采样**) = 4 + 16
+      正常模式 16 次 = S1 1 + S2 1 + 追问后重跑 S2 1 + 残差 S2 1
+                       + 两位医家各 (ReAct 5 步 + S3 **1 次采样**) = 4 + 12
       FAST_MODE 8 次 = S1 1 + S2 1 + 两位医家各 (ReAct 2 步 + S3 1) = 2 + 6
-                       （追问 0 轮所以不重跑 S2、残差整体关闭、**采样降到 1 次**）
-    降幅从"一半"变成"六成"。
+                       （追问 0 轮所以不重跑 S2、残差整体关闭）
 
-    **有意的期望值变更（R22），这正是这条 docstring 原来要求的"先想清楚为什么"**：
-    原来是 16 / 8。R22 给 S3 加了 best-of-N（默认采 3 次），正常模式因此
-    16 → 20（两位医家各多 2 次采样）；FAST_MODE 那一侧**一个数都没变**，
-    因为 best-of-N 在 FAST_MODE 下降到 1——这是 FAST_MODE 的第四处降级，
-    不降的话 FAST_MODE 会变成 2 + 2×(2+3) = 12，"省预算"这个承诺就打了对折。
-    所以这两个数的变化方向本身就是判据：**正常模式涨、FAST_MODE 不动**。
+    **两次有意的期望值变更，都留在这里**：
+      · R22 给 S3 加了 best-of-N（默认采 3 次），正常模式 16 → **20**；
+        FAST_MODE 那一侧一个数都没变，因为 best-of-N 在 FAST_MODE 下降到 1
+        （第四处降级；不降的话 FAST_MODE 会是 2 + 2×(2+3) = 12）。
+      · R36 把 `S3_BEST_OF_N` 的**默认值**从 3 改回 1（挑方的活交给 R34 的符号
+        验证器，两者叠着用等于同一件事付两次钱），正常模式 20 → **16**。
+        FAST_MODE 那一侧**还是 8，一个数都没变**——它本来就降到 1 了。
+    所以这一对数现在的读法是：**默认配置向 FAST_MODE 靠近了，FAST_MODE 的四处
+    降级里"采样降到 1"这一处在默认配置下已经不再是差异点**（另外三处仍然是：
+    追问轮数、残差、ReAct 步数）。两个数都不许手抄——下面的断言从
+    `s3_best_of_n()` 与医家数推出来。
     """
     normal, fake_n = _consult_calls(monkeypatch, FAST_MODE=None)
     normal_calls = normal["manifest"]["llm_calls"]
@@ -168,15 +172,24 @@ def test_fast_mode_integration_cuts_llm_calls(monkeypatch):
     fast, fake_f = _consult_calls(monkeypatch, FAST_MODE="1")
     fast_calls = fast["manifest"]["llm_calls"]
 
-    assert normal_calls == 20, f"正常模式实际 {normal_calls} 次：{fake_n.calls}"
-    assert fast_calls == 8, f"FAST_MODE 实际 {fast_calls} 次：{fake_f.calls}"
+    # **期望值从旋钮推出来，不写死**（R36）：`S3_BEST_OF_N` 的默认值改过两次
+    # （1 → 3 → 1），每次都让这条测试红在跟 FAST_MODE 毫无关系的地方。
+    from core.llm import s3_best_of_n
+
+    n_phys = len(normal["results"])
+    n = s3_best_of_n()          # 正常模式下的采样次数（R36 起默认 1）
+    expect_normal = 4 + n_phys * (5 + n)      # S1+S2+追问重跑+残差 + 每位 (ReAct 5 步 + S3 n 次)
+    expect_fast = 2 + n_phys * (2 + 1)        # S1+S2 + 每位 (ReAct 2 步 + S3 1 次)
+    assert normal_calls == expect_normal, f"正常模式实际 {normal_calls} 次：{fake_n.calls}"
+    assert fast_calls == expect_fast, f"FAST_MODE 实际 {fast_calls} 次：{fake_f.calls}"
     assert fast_calls < normal_calls
     # 三处降级都体现在调用数里
     assert fake_f.calls.count("ReActStep") == 4, "两位医家各 2 步"
     assert fake_f.calls.count("S2Elements") == 1, "追问不重跑 S2、残差不跑"
     # R22 第四处降级的直接判据：FAST_MODE 下每位医家只采一次
     assert fake_f.calls.count("S3Syndrome") == 2, "两位医家各一次 S3（采样没被降到 1 就会是 6）"
-    assert fake_n.calls.count("S3Syndrome") == 6, "正常模式两位医家各采 3 次"
+    assert fake_n.calls.count("S3Syndrome") == n_phys * n, \
+        f"正常模式每位医家各采 {n} 次"
     assert fast["followup"].stopped_by == "fast_mode"
     assert fast["residual"] is None
     # 关键：省了调用不等于不出结果，两位医家照样出方

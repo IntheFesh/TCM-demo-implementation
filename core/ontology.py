@@ -290,6 +290,26 @@ class Ontology:
             "empty_span_refs": empty_span,
         }
 
+    def source_books(self) -> dict[str, dict[str, int]]:
+        """三元组按书分布：`{"materia_medica": {书名: 条数}, "formulary": {...}}`。
+
+        R42 加的，为了「循证对照」那一节能说清**对照基准是哪几部书、各多少条**。
+        CLAUDE.md 那条铁律（任何数字都必须带对照）在这里的具体形式是：
+        「这味药有出处」是句空话，「这味药的性味出自《本草备要》，而本项目的
+        本草层一共只有五部书 9776 条」才是一个可核的说法。
+
+        从已加载的原始行现算，**不缓存**：本体是只读的（构造后不再变），
+        而这个接口只在点开一个节点时调一次，几毫秒。
+        """
+        out: dict[str, dict[str, int]] = {"materia_medica": {}, "formulary": {}}
+        for key, rows in (("materia_medica", self._materia_rows),
+                          ("formulary", self._formulary_rows)):
+            bucket = out[key]
+            for r in rows:
+                book = (r.get("book") or "").strip() or "未标注"
+                bucket[book] = bucket.get(book, 0) + 1
+        return out
+
     # -- 九个查询接口 --
 
     def herb(self, name: str) -> Herb | None:
@@ -303,6 +323,19 @@ class Ontology:
             return self.herbs[n]
         canon = self._by_alias.get(n)
         return self.herbs.get(canon) if canon else None
+
+    def herbs_batch(self, names: list[str] | tuple[str, ...]) -> dict[str, Herb | None]:
+        """一次解析一批药名。**"这些药在本体里是什么"这个问题的唯一批量入口。**
+
+        R40：符号验证器七条规则各自逐味 `ont.herb()`，一张 12 味的方要查 7×12 = 84
+        次（每次都重跑一遍 `normalize_herb`）。这个方法让调用方只问一次，
+        重复的名字只归一一次。
+
+        查不到的名字**保留键、值为 None**，不从结果里省掉——省掉的话调用方
+        分不清"没查"和"查了没有"，而那正是这一层最要紧的区分
+        （`Unverifiable` 与 `Violation` 的分界）。
+        """
+        return {n: self.herb(n) for n in dict.fromkeys(names)}
 
     def herbs_by_meridian(self, meridian: str) -> list[Herb]:
         return [h for h in self.herbs.values() if meridian in h.meridians]
@@ -375,6 +408,12 @@ class Ontology:
         """R35 挖出来的名医用药规律。R35 之前这份文件不存在，返回空列表。
 
         证名匹配跟 `formulas_for_syndrome` 同一条规矩（去掉尾「证」）。
+
+        **医家档（`group_value=""`）恒命中任何证型**：空串是 `group in key`
+        的子串，这是有意的——1075 诊次里只有 116 条标了证型，只放证型档
+        等于九成语料进不了知识块。代价是返回量大（医家档单个医家可上千条），
+        所以返回前必须排序（`sort_patterns`），让调用方"取前 N 条"是有意义的
+        取法而不是碰运气。**截断在调用方做并记数**，不在这里悄悄少给。
         """
         if not self._patterns:
             return []
@@ -387,7 +426,7 @@ class Ontology:
             if key and key not in group and group not in key:
                 continue
             out.append(p)
-        return out
+        return sort_patterns(out)
 
 
 # ---------- 构造 ----------
@@ -453,6 +492,23 @@ def _build_formulas(rows: list[dict]) -> dict[str, Formula]:
     return out
 
 
+def sort_patterns(patterns: list[dict]) -> list[dict]:
+    """规律的排序规则。**只有这一处实现**：`patterns_for` 与知识块的
+    合并重排都走它，两处各写一套排序会让"取前 N 条"取到不同的 N 条。
+
+    序：证型档在前（它比医家档更贴合本次辨证）→ support 从高到低
+    → `pattern_id`（确定性兜底，同 support 的顺序不能随字典序抖动）。
+    """
+    return sorted(
+        patterns,
+        key=lambda p: (
+            0 if p.get("group_by") == "physician_syndrome" else 1,
+            -int(p.get("support") or 0),
+            str(p.get("pattern_id") or ""),
+        ),
+    )
+
+
 def _load_patterns() -> list[dict]:
     """R35 的 `data/standard/prescribing_patterns.jsonl`。不在就是空列表。"""
     import json
@@ -504,6 +560,14 @@ def reset_ontology_for_tests() -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="本体层自检（零 LLM 调用）")
     ap.add_argument("--stats", action="store_true", help="打印加载统计")
+    # R34c：**先看清楚再决定改不改。** 3184 条方剂三元组归并出 235 首方，
+    # 平均 13.5 条/首，而《方剂学》教材的方数远多于此——这两个数放在一起说明
+    # 归并那一步有问题，但"问题在哪"要看方名的实际形态才知道（归一把不同方并到
+    # 一起了？还是抽取时方名带了章节前缀？）。这两个开关只打印，不动任何数据。
+    ap.add_argument("--dump-formulas", action="store_true",
+                    help="逐行打印方名与它的谓词条数（看方名形态用，不改数据）")
+    ap.add_argument("--dump-herbs", action="store_true",
+                    help="逐行打印药名与它的谓词条数")
     args = ap.parse_args(argv)
     ont = get_ontology()
     s = ont.stats()
@@ -516,8 +580,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"本草 {s['n_herbs']} 味 / 方剂 {s['n_formulas']} 首 / 用药规律 {s['n_patterns']} 条")
     print("缺谓词条数：" + "，".join(f"{p} {n}" for p, n in s["missing_predicate_counts"].items()))
     print(f"出处 span 为空的引用：{s['empty_span_refs']} 条")
-    if args.stats:
-        return 0
+    if args.dump_formulas:
+        print("\n--- 方名（名字 | 谓词数 | 组成药味数 | 主治条数）---")
+        for name, f in sorted(ont.formulas.items()):
+            print(f"{name}\t{len(f.refs)}\t{len(f.composition)}\t{len(f.indications)}")
+    if args.dump_herbs:
+        print("\n--- 药名（名字 | 谓词数 | 性 | 归经数 | 功效数）---")
+        for name, h in sorted(ont.herbs.items()):
+            print(f"{name}\t{len(h.refs)}\t{h.nature or '-'}"
+                  f"\t{len(h.meridians)}\t{len(h.effects)}")
     return 0
 
 
