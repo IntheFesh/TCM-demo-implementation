@@ -1765,6 +1765,9 @@ def _serialize_result(r: dict) -> dict:
         # 带本体引用的药味占比。**0 有两种原因**（本体不在 / 本体在但模型没引），
         # 前端要显示这个数时必须同时看 manifest 的 knowledge_entries.available。
         "herbs_grounded_ratio": r.get("herbs_grounded_ratio"),
+        # R54：第三相医案佐证。只有 `S3_MODE=derived` 才有这个键
+        # （`run_synthesis`/`run_physician` 没有这一相），`.get` 带默认值同理。
+        "corroboration": r.get("corroboration"),
     }
 
 

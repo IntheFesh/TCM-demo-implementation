@@ -110,9 +110,19 @@ def _poison(name: str):
 @pytest.fixture
 def derived(monkeypatch):
     """钉成 derived + best_of_n=1，检索层全部毒化——真的被调用就让测试爆炸，
-    而不是默默返回点什么让人看不出区别。"""
+    而不是默默返回点什么让人看不出区别。
+
+    **`CORROBORATION=off`**：这份文件测的是第一相「演绎推导」本身
+    （`run_derivation` 从构造 prompt 到验证闭环那一段）看不看得到医案，
+    不是第三相「医案佐证」（R54，`core/corroboration.py`）——那一相**故意**
+    在推导定型之后调用 `_search_cases`，这份夹具的毒化如果连它也拦下来，
+    测的就不再是这份文件标题说的那件事。R54 自己的测试
+    （`tests/test_corroboration.py`）单独钉住佐证阶段的检索行为，
+    默认 `CORROBORATION=on` 时它确实会调用 `_search_cases`。
+    """
     monkeypatch.setenv("S3_MODE", "derived")
     monkeypatch.setenv("S3_BEST_OF_N", "1")
+    monkeypatch.setenv("CORROBORATION", "off")
     llm = DerivedFakeLLM({})
     monkeypatch.setattr(chain, "get_llm", lambda: llm)
     monkeypatch.setattr(chain, "_search_cases", _poison("_search_cases"))
@@ -152,9 +162,11 @@ def test_refs_is_always_empty(derived):
     assert r["low_discrimination"] is False
 
 
-def test_physician_influences_is_always_empty(derived):
+def test_physician_influences_key_is_absent_not_empty(derived):
+    """R54 起彻底去掉这个键，不是留空列表占位——那个字段说的是"检索到的
+    医案影响了推导过程"，这一相从设计上就没有这件事，键都不该出现。"""
     r = chain.consult("胃脘胀满，纳差乏力")["results"][0]
-    assert r["physician_influences"] == []
+    assert "physician_influences" not in r
     assert r["physicians_cited"] == []
 
 
@@ -204,6 +216,7 @@ def test_rule_refs_are_flattened_and_deduped(derived):
 def test_insufficient_notes_reported_when_a_step_lacks_rules(monkeypatch):
     monkeypatch.setenv("S3_MODE", "derived")
     monkeypatch.setenv("S3_BEST_OF_N", "1")
+    monkeypatch.setenv("CORROBORATION", "off")
     llm = DerivedFakeLLM({}, payload=_derived_payload(insufficient_step="method"))
     monkeypatch.setattr(chain, "get_llm", lambda: llm)
     monkeypatch.setattr(chain, "_search_cases", _poison("_search_cases"))

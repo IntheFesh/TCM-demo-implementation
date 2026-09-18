@@ -34,6 +34,7 @@ from core.context_prefix import (
     knowledge_in_prompt,
     prefix_tokens_by_section,
 )
+from core.corroboration import corroborate
 from core.diseases import get_disease, match_disease
 from core.elements import LOCATIONS, NATURES
 from core.llm import (
@@ -1670,6 +1671,7 @@ def run_derivation(
     bypass_safety: bool = False,
     on_step: StepFn | None = None,
     refs_mode: str = "own",
+    retriever_mode: str | None = None,
 ) -> dict:
     """R52 第一相：演绎推导，**不检索任何医案**（`S3_MODE=derived`，R52 之后的默认值）。
 
@@ -1697,16 +1699,24 @@ def run_derivation(
     ## 返回值
 
     跟 `run_synthesis` 同一套键（`results` 的元素结构是既有契约），但没有
-    `refs`/`no_reference_cases`/`physician_influences` 这几个案例相关字段的
-    真实内容——`refs` 恒为空列表、`no_reference_cases` 恒为 True、
-    `physician_influences` 恒为空列表（`hallucinated` 同样恒为空列表：schema
-    校验已经把编造的 rule_id 挡在了 `S3Derived` 能被构造出来之前，不会有漏网的）。
-    新增三个键（R57 消融实验、R56 前端「本例知识地图」都读这些，不必各自重新
+    `refs`/`no_reference_cases` 这两个案例相关字段的真实内容——`refs` 恒为
+    空列表、`no_reference_cases` 恒为 True（`hallucinated` 同样恒为空列表：
+    schema 校验已经把编造的 rule_id 挡在了 `S3Derived` 能被构造出来之前，
+    不会有漏网的）。**没有 `physician_influences` 这个键**（R54 起彻底去掉，
+    不是留空列表占位——那个字段说的是"检索到的医案影响了推导过程"，这一相
+    从设计上就没有这件事，键都不该出现，不是"出现但恒空"）。
+
+    新增四个键（R57 消融实验、R56 前端「本例知识地图」都读这些，不必各自重新
     遍历 `s3_structured` 的嵌套结构）：
       - `theory`：这次进了 prompt 的医理规则统计（`_format_theory_rules` 的第二个返回值）
       - `rule_refs`：全链条引用过的医理规则（扁平化、去重）
       - `insufficient_notes`：哪几步标了"依据不足"
       - `derivation_completeness_ratio`：链上有规则支撑（非 insufficient）的条目占比
+      - `corroboration`：R54 第三相，医案佐证（`core.corroboration.corroborate` 的
+        产出，`concordant`/`divergent`/`no_precedent`/`physicians_with_precedent`
+        四个桶）——**在符号验证（R53）跑完、`s3` 已经定型之后才调用**，顺序本身
+        就是"绝不回头改推导"的第一道保证，`corroborate()` 自己也不接受"改推导"
+        这条路（见 `core/corroboration.py` 的文档字符串）。
     """
     if refs_mode not in ALLOWED_REFS_MODES:
         raise ValueError(f"未知的 refs_mode={refs_mode!r}，目前支持 {sorted(ALLOWED_REFS_MODES)}")
@@ -1759,6 +1769,11 @@ def run_derivation(
 
     formula_check = check_formula(s3.syndrome, s3.formula_candidates[s3.selected].herb_items)
 
+    # R54 第三相：医案佐证。**必须在这里、在 s3/raw 已经定型之后调用**——
+    # 前面已经过了 R53 的验证闭环，raw 不会再变，这里的调用顺序就是"绝不
+    # 回头改推导"最直接的体现：corroborate() 拿到的是最终结论，改不了它。
+    corroboration = corroborate(raw, s1, s2, retriever_mode=retriever_mode)
+
     return {
         "physician": SYNTHESIS_PHYSICIAN_ID,
         "physician_name": SYNTHESIS_PHYSICIAN_NAME,
@@ -1769,9 +1784,7 @@ def run_derivation(
         # 通用字段名，`S3Derived` 跟 `S3Structured` 字段名相同，键名换了反而要
         # 前端多判一次"这是哪种模式"。
         "s3_structured": raw,
-        # 这一相没有案例引用，两个字段恒空——保留键是为了 `results` 的元素结构
-        # 跨三条路径一致（前端/eval 收集器按同一套键读）。
-        "physician_influences": [],
+        "corroboration": corroboration.to_dict(),
         "physicians_cited": [],
         "herbs_grounded_ratio": raw.herbs_grounded_ratio(),
         "n_ontology_refs": len(raw.ontology_refs),
@@ -2285,7 +2298,7 @@ def _run_physicians_into(
                                         "physician_name": SYNTHESIS_PHYSICIAN_NAME})
         r = run_derivation(
             s1, s2, followup=followup, bypass_safety=bypass, on_step=on_step,
-            refs_mode=refs_mode,
+            refs_mode=refs_mode, retriever_mode=retriever_mode,
         )
         if on_step is not None:
             on_step("physician_done", {

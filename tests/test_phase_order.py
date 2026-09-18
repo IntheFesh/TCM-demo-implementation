@@ -23,10 +23,13 @@ def derived_env(monkeypatch):
     monkeypatch.setenv("S3_BEST_OF_N", "1")
 
 
-def test_search_cases_call_count_is_zero_across_a_full_consult(derived_env, monkeypatch):
+def test_search_cases_call_count_is_zero_when_corroboration_is_off(derived_env, monkeypatch):
     """比"抛异常才发现"更强的一条：即便 `_search_cases` 不被毒化、老老实实
-    数调用次数，也该是 0——不是"侥幸没触发"，是这条代码路径压根不存在对它
-    的引用。"""
+    数调用次数，`CORROBORATION=off` 时也该是 0——不是"侥幸没触发"，是这一相
+    在关掉第三相之后，压根不存在对它的引用。`CORROBORATION=on`（默认）下
+    第三相会调用它，见 `tests/test_corroboration.py`——那不是对这条测试的
+    否定，是两个不同开关状态下的两个事实。"""
+    monkeypatch.setenv("CORROBORATION", "off")
     calls: list[tuple] = []
     orig = chain._search_cases
 
@@ -79,8 +82,10 @@ def test_verification_happens_after_the_s3_call_not_before(derived_env, monkeypa
 
 def test_no_reference_cases_is_set_without_ever_attempting_retrieval(derived_env, monkeypatch):
     """`no_reference_cases=True` 不是"检索过、正好没查到"（那是
-    `S3StructuredUnreferenced` 的场景），是"根本没检索"——用毒化过的
-    `get_retriever` 证明：真检索过的话这条测试在拿到结果之前就该炸。"""
+    `S3StructuredUnreferenced` 的场景），是"演绎推导这一步根本没检索"——
+    `CORROBORATION=off` 隔离掉第三相（那一相**会**检索，`get_retriever`
+    毒化了会炸，见 `tests/test_corroboration.py`），只看第一相自己的字段。"""
+    monkeypatch.setenv("CORROBORATION", "off")
     llm = DerivedFakeLLM({})
     monkeypatch.setattr(chain, "get_llm", lambda: llm)
     monkeypatch.setattr(chain, "get_retriever", _poison("get_retriever"))
@@ -126,13 +131,23 @@ def test_a_second_consult_does_not_leak_state_from_the_first(derived_env, monkey
     assert "患者症状：纳差；乏力" not in second_system
 
 
-def test_future_corroboration_field_is_not_yet_present(derived_env, monkeypatch):
-    """R54（第三相：医案佐证）还没实现——这条测试钉住现状：`results[0]` 里
-    没有 `concordant`/`divergent`/`no_precedent` 这类字段。它存在的意义是
-    R54 落地时会**变红**，提醒那一轮的作者去更新／替换这条测试，而不是让
-    R54 不声不响地把佐证字段加进一个"看起来已经测过完整契约"的结果里。"""
+def test_the_corroboration_field_landed_in_r54_nested_not_flattened(derived_env, monkeypatch):
+    """R54 落地：这条测试原来叫 `test_future_corroboration_field_is_not_yet_present`，
+    钉住"R54 还没实现"这件事，好让 R54 落地时这里变红、提醒作者来更新它
+    ——现在更新成对 R54 真实形状的断言。四个桶键**嵌在 `r["corroboration"]`
+    里，不是拍平进 `r` 本身**：`concordant`/`divergent`/`no_precedent`/
+    `physicians_with_precedent` 都不是这次演绎推导结论（`s3`/`s3_structured`）
+    的一部分，混进 `r` 顶层会让"这是推导出的还是佐证附加的"这条界线在数据
+    形状上消失——跟 `s3_structured` 用同一个键、`corroboration` 单独一个键，
+    是同一条纪律的两种应用。详细的行为测试在 `tests/test_corroboration.py`。
+    """
     llm = DerivedFakeLLM({})
     monkeypatch.setattr(chain, "get_llm", lambda: llm)
     r = chain.consult("胃脘胀满，纳差乏力")["results"][0]
-    for forbidden in ("concordant", "divergent", "no_precedent", "physicians_with_precedent"):
-        assert forbidden not in r
+    for top_level_leak in ("concordant", "divergent", "no_precedent", "physicians_with_precedent"):
+        assert top_level_leak not in r
+    assert "corroboration" in r
+    assert set(r["corroboration"]) == {
+        "enabled", "concordant", "divergent", "no_precedent",
+        "physicians_with_precedent", "note",
+    }
