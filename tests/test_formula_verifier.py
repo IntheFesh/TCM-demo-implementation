@@ -467,6 +467,47 @@ def test_effect_matches_method_needs_only_one_matching_herb(ont):
     assert "effect_matches_method" not in _rules(r)
 
 
+# ---------- R61：治法/targets 是并列复句，要先拆句再展开 ----------
+# 真机实测出的根因：`expand_effect` 查不到整段复句在同义词表里的条目，就把
+# 整段复句原样当一个词收进 keys；本体里柴胡的功效是切过的短词（"疏肝解郁"），
+# `k in e` 拿一整段复句去比一个短词，长的永远不会是短的子串——即使柴胡的
+# 功效原文原原本本含着"疏肝解郁"四个字，也会被判成"没有一味药对得上"。
+# 真实治法几乎总是写成并列复句（"疏肝解郁，理气和胃"），所以这不是边界情况，
+# 是主路径。
+
+def test_effect_matches_method_splits_a_compound_principle_before_expanding(ont):
+    """治法「疏肝解郁，理气和胃」是并列复句——柴胡的功效原文「疏肝解郁」
+    对得上前半句，但整段复句当一个词去比对不上柴胡切过的短功效词。这正是
+    R61 真机实测复现出的场景：先切句再展开，前半句单独匹配上就该判通过。"""
+    r = verify_formula(mk(["柴胡"], organ="肝", syn="肝气郁结，胃失和降证",
+                          method="疏肝解郁，理气和胃", targets=("肝气郁结",),
+                          effect="疏肝解郁"), ontology=ont)
+    assert "effect_matches_method" not in _rules(r)
+    assert "effect_matches_method" in r.checked_rules
+
+
+def test_effect_matches_method_compound_principle_still_fires_when_truly_nothing_matches(ont):
+    """拆句是为了不误杀对得上的，不是把这条规则拆到形同虚设——复句里哪一句
+    都对不上任何药的功效，还是要判 revise。"""
+    r = verify_formula(mk(["石膏"], organ="肺", syn="肺气虚证",
+                          method="温中散寒，回阳救逆", targets=("中焦寒盛",)),
+                       ontology=ont)
+    assert "effect_matches_method" in _rules(r, "revise")
+    v = next(v for v in r.violations if v.rule == "effect_matches_method")
+    assert "清热泻火" in v.counterexample
+
+
+def test_effect_matches_method_splits_a_compound_target_before_expanding(ont):
+    """跟 principle 同一个坑：`targets` 里的描述也常是并列复句。这里让
+    第二句「疏肝解郁」逐字等于柴胡的真实功效——`expand_effect` 恒自带
+    "包含自己"这一条（不查表也能自匹配），只要句子切对了，不管同义词表
+    收不收这个词都该匹配上；切不对（复句当一个词）就连自匹配都够不上。"""
+    r = verify_formula(mk(["柴胡"], organ="肝", syn="肝郁兼有寒证",
+                          method="温阳散寒", targets=("中焦虚寒，疏肝解郁",),
+                          effect="疏肝解郁"), ontology=ont)
+    assert "effect_matches_method" not in _rules(r)
+
+
 def test_role_structure_requires_a_sovereign_herb(ont):
     r = verify_formula(mk(["党参", "白术"], roles=["臣", "臣"]), ontology=ont)
     assert "role_structure" in _rules(r, "revise")

@@ -125,7 +125,7 @@ Unverifiable**——`_find_same_herb_other_predicate` 命中就直接放过。�
 新的、贯穿全部 12→13 条规则签名的 notes 通道，R60 判断这个需求还没到，
 不为它扩大接口。
 
-## R61：R60 只改了一份提示词，A 组（`s3_structured.yaml`）没跟上
+## R61 §2：R60 只改了一份提示词，A 组（`s3_structured.yaml`）没跟上
 
 `check_herb_source_fabricated`/`check_herb_source_paraphrased` 是全局规则，
 三条 S3 路径（`s3_syndrome`/legacy、`s3_structured`/A 组、`s3_derived`/
@@ -137,6 +137,30 @@ B·C·D 组）**共用同一个验证器**，但 R60 的 commit 只改了
 `herb_source_fabricated` 上——不是这条规则又出新 bug，是约定只讲给了一半
 路径听。R61 把 `s3_structured.yaml` 的这一节改成跟 `s3_derived.yaml` 逐字
 同一套措辞（详见 `docs/reports/R61_report.md` §2）。
+
+## R61 §3：`effect_matches_method` 拿复句当一个词，几乎恒假
+
+用真实 claude_cli 后端跑一条 C 组问诊（`S3_MODE=derived`,
+`THEORY_LAYER=on`），第一轮唯一触发的规则就是 `effect_matches_method`
+（`n_veto=0, n_revise=1`）；模型按回灌意见重开一轮之后，**同一条规则同一批
+药**再次判 revise——不是模型没改对，是这条规则本身判不了任何输出。
+
+根因：`check_effect_matches_method` 原来把 `s3.method.principle`/
+`s3.method.targets` 整段原样丢给 `expand_effect`。治法习惯写成并列复句
+（这次实测的例子是"疏肝解郁，理气和胃"），`expand_effect` 在同义词表里
+查不到这整段复句的条目，就把**整段复句当一个词**收进 `keys`；而本体里
+柴胡的功效是 `parse_effects` 切过的短词（"疏肝解郁"、"升举阳气"……）。
+`any(k in e for e in h.effects for k in keys)` 拿一整段十几字的复句去比
+一个四字短词，长的永远不会是短的子串——**即使柴胡的功效原文原原本本含着
+"疏肝解郁"这四个字**，也会被判成"没有一味药的功效对得上"。真实治法几乎
+总是并列复句，所以这不是边界情况，是主路径——跟 R60 的
+`herb_source_fabricated` 是同一类失败（规则判据本身没错，是拿去比较的
+两边粒度不一致），区别是这次是本轮真机实测直接复现出来的，不是靠事后
+猜的。
+
+修法：**复用 `core.ontology.parse_effects`**（herb 功效原文已经在用的同一个
+切句函数——按并列分隔符切、丢单字碎片）先把 `method.principle` 与每条
+`target` 切成单句，再逐句 `expand_effect`，不再把整段复句当一个词。
 
 本体的缺谓词是实测出来的：归经缺 **598/1232（49%）**、用量缺 **672（55%）**、
 禁忌缺 770、炮制 790。一条规则要用归经而那味药没有归经，正确的结论是
@@ -159,7 +183,7 @@ from typing import Literal
 from core.effect_synonyms import expand_effect
 from core.elements import LOCATIONS
 from core.formula_check import syndrome_channels
-from core.ontology import Ontology, get_ontology
+from core.ontology import Ontology, get_ontology, parse_effects
 from core.safety_output import (
     check_dose_limits,
     check_incompatible,
@@ -801,10 +825,26 @@ def check_effect_matches_method(s3, ont) -> tuple[list[Violation], list[Unverifi
     功效缺 49/1232（4%，本体里最全的一项），所以这条规则大多判得了。
     **一味药对不上不算违规**：佐使药本来就可能针对兼夹症，所以判据是
     「没有任何一味药的功效对得上治法」——那时这张方跟它声称的治法无关。
+
+    **R61：`method.principle`/`targets` 先拆分句再展开，不能整段拿去 `expand_effect`。**
+    真机实测出的根因：治法习惯写成并列复句（"疏肝解郁，理气和胃"——两个动作
+    用逗号连着），`expand_effect` 查不到这整段复句在同义词表里的条目，就原样
+    把这一整段**当一个词**收进 `keys`；而本体里柴胡的功效是 `parse_effects`
+    切过的短词（"疏肝解郁"、"升举阳气"……）。`k in e` 拿一整段复句去比一个
+    短词，长的永远不会是短的子串——即使柴胡的功效原文原原本本含着"疏肝解郁"
+    四个字，也会被判成"没有一味药对得上"。这条规则因此在**几乎所有**复句
+    治法上失效，跟 R60 的 `herb_source_fabricated` 是同一类失败——规则本身
+    的判据逻辑没错，是拿去比较的两边粒度不一致。修法：**复用
+    `core.ontology.parse_effects` 切句**（跟切治法这件事本身没关系，纯粹是
+    "按并列分隔符切开、丢单字碎片"这同一个操作，herb 功效原文与治法/targets
+    文本都要切，不该各写一套），切开之后每个短句再各自 `expand_effect`。
     """
-    keys = set(expand_effect(s3.method.principle))
+    keys: set[str] = set()
+    for clause in parse_effects([s3.method.principle]):
+        keys |= set(expand_effect(clause))
     for t in s3.method.targets:
-        keys |= set(expand_effect(t))
+        for clause in parse_effects([t]):
+            keys |= set(expand_effect(clause))
     matched: list[str] = []
     unver: list[Unverifiable] = []
     n_with_effects = 0

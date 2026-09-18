@@ -108,7 +108,85 @@ core/chain.py:1744  s3_prompt = load_prompt("s3_derived")      ← B/C/D 走这�
 
 ## §3 验证器一次通过率 B/C/D 全 0
 
-<!-- R61_SECTION3_PLACEHOLDER -->
+### 3.1 真机实测（不是猜的，是本沙盒真的跑通了一条 C 组问诊）
+
+沙盒里 `claude` CLI 可用，但 `LLM_MODE=claude_cli` 这条路径比 R60 那次
+验证过的 A 组（`S3_MODE=structured`）更重——B/C/D 走 `S3_MODE=derived` +
+`THEORY_LAYER=on`，system prompt 里多了整张医理规则表——**默认超时不够用
+到需要先修超时才能拿到数据**，这本身也是一条值得记的发现：
+
+- `core/llm.py` 的 `ClaudeCLIBackend.DEFAULT_TIMEOUT=180`（子进程自己的
+  超时）是按 claude_cli **正常场景**校准的（"实测均值 4-8s，慢的时候到
+  48s"）——**不是**为这个沙盒的高延迟（每次子进程都要重建缓存）场景校准
+  的。第一次探针 3 次重试全部卡在 180s 超时，`LLMError`。
+- 还有第二层、独立的 210s 墙钟兜底（`_complete_within_deadline` 的
+  `deadline`，来自 `TIMEOUTS.deadline = DEFAULT_TIMEOUT + 30`），只受
+  `LLM_TIMEOUT_SECONDS` 控制，**不受**上面那个 `CLAUDE_CLI_TIMEOUT` 控制
+  ——只调对了第一层，第二层照样在 210s 掐断。
+- 两层都调大（`CLAUDE_CLI_TIMEOUT=580 LLM_TIMEOUT_SECONDS=600`）之后，
+  一条 C 组问诊真的跑完了，耗时 **422.1 秒**。
+
+第一轮（first pass）的完整验证结果：
+
+```
+n_veto=0, n_revise=1, rules=["effect_matches_method"]
+```
+
+**唯一触发的规则是 `effect_matches_method`**——不是 herb_source_fabricated
+那一档"某条规则误杀大多数正常输出"的量级（这次只有一条规则触发、一次
+真机样本），但触发的这一条本身查出来是真 bug（见 3.2），且模型按回灌
+意见重开一轮之后，**同一条规则同一批药再次判 revise**（`final_status:
+"revise_needed"`，`violations` 里的 `herbs` 跟第一轮完全一样）——模型
+没有能力"改对"一条判据本身有问题的规则，这正是"规则误判，不是模型的错"
+的行为特征（跟 R60 herb_source_fabricated 的教训是同一个判据）。
+
+### 3.2 根因：`effect_matches_method` 拿治法复句当一个词，几乎恒假
+
+`check_effect_matches_method`（`core/formula_verifier.py`）原来把
+`method.principle`/`targets` 整段原样传给 `expand_effect`。这次真机
+触发的例子：治法是"疏肝解郁，理气和胃"（并列复句），柴胡的本体功效原文
+是"疏散退热，疏肝解郁，升举阳气"——柴胡的功效**逐字**含着"疏肝解郁"
+这四个字，理应判匹配。
+
+但 `expand_effect("疏肝解郁，理气和胃")` 在同义词表里查不到这**整段
+复句**的条目，就把整段（14 个字，含逗号）原样当一个词收进 `keys`；
+本体里柴胡的功效是 `parse_effects` 切过的短词（`("疏散退热",
+"疏肝解郁", "升举阳气")`）。匹配判据是 `any(k in e for e in h.effects
+for k in keys)`——拿一个 14 字的复句去当"字符串包含"的那个 `k`，去比一个
+4 字的短词 `e`，长的字符串永远不可能是短字符串的子串。**治法几乎总是
+写成并列复句**，所以这不是边界情况，是主路径——这条规则在真实输出上
+大概率恒假，跟 R60 `herb_source_fabricated` 是同一类失败：规则的判据
+逻辑本身没错（子串匹配、同义词展开都对），错在**拿去比较的两边粒度不
+一致**（一边是整段复句，一边是切过的短词）。
+
+### 3.3 修复
+
+复用 `core.ontology.parse_effects`——herb 功效原文已经在用的同一个切句
+函数（按并列分隔符切开、丢单字碎片，不新写一套分句逻辑）：先把
+`method.principle` 与每条 `target` 切成单句，再逐句 `expand_effect`，
+不再把整段复句当一个词。修完之后："疏肝解郁"（切开后的短句）逐字等于
+柴胡的功效条目，直接匹配上。
+
+### 3.4 对§3决策树的回答
+
+用户给的判断树是"是（某条规则高频误报）→ 按 R60 思路收窄；不是 →
+说明为什么 0% 合理，考虑降级"。本轮真机实测的答案是**前者**：至少
+`effect_matches_method` 一条规则在真实（非边界）输入上会误判——不是
+"降级观测指标"能绕过去的，是这条规则真的错了，直接修（3.3）。至于
+`verifier_first_pass_rate` 本身要不要留在硬指标里：**它现在已经不是
+硬指标**——R57/R61 的三条硬指标是"C 组一次过率 ≥ A 组"（相对比较）、
+"C 组 rule_refs 完整率 ≥ 0.9"、"C-D 一致率不明显低于噪声地板"，没有一条
+要求 `verifier_first_pass_rate` 本身达到某个绝对值。第一条硬指标是
+"C 组跟 A 组比"，即使两组都不高也不会让这条门不达标——所以不需要再单独
+把它"降级"，它从设计上就已经是观测指标，不是硬指标。
+
+**样本量的诚实边界**：本节的结论基于**一条**真机样本（这个沙盒每条
+derived+医理层问诊耗时 7 分钟，拿不起更大样本）。这一条查出的
+`effect_matches_method` bug是真实存在、已经用合成本体的单元测试钉死的
+（跟本体、跟这次的具体治法文本无关，是函数本身的逻辑缺陷），不依赖
+"这条bug出现的频率有多高"这个统计判断——频率数字要等用户在自己更快的
+机器上跑完全量 100 次才有意义，那时 `verifier_first_pass_rate` 该往上
+提多少，会有真实数字，不在这里预测。
 
 ## §4 B→C 净贡献：从定性观察到可统计指标
 
@@ -133,7 +211,41 @@ core/chain.py:1744  s3_prompt = load_prompt("s3_derived")      ← B/C/D 走这�
 
 ## §5 修复验证
 
-<!-- R61_SECTION5_PLACEHOLDER -->
+### 5.1 真机（本沙盒 claude_cli，非 DeepSeek）
+
+同一条 C 组问诊（`S3_MODE=derived`, `THEORY_LAYER=on`, 主诉"胃脘胀痛，
+食后加重……"）在修复 `effect_matches_method` 之前已经跑过一次（§3.1 的
+数据）：`rejected=false`，最终仍带一条 `effect_matches_method` revise
+残留（`revise_needed`，两轮都没消掉）。§1/§2 的两条修复（噪声地板对照、
+A 组 prompt 同步）之前已经各自用一条真机 A 组问诊、和 §1 的新增/既有
+单元测试验证过（详见 `docs/reports/R60_report.md` 的 A 组验证与本报告
+§1 的三项分开测试）。
+
+`effect_matches_method` 的修复因为耗时成本（这条路径单次问诊 422 秒）
+没有再跑第二条真机问诊去确认"修完之后这条规则不再触发"——**用单元测试
+钉死**（见 5.2），这条规则的判据是纯函数、不依赖任何随机采样，单元测试
+在合成本体上验证的就是这个函数本身的逻辑，跟"这次真机问诊恰好触没触发"
+无关。
+
+### 5.2 假后端构造的等价测试（覆盖 §1/§2/§3 三处修复）
+
+- **§1（C-D 一致率）**：`tests/test_ablation_r57.py` 新增/改写 20+ 条，
+  含 `test_pair_consistency_treats_a_wording_only_method_difference_separately_from_syndrome_and_formula`
+  （直接复现 R61 §0 的 q1 场景）、`test_relative_consistency_gate_*` 四条、
+  `_normalize_formula_for_comparison`/`_char_jaccard`/`_split_formula_suffix`
+  各自的单元测试。
+- **§2（A 组 prompt 同步）**：`tests/test_prompt_verifier_contract.py`
+  参数化到两份提示词文件，7 条全绿。
+- **§3（`effect_matches_method`）**：`tests/test_formula_verifier.py`
+  新增 3 条（`test_effect_matches_method_splits_a_compound_principle_before_expanding`、
+  `test_effect_matches_method_compound_principle_still_fires_when_truly_nothing_matches`、
+  `test_effect_matches_method_splits_a_compound_target_before_expanding`），
+  加原有 3 条共 6 条覆盖这一条规则。第二条测试专门钉住"拆句不是把这条
+  规则拆到形同虚设"——复句里哪一句都对不上时仍要判 revise。
+
+### 5.3 全量测试与 ruff
+
+见 §6。
 
 ## §6 全量测试与静态检查
 
