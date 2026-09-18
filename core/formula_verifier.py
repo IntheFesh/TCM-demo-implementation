@@ -125,6 +125,19 @@ Unverifiable**——`_find_same_herb_other_predicate` 命中就直接放过。�
 新的、贯穿全部 12→13 条规则签名的 notes 通道，R60 判断这个需求还没到，
 不为它扩大接口。
 
+## R61：R60 只改了一份提示词，A 组（`s3_structured.yaml`）没跟上
+
+`check_herb_source_fabricated`/`check_herb_source_paraphrased` 是全局规则，
+三条 S3 路径（`s3_syndrome`/legacy、`s3_structured`/A 组、`s3_derived`/
+B·C·D 组）**共用同一个验证器**，但 R60 的 commit 只改了
+`prompts/v1/s3_derived.yaml` 一个文件——`s3_structured.yaml` 的
+"## ontology_refs" 一节还是旧措辞（"知识块里的那一段原文，照抄"，没有
+点名"可摘录原文"小节，也没说清楚"抄不对会怎样"）。用户真机实测：R60
+修完之后 B/C/D 六条全成功，A 组仍然 0/2、两条都挂在
+`herb_source_fabricated` 上——不是这条规则又出新 bug，是约定只讲给了一半
+路径听。R61 把 `s3_structured.yaml` 的这一节改成跟 `s3_derived.yaml` 逐字
+同一套措辞（详见 `docs/reports/R61_report.md` §2）。
+
 本体的缺谓词是实测出来的：归经缺 **598/1232（49%）**、用量缺 **672（55%）**、
 禁忌缺 770、炮制 790。一条规则要用归经而那味药没有归经，正确的结论是
 **"判不了"**，不是"通过"。
@@ -565,12 +578,15 @@ def check_herb_source_fabricated(s3, ont) -> tuple[list[Violation], list[Unverif
     已经在本体里查到了（`herb is None` 的情况交给 `check_herb_not_in_ontology`，
     两条规则回答不同的问题，见模块文档字符串）。
 
-    **跟 `prompts/v1/s3_derived.yaml` 的约定是同一份**：那份提示词在
-    "## ontology_refs" 一节明确写了"这条 span 系统怎么核对"，指名就是这两个
-    函数（`check_herb_source_fabricated`/`check_herb_source_paraphrased`）——
-    改这两个函数的判据、或改提示词那一节的措辞，**两处都要一起看**，
-    `tests/test_prompt_verifier_contract.py` 用源码级 grep 钉着两处不会
-    只改一边（R60）。
+    **跟 `prompts/v1/s3_derived.yaml`、`prompts/v1/s3_structured.yaml` 的约定
+    是同一份**：这两份提示词各自在自己的 "## ontology_refs" 一节明确写了
+    "这条 span 系统怎么核对"，指名就是这两个函数（`check_herb_source_fabricated`/
+    `check_herb_source_paraphrased`）——这条规则是全局的，B/C/D 走
+    `s3_derived.yaml`、A 组走 `s3_structured.yaml`，两份提示词都要讲清楚同一
+    件事，R60 当时只改了前者，A 组因此在 R61 里独自违规到 87% 的 veto 率
+    （见模块文档字符串 R61 一节）。改这两个函数的判据、或改任一份提示词那
+    一节的措辞，**三处都要一起看**，`tests/test_prompt_verifier_contract.py`
+    用源码级 grep 钉着不会只改一处。
 
     **R60：这条规则收窄到只判"张冠李戴"（T3）**——用户真机实测这条规则
     毙掉了 87% 的正常输出（8 条问诊 7 条全挂在它上面），逐条核对模型写的
