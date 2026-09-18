@@ -158,16 +158,25 @@ def check_fonts(root: Path = ROOT) -> Check:
 
 
 def check_physicians() -> Check:
-    from core.physicians import physicians_all, physicians_enabled
+    from core.llm import s3_mode
+    from core.physicians import physicians_all, physicians_enabled, physicians_for_mode
 
     enabled = physicians_enabled()
     total = physicians_all()
     if not enabled:
         return Check("医家注册表", "fail", "一位启用的医家都没有",
                      "检查 core/physicians.py 的 enabled 字段")
+    # **两个数都要报**（R39 验收补）：`enabled` 回答"谁算三列集注的一员"（legacy），
+    # `in_synthesis` 回答"谁参与综合分析"（structured，五位全在）——一个字段答不了
+    # 两个问题（见 physicians_for_synthesis 的文档）。而产品默认是 structured，
+    # 只报 "启用 3 位" 会让演示前的人以为这次只有三家参与，跟界面上的
+    # 「五家综合」对不上，当场解释不清。
+    mode = s3_mode()
+    in_mode = physicians_for_mode(mode)
     return Check("医家注册表", "ok",
-                 f"启用 {len(enabled)} 位 / 注册表共 {len(total)} 位："
-                 + "、".join(info["name"] for info in enabled.values()))
+                 f"本次模式 {mode} 参与 {len(in_mode)} 位（"
+                 + "、".join(info["name"] for info in in_mode.values())
+                 + f"）；三列集注启用 {len(enabled)} 位 / 注册表共 {len(total)} 位")
 
 
 def check_cases(root: Path = ROOT) -> Check:
