@@ -17,7 +17,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 import api.main as api_main
+from core import chain
 from tests.test_api import _fake_outcome, _rich_outcome
+from tests.test_chain import FakeRetriever, ReActFakeLLM, _fake_cases
 
 
 def _parse_sse(lines):
@@ -187,6 +189,51 @@ def test_stream_role_reaches_done_event_same_as_post_consult(monkeypatch):
     # 它是唯一一个按设计不该相等的键，摘出来单独比"两边都有、格式一样"。
     assert len(done_data.pop("record_id")) == len(expected.pop("record_id")) == 8
     assert done_data == expected
+
+
+def test_doctor_role_asks_zero_followup_rounds_in_the_real_event_stream(monkeypatch):
+    """R55 §5.1 第 4 条的端到端证据，直接回应"MAX_ASK_ROUNDS 仍是 3、这条
+    没执行"这个疑问：`core/followup.py` 的模块常量 `MAX_ASK_ROUNDS` 本来就
+    **不该**改成 0——它是 student/researcher 两个不受限角色落回的那个"不限制"
+    的值（改成 0 会连它们一起限制住，是另一个 bug）。真正的产品默认在
+    `core.product_mode.default_role()`：产品模式下就是 "doctor"，
+    `core.followup.max_ask_rounds_for_role("doctor") == 0`，这个 0 经
+    `api/main.py` 传进 `consult(max_ask_rounds=...)`，最终到 `run_followup`。
+
+    这里**不 mock `api_main.consult`**（跟本文件其余测试的常见写法不同）——
+    mock 掉的话，这条链路上"role 有没有传对"这件事就测不出来，那正是
+    `test_stream_role_reaches_done_event_same_as_post_consult` 上面那条
+    注释点名的坑。改成 mock `core.chain.get_llm`，让真实的
+    `core.chain.consult()`（含真实的 `run_followup` 调用）跑起来，直接读
+    SSE 事件流里的 `followup_done.rounds`。
+
+    假后端返回的证素能匹配到候选问题（同 `test_chain.py::_followup_setup`
+    的构造）——如果候选池本来就是空的，"问了 0 轮"就可能只是"没什么可问"，
+    证明不了 `max_ask_rounds=0` 真的生效；这里要的是"本来会问、因为角色是
+    医师所以没问"。
+    """
+    from core.schemas import S3Syndrome
+
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"])
+    s3_wu = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["wu_jutong-001"])
+    fake_llm = ReActFakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    monkeypatch.delenv("FAST_MODE", raising=False)
+
+    client = TestClient(api_main.app)
+    out_q: queue.Queue = queue.Queue()
+    _read_stream_into_with_role(client, "纳差乏力", "doctor", out_q)
+    events = []
+    while not out_q.empty():
+        events.append(out_q.get())
+
+    followup_done = next(d for name, d in events if name == "followup_done")
+    assert followup_done["rounds"] == 0
+    done_data = next(d for name, d in events if name == "done")
+    assert done_data["followup"]["rounds"] == 0
 
 
 # ---------- need_input 暂停 / 恢复 ----------
