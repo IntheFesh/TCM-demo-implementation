@@ -228,3 +228,40 @@ def test_fetching_a_missing_record_is_404_not_an_empty_document():
     """空文书会被当成"这次问诊什么都没生成"。"""
     client = TestClient(api_main.app)
     assert client.get("/api/emr/NOSUCHID").status_code == 404
+
+
+# ---------- R56 §6 第 4 条：危重提示段 ----------
+
+
+def test_no_safety_flag_means_no_red_flag_section():
+    """没命中危重信号时不该凭空多一段——这一段只在真的命中时才出现。"""
+    assert _emr().section("red_flag_notice") is None
+
+
+def test_a_safety_flag_adds_a_red_flag_section_first():
+    emr = _emr(safety_flag="柏油样便")
+    sec = emr.section("red_flag_notice")
+    assert sec is not None
+    assert sec.title == "危重提示"
+    assert "柏油样便" in sec.body
+    assert emr.sections[0].key == "red_flag_notice", "危重提示要排在最前面，比主诉还靠前"
+    assert sec.editable is False, "这一段是系统按角色策略给出的客观事实，不该被当成可编辑正文改掉"
+
+
+def test_the_red_flag_section_appears_in_the_rendered_text():
+    emr = _emr(safety_flag="柏油样便")
+    text = render_emr_text(emr)
+    assert "危重提示" in text and "柏油样便" in text
+
+
+def test_the_draft_endpoint_threads_safety_flag_through():
+    client = TestClient(api_main.app)
+    r = client.post("/api/emr/draft", json={
+        "record_id": "RF01AB23", "complaint": "胃脘胀痛", "s3": S3,
+        "safety_flag": "柏油样便",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    sections = body["emr"]["sections"]
+    assert sections[0]["key"] == "red_flag_notice"
+    assert "柏油样便" in sections[0]["body"]

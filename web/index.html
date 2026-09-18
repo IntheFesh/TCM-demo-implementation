@@ -243,7 +243,7 @@
           <!-- §3.2 规格 2：边透明度编码 λ1，而当前语料下 λ1 恒为 0、所有边
                同一透明度。**图上要有这一行说明**——不解释的话看图的人会以为
                图没建好。文字来自 offline/graph_stats.lambda1_note()，只此一处。 -->
-          <div id="cy-lambda1-note"></div>
+          <div id="cy-lambda1-note" class="internal-only"></div>
           <div id="residual-note"></div>
           <div id="graph-note"></div>
           <!-- role=status + aria-live=polite：钉住时读屏软件会念出内容。
@@ -326,11 +326,12 @@
       <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
            其余模式下压根不摆出来，不是禁用置灰。 -->
       <div class="input-row is-hidden" id="doctor-id-row">
-        <label id="doctor-id-label" for="doctor-id-input">医师标识</label>
-        <input type="text" id="doctor-id-input" class="text-field" placeholder="例如：dr_ye（导出处方必填）" />
+        <label id="doctor-id-label" for="doctor-id-input">医师工号</label>
+        <input type="text" id="doctor-id-input" class="text-field" placeholder="例如：dr0217（导出处方必填，HIS/SSO 登录后可自动填入并锁定）" />
         <label id="patient-ref-label" for="patient-ref-input">患者标识（可选）</label>
         <input type="text" id="patient-ref-input" class="text-field" placeholder="例如：门诊号/化名" />
       </div>
+      <div class="input-row is-hidden" id="doctor-id-error-row"><span id="doctor-id-format-error" class="field-error"></span></div>
       <!-- 全局追问（run_followup，在三位医家之前跑）的问答框。带 physician 的
            追问弹在对应那一列里，不走这里。 -->
       <div id="need-input-box">
@@ -345,7 +346,7 @@
 </div>
 
 <div id="tab-graph-browser" class="tab-panel" hidden>
-  <div id="gb-lambda1-note"></div>
+  <div id="gb-lambda1-note" class="internal-only"></div>
   <div id="gb-error-box"></div>
   <div id="gb-toolbar">
     <input type="text" id="gb-search" placeholder="搜索症状 / 证素 / 证型…" />

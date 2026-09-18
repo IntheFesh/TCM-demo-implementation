@@ -55,7 +55,7 @@ def _sections(node_id, name=None):
 # ---------- 一、八节的骨架 ----------
 
 def test_the_section_order_is_the_chain_not_an_alphabet():
-    assert SECTION_ORDER == ("是什么", "病机", "药理", "出处原文",
+    assert SECTION_ORDER == ("是什么", "病机", "相似证型与鉴别点", "药理", "出处原文",
                              "名老中医经验", "验证结果", "循证对照", "注意")
 
 
@@ -150,13 +150,29 @@ def test_a_formula_missing_the_role_predicates_says_which_rule_that_breaks():
     assert "本体里缺这几个谓词" in joined
 
 
-def test_a_method_node_resolves_effects_through_the_shared_synonym_table():
+def test_a_method_node_resolves_effects_through_the_shared_synonym_table(monkeypatch):
     """治法↔功效的等价判定只能有一处实现——就是验证器
-    `check_effect_matches_method` 用的那张 `effect_synonyms`。"""
+    `check_effect_matches_method` 用的那张 `expand_effect`。
+
+    **R56 之前这条测试靠断言正文里出现字面路径 `core/effect_synonyms.py`
+    来证明"复用了同一处实现"**——R56 §6 第 5 条要求产品面不许出现文件路径，
+    那条断言本身就在钉一个不该出现的东西，删文件路径的同时必须换一种
+    真正测"复用"的方式：直接 monkeypatch 那个共享函数，断言 node_explain
+    真的调用了它，而不是另外拼一份字面匹配。"""
+    calls = []
+    import core.effect_synonyms as es
+    orig = es.expand_effect
+
+    def spy(text):
+        calls.append(text)
+        return orig(text)
+
+    monkeypatch.setattr(es, "expand_effect", spy)
     sec = _sections("method::益气健脾")["药理"]
+    assert calls and all(c == "益气健脾" for c in calls), (
+        "没有走 core.effect_synonyms.expand_effect，是另一处实现")
     joined = "".join(sec["lines"])
-    assert "core/effect_synonyms.py" in (sec.get("source") or "") + joined
-    assert "条表" in joined or "同义词表" in joined
+    assert "条" in joined and ("同义词表" in joined or "同义功效词" in joined)
 
 
 def test_an_out_of_table_method_says_the_match_degrades_to_substring():
@@ -213,7 +229,9 @@ def test_the_verification_section_reports_verifiability_not_a_verdict():
     joined = "".join(_sections("herb::四君子汤::党参")["验证结果"]["lines"])
     assert "可验证" in joined
     assert "不在这里重复一份" in joined
-    assert "core/formula_verifier.py" in joined
+    # R56 §6 第 5 条：这句指向问诊结果「验证」段的话不许带文件路径
+    # （原来断言过 "core/formula_verifier.py" 在正文里，那正是要删的东西）。
+    assert "问诊结果的「验证」段" in joined
 
 
 def test_the_rule_names_come_from_the_backend_label_table():
@@ -254,10 +272,14 @@ def test_every_evidence_section_carries_the_guideline_gap_note(node_id, name):
     assert GUIDELINE_GAP_NOTE in sec["lines"]
 
 
-def test_the_gap_note_says_the_guideline_itself_is_not_in_the_repo():
-    assert "《中医药循证临床实践指南》全文不在本项目内" in GUIDELINE_GAP_NOTE
+def test_the_gap_note_says_coverage_is_not_the_same_as_evidence_grading():
+    """R56 §6 第 6 条：产品面把这句口径声明收窄成一句干净的话，不逐段展开
+    "全文不在项目内/没有可用授权文本"这些内部措辞——原来那段话里两处
+    `**...**` markdown 星号没有渲染，读者看到的是字面星号，比没有这句话
+    观感更差（见截图实证）。核心信息（教材收录 ≠ 循证等级）保留，
+    R46 那段更完整的解释挪进模块文档（不印进响应体）。"""
     assert "循证等级" in GUIDELINE_GAP_NOTE
-    assert "不等于" in GUIDELINE_GAP_NOTE
+    assert "**" not in GUIDELINE_GAP_NOTE, "markdown 星号不会被前端渲染成粗体"
 
 
 def test_the_herb_evidence_baseline_names_the_books_and_counts():

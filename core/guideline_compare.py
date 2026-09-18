@@ -183,10 +183,10 @@ def compare(
         "summary": "",
     }
     if not entries:
-        base["not_covered"] = (
-            f"{BASIS_LABEL}里没有「{syndrome or '（未给出证型）'}」这一条"
-            f"——本次推导没有可比对的教材条目，不代表推导有误，也不代表它被教材支持。")
-        base["summary"] = f"与{BASIS_LABEL}的对照：未覆盖本证型"
+        # R56 §6 第 6 条：产品面只说这一句，不展开"不代表推导有误/不代表被支持"
+        # 那段解释——那段解释属于研究面，产品面需要的只是"有没有这一条"。
+        base["not_covered"] = f"{BASIS_LABEL}未收录本证型"
+        base["summary"] = f"与{BASIS_LABEL}的对照：未收录本证型"
         return base
 
     ours_herbs = _herb_set(herbs or [])

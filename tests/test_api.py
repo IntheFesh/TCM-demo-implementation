@@ -46,7 +46,7 @@ def _fake_rejected_outcome() -> dict:
         "results": [],
         "divergence": None,
         "rejected": True,
-        "reject_reason": "检测到危重症状信号（柏油样便），本 demo 不适用于此类情况，请立即就医。",
+        "reject_reason": "检测到危重症状信号（柏油样便），本系统不适用于此类情况，请立即就医。",
     }
 
 

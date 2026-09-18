@@ -31,6 +31,7 @@ from core.chain import (
 from core.diseases import get_disease, triage_advice
 from core.examples import EXAMPLE_COMPLAINTS
 from core.followup import max_ask_rounds_for_role, stop_label
+from core.safety import role_sees_full_reasoning_on_red_flag
 from core.herbs import is_western_drug, strip_dose_and_parens
 from core.llm import (
     ByokBackend,
@@ -1160,9 +1161,15 @@ def api_consult(
             # R55：追问轮数上限按角色算，在这里算（role 已经解出来了），
             # consult() 本身只认一个整数，不认 role——见 core.chain.consult
             # 的文档字符串那段"刻意不接收 role 本身"。
+            # R56 §6：`eval_mode` 同理——按角色算好一个布尔值再传进去，
+            # consult() 不知道 role 这个概念。见
+            # core.safety.role_sees_full_reasoning_on_red_flag 的文档字符串：
+            # 只有 patient 会在危重命中时整页拦截，其余角色拿完整推理 +
+            # safety_flag（前端据此渲染红色警示条等 red-flag UI）。
             outcome = consult(_effective_complaint(req), retriever_mode=req.retriever_mode,
                               patient_profile=req.patient_profile,
-                              max_ask_rounds=max_ask_rounds_for_role(role))
+                              max_ask_rounds=max_ask_rounds_for_role(role),
+                              eval_mode=role_sees_full_reasoning_on_red_flag(role))
     except LLMAuthError as e:
         # 见 stream 里那条注释：这一类要说给访问者听。
         raise HTTPException(status_code=502, detail=str(e)) from e
@@ -1601,6 +1608,8 @@ def api_consult_stream(
                     retriever_mode=req.retriever_mode,
                     patient_profile=req.patient_profile,
                     max_ask_rounds=max_ask_rounds_for_role(_req_role),
+                    # R56 §6：跟非流式端点同一条逻辑，见那边的注释。
+                    eval_mode=role_sees_full_reasoning_on_red_flag(_req_role),
                 )
             # R40 背压：丢过增量就**说出来**，紧挨在 done 之前。
             # 单独一个事件而不是塞进 done 的载荷：done 的形状跟 /api/consult
@@ -2610,6 +2619,10 @@ class EMRRequest(BaseModel):
     decoction: str = ""
     doctor_id: str = ""
     edits: dict[str, str] = Field(default_factory=dict)
+    # R56 §6：前端把这次问诊响应里的 safety_flag 原样带过来（不在这里重新
+    # 判一次危重信号——判定只在 core.safety.check_safety 一处，这里只是
+    # 把已经判过的结论透传给 build_emr() 写进文书）。
+    safety_flag: str | None = None
 
 
 def _emr_from_request(req: EMRRequest):
@@ -2620,7 +2633,7 @@ def _emr_from_request(req: EMRRequest):
         record_id=req.record_id, complaint=req.complaint, form=req.intake,
         profile=req.patient_profile, s2=req.s2, s3=req.s3, formula=req.formula,
         individualization=ind, triage=req.triage, guideline=req.guideline,
-        doses=req.doses, decoction=req.decoction,
+        doses=req.doses, decoction=req.decoction, safety_flag=req.safety_flag,
     )
 
 

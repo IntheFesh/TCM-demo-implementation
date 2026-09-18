@@ -160,6 +160,47 @@ def mentions_danger(text: str) -> str | None:
     return "、".join(dict.fromkeys(hits)) if hits else None
 
 
+#: R56 §6：危重命中之后，这些角色拿完整推理（不整页拦截）。**只排除
+#: patient**——见 `role_sees_full_reasoning_on_red_flag` 的文档字符串。
+ROLES_SEEING_FULL_REASONING_ON_RED_FLAG = frozenset({"doctor", "student", "researcher"})
+
+
+def role_sees_full_reasoning_on_red_flag(role: str | None) -> bool:
+    """危重信号命中之后，这个角色要不要拿到完整推理，而不是被整页拦截。
+
+    只有 patient 拦截：那道整页拦截保护的是"没有专业判断力、看到系统说
+    什么就信什么"的终端使用者——他们没有能力核实系统给的推理对不对，藏起来
+    直接让他们去看急诊是唯一安全的选择。doctor/student/researcher 都是有
+    专业判断力的人，把完整推理藏起来对他们没有保护作用，反而让他们没法核实
+    系统的判断、没法自己决定要不要采信——所以给他们完整推理 + 醒目的危重
+    提示（顶部红色警示条/方剂区水印/EMR「危重提示」段/导出二次确认，见
+    api/main.py 与 web/app.js 的 red flag 相关代码），不是整页拦截。
+
+    **复用的是 `safety_bypassed()`/`consult(eval_mode=)` 那同一套"命中后
+    继续走、但把命中原因记下来"的机制**——`EVAL_MODE` 原本是给离线评测脚本用
+    的（量化安全否决的代价，见 `safety_bypassed` 文档字符串），这里是给
+    api/main.py 的角色分流用的：两个入口问的是同一个问题（"命中安全规则之后
+    要不要中止链路"），答案也一样（"不中止，但把命中原因带出来"），所以复用
+    同一个开关，不是在 `check_safety` 之外另开一套判法（CLAUDE.md「同一概念
+    的匹配逻辑只能有一处实现」）。
+
+    这条也带来一个副作用，是**特意**的：api/main.py 一旦按这个函数给每次
+    HTTP 请求显式传 `eval_mode=`，服务端全局的 `EVAL_MODE` 环境变量就不再能
+    通过 HTTP 接口影响任何角色的拦截结果了（`safety_bypassed` 的"显式参数
+    优先"规则）——`scripts/preflight_deploy.py` 早就把 `EVAL_MODE=1` 列为
+    "这一项红的话不要上线"的部署事故，这里让它连误开着都伤不到走 HTTP 的
+    patient 请求，是加固，不是收窄评测脚本的能力（离线评测脚本
+    `eval/sdt/run.py` 等直接调 `core.chain.consult()`，不经过 api/main.py，
+    不受这条影响）。
+
+    不认识的 role（`None`、以后新加的角色）一律落回"不在这张表里就拦截"——
+    默认站在更保守的一边，新角色要显式加进
+    `ROLES_SEEING_FULL_REASONING_ON_RED_FLAG` 才会被当成"有专业判断力"，
+    不是反过来。
+    """
+    return (role or "") in ROLES_SEEING_FULL_REASONING_ON_RED_FLAG
+
+
 def safety_bypassed(explicit: bool | None = None) -> bool:
     """**这次调用要不要跳过"命中后中止"这个动作**——注意跳过的只是中止，
     `check_safety()` 本身照跑、命中原因照记，不是不检测了。
@@ -197,9 +238,13 @@ def check_safety(symptoms: list[str]) -> str | None:
 def veto_message(matched: str) -> str:
     """拒绝辨证的文案，**全项目只在这里拼一次**。之前 check_safety、chain.py 的
     ReAct ask_user 路径、followup.py 的十问歌兜底各拼了一份一字不差的字符串——
-    改措辞时必然漏改一处，而这三处恰恰是 CLAUDE.md 点名不能分叉的安全后门。"""
+    改措辞时必然漏改一处，而这三处恰恰是 CLAUDE.md 点名不能分叉的安全后门。
+
+    R56 §6：原文里的「本 demo」是产品面违禁词——这句话会原样显示给患者，
+    "demo" 这个字眼会让人以为这是一个玩具/测试系统，不该出现在拒绝辨证这种
+    严肃场合。"""
     return (
-        f"检测到危重症状信号（{matched}），本 demo 不适用于此类情况，"
+        f"检测到危重症状信号（{matched}），本系统不适用于此类情况，"
         "请立即就医或拨打急救电话，本次不提供辨证结果。"
     )
 

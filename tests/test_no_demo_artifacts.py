@@ -44,6 +44,25 @@ BANNED = {
     "traceback": 12, "Traceback": 12, "LLMError": 12, "exit code": 12,
     "实验性": 16, "beta": 16, "原型": 16, "demo": 16, "Demo": 16,
     "待跑": 11, "未做": 11, "TODO": 11, "⏳": 11,
+    # R56 §6：R56 审计发现的那一批——流式遥测（第 3 条同一类"内部运行状态"）
+    # 与裸文件路径/证候编码前缀（新开第 17 条：这些是给代码/数据看的标识符，
+    # 不是给人看的文字，出现在用户可见文字里说明一处该走 _display_source() /
+    # isProductMode() / codes= 参数那类清洗点的地方没接上）。
+    #
+    # 刻意不收的候选词，连同没收的理由一并记下——省得下一轮又试一遍撞回
+    # 同一堵墙：
+    #   - "JSON"：EMR 导出面板真的有一个「复制结构化 JSON」按钮，是给 HIS
+    #     对接的技术人员看的合法产品功能，不是研究痕迹，禁了它是误伤。
+    #   - "cited_case_ids" / "physician_influences" / "count_support" /
+    #     "evidences"：这几个只在代码里当**属性名**用（`r.cited_case_ids`），
+    #     从不作为字面文字显示给用户；它们几乎总是出现在模板字符串的
+    #     `${...}` 插值表达式里，而 `chinese_strings()` 扫的是整段模板字符串
+    #     的**源码**（含 `${}` 里的表达式代码），不是渲染后的文本——按这几个
+    #     词扫会把"某个中文模板字符串里用了这个属性"全部错判成"泄漏了这个
+    #     字面词"，遍地假阳性。
+    "帧流式": 3, "首字": 3, "样本": 3, "max_rounds": 3, "λ": 3,
+    "core/": 17, "data/": 17, ".py": 17, ".jsonl": 17, ".tsv": 17,
+    "**": 17, "SP-": 17, "B04.": 17,
 }
 
 #: 内部轮次编号：`R32` / `R33` 这种。docs/ 里可以留，用户可见处不行。
@@ -55,8 +74,16 @@ ROUND_RE = re.compile(r"\bR\d{1,2}\b")
 RETRIEVER_WORDS = ("hybrid", "dense", "bm25", "full_context")
 
 #: 含研究词的渲染函数登记表：函数名 → 它属于 §8.2 的哪一条。
-#: **登记不等于放行**：这些函数渲染的 DOM 必须挂在 `internal-only` 的块里，
-#: 那一条由 tests/test_product_mode.py 的标记表钉着。
+#: **登记不等于放行**。两种门控方式都算数，但登记时要写清楚是哪一种：
+#:   1. **CSS 门控**——函数渲染的 DOM 挂在 `internal-only` 的块里，那一条由
+#:      tests/test_product_mode.py 的标记表钉着（多数条目是这一种）。
+#:   2. **运行时门控**——函数内部按 `isProductMode()` 分支，产品面分支不含
+#:      研究词；这种函数的 DOM 容器本身不带 `internal-only`（R56 §6 第 3 条：
+#:      `describeProgressEvent` 写进 `#progress-log`，那是个普通 div，
+#:      不是按 CSS 类整块藏）。这一种必须有专门的测试钉住"产品面分支真的
+#:      不含研究词"，不能只靠这张登记表兜底——登记表本身证明不了运行时
+#:      分支对不对，只是告诉这条静态扫描"这里的研究词字面量是故意的，
+#:      去看对应测试"。
 INTERNAL_RENDERERS = {
     # 第 7 条：用药对照带、噪声地板、分层读数。它们渲染进 #rx-compare 与
     # #divergence-detail，两块都标了 internal-only。
@@ -65,6 +92,11 @@ INTERNAL_RENDERERS = {
     # 第 3 条：回放提示。渲染进 #demo-mode-banner；产品模式下这台服务若真
     # 在回放，走的是 §6 的降级机制，不用"演示模式"这个词。
     "demoModeText": 3,
+    # 第 3 条，运行时门控（上面第 2 种）：`帧流式`/`首字`/`思考`这几个字
+    # 只在 `!isProductMode()` 的分支里，产品面分支只说"完成"——见
+    # tests/test_ui_r56_progress_stats.py 的
+    # test_product_mode_drops_the_telemetry_numbers。
+    "describeProgressEvent": 3,
 }
 
 CJK = re.compile(r"[一-鿿]")
@@ -152,11 +184,21 @@ def product_visible_html_text() -> str:
 
 
 def js_chunks(src: str) -> dict[str, str]:
-    """按顶层 `function name(` 把文件切成块。切不到函数里的那部分算
-    `"<module>"`。"""
+    """按顶层 `function name(` / `async function name(` 把文件切成块。
+    切不到函数里的那部分算 `"<module>"`。
+
+    **`async` 不能漏**：正则本来只认裸 `function`，这个仓库有 25 个顶层
+    `async function`（app.js 16 个、graph.js 9 个）——漏了它们不是"少切
+    几块"，是每一个 `async function` 的函数体会被**悄悄并进它前面那个
+    `function` 声明的块里**，攻陷的是判据本身：一个 `async function` 里的
+    违禁词会被安在别的函数名下报出来（曾经真的把 `gbToggleLayer` 里的
+    λ1 泄漏报成了 `gbRenderRingLegend` 的），而如果那个"前面的函数"恰好
+    登记在 INTERNAL_RENDERERS 里，这条测试会假绿——真正违规的那段代码被
+    藏进了一个不相干、且已经被登记豁免的名字底下。"""
     src = strip_js_comments(src)
     out: dict[str, str] = {}
-    marks = [(m.start(), m.group(1)) for m in re.finditer(r"(?m)^function\s+(\w+)\s*\(", src)]
+    marks = [(m.start(), m.group(1)) for m in
+             re.finditer(r"(?m)^(?:async\s+)?function\s+(\w+)\s*\(", src)]
     if not marks:
         return {"<module>": src}
     out["<module>"] = src[: marks[0][0]]
@@ -304,3 +346,58 @@ def test_the_h1_matches_the_product_name():
 
     m = re.search(r"<h1>(.*?)</h1>", load_html())
     assert m and m.group(1).strip() == PRODUCT_NAME
+
+
+# ---------- R56 §6：core/safety.py::veto_message() ----------
+#
+# 这一句直接显示给被拦截的患者——安全否决是全站最不该带研究痕迹的地方
+# （之前真的漏过一次："本 demo 不适用于此类情况"，R56 §6 才补上）。
+#
+# 不扫整份源码（那样连函数自己的文档字符串都会被当正文，而文档字符串
+# 就是给开发者看的，里面提"评测"/"demo"是正常的开发者交流，见模块里
+# `role_sees_full_reasoning_on_red_flag` 那段文档）。**直接跑一遍真实函数**，
+# 扫它的返回值——这是唯一真的会显示给用户的文字，源码扫得再全也不如
+# 跑一次准。
+
+
+def test_veto_message_has_no_banned_word():
+    from core.safety import veto_message
+
+    text = veto_message("柏油样便")
+    bad = [w for w in BANNED if w in text]
+    assert not bad, f"veto_message() 的真实返回值里有禁词：{bad}（{text!r}）"
+
+
+def test_check_safety_rejection_text_has_no_banned_word():
+    """跟上一条测的是同一份文案，但走 `check_safety()` 这条真实调用路径
+    （危重症状命中 → 拒绝理由），不是直接拼参数调 `veto_message`——万一将来
+    有人在 `check_safety` 里另外接了一段文字，这条能测到那一段。"""
+    from core.safety import check_safety
+
+    text = check_safety(["解黑色柏油样便"])
+    assert text is not None
+    bad = [w for w in BANNED if w in text]
+    assert not bad, f"check_safety() 的真实返回值里有禁词：{bad}（{text!r}）"
+
+
+# ---------- 自检：禁词表规模 + async function 切块 ----------
+
+
+def test_the_banned_word_list_has_grown_to_at_least_35():
+    """R56 §6：这一条不是给这份测试凑数，是给"以后又漏加"设一道数值下限——
+    低于 35 说明有人删条目删过头了，得说清楚为什么。"""
+    assert len(BANNED) >= 35, f"当前只有 {len(BANNED)} 条，应 ≥35"
+
+
+def test_the_chunker_recognizes_async_functions():
+    """自检：`js_chunks` 漏认 `async function` 曾经把 gbToggleLayer 里的
+    违禁词错安在 gbRenderRingLegend 头上（见 js_chunks 文档字符串）。这里
+    钉住修复：async 函数有自己的块，不会被前一个函数吞掉。"""
+    chunks = js_chunks(
+        'function alpha() { return "甲"; }\n'
+        'async function beta() { return "乙违禁词"; }\n'
+        'function gamma() { return "丙"; }\n'
+    )
+    assert "违禁词" in chunks["beta"]
+    assert "违禁词" not in chunks["alpha"]
+    assert "丙" in chunks["gamma"] and "违禁词" not in chunks["gamma"]

@@ -459,6 +459,20 @@ def test_to_dict_is_json_serialisable_and_keeps_the_counts(ont):
                       "n_veto", "n_revise", "n_unverifiable"}
 
 
+def test_to_dict_includes_checked_rule_labels_for_the_product_checklist(ont):
+    """R56 §6 第 13 条：产品面要把逐条校验摆成核对清单，每条要有中文名。
+    `violations`/`unverifiable` 里的条目各自带一份 `rule_label`，但**通过**
+    的那些规则只在 `checked_rules` 里、是裸 id——前端不该为它们另建一张
+    ALL_RULES→中文名的表（那是 `rule_label()` 已经有的同一张表的第二份
+    实现），所以这里补一份 `{rule: label}` 映射。"""
+    from core.formula_verifier import rule_label
+
+    d = verify_formula(mk(["甘草", "甘遂"]), ontology=ont).to_dict()
+    assert "checked_rule_labels" in d
+    for rule in d["checked_rules"]:
+        assert d["checked_rule_labels"][rule] == rule_label(rule)
+
+
 # ---------- 回灌文本 ----------
 
 def test_the_revise_feedback_lists_vetoes_and_revisables_separately(ont):

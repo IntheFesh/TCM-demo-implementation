@@ -295,6 +295,13 @@ class VerificationResult:
             "ontology_available": self.ontology_available,
             "theory_available": self.theory_available,
             "checked_rules": list(self.checked_rules),
+            # R56 §6 第 13 条：产品面要把这份结论摆成逐条核对清单（"归经覆盖
+            # 病位 ✓"这种），每条要显示中文名——`rule_label` 这唯一一张表就在
+            # 这个模块里，不在前端另建一份（CLAUDE.md「同一概念只能有一处
+            # 实现」）。`violations`/`unverifiable` 已经各带一份 rule_label，
+            # 这里补的是**通过**（在 checked_rules 里、没有违规）的那些规则的
+            # 中文名——它们不落在前两个列表里，没地方带这份映射。
+            "checked_rule_labels": {r: rule_label(r) for r in self.checked_rules},
             "n_veto": len(self.vetoes),
             "n_revise": len(self.revisables),
             "n_unverifiable": len(self.unverifiable),

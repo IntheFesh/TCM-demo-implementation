@@ -1317,8 +1317,15 @@ STATES = {
         """() => {
           const box = document.getElementById('node-explain');
           if (!box || !box.classList.contains('show')) return '释义面板没弹出来';
-          // 同 CHAIN_FLOW_CHECK 那条：类名对 ≠ 看得见
-          if (box.offsetParent === null) return '释义面板有 .show 但没在版面上';
+          // 同 CHAIN_FLOW_CHECK 那条：类名对 ≠ 看得见。**但 `offsetParent === null`
+          // 这条判据本身在 R56 §6 之后不再成立**：桌面端（>768px）改成了
+          // `position: fixed` 的吸顶侧栏，而 `position: fixed` 的元素按规范
+          // `offsetParent` 恒为 null——跟"有没有显示"无关。改用
+          // `getComputedStyle` 直接查 display/visibility，这是唯一一处不会
+          // 被定位方式影响的判据。
+          const cs0 = getComputedStyle(box);
+          if (cs0.display === 'none' || cs0.visibility === 'hidden')
+            return '释义面板有 .show 但没在版面上';
           if (box.getBoundingClientRect().height < 40)
             return '释义面板高 ' + Math.round(box.getBoundingClientRect().height) + 'px';
           const heads = [...box.querySelectorAll('.ne-head')].map(x => x.textContent);
@@ -1337,7 +1344,13 @@ STATES = {
           for (const want of ['药理', '验证结果', '循证对照']) {
             if (!heads.includes(want)) return 'R42 新增的「' + want + '」这一节没出现';
           }
-          if (!box.textContent.includes('中医药循证临床实践指南'))
+          // GUIDELINE_GAP_NOTE（core/node_explain.py）的措辞早就改成了
+          // "对照基准是仓库内已收录的典籍与参考表，不是循证等级评定。"——
+          // 不再逐字提《中医药循证临床实践指南》这个书名（那句话现在只在
+          // 模块文档字符串里，不在渲染输出里）。这条判据没跟着改过，一直
+          // 断言一个已经不存在的字面量，这次先跑起来的 Playwright 才第一次
+          // 抓到。
+          if (!box.textContent.includes('对照基准是仓库内已收录的典籍与参考表'))
             return '循证对照少了那句口径声明——"教材里有"会被读成"有循证支持"';
           return null;
         }""",
@@ -1491,7 +1504,8 @@ STATES = {
           for (const want of ['药理', '验证结果', '循证对照']) {
             if (!text.includes(want)) return 'R42 新增的「' + want + '」这一节没出现';
           }
-          if (!text.includes('中医药循证临床实践指南'))
+          // 同上：GUIDELINE_GAP_NOTE 现在的措辞不含书名，见 node_explain 那条的注释。
+          if (!text.includes('对照基准是仓库内已收录的典籍与参考表'))
             return '循证对照少了那句口径声明';
           // 关闭按钮要够大能用手指点到（WCAG 最小 44px）
           const close = el.querySelector('.ne-close');

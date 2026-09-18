@@ -142,7 +142,11 @@ def test_the_frontend_handles_the_three_new_events():
     每 15 秒一行噪音），所以对它们的断言是"翻译函数返回 null"，
     而它们真正的去处（流式区、只重置看门狗）在 submitConsult 的分派里。
     """
+    # R56 §6 第 3 条之后，s3_done 的「N 帧流式/首字 Xs」这类底层遥测只在
+    # 研究模式显示（产品面简化成"完成"，见 test_ui_r56_progress_stats.py）
+    # ——这条测试测的是"事件有没有人接"，不是产品面文案，显式钉在研究模式。
     js = """
+isProductMode = () => false;
 process.stdout.write(JSON.stringify({
   delta_log: describeProgressEvent("s3_delta", {text: "x", kind: "content"}),
   done_log: describeProgressEvent("s3_done", {physician_name: "五家综合", events: 7,

@@ -86,14 +86,20 @@ def _any_covered_syndrome() -> str:
 def test_not_covered_says_so_and_does_not_invent():
     out = compare("一个底本里没有的证型", "疏肝", "柴胡疏肝散", ["柴胡"])
     assert out["covered"] is False
-    assert out["not_covered"] and "没有" in out["not_covered"]
+    assert out["not_covered"] and "未收录" in out["not_covered"]
     assert out["aligned"] == [] and out["deviations"] == []
 
 
-def test_not_covered_does_not_imply_the_reasoning_is_wrong():
-    """**措辞要紧**：未覆盖不代表推导有误，也不代表它被教材支持。"""
+def test_not_covered_message_is_the_r56_product_wording_not_the_longer_caveat():
+    """R56 §6 第 6 条：产品面只说「教材推荐方案未收录本证型」这一句，不展开
+    "不代表推导有误/不代表被教材支持"那段研究向的措辞说明——**这条测试原来
+    钉的是那句展开的措辞**（`test_not_covered_does_not_imply_the_reasoning_
+    is_wrong`），R56 把它从产品文案里删掉是有意的收窄，不是退化：那层"这不
+    代表什么"的 nuance 换成了 `compare()` 这个函数自己的文档字符串
+    （"没有分数，没有排序，没有建议采用哪一个"那段），给看代码的人看，
+    不再印在响应体里给最终用户看。"""
     out = compare("一个底本里没有的证型", "疏肝", "柴胡疏肝散", [])
-    assert "不代表推导有误" in out["not_covered"]
+    assert out["not_covered"] == f"{BASIS_LABEL}未收录本证型"
 
 
 def test_a_matching_formula_lands_in_aligned_with_its_source():

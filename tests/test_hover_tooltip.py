@@ -41,8 +41,20 @@ def _describe_node(data: dict, physician_names: dict | None = None) -> str:
 
 
 def _describe_edge(data: dict, source_label: str, target_label: str,
-                   physician_names: dict | None = None, current_physician: str | None = None) -> str:
+                   physician_names: dict | None = None, current_physician: str | None = None,
+                   product_mode: bool = False) -> str:
+    # R56 §6 第 2 条：λ1 那一行现在走 `graphHooks.checkProductMode()`（不是裸的
+    # `isProductMode()`——graph.js 不许直接调 app.js 的全局函数，见
+    # tests/test_web_split.py 的依赖方向测试；钩子名特意跟 app.js 的
+    # `isProductMode` 函数名不同，因为那条测试按名字做跨文件调用的静态分析，
+    # 同名会被当成"graph.js 直接调了 app.js 的函数"，哪怕实际走的是钩子）。
+    # 直接改 `graphHooks` 这个对象上的字段，不去动 `document`——整个替换
+    # `globalThis.document` 会连累 app.js 加载时挂的异步回调（`initDemoModeBanner`
+    # 那类 `fetch('/health').then(...)`），脚本主体跑完之后、回调触发时
+    # `document` 已经被换成没有 `getElementById` 的假对象，进程带着非零
+    # 退出码收尾，尽管我们要断言的 stdout 内容其实是对的。
     js = (
+        f"graphHooks.checkProductMode = () => {str(product_mode).lower()};\n"
         f"PHYSICIAN_NAMES = {json.dumps(physician_names or {}, ensure_ascii=False)};\n"
         f'process.stdout.write(describeEdgeTooltip({json.dumps(data, ensure_ascii=False)}, '
         f'{json.dumps(source_label, ensure_ascii=False)}, {json.dumps(target_label, ensure_ascii=False)}, '
@@ -303,6 +315,19 @@ def test_persistent_indicates_edge_shows_cardinal_and_lambda1_for_selected_physi
     assert "纳呆" in out and "脾" in out and "indicates" in out
     assert "主症" in out
     assert "叶天士" in out and "0.00" in out
+
+
+def test_the_lambda1_line_is_hidden_in_product_mode():
+    """R56 §6 第 2 条：λ1 是内部统计权重符号，产品面（默认模式）不该露出来
+    ——医师/患者看不懂这个记号，也不该需要看懂。"""
+    edge = {
+        "edge_type": "indicates", "is_cardinal": True,
+        "lambda1_by_physician": {"ye_tianshi": 0.0},
+    }
+    out = _describe_edge(edge, "纳呆", "脾", physician_names={"ye_tianshi": "叶天士"},
+                         current_physician="ye_tianshi", product_mode=True)
+    assert "λ1" not in out
+    assert "主症" in out  # 其余内容不受影响，只是少了 λ1 这一行
 
 
 def test_persistent_indicates_edge_secondary_symptom_label():

@@ -258,8 +258,10 @@ def test_escape_html_also_escapes_quotes():
 
 
 def test_describe_safety_flag():
-    """safety_flag 非空 = 服务端开着 EVAL_MODE、这条主诉本该被拦。之前 JSON 里
-    带着这个字段但页面上什么都不显示，方药照常开。"""
+    """R56 §6：safety_flag 非空 = 危重信号命中，按角色策略给出了完整推理
+    （非 patient 角色，见 core.safety.role_sees_full_reasoning_on_red_flag）。
+    这条不再是"服务端开着 EVAL_MODE"那句话——api/main.py 现在按角色显式传
+    eval_mode，走 HTTP 接口这条字段非空就是角色策略在生效，不是诊断配置。"""
     js = """
     process.stdout.write(JSON.stringify([
       describeSafetyFlag(null), describeSafetyFlag(""), describeSafetyFlag("柏油样便"),
@@ -268,6 +270,7 @@ def test_describe_safety_flag():
     out = json.loads(_run_node(js))
     assert out[0] is None and out[1] is None
     # R47 §8.2 第 15 条：这一行不在 internal-only 块里（安全警告任何模式下
-    # 都必须显示），所以措辞也要过产品面那关——原话把一个内部开关名
-    # （EVAL_MODE）摆在了使用者面前。要拦的行为一个字没变。
-    assert "不中止" in out[2] and "柏油样便" in out[2] and "不产出任何方药" in out[2]
+    # 都必须显示），措辞要过产品面那关——不出现内部开关名/研究向措辞。
+    assert "柏油样便" in out[2]
+    assert "EVAL_MODE" not in out[2] and "诊断配置" not in out[2]
+    assert "临床" in out[2]

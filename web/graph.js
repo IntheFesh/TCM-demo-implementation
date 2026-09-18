@@ -52,6 +52,17 @@ const graphHooks = {
   onError: (message) => { console.error("[graph]", message); },
   onOpenEvidence: () => {},
   onCloseEvidence: () => {},
+  // R56 §6 第 2 条：λ1 是内部统计权重符号，产品面不该看到——这个判据定义在
+  // app.js，依赖方向只能是 app.js → graph.js，所以走钩子注入，不直接调那个
+  // 全局函数（同上面三个钩子的理由，见文件顶部依赖方向说明）。钩子名故意
+  // 跟 app.js 那边的同款判据函数改了个名字，不完全同名——`test_web_split.py`
+  // 的静态分析按"标识符紧跟左括号"这个形状抓跨文件调用，就算挂在 `graphHooks.`
+  // 后面、走的是注入钩子，只要名字一样照样会被当成直接调了 app.js 的全局
+  // 函数（连这条解释性注释里写出那个名字本身、后面又紧跟括号，都会被同一条
+  // 正则命中——所以这里也不这么写）。默认真值（产品模式）：跟 app.js 那边
+  // 同一个判据的默认值同一条理由——没接上钩子时（graph.js 单独跑的 node
+  // 测试）应该是"藏起来"这一边，不是"露出来"那一边。
+  checkProductMode: () => true,
 };
 
 function setGraphHooks(hooks) {
@@ -1053,7 +1064,10 @@ function describeEdgeTooltip(edgeData, sourceLabel, targetLabel, currentPhysicia
     const lines = [`${escapeHtml(sourceLabel || "?")} → ${escapeHtml(targetLabel || "?")}　<span class="tt-meta">(${escapeHtml(edgeData.edge_type)})</span>`];
     if (edgeData.edge_type === "indicates") {
       lines.push(`<div class="tt-meta">${edgeData.is_cardinal ? "主症" : "次症"}</div>`);
-      if (currentPhysician && edgeData.lambda1_by_physician) {
+      // R56 §6 第 2 条：λ1 是内部统计权重符号，产品面（医师/患者）不该看到
+      // 这种记号——判据走 graphHooks.checkProductMode（app.js 注入），不直接调
+      // app.js 的全局函数（依赖方向只能是 app.js → graph.js，见文件顶部）。
+      if (currentPhysician && edgeData.lambda1_by_physician && !graphHooks.checkProductMode()) {
         const l1 = edgeData.lambda1_by_physician[currentPhysician];
         if (l1 !== undefined) {
           lines.push(`<div class="tt-meta">λ1（${escapeHtml(PHYSICIAN_NAMES[currentPhysician] || currentPhysician)}）= ${l1.toFixed(2)}</div>`);
@@ -2071,13 +2085,14 @@ async function gbToggleLayer() {
   }
   // 医案层直接按类型取一页，不再"从可见节点展开出 case 邻居"。后者在这个项目上
   // 恒为空：case -evidences-> syndrome 的边实测是 0 条（医案用「胃阳虚」「悬饮」，
-  // 国标用「肝胃不和证」，两套术语体系对不上——就是 λ1 恒为 0 那件事）。
+  // 国标用「肝胃不和证」，两套术语体系对不上——内部记这个原因叫 λ1 恒为 0，
+  // 但那是给排查问题看的符号，产品面只说"术语对不上"这个事实本身，不带符号）。
   // 按邻居找等于永远显示不出医案层。
   await gbFetchInto(
     `/api/graph?node_types=case&limit=${GB_MAX_NEW_NODES}`,
     (page) => page.next_cursor !== null
       ? `医案层共 ${page.total} 条，显示前 ${page.returned} 条。`
-        + `它们跟国标层之间没有边——这正是 λ1 恒为 0 的原因，不是没加载出来。`
+        + `它们跟国标层之间暂时没有边——医案用词与国标术语体系不同，尚未打通，不是没加载出来。`
       : `医案层 ${page.returned} 条`,
     null, "layer"
   );
@@ -2239,6 +2254,31 @@ function gbExitFocus() {
   gbOverviewIds = null;
   if (back.length) gbAddNodes(back);
   else gbResetView();
+}
+
+// ---------- R56 §6：本例知识地图——programmatic 聚焦（不需要先点开）----------
+//
+// `gbFocus` 只认已经在 `gbIndex` 里的节点，这条是给它补一步：节点不在索引里
+// 就先按 `gbExpandNode` 同一条路径（`/api/graph/neighbors`）把它的邻域拉
+// 进来，再聚焦。整个函数是"入口"，不是新判据——真正的加载/合并/聚焦各自
+// 只有一处实现（gbFetchInto/gbMergeGraph/gbFocus），这里只是把它们接成
+// "从一个 syn:: id 直接到位"这一条路径，给"切到图谱页自动定位到本次证型"
+// 这个新入口用，取代原来"必须先手动点开证素、找到证型再双击"的路径。
+//
+// 找不到这个节点（证候表覆盖不到这个证型）时返回 null，不抛——找不到是
+// 数据覆盖缺口，不是程序错误，调用方据此决定要不要打开释义面板。
+async function gbFocusOnNodeId(nodeId) {
+  if (!gbGraphData) await loadGraphBrowserData();
+  if (!gbGraphData || !gbIndex) return null;
+  if (!gbIndex.nodeById.has(nodeId)) {
+    await gbFetchInto(
+      `/api/graph/neighbors?node=${encodeURIComponent(nodeId)}&limit=${GB_MAX_NEW_NODES}`,
+      () => "", null, "expand"
+    );
+  }
+  if (!gbIndex.nodeById.has(nodeId)) return null;
+  if (gbInFocus()) gbExitFocus();
+  return gbFocus(nodeId);
 }
 
 function gbBreadcrumbHtml(stack) {
@@ -2846,6 +2886,8 @@ window.TCM = Object.assign(window.TCM || {}, {
   // app.js 用到的图谱侧函数
   gbApplyPhysicianWeighting, gbBrowseCategory, gbSearch, hideTooltip, loadGraphBrowserData,
   renderGraph,
+  // R56 §6：本例知识地图——切到图谱页时按当前证型自动聚焦
+  gbFocusOnNodeId,
   // 两边共用的纯工具（定义在这一层，见文件顶部的依赖方向说明）。
   // sleep 不在清单里：搬过来之后只有 growGraph 用，app.js 一次都没调——
   // 清单只列**对面真的用到的**，多列一个就是给"清单齐全"那条测试留一个假绿点。

@@ -243,13 +243,47 @@ async function refreshUsage() {
   } catch (e) { /* 看板拿不到不影响问诊本身，静默 */ }
 }
 
+// R56 §6：本例知识地图。有活跃问诊（LAST_RESULT 非空）时切到图谱页要直接
+// 定位到这次的证型，不是回退到脾胃门首屏——首屏那套"证素在内圈"的布局
+// 回答的是另一个问题（这个知识库整体长什么样），医师这时候要的是"这一次
+// 这个证，跟哪些证容易混、还有什么别的治法方剂、名老中医怎么用"。
+//
+// 只在证型**变了**的时候才重新聚焦（`gbAutoFocusedSyndrome` 记的是上一次
+// 自动聚焦过的证型名）——不然医师在图谱页手动探索到别处、切回问诊页看一眼
+// 结果、再切回来，会被强制拉回原地，那不是"回到本例地图"，是打断医师
+// 自己的浏览。
+let gbAutoFocusedSyndrome = null;
+
+//: 当前这次问诊结论的证型名。**只取 results[0]**——图谱页一次只能聚焦一个
+//: 节点，legacy 模式下三位医家各有各的证型时，取第一个作为代表足够回答
+//: "这次大概在看哪个证"，不必也不该在这里另起一套"三证怎么合成一个"的判断
+//: （那件事 renderDivergence 已经做过了，产品面看分歧度就是看它）。
+function currentSyndromeName() {
+  const r = (LAST_RESULT && LAST_RESULT.results || [])[0];
+  if (!r) return null;
+  const st = r.s3_structured;
+  return (st ? st.syndrome.name : (r.s3 || {}).syndrome) || null;
+}
+
 function switchTab(tab) {
   const toConsult = tab === "consult";
   document.getElementById("tab-btn-consult").classList.toggle("active", toConsult);
   document.getElementById("tab-btn-graph-browser").classList.toggle("active", !toConsult);
   document.getElementById("tab-consult").hidden = !toConsult;
   document.getElementById("tab-graph-browser").hidden = toConsult;
-  if (!toConsult && !gbGraphData) loadGraphBrowserData();
+  if (toConsult) return;
+  const syndrome = currentSyndromeName();
+  if (syndrome && syndrome !== gbAutoFocusedSyndrome) {
+    gbAutoFocusedSyndrome = syndrome;
+    gbFocusOnNodeId(NODE_ID.syndrome(syndrome)).then((found) => {
+      // 找不到（证候表覆盖不到这个证型）就不强行打开一个空释义面板——
+      // 那会让医师以为点错了，实际是数据覆盖缺口，跟证候表本身"没有这一条
+      // 就如实说"是同一条纪律。画布仍然留在首屏，不是留一片空白。
+      if (found) openNodeExplain(NODE_ID.syndrome(syndrome), syndrome);
+    });
+    return;
+  }
+  if (!gbGraphData) loadGraphBrowserData();
 }
 
 document.getElementById("tab-btn-consult").addEventListener("click", () => switchTab("consult"));
@@ -1098,7 +1132,7 @@ function blankHerbItem() {
   return { name: "", dose: null, dose_unit: "g", processing: null, decoction: null, role: null, function_in_formula: null };
 }
 
-function initDoctorState(results) {
+function initDoctorState(results, safetyFlag) {
   DOCTOR_STATE = {};
   for (const r of results) {
     const s3 = r.s3;
@@ -1122,6 +1156,12 @@ function initDoctorState(results) {
       exportResult: null,
       exportError: null,
       pendingOverrideReason: null,
+      // R56 §6：这次问诊命中过危重信号（safety_flag 非空）。导出这张方之前
+      // 要跟 safety.blocking（方剂本身超量/配伍禁忌）一样走"坚持导出"那条
+      // 二次确认——两者问的不是同一个问题（一个问"这张方本身有没有问题"，
+      // 一个问"这条主诉本身危不危重"），但都需要医师明确写一句理由才能导出，
+      // 所以复用同一套确认 UI，不另起一套弹窗。
+      redFlag: safetyFlag || null,
     };
   }
 }
@@ -1271,6 +1311,20 @@ function doctorExportPanelHtml(state, physician) {
     return `<div class="rx-pharmacy-text">${escapeHtml(state.exportResult.text)}</div>
       <div class="rx-audit-id">审计编号：${escapeHtml(state.exportResult.audit_id)}</div>`;
   }
+  // R56 §6 第 4 条：这次问诊命中过危重信号——导出前先要求医师写一句理由，
+  // 跟 safety.blocking（方剂本身超量/配伍禁忌）复用同一套"填理由才能坚持
+  // 导出"的 UI（同一个 rx-override-input / rx-confirm-export 判据，见
+  // runExport 里的门槛）。这个分支必须排在 exportError 检查之前——还没点过
+  // 导出按钮时（exportError 还是 null）也要先看到这道确认，不能等医师点了
+  // 才发现要多填一步。
+  if (state.redFlag && !state.pendingOverrideReason && !state.exportResult) {
+    return `<div class="rx-override-box">
+      <div class="rx-reject-title">⚠ 本次问诊命中危重症状信号（${escapeHtml(state.redFlag)}）</div>
+      <div class="rx-reject-item">· 导出前请确认已结合临床实际判断，必要时已提醒患者立即就医或转诊/急诊处理</div>
+      <textarea id="rx-override-input-${physician}" placeholder="填写确认理由（必填，将原样记入审计日志，医师对该理由负责）"></textarea>
+      <button type="button" class="rx-export-btn" data-rx-confirm-export="${physician}">确认并导出</button>
+    </div>`;
+  }
   if (state.exportError) {
     const message = state.exportError.message || "该方存在拦截级安全问题，拒绝导出。";
     const problems = state.exportError.problems || null;
@@ -1297,13 +1351,36 @@ function renderDoctorExportPanel(physician) {
   el.innerHTML = doctorExportPanelHtml(state, physician);
 }
 
+// R56 §6 第 10 条：医师工号格式校验。三甲的工号是 HIS/SSO 发的，不是自由
+// 文本——至少 3 位字母数字，挡掉"随手打几个字"这类肯定不是工号的输入。
+// 真正的工号规则（几位、有没有院区前缀）要接哪家医院的 HIS 才能定，这里
+// 只挡明显不像工号的输入，不冒充"已对接 HIS 的工号校验"。
+const DOCTOR_ID_FORMAT_RE = /^[A-Za-z0-9]{3,}$/;
+
+function isValidDoctorId(id) {
+  return DOCTOR_ID_FORMAT_RE.test(id);
+}
+
 async function runExport(physician) {
   const state = DOCTOR_STATE[physician];
   if (!state) return;
+  // R56 §6 第 4 条：危重信号命中时，导出前必须先拿到医师写的确认理由——
+  // 门槛跟 doctorExportPanelHtml() 里那个判据是同一条（redFlag 非空、
+  // pendingOverrideReason 还没填），不发请求、直接把确认框渲染出来。
+  if (state.redFlag && !state.pendingOverrideReason) {
+    renderDoctorExportPanel(physician);
+    return;
+  }
   const doctorIdInput = document.getElementById("doctor-id-input");
   const doctorId = (doctorIdInput ? doctorIdInput.value : "").trim();
   if (!doctorId) {
-    state.exportError = { message: "请先在上方填写医师标识再导出处方。" };
+    state.exportError = { message: "请先在上方填写医师工号再导出处方。" };
+    state.exportResult = null;
+    renderDoctorExportPanel(physician);
+    return;
+  }
+  if (!isValidDoctorId(doctorId)) {
+    state.exportError = { message: "医师工号格式不对：至少 3 位字母或数字（HIS/SSO 登录后会自动填入，无需手填）。" };
     state.exportResult = null;
     renderDoctorExportPanel(physician);
     return;
@@ -1334,7 +1411,12 @@ async function runExport(physician) {
       state.exportError = data.detail;
       state.exportResult = null;
     } else if (!resp.ok) {
-      state.exportError = { message: `导出失败（HTTP ${resp.status}）：${JSON.stringify(data)}` };
+      // R56 §6 第 1 条：不把整个响应体 JSON.stringify 印给用户——`data.detail`
+      // 是后端已经写好的人话错误，没有的话才退到一句通用说明，不裸露原始 JSON。
+      state.exportError = {
+        message: `导出失败（HTTP ${resp.status}）：${
+          typeof data.detail === "string" ? data.detail : "服务器未给出可读的失败原因"}`,
+      };
       state.exportResult = null;
     } else {
       state.exportResult = data;
@@ -1429,6 +1511,35 @@ function updateDoctorFieldsVisibility() {
   // "要不要显示"。R14 之前这行写死 flex，改版面时要同时改 JS 才生效。
   if (row) row.classList.toggle("is-hidden", getSelectedRole() !== "doctor");
 }
+
+// R56 §6 第 10 条：真实部署里工号来自 HIS/SSO 单点登录，不是护士站手敲。
+// 这里没有真的 HIS 网关可接，用 URL 参数模拟"上级系统已经把身份传进来"这
+// 一步——`?doctor_id=dr0217` 预填并锁定输入框，跟真实 SSO 回跳时后端把
+// 工号写进页面的效果一致。没带这个参数时保持原样（手填，未锁定）。
+function applyDoctorIdFromQuery() {
+  const params = new URLSearchParams(window.location.search);
+  const injected = (params.get("doctor_id") || "").trim();
+  if (!injected) return;
+  const input = document.getElementById("doctor-id-input");
+  if (!input) return;
+  input.value = injected;
+  input.readOnly = true;
+  input.title = "由 HIS/SSO 登录自动填入，不可手改";
+}
+
+function validateDoctorIdLive() {
+  const input = document.getElementById("doctor-id-input");
+  const errEl = document.getElementById("doctor-id-format-error");
+  const errRow = document.getElementById("doctor-id-error-row");
+  if (!input || !errEl || !errRow) return;
+  const v = input.value.trim();
+  const bad = v.length > 0 && !isValidDoctorId(v);
+  errEl.textContent = bad ? "格式不对：至少 3 位字母或数字" : "";
+  errRow.classList.toggle("is-hidden", !bad);
+}
+
+document.getElementById("doctor-id-input").addEventListener("input", validateDoctorIdLive);
+applyDoctorIdFromQuery();
 
 // R15 第四条：**角色切换不刷新页面、不重新问诊，但已有结果要按新角色重新
 // 请求后端。**
@@ -1863,6 +1974,37 @@ function chainLine(key, value) {
   return `<div class="chain-line"><span class="chain-key">${escapeHtml(key)}</span>${value}</div>`;
 }
 
+// R56 §6 第 9 条：「轮数：3（max_rounds）」是给自己看的统计口径，医师要的是
+// "系统问了什么、病人怎么答的"这段对话本身——`f.history` 每一轮都带
+// `question`/`answer`（core/schemas.py::HistoryItem），原样摆成一问一答的
+// 气泡，比一行统计更快让医师确认"该问的都问了、答案也对"。
+// 轮数/停因挪到气泡下面一行小结，不再是唯一的呈现方式，而是补充。
+function followupChatHtml(f) {
+  const turns = (f.history || []).map((h) => `
+    <li class="followup-turn">
+      <div class="followup-bubble followup-q">${escapeHtml(h.question || "")}</div>
+      <div class="followup-bubble followup-a">${escapeHtml(h.answer || "")}</div>
+    </li>`).join("");
+  const parts = [];
+  if (turns) {
+    parts.push(`<div class="followup-chat" aria-label="补充问诊">`
+      + `<div class="followup-chat-title">补充问诊</div>`
+      + `<ul class="followup-turns">${turns}</ul>`
+      + `</div>`);
+  }
+  // 小结：轮数/停因 + 汇总出的确认/排除项，回答的是"结果"，气泡回答的是
+  // "过程"——两者都要，读者可以先扫小结、要细节再看气泡。
+  parts.push(chainLine("小结", `共 ${escapeHtml(String(f.rounds))} 轮，`
+    + `${escapeHtml(f.stopped_by_label || f.stopped_by || "")}`));
+  if ((f.asserted || []).length) {
+    parts.push(chainLine("问出的症状", escapeHtml((f.asserted || []).join("、"))));
+  }
+  if ((f.denied || []).length) {
+    parts.push(chainLine("已排除", escapeHtml((f.denied || []).join("、"))));
+  }
+  return parts.join("");
+}
+
 // 可点开释义的词。`data-node` 是节点 id、`data-name` 是显示名——
 // 证型节点的 id 是 `syn::{physician}`（那个 id 是证据链反查的键，改不得），
 // 名字只在 label 里，所以两个都带上（见 core/node_explain.explain_node 的文档）。
@@ -1994,6 +2136,44 @@ function agentTraceHtml(trace) {
     </section>`;
 }
 
+// R56 §6 第 13 条：⑨「校验与出处」原来是"违规 veto N / revise N" + "判不了
+// N（...）"两行统计，医师读不出"到底是哪几条规则的事"。改成逐条核对清单——
+// 每条规则一行，✓ 通过 / ✗ 不通过（附原因） / — 判不了（附缺什么）。
+//
+// 一条规则可能同时落在 violations 与 checked_rules 里（`check_meridian_
+// coverage` 那类：有违规时 checked 依然带它自己的名字，因为"判过"这件事跟
+// "判的结果是不是违规"是两回事，见 core/formula_verifier.py 的模块注释）——
+// 所以这里按 violations > checked_rules（通过） > unverifiable 的优先级取
+// 每条规则的显示状态：出了问题最要紧，其次是判过通过，最后才是判不了。
+function verificationChecklistHtml(v) {
+  const byRule = {};
+  for (const rule of (v.checked_rules || [])) {
+    byRule[rule] = { state: "pass", label: (v.checked_rule_labels || {})[rule] || rule };
+  }
+  for (const u of (v.unverifiable || [])) {
+    if (!byRule[u.rule]) {
+      byRule[u.rule] = { state: "unverifiable", label: u.rule_label || u.rule, detail: u };
+    }
+  }
+  for (const viol of (v.violations || [])) {
+    byRule[viol.rule] = { state: "fail", label: viol.rule_label || viol.rule, detail: viol };
+  }
+  const rules = Object.keys(byRule);
+  if (!rules.length) return "";
+  const marks = { pass: "✓", fail: "✗", unverifiable: "—" };
+  const items = rules.map((rule) => {
+    const e = byRule[rule];
+    const reason = e.state === "fail" ? (e.detail && e.detail.reason)
+      : e.state === "unverifiable" ? `判不了：${(e.detail && e.detail.reason) || ""}` : "";
+    return `<li class="verify-item verify-${e.state}">`
+      + `<span class="verify-label">${escapeHtml(e.label)}</span>`
+      + `<span class="verify-mark">${marks[e.state]}</span>`
+      + (reason ? `<div class="verify-reason">${escapeHtml(reason)}</div>` : "")
+      + `</li>`;
+  });
+  return `<ul class="verify-checklist" aria-label="逐条校验">${items.join("")}</ul>`;
+}
+
 function renderChainFlow(data) {
   const el = document.getElementById("chain-flow");
   if (!el) return;
@@ -2052,12 +2232,7 @@ function renderChainFlow(data) {
     } else if (sec.key === "followup") {
       const f = data.followup;
       body = f
-        ? chainLine("轮数", `${escapeHtml(String(f.rounds))}`
-            + `（${escapeHtml(f.stopped_by_label || f.stopped_by || "")}）`)
-          + ((f.asserted || []).length ? chainLine("问出的症状",
-              escapeHtml((f.asserted || []).join("、"))) : "")
-          + ((f.denied || []).length ? chainLine("已排除",
-              escapeHtml((f.denied || []).join("、"))) : "")
+        ? followupChatHtml(f)
         : chainLine("追问", "（这一次没有追问：没有提问渠道或 FAST_MODE）");
     } else if (sec.key === "organs") {
       body = st && (st.organs || []).length
@@ -2104,17 +2279,8 @@ function renderChainFlow(data) {
       const v = r.verification || null;
       const m = r.verifier_metrics || null;
       body = v
-        // 中文名由后端随结论一起下发（`core/formula_verifier.RULE_LABELS`），
-        // 前端只负责显示、并在拿不到时回落到 id——不在这里再建一张表。
         ? chainLine("符号验证", escapeHtml(v.status_label || v.status || ""))
-          + chainLine("违规", `veto ${escapeHtml(String(v.n_veto || 0))}`
-              + ` / revise ${escapeHtml(String(v.n_revise || 0))}`)
-          // **判不了的那几条要显示出来**：查不到依据 ≠ 查到了且通过（R34a）。
-          + chainLine("判不了", escapeHtml(String(v.n_unverifiable || 0))
-              + ((v.unverifiable || []).length
-                  ? `（${(v.unverifiable || []).map((u) =>
-                      escapeHtml(`${u.rule_label || u.rule}缺${u.missing_predicate}`))
-                      .join("；")}）` : ""))
+          + verificationChecklistHtml(v)
         : chainLine("符号验证", "（legacy 模式不跑符号验证器）");
       if (m && m.revise_rounds !== undefined) {
         body += chainLine("重开轮数", escapeHtml(String(m.revise_rounds)));
@@ -2152,10 +2318,16 @@ function renderChainFlow(data) {
 // 写死一份的话，后端加一节前端不显示，而"不显示"看起来跟"这一节没内容"一样。
 
 let NODE_EXPLAIN_SEQ = 0;
+// R56 §6：吸顶侧栏的「固定」——钉住之后点图上/正文里别的节点不再换内容，
+// 医师可以带着这份释义到处看图，不会被自己下一次点击顶掉。跟 graph.js 的
+// `.gt-tooltip.pinned` 是两个不同的东西（那个钉的是悬浮 tooltip，这个钉的
+// 是侧栏面板），故意不共用一个状态名，避免以后有人以为改一个另一个也变了。
+let NODE_EXPLAIN_PINNED = false;
 
 async function openNodeExplain(nodeId, name) {
   const el = document.getElementById("node-explain");
   if (!el) return;
+  if (NODE_EXPLAIN_PINNED && el.classList.contains("show")) return;
   const seq = ++NODE_EXPLAIN_SEQ;
   // R43：**点下去立刻有反馈。** 改之前面板要等响应回来才出现——点一个节点之后
   // 屏幕上什么都不变，人会以为"点了没反应"再点一下（于是又发一次请求）。
@@ -2181,30 +2353,44 @@ async function openNodeExplain(nodeId, name) {
 //: 等待态的骨架。**不是一个转圈图标**：这里能立刻说出"正在查哪个节点"，
 //: 那比一个匿名的加载动画有用得多（人据此确认自己点对了）。
 //: `aria-busy` 让读屏软件知道这一块还在变。
+//: 面板头部那两个按钮，钉/关闭两处共用同一个片段——按钮的判据只有一处。
+function neHeaderButtonsHtml() {
+  return `<button type="button" class="ne-pin" data-ne-pin="1" `
+    + `aria-pressed="${NODE_EXPLAIN_PINNED ? "true" : "false"}" `
+    + `title="固定：点图上/正文里别的节点不再换内容">${NODE_EXPLAIN_PINNED ? "📌 已固定" : "📌 固定"}</button>`
+    + `<span class="ne-close" data-ne-close="1">×</span>`;
+}
+
 function showNodeExplainPending(title) {
   const el = document.getElementById("node-explain");
   if (!el) return;
-  el.innerHTML = `<div><span class="ne-close" data-ne-close="1">×</span>
+  el.innerHTML = `<div>${neHeaderButtonsHtml()}
       <span class="ne-title">${escapeHtml(String(title || ""))}</span>
       <span class="ne-kind">查询中…</span></div>`;
   el.setAttribute("aria-busy", "true");
   el.classList.add("show");
+  document.body.classList.add("ne-open");
 }
 
 function renderNodeExplain(data) {
   const el = document.getElementById("node-explain");
   if (!el) return;
+  // R56 §6 第 7 条：证候编码（SP-01/B04.xxx）不进正文——`s.codes` 是后端
+  // 单独带出来的编码列表，只挂成这一节标题的 title= 属性（鼠标悬停才看
+  // 得到），正文 `lines` 里已经不含编码。
   const secs = (data.sections || []).map((s) => `<div class="ne-sec">
-      <div class="ne-head">${escapeHtml(s.heading)}</div>
+      <div class="ne-head"${(s.codes || []).length
+        ? ` title="编码：${escapeHtml(s.codes.join("、"))}"` : ""}>${escapeHtml(s.heading)}</div>
       ${(s.lines || []).map((ln) => `<div class="ne-line">${escapeHtml(ln)}</div>`).join("")}
       ${s.source ? `<div class="ne-src">出处：${escapeHtml(s.source)}</div>` : ""}
     </div>`).join("");
-  el.innerHTML = `<div><span class="ne-close" data-ne-close="1">×</span>
+  el.innerHTML = `<div>${neHeaderButtonsHtml()}
       <span class="ne-title">${escapeHtml(data.title || "")}</span>
       <span class="ne-kind">${escapeHtml(NODE_KIND_LABEL[data.kind] || data.kind || "")}</span>
     </div>${secs}`;
   el.setAttribute("aria-busy", "false");
   el.classList.add("show");
+  document.body.classList.add("ne-open");
 }
 
 //: 节点种类的中文名。**R42 补齐三类新节点**（病机/治则/治法）——漏一个的
@@ -2223,6 +2409,10 @@ function closeNodeExplain() {
     el.innerHTML = "";
     el.setAttribute("aria-busy", "false");
   }
+  // Esc/关闭键无条件解除固定：固定是"面板开着的时候别换"，面板都关了就没有
+  // "别换"这回事，留着这个状态会让下次打开面板时无缘无故就是钉住的。
+  NODE_EXPLAIN_PINNED = false;
+  document.body.classList.remove("ne-open");
 }
 
 // 事件委托挂在 document 上一次，不给每个 .explainable 各挂一个——
@@ -2231,6 +2421,13 @@ function closeNodeExplain() {
 document.addEventListener("click", (e) => {
   const closer = e.target.closest("[data-ne-close]");
   if (closer) { closeNodeExplain(); return; }
+  const pinner = e.target.closest("[data-ne-pin]");
+  if (pinner) {
+    NODE_EXPLAIN_PINNED = !NODE_EXPLAIN_PINNED;
+    pinner.setAttribute("aria-pressed", NODE_EXPLAIN_PINNED ? "true" : "false");
+    pinner.textContent = NODE_EXPLAIN_PINNED ? "📌 已固定" : "📌 固定";
+    return;
+  }
   const hit = e.target.closest(".explainable");
   if (hit) openNodeExplain(hit.dataset.node, hit.dataset.name);
 });
@@ -2686,17 +2883,18 @@ function showError(message) {
   box.classList.add("show");
 }
 
+// R56 §6：危重症状按角色分流。patient 角色命中即整页拦截（不会走到这个
+// 函数——`showSafetyBlock` 那条分支），doctor/student/researcher 命中之后
+// 拿完整推理，`flag` 非空就是这件事的唯一信号（见 core.safety.
+// role_sees_full_reasoning_on_red_flag 的文档字符串：api/main.py 现在按角色
+// 显式传 eval_mode，服务端全局 EVAL_MODE 不再能通过 HTTP 接口影响这个字段，
+// 所以这里不用再区分"服务端配置"还是"角色策略"——走到这条 HTTP 接口，
+// 非 patient 角色下 flag 非空恒等于角色策略在生效）。
 function describeSafetyFlag(flag) {
-  // safety_flag 非空 = 服务端开着 EVAL_MODE，这条主诉本该在辨证前被拦下、
-  // 不产出任何方药，但评测模式让它跑完了。README 说"不要在对外演示的机器上
-  // 打开"，可是之前页面上完全看不出来它开着——结果照常显示、方药照常开。
-  // 返回 null 表示不需要横幅。
   if (!flag) return null;
-  // R47 §8.2 第 15 条：这一行**不在 internal-only 块里**（它是安全警告，
-  // 任何模式下都必须显示），所以它的措辞也必须过产品面那关——原话里的
-  // 「评测模式（EVAL_MODE）」把一个内部开关名摆在了使用者面前。
-  // 换成说人话的同一件事：不中止的诊断配置。要拦的行为一个字没变。
-  return `⚠ 当前服务运行在一种「命中安全规则也不中止」的诊断配置下：这条主诉命中了安全否决（${flag}），正常配置下会在辨证开始前被拦截、不产出任何方药。下面的结果不可用于临床参考。`;
+  return `⚠ 危重信号提示（${flag}）：这条主诉命中了危重症状信号，`
+    + `以下推理结果按角色权限完整给出，不做删减。请结合临床实际判断，`
+    + `必要时提醒患者立即就医或转诊/急诊处理。`;
 }
 
 function renderSafetyFlag(flag) {
@@ -2705,6 +2903,9 @@ function renderSafetyFlag(flag) {
   const text = describeSafetyFlag(flag);
   box.textContent = text || "";
   box.classList.toggle("show", !!text);
+  // 方剂区水印：有危重信号时，处方表格本身要带着这个提示，不能只在页面顶部
+  // 出现一条横幅——医师滚动到处方区域时横幅可能已经不在视口里了。
+  document.body.classList.toggle("red-flag-active", !!text);
 }
 
 function clearError() {
@@ -2844,7 +3045,7 @@ function renderConsultResult(data) {
   // M8：医生模式的可编辑处方状态要在渲染卡片之前建好——cardHtml() 里的
   // doctorSectionHtml() 读的是 DOCTOR_STATE，不是 data.results 本身
   // （医生编辑的是自己的一份拷贝，不直接改问诊响应）。
-  initDoctorState(data.results);
+  initDoctorState(data.results, data.safety_flag);
   setConsultState("done");
   // R15：患者模式是**另一种形态**，不是三列的裁剪版（§3.5）。两块互斥——
   // 不是把三列渲染出来再用 CSS 藏起来：藏起来的东西仍然在 DOM 里，而 patient
@@ -3068,14 +3269,19 @@ function describeProgressEvent(name, data) {
     case "s3_start":
       return `　${data.physician_name} 正在拟定证型与方药…`;
     case "s3_done": {
-      // 没流式的时候**把原因说出来**（后端不支持 / 是模拟的 / best-of-N），
-      // 不然界面上只是"没有增量"，看不出是不是卡了。
-      if (!data.events) {
-        return `　${data.physician_name} 输出完成（无增量${data.streaming_note ? "：" + data.streaming_note : ""}）`;
+      // R56 §6 第 3 条：「N 帧流式 / 首字 Xs / 思考 N 字」是给排查问题看的
+      // 底层遥测（流式帧数、思考 token 字数这类实现细节），医师读不出信息、
+      // 只会觉得系统在讲他听不懂的话。产品面只报"完成"这件事本身；
+      // 研究模式保留完整数字（调优、排查卡顿就靠它）。
+      if (!isProductMode()) {
+        if (!data.events) {
+          return `　${data.physician_name} 输出完成（无增量${data.streaming_note ? "：" + data.streaming_note : ""}）`;
+        }
+        const first = data.first_delta_s == null ? "—" : `${data.first_delta_s}s`;
+        return `　${data.physician_name} 输出完成：${data.events} 帧流式，首字 ${first}，` +
+          `正文 ${data.chars_content} 字${data.chars_reasoning ? `，思考 ${data.chars_reasoning} 字` : ""}`;
       }
-      const first = data.first_delta_s == null ? "—" : `${data.first_delta_s}s`;
-      return `　${data.physician_name} 输出完成：${data.events} 帧流式，首字 ${first}，` +
-        `正文 ${data.chars_content} 字${data.chars_reasoning ? `，思考 ${data.chars_reasoning} 字` : ""}`;
+      return `　${data.physician_name} 输出完成`;
     }
     case "physician_done":
       return `✓ ${data.physician_name} 完成：${data.syndrome}`;
@@ -3234,7 +3440,9 @@ async function submitConsult() {
 
   const t0 = Date.now();
   const ticker = setInterval(() => {
-    status.textContent = `已用时 ${Math.round((Date.now() - t0) / 1000)}s`;
+    // R56 §6 第 4 条：跟 #eta-note 同一个格式函数（formatElapsed），
+    // 超过一分钟显示"X 分 Y 秒"，不是一直显示三位数的秒数。
+    status.textContent = `已用时 ${formatElapsed(Date.now() - t0)}`;
   }, 1000);
 
   let idleTimer = null;
@@ -3452,6 +3660,12 @@ document.getElementById("evidence-close").addEventListener("click", closeEvidenc
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeEvidence();
 });
+// R56 §6：吸顶侧栏要能用 Esc 关——键盘用户不该被逼着去找那个 × 按钮。
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const el = document.getElementById("node-explain");
+  if (el && el.classList.contains("show")) closeNodeExplain();
+});
 
 
 // ---------- 把宿主 UI 注册给 graph.js ----------
@@ -3464,6 +3678,7 @@ setGraphHooks({
   onError: showError,
   onOpenEvidence: openEvidence,
   onCloseEvidence: closeEvidence,
+  checkProductMode: isProductMode,
 });
 
 
@@ -3665,19 +3880,49 @@ function durationP50() {
   return xs.length % 2 ? xs[mid] : Math.round((xs[mid - 1] + xs[mid]) / 2);
 }
 
+// R56 §6 第 4 条：无历时样本时**不出现"样本"这个词**——「这台服务还没有
+// 足够的历时样本（0/3）」读起来像在说"这台服务没人用过"，不是给患者/医师
+// 看的产品文案。改成按 S3 推理档位给一个预计区间。
+//
+// **这两个数是占位的经验估计，不是真机实测**：R55 把 S3_REASONING_EFFORT_
+// TOP3 降到 low、FULL_CONTEXT 降到 medium 之后，2026-09-17 那次真机三档
+// 墙钟（264.6/276.3/208.9 秒）落在测量噪声内、顺序还乱——档位越高越久这个
+// 排序本身都还没坐实，这里只给"大致要多久"的粗略量级，不假装是精确预测。
+// 真实的按档位耗时表要等 R57/R58 在用户 AutoDL 上重新跑出来才能替换
+// （scripts/compare_reasoning_tiers.py），到那时这两个数字要用实测值覆盖。
+const ETA_PRESET_SECONDS_TOP3 = 45;
+const ETA_PRESET_SECONDS_FULL_CONTEXT = 75;
+
+function presetEtaSeconds() {
+  const sel = document.getElementById("retriever-mode");
+  const mode = (sel && sel.value) || "";
+  // 空值或显式 "full_context" 都是 full_context 档（core.retrieval_hybrid.
+  // DEFAULT_MODE），其余（dense/bm25/graph/hybrid）是 top3 系——跟
+  // core.llm.s3_reasoning_effort() 判定档位的口径同一条，不在前端另写一份。
+  return (mode === "" || mode === "full_context")
+    ? ETA_PRESET_SECONDS_FULL_CONTEXT : ETA_PRESET_SECONDS_TOP3;
+}
+
+function formatElapsed(ms) {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+}
+
 function etaText(elapsedMs) {
+  const elapsed = formatElapsed(elapsedMs);
   const p50 = durationP50();
   if (p50 === null) {
-    const n = readDurations().length;
-    return `已用 ${Math.round(elapsedMs / 1000)} 秒。这台服务还没有足够的历时样本`
-      + `（${n}/${DURATION_MIN_SAMPLES}），走完这一次之后就能给出预计时间。`;
+    const left = Math.round(presetEtaSeconds() - elapsedMs / 1000);
+    return left > 0
+      ? `已用 ${elapsed}，预计还需约 ${left} 秒（按当前档位的经验估计）。`
+      : `已用 ${elapsed}，复杂主诉会更久，可随时取消。`;
   }
   const left = Math.round((p50 - elapsedMs) / 1000);
   if (left > 0) {
-    return `已用 ${Math.round(elapsedMs / 1000)} 秒，预计还需约 ${left} 秒`
+    return `已用 ${elapsed}，预计还需约 ${left} 秒`
       + `（按本机近 ${readDurations().length} 次的中位数）。`;
   }
-  return `已用 ${Math.round(elapsedMs / 1000)} 秒，已超过本机中位数`
+  return `已用 ${elapsed}，已超过本机中位数`
     + `（${Math.round(p50 / 1000)} 秒）；复杂主诉会更久，可随时取消。`;
 }
 
@@ -4036,6 +4281,9 @@ async function buildEmrFromLastResult(data) {
       guideline: data.guideline || null,
       doctor_id: (document.getElementById("doctor-id-input") || {}).value || "",
       edits: collectEmrEdits(),
+      // R56 §6：危重信号按角色分流的产品面第 3 条——EMR「危重提示」段，
+      // 原样透传这次响应的 safety_flag，不在前端重新判断。
+      safety_flag: data.safety_flag || null,
     }),
   });
   if (!resp.ok) return null;

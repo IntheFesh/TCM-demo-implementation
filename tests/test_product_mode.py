@@ -269,6 +269,8 @@ def test_the_root_element_defaults_to_product_mode():
     'id="divergence-detail" class="internal-only"',  # 第 7 条：分层读数
     'id="manifest-footer" class="internal-only"',    # 第 8 条：运行清单
     'id="token-panel" class="internal-only"',        # 第 8 条：上下文面板
+    'id="cy-lambda1-note" class="internal-only"',    # R56 §6 第 2 条：λ1 技术注记（问诊图）
+    'id="gb-lambda1-note" class="internal-only"',    # R56 §6 第 2 条：λ1 技术注记（图谱浏览器）
 ])
 def test_each_internal_block_carries_the_marker(anchor):
     assert anchor in HTML, f"这一块没标 internal-only：{anchor}"

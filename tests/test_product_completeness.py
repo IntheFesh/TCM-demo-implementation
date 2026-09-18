@@ -75,10 +75,15 @@ def test_the_eta_comes_from_measured_durations_not_a_hardcoded_number():
 
 
 def test_the_eta_says_it_has_no_samples_instead_of_guessing():
-    """样本不足时如实说没有。**不给一个编的秒数**——「任何数字都必须带对照」
-    那条铁律的反面用法。"""
+    """R56 §6 第 4 条：样本不足时**不说"样本"这个词**——「这台服务还没有
+    足够的历时样本（0/3）」读起来像在说"这台服务没人用过"，不是给患者/医师
+    看的产品文案。改成按 S3 推理档位给一个经验估计区间，并且**在文案里
+    明说这是经验估计**（不是本机实测中位数）——不给一个不带说明的编造秒数，
+    这才是「任何数字都必须带对照」那条铁律的反面用法：不能不给对照，
+    但更不能连"这是估计还是实测"都不说清楚。"""
     assert "DURATION_MIN_SAMPLES" in APP_JS
-    assert "还没有足够的历时样本" in APP_JS
+    assert "样本" not in APP_JS.split("function etaText(")[1][:APP_JS.split("function etaText(")[1].index("\n}\n")]
+    assert "按当前档位的经验估计" in APP_JS
 
 
 def test_only_completed_consults_feed_the_median():

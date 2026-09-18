@@ -236,6 +236,53 @@ def test_doctor_role_asks_zero_followup_rounds_in_the_real_event_stream(monkeypa
     assert done_data["followup"]["rounds"] == 0
 
 
+def test_red_flag_role_split_reaches_the_real_event_stream(monkeypatch):
+    """R56 §6：`/api/consult/stream` 的 worker 里那行新加的
+    `eval_mode=role_sees_full_reasoning_on_red_flag(_req_role)` 照抄自
+    `/api/consult`，"接线接对了没有"要单独证一次——同
+    `test_stream_role_reaches_done_event_same_as_post_consult` 上面那条
+    注释的理由，mock 掉 consult 测不出接线漏了没有。这里不 mock，让真实的
+    `core.chain.consult()` 跑一遍含危重词的主诉：patient 角色走 `rejected`
+    事件序列（S2/S3 从未被调用），doctor 角色走完整推理并在 `done` 事件里
+    带着 `safety_flag`。
+    """
+    from core.schemas import S1Normalize, S3Syndrome
+    from tests.test_chain import FakeLLM
+
+    danger_s1 = S1Normalize(
+        symptoms=["解黑色柏油样便"], tongue="淡", pulse="细数", unmapped=[]
+    )
+    s3_ye = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["ye_tianshi-001"])
+    s3_wu = S3Syndrome(syndrome="脾胃气虚", reasoning="...", treatment_principle="健脾益气",
+                       cited_case_ids=["wu_jutong-001"])
+    fake_llm = FakeLLM({"叶天士": s3_ye, "吴鞠通": s3_wu}, s1=danger_s1)
+    monkeypatch.setattr(chain, "get_llm", lambda: fake_llm)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    monkeypatch.delenv("EVAL_MODE", raising=False)
+
+    client = TestClient(api_main.app)
+
+    def _drain(q: queue.Queue) -> list:
+        out = []
+        while not q.empty():
+            out.append(q.get())
+        return out
+
+    out_q: queue.Queue = queue.Queue()
+    _read_stream_into_with_role(client, "解黑色柏油样便", "patient", out_q)
+    patient_done = next(d for name, d in _drain(out_q) if name == "done")
+    assert patient_done["rejected"] is True
+    assert patient_done["safety_flag"] is not None
+
+    out_q = queue.Queue()
+    _read_stream_into_with_role(client, "解黑色柏油样便", "doctor", out_q)
+    doctor_done = next(d for name, d in _drain(out_q) if name == "done")
+    assert doctor_done["rejected"] is False
+    assert doctor_done["safety_flag"] is not None and "柏油样便" in doctor_done["safety_flag"]
+    assert doctor_done["results"], "医师角色应该拿到完整推理"
+
+
 # ---------- need_input 暂停 / 恢复 ----------
 
 

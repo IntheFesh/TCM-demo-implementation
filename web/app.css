@@ -1468,6 +1468,7 @@
 .ref-note { font-size: 13px; line-height: 1.6; color: var(--ink-2); }
 .ref-empty { font-size: 13px; color: var(--muted); }
 .ref-error { color: var(--danger); }
+.field-error { color: var(--danger); font-size: 12px; }
 
 /* ============================================================================
    R24：自绘下拉。原生 `<select>` 的弹出层由操作系统画、不吃页面字体，
@@ -1689,6 +1690,56 @@
 /* 段与段之间那条竖线是"链"的视觉表达：上一段的结论是下一段的输入
    （schema 层的 from_organs / from_syndrome / from_method 就是这条线）。 */
 .chain-sec + .chain-sec { border-top: 1px dashed var(--rule); }
+
+/* R56 §6 第 9 条：③ 追问段从"轮数：N（停因）"一行统计改成一问一答的气泡——
+   医师扫的是"问了什么、答了什么"这段过程，不是一个计数。 */
+.followup-chat-title {
+  font-family: var(--font-ui); font-size: 12px; color: var(--muted);
+  margin-bottom: 4px;
+}
+.followup-turns { list-style: none; margin: 0 0 6px 0; padding: 0; }
+.followup-turn { margin: 0 0 8px 0; }
+.followup-bubble {
+  display: block; max-width: 88%;
+  padding: 6px 10px; margin: 2px 0;
+  border-radius: var(--r-sm); font-size: 14px; line-height: 1.5;
+}
+.followup-q {
+  background: var(--surface-2); color: var(--ink);
+  border-left: 2px solid var(--muted);
+}
+.followup-a {
+  background: var(--node-reason-bg, var(--surface-2)); color: var(--ink);
+  margin-left: auto; border-left: 2px solid var(--verified);
+}
+
+/* R56 §6 第 13 条：⑨「校验与出处」的逐条核对清单。 */
+.verify-checklist { list-style: none; margin: 4px 0; padding: 0; }
+.verify-item {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 2px 0; font-size: 14px; flex-wrap: wrap;
+}
+.verify-item .verify-mark { font-family: var(--font-num); }
+.verify-item.verify-pass .verify-mark { color: var(--verified); }
+.verify-item.verify-fail .verify-mark { color: var(--danger); }
+.verify-item.verify-unverifiable .verify-mark { color: var(--muted); }
+.verify-item .verify-reason {
+  flex-basis: 100%; font-size: 13px; color: var(--muted); margin-left: 2px;
+}
+
+/* R56 §6：危重信号命中、非患者角色拿到完整推理时，方剂/药材区要带水印——
+   顶部横幅滚出视口之后，这是提醒医师"这份处方对应一条危重主诉"的第二道
+   视觉线索。纯装饰层（`::before` + `pointer-events: none`），不影响交互，
+   不影响可编辑表格里的内容或 XSS 面（跟真实数据完全无关，是固定文案）。 */
+body.red-flag-active #columns { position: relative; }
+body.red-flag-active #columns::before {
+  content: "⚠ 危重信号 · 请结合临床判断";
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 28px; font-weight: 700; color: var(--danger);
+  opacity: 0.08; transform: rotate(-20deg);
+  pointer-events: none; z-index: 1; white-space: nowrap;
+}
 /* 可点开释义的词：下划虚线，不是按钮——它是词，不是操作 */
 .explainable {
   border-bottom: 1px dashed var(--muted);
@@ -1785,11 +1836,63 @@
 #node-explain .ne-title { font-weight: 600; font-size: 15px; color: var(--ink); }
 #node-explain .ne-kind { color: var(--muted); font-size: 12px; margin-left: 6px; }
 #node-explain .ne-close { float: right; cursor: pointer; color: var(--muted); }
+#node-explain .ne-pin {
+  float: right; cursor: pointer; color: var(--muted); margin-right: 10px;
+  border: none; background: none; font-size: 14px; padding: 0;
+}
+#node-explain .ne-pin[aria-pressed="true"] { color: var(--verified); }
 #node-explain .ne-sec { margin-top: 8px; }
 #node-explain .ne-head { font-size: 13px; font-weight: 600; color: var(--ink-2); }
 #node-explain .ne-line { font-size: 13px; line-height: 1.7; color: var(--ink); }
 /* 出处那一行要小一号、淡一点：它是凭据，不是正文 */
 #node-explain .ne-src { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+/* ---------- R56 §6：桌面端（>768px）改吸顶右侧栏 ----------
+
+   R37 原来是"结果流里的一块"（in-flow，`margin: 8px auto`）——点一个节点，
+   页面滚到那块位置，图和正在读的九段正文一起被顶下去。三甲医师真实用法是
+   "边看图/边看结论、边点开释义核对"，这三件事应该同时留在视野里，所以改成
+   固定在右侧、不随内容滚动的侧栏。
+
+   宽度 380–420px（`clamp` 夹在这个区间，随视口宽度在里面浮动，不是写死一个
+   数）；打开时给 `main` 让出同样宽的右边距（+ 24px 呼吸间隙），不然侧栏会
+   盖住 1366×768 这种常见笔记本分辨率下的方剂/图谱区——`main` 的 `max-width:
+   1180px` 在 1366px 视口下只留 93px 边距，不够盖住 420px 的侧栏。
+   两处宽度共用同一个自定义属性，改一处不会漏改另一处。 */
+:root { --ne-w: clamp(380px, 32vw, 420px); }
+@media (min-width: 769px) {
+  #node-explain {
+    display: block;
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: var(--ne-w);
+    margin: 0;
+    max-width: none;
+    padding: 16px;
+    background: var(--surface);
+    border: none;
+    border-left: 1px solid var(--rule);
+    border-radius: 0;
+    box-shadow: var(--shadow-float);
+    overflow-y: auto;
+    z-index: 25;
+    /* 隐藏态挪到视口外而不是 display:none——后者没法动画。
+       visibility 保证隐藏时既不可见也不可 tab 到、不吃点击。 */
+    transform: translateX(100%);
+    visibility: hidden;
+    /* 跟 #evidence-panel 同一种"侧栏滑入滑出"，用同一个令牌
+       （--t-collapse：展开/折叠），不为这个侧栏另写一个时长。 */
+    transition: transform var(--t-collapse) ease, visibility var(--t-collapse);
+  }
+  #node-explain.show { transform: translateX(0); visibility: visible; }
+  /* 侧栏打开时把主内容让出同样宽度，不然 1366×768 这种视口下侧栏会盖住
+     图谱/方剂区的右侧——main 的 max-width 只在视口足够宽时才留得出这块。
+     `prefers-reduced-motion` 不在这里另判——第 168 行那条全局规则已经用
+     `*, *::before, *::after { transition-duration: .001ms !important }`
+     盖住了页面上所有 transition（包含这两条新加的），再判一次是同一件事的
+     第二处实现。 */
+  body.ne-open main { margin-right: calc(var(--ne-w) + 24px); transition: margin-right var(--t-collapse) ease; }
+}
 
 /* ---------- R42：窄屏（≤768px）把释义面板改成底部抽屉 ----------
 

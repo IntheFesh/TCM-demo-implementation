@@ -304,11 +304,16 @@ def test_the_benchmark_takes_a_median_not_a_single_run():
 
 def test_the_focus_hooks_live_on_gb_perf_not_on_the_tcm_contract():
     """`window.TCM` 的契约是"恰好等于 app.js 真正调用到的那些"。
-    量具混进去就是给那条"清单齐全"的测试留一个假绿点。"""
+    量具混进去就是给那条"清单齐全"的测试留一个假绿点。
+
+    **判据要按整词匹配，不能是裸子串**：R56 §6 加了 `gbFocusOnNodeId`
+    （合法导出——app.js 切图谱页时要调它），它的名字以 `gbFocus` 开头，
+    裸子串 `"gbFocus" in tcm` 会把这个合法导出误判成"gbFocus 混进来了"。
+    """
     i = GRAPH_JS.index("window.TCM = Object.assign")
     tcm = GRAPH_JS[i:GRAPH_JS.index("});", i)]
     for name in ("gbFocus", "gbExitFocus", "benchLayouts", "gbNeighborhood"):
-        assert name not in tcm, f"{name} 混进了 window.TCM"
+        assert not re.search(rf"\b{name}\b", tcm), f"{name} 混进了 window.TCM"
     j = GRAPH_JS.index("window.__gbPerf = {")
     perf = GRAPH_JS[j:GRAPH_JS.index("\n};", j)]
     for name in ("focus", "exitFocus", "breadcrumb", "neighborhood", "benchLayouts"):

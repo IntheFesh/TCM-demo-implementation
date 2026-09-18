@@ -295,6 +295,62 @@ def test_api_passes_safety_flag_through_on_normal_path(monkeypatch):
     assert body["safety_flag"] is not None and "柏油样便" in body["safety_flag"]
 
 
+# ---------- R56 §6：按角色分流——不靠 EVAL_MODE 环境变量 ----------
+#
+# 上面 `test_api_passes_safety_flag_through_on_normal_path` 靠的是全局
+# EVAL_MODE=1；这里验的是新加的那条路：api/main.py 现在给每次 HTTP 请求
+# 显式算一个 eval_mode（`core.safety.role_sees_full_reasoning_on_red_flag`），
+# 不设 EVAL_MODE 也能按角色拿到完整推理——同样"每一组打开旁路的用例配一条
+# 默认关时照样拦的对照"这条红线，对照就是 patient 角色本身。
+
+
+def test_patient_role_is_blocked_without_needing_eval_mode(monkeypatch):
+    _setup(monkeypatch, s1=DANGER_S1)
+    body = TestClient(api_main.app).post(
+        "/api/consult", json={"complaint": DANGER_COMPLAINT, "role": "patient"}
+    ).json()
+    assert body["rejected"] is True
+    assert body["safety_flag"] is not None and "柏油样便" in body["safety_flag"]
+    assert body["results"] == []
+
+
+@pytest.mark.parametrize("role", ["doctor", "student", "researcher"])
+def test_non_patient_roles_get_full_reasoning_and_the_flag_without_eval_mode(monkeypatch, role):
+    _setup(monkeypatch, s1=DANGER_S1)
+    body = TestClient(api_main.app).post(
+        "/api/consult", json={"complaint": DANGER_COMPLAINT, "role": role}
+    ).json()
+    assert body["rejected"] is False
+    assert body["safety_flag"] is not None and "柏油样便" in body["safety_flag"]
+    assert body["results"], "非患者角色应该拿到完整推理，不是空列表"
+
+
+def test_a_stray_eval_mode_env_var_cannot_unblock_a_patient_request(monkeypatch):
+    """加固：服务端就算不小心开着 EVAL_MODE，患者角色走 HTTP 接口依然被拦——
+    显式参数优先于环境变量（`safety_bypassed` 的既有规则），`EVAL_MODE` 误开
+    不该连累真实患者请求。`scripts/preflight_deploy.py` 把 EVAL_MODE=1 列为
+    "这一项红的话不要上线"的部署事故，这条测试钉住就算它真的漏开了，
+    HTTP 接口这一层患者角色也不受影响。"""
+    _setup(monkeypatch, s1=DANGER_S1)
+    monkeypatch.setenv("EVAL_MODE", "1")
+    body = TestClient(api_main.app).post(
+        "/api/consult", json={"complaint": DANGER_COMPLAINT, "role": "patient"}
+    ).json()
+    assert body["rejected"] is True
+
+
+def test_clean_complaint_role_bypass_does_not_invent_a_flag(monkeypatch):
+    """角色分流不是把 safety_flag 无条件塞进去——没命中的时候，医师角色的
+    请求跟其他角色一样，safety_flag 仍然是 None（同
+    `test_clean_complaint_has_none_flag_in_both_modes` 那条对 EVAL_MODE
+    路径的钉法，这里换成角色路径）。"""
+    _setup(monkeypatch)  # 默认 s1（"纳差"/"乏力"），没有危重词
+    body = TestClient(api_main.app).post(
+        "/api/consult", json={"complaint": "纳差乏力", "role": "doctor"}
+    ).json()
+    assert body["safety_flag"] is None
+
+
 # ---------- eval/sdt/：同一个判定函数，参数式接口保留 ----------
 
 

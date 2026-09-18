@@ -26,6 +26,15 @@ R37 的「名医怎么用」在 R42 更名为「名老中医经验」——**同
 产品面上这是一个有分量的词（对标黄煌经方 AI 的「名医经验」条目），而"名医怎么用"
 读起来像一句口语。改名只改标题，数据来源和统计口径一个字没动。
 
+## 证型节点多一节：相似证型与鉴别点（R56 §6）
+
+「本例知识地图」要能回答"跟这个证容易混的是哪几个、怎么区分"，这不属于上面
+八节里任何一节——不是"这个证是什么"（那是身份），也不是"它在病机链哪一步"
+（那是单个证自己的定位），是**跟别的证的关系**。所以只给证型节点单独加了
+第九节，加在「病机」之后、「药理」之前：先说清楚这个证自己是什么、在哪一步，
+再说它跟谁容易混，然后才进到治法方药那半段。别的节点种类不加这一节——
+药材/方剂之间没有这种"鉴别诊断"关系。
+
 ## 四条纪律
 
 **一、零 LLM。** 释义全部来自本地数据。让模型现编一段解释是这个项目从头到尾
@@ -86,9 +95,11 @@ _PREFIX_KIND: dict[str, NodeKind] = {
     "elem": "element",
 }
 
-#: 八节的顺序与标题。**顺序是链条，不是排版偏好**（见模块文档）。
+#: 节的顺序与标题。**顺序是链条，不是排版偏好**（见模块文档）。「相似证型与
+#: 鉴别点」只有证型节点会产出（R56 §6），但顺序表只有一张，不按节点种类分叉。
 SECTION_ORDER = (
-    "是什么", "病机", "药理", "出处原文", "名老中医经验", "验证结果", "循证对照", "注意",
+    "是什么", "病机", "相似证型与鉴别点", "药理", "出处原文",
+    "名老中医经验", "验证结果", "循证对照", "注意",
 )
 
 #: 本草层的六个谓词。**缺哪个要列出来**，不是只显示有的那几个——
@@ -101,12 +112,13 @@ FORMULARY_PREDICATES = ("组成", "功用", "主治", "君药", "臣药", "佐�
 
 #: 「循证对照」这一节永远要带的那句话。**不是免责话术，是一条口径声明**：
 #: 少了它，这一节列出的"五部书 9776 条"会被读成"有循证依据"。
-GUIDELINE_GAP_NOTE = (
-    "对照基准是上面列出的仓库内典籍与参考表。"
-    "**《中医药循证临床实践指南》全文不在本项目内**（没有可用的授权文本），"
-    "所以这里给不出循证等级（Ⅰ/Ⅱ/Ⅲ 级推荐）——"
-    "「教材里有这一条」不等于「有循证支持」，两者不许混着说。"
-)
+#: R56 §6 第 6 条：产品面只留一句干净的口径声明，不逐段展开"全文不在项目内/
+#: 没有可用授权文本/两者不许混着说"这些内部措辞——那段完整解释原来带着两处
+#: 没有渲染的 markdown 星号（`**...**` 印成字面星号），读者看到的是"星号乱码
+#: + 一堆内部术语"，比没有这句话观感更差。核心信息（教材收录 ≠ 循证等级）
+#: 一句话说完，保留在这一句里；R46 原文那段更长的解释挪进模块文档（上面
+#: 第四条纪律），给看代码的人看，不再印进响应体。
+GUIDELINE_GAP_NOTE = "对照基准是仓库内已收录的典籍与参考表，不是循证等级评定。"
 
 
 def parse_node_id(node_id: str) -> tuple[NodeKind, str]:
@@ -144,14 +156,62 @@ def syndrome_row(name: str) -> dict | None:
     return loose[0] if loose else None
 
 
-def _section(heading: str, lines: list[str], source: str | None = None) -> dict | None:
-    """一节。**空行全部滤掉；滤完没内容就返回 None**（那一节不出现）。"""
-    kept = [ln for ln in (lines or []) if ln and ln.strip()]
+#: R56 §6 第 5 条：「出处：core/elements.py 词表」这类文件路径不许出现在
+#: 产品面。**这张表是唯一的映射实现**——`_section()`/`_evidence_section()`
+#: 全部经它转一道，不在 45 处调用点各自决定怎么措辞（CLAUDE.md 第 31 条）。
+#: 只收精确匹配；表外的兜底交给 `_display_source()` 的正则那一步。
+_SOURCE_LABELS: dict[str, str] = {
+    "core/formula_verifier.py 的七条规则": "符号验证规则表",
+    "core/formula_verifier.py::check_effect_matches_method": "符号验证规则表·治法与功效匹配",
+    "core/safety_output.py 同一张表": "剂量与配伍安全表",
+    "data/standard/syndromes.jsonl": "标准证候表",
+    "data/standard/syndromes.jsonl 的 source 列": "标准证候表·来源标签",
+    "core/elements.py 词表": "证素词表",
+    "证候表 + core/elements.py 词表": "标准证候表 + 证素词表",
+    "core/elements.py + 证候表": "证素词表 + 标准证候表",
+    "data/standard/effect_synonyms.tsv": "治法功效同义词表",
+}
+
+#: 兜底正则：万一新加一处 `source=` 忘了进上面那张表，也不能让明显的
+#: 路径样式字符串（`core/`、`data/`、`.py`、`.jsonl`、`.tsv`）原样递给用户
+#: ——`tests/test_no_demo_artifacts.py` 的禁词表会拿真实节点释义核对这一点。
+import re as _re  # noqa: E402 - 只在这个小函数里用，不提到模块顶层
+
+_PATH_LEAK_RE = _re.compile(r"(?:^|[\s（(])(?:core|data)/|\.py\b|\.jsonl\b|\.tsv\b")
+
+
+def _display_source(raw: str | None) -> str | None:
+    """把内部实现措辞的 `source` 翻成医师读得懂的出处标签（R56 §6 第 5 条）。"""
+    if not raw:
+        return raw
+    mapped = _SOURCE_LABELS.get(raw)
+    if mapped is not None:
+        return mapped
+    return "内部数据表" if _PATH_LEAK_RE.search(raw) else raw
+
+
+def _section(heading: str, lines: list[str], source: str | None = None,
+            codes: list[str] | None = None) -> dict | None:
+    """一节。**空行全部滤掉；滤完没内容就返回 None**（那一节不出现）。
+
+    `codes`（R56 §6 第 7 条）：证候编码（SP-01/B04.xxx 这类）不进正文
+    `lines`，单独一个字段带给前端做 tooltip——正文只显示证候名，编码是
+    给想深挖的人看的，不该占正文的视觉权重（用户原话："只显示证候名，
+    编码进 tooltip"）。空列表/None 时不带这个键，跟 `source` 同一条纪律。
+    """
+    # R56 §6 禁词表：`**` 是 markdown 加粗语法，前端只显示纯文本、不渲染
+    # markdown，字面星号印出来比没有强调更难读（GUIDELINE_GAP_NOTE 那条
+    # 截图实证）。这里统一剥掉，**唯一一处实现**——不在每条拼字符串的地方
+    # 各自记得别用 `**`。
+    kept = [ln.replace("**", "") for ln in (lines or []) if ln and ln.strip()]
     if not kept:
         return None
     out = {"heading": heading, "lines": kept}
+    source = _display_source(source)
     if source:
         out["source"] = source
+    if codes:
+        out["codes"] = codes
     return out
 
 
@@ -200,7 +260,7 @@ def _evidence_section(lines: list[str], source: str) -> dict | None:
 
 _VERIFICATION_POINTER = (
     "本次处方的实际验证结论不在这里重复一份（那会是同一个判据的第二处实现），"
-    "见问诊结果的「验证」段——同一份 core/formula_verifier.py。"
+    "见问诊结果的「验证」段——同一套符号验证规则。"
 )
 
 
@@ -372,6 +432,58 @@ def _herb_sections(name: str, *, ontology=None, patterns_limit: int = 3) -> list
     return [s for s in out if s]
 
 
+def _differentiation_section(row: dict, rows: list[dict], *, limit: int = 4) -> dict | None:
+    """相似证型与鉴别点——「本例知识地图」（R56 §6）问的第一个问题："跟这个证
+    容易混的是哪几个、怎么区分"。
+
+    临床鉴别诊断真正比的维度是**同一个病名下**的其他证型（"胃痛"底下到底是
+    肝胃不和还是脾胃虚寒），不是随便两个病位病性沾边的证——同病名条目不够
+    `limit` 个时才退到共享病位/病性兜底，这样退化路径不会让"同病异证"这个
+    临床上最要紧的对比被稀释掉。
+
+    鉴别点是两条主症集合的对称差，不调用 LLM、不新写一套匹配——跟上面
+    「病机」用的是同一份证候表、同一组字段，只是换了个角度问。
+    """
+    name = row.get("name") or ""
+    if not name:
+        return None
+    disease = row.get("disease")
+    loc = set(row.get("location") or [])
+    nat = set(row.get("nature") or [])
+    cand = [r for r in rows if r.get("name") and r.get("name") != name and not r.get("is_category")]
+    same_disease = [r for r in cand if disease and r.get("disease") == disease]
+    if len(same_disease) >= limit:
+        picked = same_disease[:limit]
+    else:
+        seen = {r.get("code") for r in same_disease}
+        overlapping = [r for r in cand if r.get("code") not in seen
+                       and ((set(r.get("location") or []) & loc)
+                            or (set(r.get("nature") or []) & nat))]
+        picked = (same_disease + overlapping)[:limit]
+    if not picked:
+        return None
+    mine = set(row.get("cardinal_symptoms") or [])
+    lines = []
+    for r in picked:
+        theirs = set(r.get("cardinal_symptoms") or [])
+        only_mine = sorted(mine - theirs)
+        only_theirs = sorted(theirs - mine)
+        same_dis = "同病" if r.get("disease") and r.get("disease") == disease else "不同病"
+        detail = f"{r.get('name')}（{same_dis}）"
+        if only_mine or only_theirs:
+            detail += "——鉴别点："
+            if only_mine:
+                detail += f"本证独有「{'、'.join(only_mine)}」"
+            if only_mine and only_theirs:
+                detail += "，"
+            if only_theirs:
+                detail += f"对方独有「{'、'.join(only_theirs)}」"
+        else:
+            detail += "——主症记载相同，证候表这一层区分不出，需结合病机与舌脉"
+        lines.append(detail)
+    return _section("相似证型与鉴别点", lines, source="证候表（同病名优先，否则按病位/病性）")
+
+
 def _syndrome_sections(name: str, *, ontology=None) -> list[dict]:
     from core.ontology import get_ontology
 
@@ -401,6 +513,11 @@ def _syndrome_sections(name: str, *, ontology=None) -> list[dict]:
                         "**不是一段现成的病机陈述**——证候表没有独立的病机字段，"
                         "从上面的定义里切一句话当病机是伪造。")
         out.append(_section("病机", mech, source="证候表的 location / nature 两列"))
+        # R56 §6：相似证型与鉴别点——「本例知识地图」的核心一节。同一个病名下
+        # 的其他证型是临床鉴别诊断真正比的维度（"胃痛"底下到底是哪个证），
+        # 同病名条目不够时退到共享病位/病性；鉴别点是主症集合的对称差，
+        # 不是另起一套判断——跟前面「病机」用的是同一份证候表、同一组字段。
+        out.append(_differentiation_section(row, rows))
         # 药理：这个证在方剂本体里对得上哪些方
         formulas = [f.name for f in ont.formulas_for_syndrome(name)][:8]
         out.append(_section("药理", [
@@ -413,11 +530,13 @@ def _syndrome_sections(name: str, *, ontology=None) -> list[dict]:
         # 教材的原文。所以这一节报的是"这一条来自哪、编码是什么"，措辞照实。
         src = row.get("source") or "未标注"
         icd = row.get("icd11_code")
+        # R56 §6 第 7 条：编码（SP-01、ICD-11 的 B04.xxx）不进正文，走
+        # `codes=` 单独带给前端做 tooltip——正文只留来源标签这句话。
+        code_list = [c for c in (row.get("code"), icd) if c]
         out.append(_section("出处原文", [
-            f"证候编码 {row.get('code') or '-'}｜来源标签：{src}"
-            + (f"｜ICD-11：{icd}" if icd else ""),
+            f"来源标签：{src}",
             "（这一条是人工整理的证候参考表，不是逐字引文；教材原文见 books/ 下的源书）",
-        ], source="data/standard/syndromes.jsonl"))
+        ], source="data/standard/syndromes.jsonl", codes=code_list))
     else:
         out.append(_section("是什么", [
             f"「{name}」不在 data/standard/syndromes.jsonl 里。证候表现在收 "
@@ -537,7 +656,7 @@ def _formula_sections(name: str, *, ontology=None) -> list[dict]:
                else "不可验证——本体里这个方没有君臣佐使的标注"),
             f"{rule_label('effect_matches_method')}："
             + (f"可验证（功用 {len(f.functions)} 条，"
-               "治法↔功效的等价判定走 core/effect_synonyms.py 同一张表）" if f.functions
+               "治法↔功效的等价判定走同一张功效同义词表）" if f.functions
                else "不可验证——本体里这个方没有「功用」谓词"),
             f"{rule_label('herb_grounded')}、{rule_label('dose_exceeds')}、"
             f"{rule_label('incompatible_pair')}：按方里每一味药逐个判，点那味药看它那一节",
@@ -580,7 +699,9 @@ def _element_sections(name: str, *, ontology=None) -> list[dict]:
     out: list[dict | None] = [_section("是什么", [
         f"{name}：{kind}" if kind else
         f"「{name}」不在证素词表里（病位 {len(LOCATIONS)} 个、病性 {len(NATURES)} 个）",
-        f"证候表里有 {len(rows)} 条证候用到它" if rows else "",
+        # R56 §6 第 8 条：「常见于 N 种证候」——原文「证候表里有 N 条证候用到它」
+        # 读起来像在描述一张数据表，不是在描述这个证素本身。
+        f"常见于 {len(rows)} 种证候" if rows else "",
     ], source="core/elements.py 词表")]
     # R42 新增：病机一节。证素**就是**病机的要素，所以这一节报它在哪些证的
     # 病机里出现、以及它是病位还是病性（这两者在病机链上的位置不同）。
@@ -609,14 +730,18 @@ def _element_sections(name: str, *, ontology=None) -> list[dict]:
                  "病性证素与药性不是同一套词（证候说「气虚」，药性说「温/寒」），"
                  "这一格查不到是正常的。",
         ], source="药理层三元组（性味）"))
+    # R56 §6 第 7 条：这里只列证候**名**，不带编码（SP-01/B04.xxx 这类内部
+    # 编码进 tooltip，不进正文——见 web/app.js renderNodeExplain 里读
+    # `s.codes` 拼 title= 属性那一段，`lines` 只放名字）。
     out.append(_section("出处原文", [
-        "；".join(f"{r.get('code')} {r.get('name')}" for r in rows[:6]),
-    ], source="证候表"))
-    out.append(_evidence_section([
-        f"证素词表对照基准：病位 {len(LOCATIONS)} 个、病性 {len(NATURES)} 个"
-        f"（core/elements.py，人工整理）；证候表 {len(_load_standard_rows())} 条里"
-        f"{len(rows)} 条用到它",
-    ], source="core/elements.py + 证候表"))
+        "；".join((r.get("name") or "") for r in rows[:6]),
+    ], source="证候表", codes=[r.get("code") for r in rows[:6] if r.get("code")]))
+    # R56 §6 第 8 条：「病位 10 个、病性 12 个（core/elements.py，人工整理）」
+    # 这句话整句删掉（不是改措辞）——它回答的是"这张词表本身有多大"，跟
+    # "这个证素在这次问诊里意味着什么"没有关系，是纯粹的内部实现细节。
+    # 循证对照这一节仍然保留（GUIDELINE_GAP_NOTE 那句口径声明对证素也适用），
+    # 只是不再带这条内部统计。
+    out.append(_evidence_section([], source="证候表"))
     return [s for s in out if s]
 
 
@@ -697,7 +822,7 @@ def _method_like_sections(kind: str, text: str, *, ontology=None) -> list[dict]:
     herbs = ont.herbs_by_effect(text)
     tstats = table_stats()
     pharm = [
-        f"同义功效词（走 core/effect_synonyms.py 的 {tstats['n_rows']} 条表）："
+        f"同义功效词（走治法功效同义词表的 {tstats['n_rows']} 条）："
         f"{'、'.join(syns)}" if len(syns) > 1
         else f"功效同义词表（{tstats['n_rows']} 条）里没有「{text}」这条，"
              "所以下面的匹配退化成裸子串比——**命中少不代表没有对得上的药**。",

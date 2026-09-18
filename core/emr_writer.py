@@ -183,16 +183,33 @@ def build_emr(
     visit_date: str = "",
     doses: int | None = None,
     decoction: str = "",
+    safety_flag: str | None = None,
 ) -> EMRDraft:
     """把一次问诊拼成一份文书草稿。
 
     **全部入参可空**：被安全层拦下的那一次也要能出一份文书（记下"因何中止"），
     一个"只有开出方来才有病历"的实现会让最需要留痕的那一类问诊反而没有记录。
+
+    `safety_flag` 非空 = R56 §6 的危重信号按角色分流：这次问诊命中了危重
+    症状信号，但当前角色（医师/学生/研究者）拿到了完整推理，不是被拦截。
+    **这份文书本身必须把这件事记下来**——质控回查这份病历时，需要知道医师
+    当时是在"系统已经提示过危重信号"的前提下签发的这张方，这条提示不能只
+    活在网页界面上、不落进留痕的文书里。放在 `sections` 最前面（比主诉还靠
+    前）：这是审核这份病历时**第一件要看到的事**。
     """
     form = form or IntakeForm()
     chief = (complaint or form.chief_complaint or "").strip()
     st = s3 or {}
-    sections = [
+    sections = []
+    if safety_flag:
+        sections.append(EMRSection(
+            key="red_flag_notice", title="危重提示",
+            body=f"本次问诊命中危重症状信号（{safety_flag}）。系统按角色权限给出了"
+                 "完整推理供参考，处方是否采用、是否需要立即转诊/急诊处理，"
+                 "由签发医师结合临床实际判断并承担责任。",
+            editable=False,
+        ))
+    sections += [
         EMRSection(key="chief_complaint", title="主诉", body=chief),
         EMRSection(key="present_illness", title="现病史",
                    body=form.present_illness or chief),
