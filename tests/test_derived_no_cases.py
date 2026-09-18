@@ -309,6 +309,76 @@ def test_insufficient_alone_is_enough():
     assert step.insufficient is not None
 
 
+# ---------- 六、五步链每一步单独钉住"不存在没依据但给了结论"这第三种状态 ----------
+#
+# `rule_refs` 字段本身用 `Field(default_factory=list)` 而不是逐字面的
+# `Field(min_length=1)`——后者会让 `insufficient` 这条逃生舱结构上永远走不到
+# （字段级约束不看别的字段，min_length=1 会无条件拒绝空列表，不管
+# insufficient 填没填）。真正的约束在 `_cites_or_flags` 这条跨字段校验器上：
+# rule_refs 非空、或 insufficient 非空，二选一，两者都空才拒绝——这五条
+# 逐个把这件事钉死，不靠读代码猜。
+
+def test_syndrome_step_derived_rejects_neither():
+    with pytest.raises(ValidationError, match="依据不足"):
+        from core.schemas import SyndromeStepDerived
+
+        SyndromeStepDerived(name="脾胃气虚证", from_organs=["脾"],
+                            reasoning="x", reasoning_plain="y")
+
+
+def test_method_step_derived_rejects_neither():
+    with pytest.raises(ValidationError, match="依据不足"):
+        from core.schemas import MethodStepDerived
+
+        MethodStepDerived(principle="健脾益气", from_syndrome="脾胃气虚证",
+                          targets=["脾失健运"])
+
+
+def test_formula_step_derived_rejects_neither():
+    with pytest.raises(ValidationError, match="依据不足"):
+        from core.schemas import FormulaStepDerived
+
+        FormulaStepDerived(from_method="健脾益气", candidate={
+            "name": "方", "source": "composed", "confidence": "high",
+            "rationale": "x", "herb_items": [{"name": "党参"}]})
+
+
+def test_herb_choice_derived_rejects_neither():
+    with pytest.raises(ValidationError, match="依据不足"):
+        HerbChoiceDerived(item={"name": "党参"}, for_element="脾", effect_cited="补中益气")
+
+
+def test_organ_locus_derived_rejects_neither_again_with_a_different_organ():
+    """跟顶部 `test_a_step_needs_rule_refs_or_insufficient_not_neither` 是同一个
+    断言点，换一个脏腑重复一遍——防止前一条测试的通过是因为「脾」这个具体值
+    走了什么特殊分支（`_cites_or_flags` 不该按 organ 的值分支）。"""
+    with pytest.raises(ValidationError, match="依据不足"):
+        OrganLocusDerived(organ="肝", supporting_symptoms=["胁痛"], pathogenesis="肝失疏泄")
+
+
+def test_a_full_s3_derived_is_rejected_if_any_single_step_omits_both():
+    """五步链整体构造：其余四步都给全了依据，只有 method 这一步既没引规则
+    也没标 insufficient——整个 `S3Derived` 必须在这一步上就被拒绝，不能因为
+    "别的步骤都合规"就放过它。这是"不存在没依据但给了结论"这条铁律在
+    完整链条层面的钉子，不只是单个步骤类的钉子。"""
+    ref = {"rule_id": _some_rule_id("organ_relation"), "note": "x"}
+    with pytest.raises(ValidationError, match="依据不足"):
+        S3Derived(
+            organs=[{"organ": "脾", "supporting_symptoms": ["纳差"],
+                    "pathogenesis": "脾失健运", "rule_refs": [ref]}],
+            syndrome={"name": "脾胃气虚证", "from_organs": ["脾"], "reasoning": "x",
+                     "reasoning_plain": "y", "rule_refs": [ref]},
+            # method 这一步既没有 rule_refs 也没有 insufficient——五步里唯一
+            # 违规的一步，仍然要让整个 S3Derived 构造失败。
+            method={"principle": "健脾益气", "from_syndrome": "脾胃气虚证",
+                   "targets": ["脾失健运"]},
+            formula={"from_method": "健脾益气", "candidate": {
+                "name": "方", "source": "composed", "confidence": "high",
+                "rationale": "x", "herb_items": [{"name": "党参"}]}, "rule_refs": [ref]},
+            herb_choices=[{"item": {"name": "党参"}, "for_element": "脾",
+                          "effect_cited": "补中益气", "rule_refs": [ref]}])
+
+
 def test_herb_choice_derived_has_no_physician_source_field():
     """`HerbChoiceDerived` 没有 `physician_source`——这是从设计上消除的字段，
     不是留着不填。"""
