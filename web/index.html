@@ -1,9 +1,15 @@
 <!doctype html>
-<html lang="zh-CN">
+<!-- R47：产品形态写在根元素上，**默认就是正式版**（`data-product-mode="1"`）。
+     为什么不等 /health 回来再设：产品面要藏的东西有十六处，靠 JS 在
+     /health 之后一处处摘，访问者会先看到半秒的内部界面再看它们消失——
+     那半秒正是"这是个内部工具"的全部印象。默认值站在正式版这边，
+     只有 `PRODUCT_MODE=0` 时才由 JS 把它翻成 "0"（内部研究面，晚半秒
+     长出几块面板是可以接受的）。 -->
+<html lang="zh-CN" data-product-mode="1">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>名医辨证对照</title>
+<title>中医辨证推理辅助系统</title>
 <!-- 内联 data URI 的 favicon：不额外加静态文件，也不再每次加载吃一个 404。 -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232C5F5A'/%3E%3Ctext x='16' y='23' font-size='20' text-anchor='middle' fill='white' font-family='sans-serif'%3E%E8%AF%81%3C/text%3E%3C/svg%3E" />
 <!-- R41：cytoscape 不在这里加载，理由见 graph.js 的 ensureCytoscape()。三个 script 用 defer，理由见 tests/test_web_split.py。preload 两个首屏字体：它们本来要等 CSS 解析完、布局判定"这一段确实用到这个字重"之后才开始下，preload 让下载跟 HTML 解析并行，缩短 FOUT 那一段；另外两个字重（serif 600 / sans 500）不 preload——它们在首屏之下，preload 会把带宽从要用的那两个身上抢走。 -->
@@ -18,7 +24,7 @@
      混在输入区里会跟"输入主诉"这个动作抢注意力。 -->
 <header id="topbar">
   <div class="tb-title">
-    <h1>名医辨证对照</h1>
+    <h1>中医辨证推理辅助系统</h1>
     <!-- M8：定位表述分模式——患者/学生/研究者模式沿用原文案，医生模式换成
          处方辅助工具表述（见 describeDisclaimer()）。同一个位置内容跟着角色换，
          不是另起一块只在医生模式下才出现的提示。 -->
@@ -32,11 +38,15 @@
   <div class="tb-controls" id="topbar-controls">
     <!-- §5.1：额度看板在顶栏右侧。80% 变 --caution，降级变 --danger，
          降级的原话由顶栏下方那一行给（它不是错误，是"换了个后端继续跑"）。 -->
-    <span id="quota-chip" role="status" aria-live="polite"></span>
+    <!-- R47 §8.2 第 2 条：额度显示是站点运营的产物，医院用机构密钥、
+         由运维配置，使用者不需要也不该看到"今日还剩几次"。
+         **额度逻辑保留在服务端做保护**，只是不向使用者展示。 -->
+    <span id="quota-chip" class="internal-only" role="status" aria-live="polite"></span>
     <!-- §5.1：BYOK 入口**默认收起成一行小字**，点开才是输入框。
          不做成弹窗、不在首次进入时拦路——它是给用完额度的人用的后路，
          不是每个访问者都要先过的一道关。 -->
-    <details id="byok-box">
+    <!-- R47 §8.2 第 1 条：BYOK 整块只在内部模式下出现。 -->
+    <details id="byok-box" class="internal-only">
       <summary>用自己的 API key（不限次数）</summary>
       <div class="byok-panel">
         <div class="byok-note">你的 key 只在本次请求中转发给 DeepSeek，不会存储在服务器上。关闭标签页后即清除。</div>
@@ -52,13 +62,18 @@
     </details>
     <label id="role-select-label" for="role-select">查看模式</label>
     <select id="role-select" data-custom-select>
-      <option value="researcher" selected>研究者（完整信息）</option>
+      <!-- R47 §8.2 第 5 条：研究者这一档由 applyProductMode() 在产品模式下
+           **从 DOM 里摘掉**，不是用 CSS 藏起来——一个被 CSS 藏起来的 option
+           仍然是 select 的 value，页面一加载就会以研究者身份去请求。 -->
+      <option value="researcher" data-internal-role="1">研究者（完整信息）</option>
       <option value="student">学生（教学展开）</option>
-      <option value="doctor">医生（可编辑处方）</option>
+      <option value="doctor">医师（可编辑处方）</option>
       <option value="patient">患者（导诊，不提供方药）</option>
     </select>
-    <label id="retriever-mode-label" for="retriever-mode">检索模式</label>
-    <select id="retriever-mode" data-custom-select>
+    <!-- R47 §8.2 第 14 条：检索模式由运维用环境变量固定。使用者无法判断
+         该选哪个——摆一个选不对的下拉，比不摆更伤信任。能力保留。 -->
+    <label id="retriever-mode-label" class="internal-only" for="retriever-mode">检索模式</label>
+    <select id="retriever-mode" class="internal-only" data-custom-select>
       <option value="">默认</option>
       <option value="hybrid">hybrid（稠密+BM25 融合）</option>
       <option value="dense">dense（稠密向量）</option>
@@ -100,9 +115,20 @@
       <!-- **不写医家数**：注册表现在跑三位（R18 之后可开到五位），题记里写死
            「两位」「三位」就是 CLAUDE.md 那条「写死的常量也算一处实现」——
            加一位医家时这行字不会跟着改，而它就在首屏正中央。 -->
-      <div class="eg-line eg-1">同一个病人，请几位名医各自辨证，把他们分道的地方摆出来。</div>
-      <div class="eg-line eg-2">每条结论都带它依据的医案编号；分歧度旁边永远有一条噪声地板。</div>
-      <div class="eg-line eg-3">教学与研究用途。它不做诊断，也不替医生开方。</div>
+      <div class="eg-line eg-1">同一位患者，请几位名医各自辨证，把他们分道的地方摆出来。</div>
+      <!-- R47 §8.2 第 7 条：产品面不出现"分歧度""噪声地板"这类研究词。
+           两句话说的是同一件事（结论可核对），换的是听的人——
+           主治医师要的是"这条结论出自哪本书哪一页"，不是 ε。 -->
+      <div class="eg-line eg-2 internal-only">每条结论都带它依据的医案编号；分歧度旁边永远有一条噪声地板。</div>
+      <div class="eg-line eg-2 product-only">每条结论都注明它出自哪一部医籍、哪一条医案，可逐条核对原文。</div>
+      <div class="eg-line eg-3 internal-only">教学与研究用途。它不做诊断，也不替医师开方。</div>
+      <div class="eg-line eg-3 product-only">本系统为中医知识辅助与教学工具，不作为医疗器械管理，不提供诊断结论。</div>
+      <!-- §8.4 第 25 条：空状态不是光秃秃的输入框。三行说明 + 一句能力边界。 -->
+      <ul id="how-to-use" class="product-only">
+        <li><b>输入</b>：患者主诉与病历文字描述（症状、舌象脉象的文字记录、现病史）。</li>
+        <li><b>得到</b>：证型与病机推导链、教材治法与代表方、每一步所依据的原文出处。</li>
+        <li><b>边界</b>：不接受舌象照片、脉诊仪信号、检验数值；生成内容须由执业医师审核后方可使用。</li>
+      </ul>
     </div>
     <div id="error-box" role="alert" aria-live="assertive"></div>
     <div id="safety-flag-note" role="alert" aria-live="assertive"></div>
@@ -111,12 +137,35 @@
     <!-- 主诉正文：28px 宋体，行宽 ≤ 38 汉字。这是页面的"正文"，不是回显。 -->
     <div id="complaint-body"></div>
 
-    <!-- 用药对照带：点阵 + ε 参考线。页面的主角，不是一段文字横幅。 -->
-    <div id="rx-compare"></div>
+    <!-- §8.4 第 26 条：加载态是**骨架屏 + 分步进度 + 预计剩余**，不是转圈。
+         转圈只说"在忙"，骨架屏说"待会儿这里会出现什么"——一次问诊要几十秒
+         到几分钟，这中间页面的形状必须是可预期的。
+         预计剩余时间的口径见 app.js `etaText()`：它用**这台部署自己跑过的
+         历时中位数**，样本不足时如实说没有，不摆一个编的秒数。 -->
+    <div id="chain-skeleton" aria-hidden="true">
+      <div class="sk-row sk-w80"></div>
+      <div class="sk-row sk-w60"></div>
+      <div class="sk-row sk-w90"></div>
+      <div class="sk-row sk-w50"></div>
+      <div class="sk-row sk-w70"></div>
+    </div>
+    <div id="eta-note" role="status" aria-live="polite"></div>
+
+    <!-- §8.4 第 28 条：语料范围外的主诉不是静默返空——明确告知覆盖范围
+         并给下一步建议。 -->
+    <div id="empty-result" role="status"></div>
+
+    <!-- 用药对照带：点阵 + ε 参考线。页面的主角，不是一段文字横幅。
+         R47 §8.2 第 7 条：这是研究指标，产品面不出现。**能力没删**——
+         内部模式下它还是原来那张图，一个像素没改。 -->
+    <div id="rx-compare" class="internal-only"></div>
+    <!-- R47：产品面替代物。对医师有价值的那部分改写成一句话「本方的依据
+         强度」，不出现 ε / Jaccard / 噪声地板。文案由 app.js 一处产出。 -->
+    <div id="evidence-strength" class="product-only"></div>
     <!-- 分层读数：君臣/佐使各自的 Jaccard 与各自的 ε、未标注 role 的药味数、
          两两配对的师承内 vs 跨学派均值。这些是对照带画不出来又确实有意义的数，
          默认折叠但一个字都没删——R14 换的是主角，不是把信息砍掉。 -->
-    <details id="divergence-detail" hidden>
+    <details id="divergence-detail" class="internal-only" hidden>
       <summary>分层读数（君臣 / 佐使各自的噪声地板）</summary>
       <div id="divergence-banner"></div>
     </details>
@@ -130,6 +179,9 @@
          `!important`，两者同时在就永远 display:none，而"类名对、就是看不见"
          查 class 的判据查不出来：R37 四张单链截图全空白、判据全绿）。 -->
     <div id="chain-flow" aria-live="polite"></div>
+    <!-- 帮助气泡：一处 DOM、按 data-help 取文案（app.js 的 HELP_TEXT）。
+         每个复杂区域一个「?」，点开是一句话说明与一个例子。 -->
+    <div id="help-pop" role="dialog" aria-label="功能说明" hidden></div>
     <div id="node-explain" role="dialog" aria-label="节点释义"></div>
 
     <!-- R18-I「参考医家」：注册表里 enabled=false 的那几位（李可、王云启）。
@@ -148,7 +200,7 @@
     <div id="patient-view" hidden></div>
 
     <details id="detail-zone">
-      <summary>推理链 · 图谱 · 取证过程</summary>
+      <summary>推理链 · 图谱 · 取证过程<button type="button" class="help-btn" data-help="detail-zone" aria-label="这一区是什么">?</button></summary>
       <div id="detail-body">
         <div id="followup-note"></div>
         <div id="graph-panel">
@@ -184,11 +236,13 @@
              逐字刷新的区域交给读屏软件会念个不停，结论出来后由结果区播报。 -->
         <div id="s3-stream" aria-live="off"></div>
         <div id="progress-log" role="status" aria-live="polite"></div>
-        <div id="manifest-footer"></div>
+        <!-- R47 §8.2 第 8 条：运行清单（模型名、调用次数、耗时、可比性
+             警告）是内部诊断信息，产品面不露；它仍然进审计日志。 -->
+        <div id="manifest-footer" class="internal-only"></div>
         <!-- R24：R21 的 token 面板。**挂在 manifest 旁边而不是顶栏**：
              它回答的是"这一次问诊的知识是怎么进模型的、命中了多少缓存"，
              跟 manifest（模型/调用数/语料版本）是同一类元数据。 -->
-        <div id="token-panel"></div>
+        <div id="token-panel" class="internal-only"></div>
       </div>
     </details>
 
@@ -196,6 +250,9 @@
          由 CSS 居中放大，并显示下面那三条示例。 -->
     <div id="input-panel">
       <div id="examples"></div>
+    <div id="input-help-row">
+      <button type="button" class="help-btn" data-help="complaint" aria-label="该输入什么">?</button>
+    </div>
       <textarea id="complaint" placeholder="请输入患者主诉，例如：胃脘胀痛，食后加重，嗳气泛酸，舌淡红苔薄白，脉弦。"></textarea>
       <div class="input-row">
         <span id="status-text"></span>
@@ -206,7 +263,7 @@
       <!-- M8：doctor_id/patient_ref 只在医生模式下有意义（导出接口需要），
            其余模式下压根不摆出来，不是禁用置灰。 -->
       <div class="input-row is-hidden" id="doctor-id-row">
-        <label id="doctor-id-label" for="doctor-id-input">医生标识</label>
+        <label id="doctor-id-label" for="doctor-id-input">医师标识</label>
         <input type="text" id="doctor-id-input" class="text-field" placeholder="例如：dr_ye（导出处方必填）" />
         <label id="patient-ref-label" for="patient-ref-input">患者标识（可选）</label>
         <input type="text" id="patient-ref-input" class="text-field" placeholder="例如：门诊号/化名" />
@@ -251,6 +308,38 @@
   <div id="gb-stats"></div>
 </div>
 </main>
+
+<!-- R47 §8.3 第 17 条 + §8.4 第 31 条：用途与免责声明**必须保留且显著**，
+     版本号与本次记录编号在同一行小字里。
+     - 免责声明是法律与安全要求，不是 demo 痕迹，不许当成"多余的话"删掉；
+     - 记录编号供报障用，叫「本次记录编号」不叫 trace_id（§8.2 第 9 条）；
+     - 版本号出自 core/version.py 一处，由 /health 下发，前端不写死。 -->
+<footer id="app-footer">
+  <p id="footer-disclaimer">本系统为中医知识辅助与教学工具，不作为医疗器械管理，不提供诊断结论；生成内容须由执业医师审核后方可使用。</p>
+  <p class="footer-meta">
+    <span id="footer-version"></span>
+    <span id="footer-record"></span>
+    <button type="button" id="guide-open-btn" class="link-btn">使用引导</button>
+  </p>
+</footer>
+
+<!-- §8.4 第 34 条：首次使用引导三步（输入什么 → 看什么 → 怎么用）。
+     可跳过、可从页脚再次打开。**只在首次进入时自动弹一次**，看过就不再弹
+     （记在 localStorage）——每次都弹的引导是最快被用户训练成"闭眼点掉"的东西。 -->
+<div id="onboarding" role="dialog" aria-modal="true" aria-labelledby="ob-title" hidden>
+  <div id="ob-card">
+    <h2 id="ob-title">三步开始</h2>
+    <ol id="ob-steps">
+      <li><b>输入什么</b>：把患者的主诉与四诊文字描述写进下方输入框，包括舌象脉象的文字记录。越接近病历原文越好。</li>
+      <li><b>看什么</b>：结果是一条自上而下的推导链——症状 → 脏腑病位 → 病性 → 证型 → 病机 → 治则 → 治法 → 方剂 → 君臣佐使。点任一节点看它的依据与原文出处。</li>
+      <li><b>怎么用</b>：把推导链与出处作为辨证思路的参考；处方须由执业医师审核修改后签发。危重表现会在辨证开始前直接中止并给出就医指引。</li>
+    </ol>
+    <div id="ob-actions">
+      <button type="button" id="ob-skip" class="ghost-btn">跳过</button>
+      <button type="button" id="ob-done">知道了</button>
+    </div>
+  </div>
+</div>
 
 <aside id="evidence-panel" role="dialog" aria-modal="false" aria-label="证据详情" aria-hidden="true">
   <div id="evidence-head">

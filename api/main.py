@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import queue
 import secrets
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException, Header, Request, Response
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -49,6 +50,12 @@ from core.physicians import (
     resolve_physician_id,
 )
 from core.prescription import compute_herb_diffs, format_pharmacy_text
+from core.product_mode import (
+    InternalOnly,
+    product_flags,
+    require_internal,
+    resolve_role,
+)
 from core.formula_check import advice_dicts, check_formula
 from core.safety_output import (
     INCOMPATIBLE_TRAINING_NOTE,
@@ -57,6 +64,7 @@ from core.safety_output import (
 )
 from core.schemas import FormulaCandidate, FormulaSafety, HerbItem, S1Normalize
 from core.tools import GRAPH_PATH, get_graph_store, search_cases
+from core.version import PRODUCT_NAME, VERSION
 from offline.graph_stats import compute_stats, lambda1_note
 
 # M6：四种角色。前端按角色显示不同的 UI，但**字段裁剪在这里做，不在前端做**
@@ -143,7 +151,22 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title="名医辨证对照 demo", lifespan=_lifespan)
+# R47：标题从「名医辨证对照 demo」改成产品名 + 版本。**这不是措辞洁癖**：
+# 这个字符串会出现在 OpenAPI 文档、`/docs` 页面和将来给 HIS 的接口说明里，
+# 而"demo"两个字在三甲的采购语境里是一票否决的词（§8.2 第 16 条）。
+app = FastAPI(title=PRODUCT_NAME, version=VERSION, lifespan=_lifespan)
+
+
+@app.exception_handler(InternalOnly)
+async def _internal_only_handler(request: Request, exc: InternalOnly) -> JSONResponse:
+    """内部功能在产品模式下被访问 → **404，不是 403**。
+
+    403 承认这个端点存在，404 连存在性都不暴露。响应体给的是使用者能看懂的
+    中文，不是异常类名——`InternalOnly` 这个词只留在服务端日志里。
+    """
+    logging.getLogger("tcm.product_mode").info(
+        "产品模式下访问了内部功能：feature=%s path=%s", exc.feature, request.url.path)
+    return JSONResponse(status_code=404, content={"detail": "没有这个功能。"})
 
 
 # ---------- R43：响应压缩（**选择性**，不是无脑全开） ----------
@@ -232,7 +255,11 @@ class ConsultRequest(BaseModel):
     # core.chain.consult()——consult() 本身完全不知道 role 这个概念，
     # 字段裁剪只发生在 _consult_response() 这一层，role 传得太深只会让
     # consult() 背上一个它不需要关心的参数。
-    role: Role = "researcher"
+    # R47：**默认值改成 None，不再是字面量 `"researcher"`**。谁是默认角色由
+    # `core.product_mode.default_role()` 说了算（产品模式下是医师，内部模式
+    # 下仍是研究者）——把默认写死在 schema 里等于让产品形态有第二个决定点。
+    # 合法值仍由 Literal 卡，产品模式下研究者角色由 `resolve_role()` 拦。
+    role: Role | None = None
 
 
 def demo_mode_info() -> dict | None:
@@ -258,6 +285,18 @@ def demo_mode_info() -> dict | None:
         "notice": (f"演示模式：结果来自 {info['recorded_at'][:10]} 录制的真实推理"
                    f"（{info['model']}），非实时调用"),
     }
+
+
+def _knowledge_base_block() -> dict:
+    """本草/方剂本体在不在。**只看文件在不在、多大**，不装载。"""
+    from core.data_paths import pharmacology_read_path
+
+    out: dict[str, object] = {}
+    for kind, key in (("materia_medica", "materia_medica"), ("formulary", "formulary")):
+        path = pharmacology_read_path(kind)  # type: ignore[arg-type]
+        out[key] = bool(path and path.exists() and path.stat().st_size > 0)
+    out["available"] = bool(out["materia_medica"] or out["formulary"])
+    return out
 
 
 def _lambda1_note_or_none() -> str | None:
@@ -356,6 +395,23 @@ async def health(response: Response) -> dict:
         # R40：预热进度。`ready=false` 时上面那个 503 才有可读的原因，
         # 前端据此显示"正在加载知识库（1/2）"而不是干等。
         "warmup": warmup_block,
+        # R47：这台服务是正式版还是内部研究版，以及这一次能选哪几个角色。
+        # **前端不自己判断**——它读不到环境变量，也不该按 URL 猜。页面上
+        # 那十六处要藏的东西全部由这一个布尔值分派（core/product_mode.py）。
+        **product_flags(),
+        # 页脚那一行。产品名与版本只有 core/version.py 一处定义。
+        "version": VERSION,
+        "product_name": PRODUCT_NAME,
+        # R47：这台部署装没装本草/方剂本体。**产品面必须能分清**
+        # `herbs_grounded_ratio = 0` 的两种含义：「本体不在，无从核对」和
+        # 「本体在，但这一方的药味没查到出处」。此前只有 manifest 里的
+        # `knowledge_entries.available` 能分，而 manifest 只下发给研究者
+        # ——产品面（医师/学生/患者）恰恰看不到它。
+        #
+        # 放 /health 而不是问诊响应：它描述的是**这台部署**，不是这一次问诊。
+        # 只做 `stat`，不读文件——/health 不做 IO 那条纪律指的是"不读大文件、
+        # 不算图"，两次 stat 在同一个数量级上可以忽略。
+        "knowledge_base": _knowledge_base_block(),
     }
 
 
@@ -964,6 +1020,7 @@ def api_validate_key(x_llm_key: str | None = Header(default=None)) -> dict:
     没有这个端点的话，填错 key 的人只能靠跑一次问诊才知道——而那一次可能已经
     走完 S1/S2。返回里不回显 key。
     """
+    require_internal("byok")
     key = _byok_key(x_llm_key)
     if not key:
         raise HTTPException(status_code=400, detail="没有收到 key。")
@@ -1009,6 +1066,7 @@ def _prefix_warmup_note() -> str:
 @app.get("/api/usage")
 def api_usage(request: Request, x_llm_key: str | None = Header(default=None)) -> dict:
     """用量看板。**不消耗任何额度**（decide 只读账本），前端可以随时轮询。"""
+    require_internal("usage_dashboard")
     ledger = usage_mod.get_ledger()
     decision = ledger.decide(
         ledger.bucket_for(_client_ip(request), MAX_TRACKED_IPS),
@@ -1038,6 +1096,10 @@ def api_consult(
     response: Response,
     x_llm_key: str | None = Header(default=None),
 ) -> dict:
+    # R47：角色在**做任何事之前**解析。产品模式下请求了研究者角色时，
+    # 这里抛 InternalOnly → 404；放在最后解析的话，模型已经跑完、钱已经
+    # 花掉、审计记录已经写了，才发现这份结果不该给出去。
+    role = resolve_role(req.role)
     decision, backend, token = _gate(request, x_llm_key)
     try:
         slots = _acquire_consult_slot()
@@ -1068,7 +1130,18 @@ def api_consult(
     snap = _usage_block(request, decision)
     response.headers["X-Usage-Mode"] = decision.mode
     response.headers["X-Usage-Remaining-Calls"] = str(snap["remaining_calls"])
-    return _consult_response(outcome, role=req.role)
+    return _consult_response(outcome, role=role)
+
+
+#: 记录编号用的字母表：**去掉 0/O/1/I/L**。使用者要在电话里把它念给运维，
+#: 而这五个字符是电话里最容易听错的。
+_RECORD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _record_id() -> str:
+    """本次问诊的记录编号（8 位）。`secrets` 而不是 `random`：编号会进审计
+    日志，可预测的编号等于可以伪造一条"我查过这个编号"。"""
+    return "".join(secrets.choice(_RECORD_ALPHABET) for _ in range(8))
 
 
 def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
@@ -1118,6 +1191,15 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         # 非 None = 这次结果是回放的录制推理。跟 manifest 分开放：manifest 只
         # 给 researcher，而这行提示要给所有角色看（见 demo_mode_info 的注释）。
         "demo_mode": demo_mode_info(),
+        # R47 §8.2 第 9 条：给所有角色一个**本次记录编号**，页脚一行小字，
+        # 供报障时报给运维。刻意不叫 trace_id、不在产品面上出现这个词——
+        # 使用者报障时要念得出来，所以是 8 位大写字母数字，不是 uuid。
+        #
+        # **这里生成而不是在 core.chain 里**：R45 会把贯穿全链的 trace_id
+        # 做进推理链与审计链，那时候这个编号改成从 trace_id 派生（取前 8 位
+        # 的 base32），产品面这一行的形状不变。现在先把产品面这一处补上，
+        # 不等 R45——录制视频时页脚不能是空的。
+        "record_id": _record_id(),
     }
 
     if outcome["rejected"]:
@@ -1358,6 +1440,10 @@ def api_consult_stream(
     把同一个判断连同错误文案实现两遍。worker 里 consult() 抛的 ValueError 会
     被兜成 error 事件，消息跟 400 那条完全一样，前端的 error 分支照样能显示。
     """
+    # R47：角色在**开流之前**解析。产品模式下请求了研究者角色时，这里抛
+    # InternalOnly → 404，而不是先把流开起来、跑几十秒之后在 done 事件里
+    # 才发现给不了——半条流比一个干脆的 404 更像半成品。
+    _req_role = resolve_role(req.role)
     decision, backend, token = _gate(request, x_llm_key)
     usage_snapshot = _usage_block(request, decision)
     try:
@@ -1388,7 +1474,7 @@ def api_consult_stream(
             # 往里加一个只有流式路径才有的键会让那份契约分叉。
             if stream.dropped_deltas:
                 stream.emit("deltas_dropped", {"n": stream.dropped_deltas})
-            stream.events_q.put(("done", _consult_response(outcome, role=req.role)))
+            stream.events_q.put(("done", _consult_response(outcome, role=_req_role)))
         except StreamClosed:
             pass  # 客户端已断开，没人读了，正常提前结束
         except LLMAuthError as e:

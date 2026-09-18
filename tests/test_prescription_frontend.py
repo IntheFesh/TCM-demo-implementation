@@ -35,7 +35,10 @@ def _run_node(js_tail: str) -> str:
 def test_disclaimer_doctor_mode_uses_prescription_tool_wording():
     js = 'process.stdout.write(describeDisclaimer("doctor"));'
     out = _run_node(js)
-    assert "处方辅助工具" in out
+    # R47 §0.4：「处方辅助工具」→「知识辅助工具」。输出侧的措辞决定这个产品
+    # 算不算"辅助决策类"——系统陈述的是教材与医案里的记载，不是对这位患者
+    # 的诊疗建议。判据跟着改，要测的那件事（医师模式有自己的定位表述）没变。
+    assert "知识辅助工具" in out
     assert "医师承担全部临床责任" in out
     assert "审计日志" in out
 
@@ -44,7 +47,8 @@ def test_disclaimer_other_modes_keep_original_wording():
     for mode in ["researcher", "student", "patient", None]:
         js = f'process.stdout.write(describeDisclaimer({json.dumps(mode)}));'
         out = _run_node(js)
-        assert out == "教学与研究用途，非诊断工具，不能替代执业医师"
+        # R47 §8.3 第 17 条：免责声明改成写明产品性质界定的那一句。
+        assert out == "中医知识辅助与教学工具，不作为医疗器械管理，不提供诊断结论"
 
 
 # ---------- blankHerbItem ----------
@@ -186,7 +190,10 @@ def test_doctor_section_html_empty_when_no_state_for_physician():
 def test_doctor_section_html_renders_disclaimer_and_table_for_doctor_mode():
     out = _with_doctor_state("ye_tianshi", _sample_state(),
                              'process.stdout.write(doctorSectionHtml("ye_tianshi", "doctor"));')
-    assert "处方辅助工具" in out
+    # R47 §0.4：「处方辅助工具」→「知识辅助工具」。输出侧的措辞决定这个产品
+    # 算不算"辅助决策类"——系统陈述的是教材与医案里的记载，不是对这位患者
+    # 的诊疗建议。判据跟着改，要测的那件事（医师模式有自己的定位表述）没变。
+    assert "知识辅助工具" in out
     assert "柴胡疏肝散" in out
     assert "柴胡" in out
     assert "+ 添加药味" in out

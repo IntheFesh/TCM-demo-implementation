@@ -139,6 +139,9 @@ def test_done_event_payload_matches_consult_response_shape(monkeypatch):
         events.append(out_q.get())
     done_data = next(d for name, d in events if name == "done")
 
+    # R47：`record_id` 标识"这一次问诊"，两次请求本来就是两个编号——
+    # 它是唯一一个按设计不该相等的键，摘出来单独比"两边都有、格式一样"。
+    assert len(done_data.pop("record_id")) == len(expected.pop("record_id")) == 8
     assert done_data == expected
 
 
@@ -180,6 +183,9 @@ def test_stream_role_reaches_done_event_same_as_post_consult(monkeypatch):
     done_data = next(d for name, d in events if name == "done")
 
     assert "formula_candidates" not in done_data["results"][0]["s3"]
+    # R47：`record_id` 标识"这一次问诊"，两次请求本来就是两个编号——
+    # 它是唯一一个按设计不该相等的键，摘出来单独比"两边都有、格式一样"。
+    assert len(done_data.pop("record_id")) == len(expected.pop("record_id")) == 8
     assert done_data == expected
 
 

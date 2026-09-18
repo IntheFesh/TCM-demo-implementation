@@ -483,6 +483,14 @@ def test_researcher_role_response_matches_pre_m6_shape_byte_for_byte(monkeypatch
     client = TestClient(api_main.app)
     body_default = _post_consult(client, None).json()
     body_explicit = _post_consult(client, "researcher").json()
+    # R47：`record_id`（本次记录编号，页脚那一行）**按设计每次请求都不同**
+    # ——它标识的是"这一次问诊"，两次请求本来就是两次。所以逐字节比对时把
+    # 它摘出来单独比：两边都要有、格式一样、值不相同。把它算进"逐字节一致"
+    # 会让这条测试要求编号可预测，而可预测的编号等于可以伪造审计记录。
+    rec_default = body_default.pop("record_id")
+    rec_explicit = body_explicit.pop("record_id")
+    assert len(rec_default) == len(rec_explicit) == 8
+    assert rec_default != rec_explicit
     assert body_default == body_explicit
     for key in ("triage", "food_therapy", "patent_medicines"):
         assert key not in body_default, f"researcher/默认角色不该出现 M6 新增字段「{key}」"

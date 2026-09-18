@@ -105,8 +105,16 @@ def test_the_epigraph_is_three_lines_and_claims_no_classical_source():
     这条判据就是钉住"没有伪造的引文"。"""
     html = load_html()
     block = html[html.index('<div id="epigraph">'):]
-    block = block[:block.index("</div>", block.index('eg-3'))]
-    assert block.count('class="eg-line') == 3
+    # R47：`eg-3` 现在有两行（产品面 / 研究面），切到**第一个** eg-3 的话
+    # 会把第二行漏在外面，于是"产品模式下是三行"这条恒差一行。切到最后一个。
+    block = block[:block.index("</div>", block.rindex('eg-3'))]
+    # R47：第二、三行各有产品面与研究面两套措辞（`product-only` / `internal-only`），
+    # 所以 DOM 里是 5 个 `.eg-line`，**任何一种模式下渲染出来仍然是三行**。
+    # 判据跟着形状改：分别数两种模式下会被渲染的那几行。
+    product = block.count('class="eg-line') - block.count("internal-only")
+    internal = block.count('class="eg-line') - block.count("product-only")
+    assert product == 3, f"产品模式下题记不是三行，是 {product}"
+    assert internal == 3, f"内部模式下题记不是三行，是 {internal}"
     for forged in ("云：", "曰：", "《临证指南医案》云", "《温病条辨》云"):
         assert forged not in block, f"题记里出现了引文式表述：{forged}"
     # 三行的分工：这是什么 / 给什么 / 不给什么
@@ -115,8 +123,10 @@ def test_the_epigraph_is_three_lines_and_claims_no_classical_source():
     # 写死「两位/三位」就是第二处实现，而它在首屏正中央，改了注册表也不会有人想到它。
     for n in ("两位名医", "三位名医", "五位名医"):
         assert n not in block, f"题记里写死了医家数：{n}"
+    # 研究面那两行照旧；产品面那两行说的是同一件事、换了听的人
     assert "医案编号" in block and "噪声地板" in block
     assert "不做诊断" in block
+    assert "可逐条核对原文" in block and "不作为医疗器械管理" in block
 
 
 def test_the_epigraph_only_shows_on_the_first_screen():

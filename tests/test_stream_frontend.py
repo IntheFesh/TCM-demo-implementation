@@ -267,4 +267,7 @@ def test_describe_safety_flag():
     """
     out = json.loads(_run_node(js))
     assert out[0] is None and out[1] is None
-    assert "EVAL_MODE" in out[2] and "柏油样便" in out[2] and "不产出任何方药" in out[2]
+    # R47 §8.2 第 15 条：这一行不在 internal-only 块里（安全警告任何模式下
+    # 都必须显示），所以措辞也要过产品面那关——原话把一个内部开关名
+    # （EVAL_MODE）摆在了使用者面前。要拦的行为一个字没变。
+    assert "不中止" in out[2] and "柏油样便" in out[2] and "不产出任何方药" in out[2]

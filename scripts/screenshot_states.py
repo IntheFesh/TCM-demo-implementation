@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -74,6 +75,9 @@ PREFIX = {
     "chain_flow_1280": "r37", "chain_running": "r37", "node_explain": "r37",
     "cancel_button": "r37",
     "single_chain_graph": "r37",
+    # R47：首次引导与帮助气泡。**跑在内部模式下**（跟其余 33 张一样）——
+    # 这两块不是 internal-only，两种模式下长得一样，没必要再占一档分辨率循环。
+    "onboarding": "r47", "help_popover": "r47",
     # R42：九层图 + 层名列头 + tooltip 钉住 + 窄屏抽屉 + 图谱浏览器聚焦
     "graph_layer_bands": "r42", "graph_tooltip_pinned": "r42",
     "node_explain_drawer": "r42", "browser_focus": "r42",
@@ -478,6 +482,14 @@ def _r37_payload():
 
 
 R37_DONE_PAYLOAD = _r37_payload()
+
+# R47：这几份手写的响应体要带 `record_id`——真实的 `_consult_response` 每次
+# 都下发它（页脚那一行「本次记录编号」）。fixture 里缺了它，产品模式截图的
+# 判据就会红在"页脚没有记录编号"上，而那是 fixture 过时、不是页面写错了。
+# 固定值而不是随机：截图要可复现，两次跑出来的 PNG 不该只差一个编号。
+for _payload in (PATIENT_PAYLOAD, PATIENT_HIGH_PAYLOAD, DONE_PAYLOAD,
+                 S33_DONE_PAYLOAD, R37_DONE_PAYLOAD):
+    _payload.setdefault("record_id", "K7M3QX92")
 
 
 def _agent_trace():
@@ -1472,6 +1484,38 @@ STATES = {
           return null;
         }""",
     ),
+    # R47 §8.4 第 34 条：首次引导。**截图里它是被显式打开的**——跑图前
+    # `_seed_onboarding()` 把"已看过"预置进了 localStorage（否则每一张截图上
+    # 都盖着这张卡），所以这里要自己开一次。
+    "onboarding": (
+        "openOnboarding();",
+        """() => {
+          const ob = document.getElementById('onboarding');
+          if (!ob || ob.hidden) return '引导没打开';
+          const steps = ob.querySelectorAll('#ob-steps li');
+          if (steps.length !== 3) return '不是三步，是 ' + steps.length;
+          const card = document.getElementById('ob-card').getBoundingClientRect();
+          if (card.height > window.innerHeight)
+            return '引导卡比屏幕还高：' + Math.round(card.height);
+          // 两个出口都要在：只能靠一个按钮关的对话框在平板上很容易变成死路
+          if (!document.getElementById('ob-skip')) return '没有跳过';
+          if (!document.getElementById('ob-done')) return '没有知道了';
+          return null;
+        }"""),
+    # R47 §8.4 第 35 条：帮助气泡。点「?」，一句话说明 + 一个例子。
+    "help_popover": (
+        "document.querySelector('.help-btn[data-help=\"complaint\"]').click();",
+        """() => {
+          const pop = document.getElementById('help-pop');
+          if (!pop || pop.hidden) return '帮助气泡没出来';
+          const text = pop.innerText || '';
+          if (!text.includes('例')) return '说明里没有例子——没有例子的说明等于换个说法';
+          const box = pop.getBoundingClientRect();
+          const de = document.documentElement;
+          if (box.right > de.clientWidth + 1) return '气泡右边出屏了';
+          if (box.left < 0) return '气泡左边出屏了';
+          return null;
+        }"""),
     "done": (
         "renderComplaintBody(COMPLAINT); renderConsultResult(DONE_PAYLOAD);",
         """() => {
@@ -1516,7 +1560,12 @@ STATES = {
           const eg = document.getElementById('epigraph');
           if (!eg) return '题记不在 DOM 里';
           if (getComputedStyle(eg).display === 'none') return '首屏没显示题记';
-          const lines = eg.querySelectorAll('.eg-line');
+          // R47：DOM 里是 5 个 `.eg-line`（第二、三行各有产品面/研究面两套措辞），
+          // **任何一种模式下真正显示出来的仍然是三行**。判据改成数"看得见的"
+          // ——这条判据跑在真浏览器里，本来就该问"屏幕上有几行"，
+          // 而不是"DOM 里有几个节点"。
+          const lines = [...eg.querySelectorAll('.eg-line')]
+            .filter(l => l.offsetParent !== null);
           if (lines.length !== 3) return '题记不是三行：' + lines.length;
           // 三行三种字号/颜色：它们是三句不同性质的话，不是一段话的三行
           const sizes = [...lines].map(l => parseFloat(getComputedStyle(l).fontSize));
@@ -1692,6 +1741,207 @@ STATES = {
 }
 
 
+def _start_server(port: int, *, product: bool) -> subprocess.Popen:
+    """起一台 uvicorn。产品形态由环境变量决定，**不是由请求参数决定**
+    ——它决定的是整台服务的形状（见 core/product_mode.py）。"""
+    env = dict(os.environ)
+    env["PRODUCT_MODE"] = "1" if product else "0"
+    return subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "api.main:app", "--host", "127.0.0.1",
+         "--port", str(port), "--log-level", "warning"],
+        cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _seed_onboarding(page) -> None:  # noqa: ANN001 - playwright Page
+    """把「首次引导已看过」预置进 localStorage。
+
+    **不这么做的话每一张截图上都盖着那张引导卡**——它按设计就是首次进入时
+    自动弹的，而每个 Playwright 页面都是全新的浏览器上下文、localStorage 是
+    空的，所以每一次都算"首次"。引导本身另有一张专门的截图验它。"""
+    page.add_init_script(
+        "try { localStorage.setItem('tcm.onboardingSeen', '1'); } catch (e) {}")
+
+
+# ---------- R47 §8.5：产品模式全套截图 ----------
+#
+# **三档分辨率 × 三种角色 × 五种状态 = 45 张**，与内部模式的截图分开存放
+# （`docs/screenshots/product/`）。判据是**共用的产品面判据 + 每态一条**：
+# 共用那条扫的是"十六条清单里的东西一样都没露出来"，它才是这一套的意义；
+# 每态那条只确认这一态确实渲染出来了，不是一张空白页。
+PRODUCT_OUT_DIR = OUT_DIR / "product"
+
+#: 1920×1080 评审大屏、1366×768 诊室常见（竖向最紧）、768×1024 平板。
+PRODUCT_VIEWPORTS = {
+    "1920": {"width": 1920, "height": 1080},
+    "1366": {"width": 1366, "height": 768},
+    "768": {"width": 768, "height": 1024},
+}
+
+#: 产品面只剩三种角色（§8.2 第 5 条）。
+PRODUCT_SCREENSHOT_ROLES = ("doctor", "student", "patient")
+
+#: 五种状态的构造。`$PAYLOAD` 由 role 决定——患者角色下后端下发的是裁剪过的
+#: 那一份（不含方药），拿医师那份去渲染患者界面等于把这条安全边界绕过去。
+PRODUCT_STATE_SETUP = {
+    "first": "setConsultState('first');",
+    "running": "renderComplaintBody(COMPLAINT); setConsultState('running');"
+               " resetColumnProgress();",
+    "insufficient": "renderConsultResult({...$PAYLOAD, results: [], divergence: null,"
+                    " insufficient: true, insufficient_reason: '请补充舌象、脉象与二便情况。'});",
+    "followup": "setConsultState('running'); resetColumnProgress();"
+                " showNeedInput('有没有解黑色柏油样便？', 'wu_jutong');",
+    "done": "renderComplaintBody(COMPLAINT); renderConsultResult($PAYLOAD);",
+}
+
+#: 角色 → 用哪份响应体。患者走 PATIENT_PAYLOAD（后端裁剪过的那一份）。
+PRODUCT_PAYLOAD_BY_ROLE = {
+    "doctor": "R37_DONE_PAYLOAD",
+    "student": "R37_DONE_PAYLOAD",
+    "patient": "PATIENT_PAYLOAD",
+}
+
+#: 共用的产品面判据。**这一条才是这套截图的意义**——它在真实 DOM 上验
+#: §8.2 那十六条，而不是在源码里验标记。静态那层在
+#: tests/test_no_demo_artifacts.py，两层都要。
+PRODUCT_FACE_CHECK = r"""() => {
+  if (document.documentElement.dataset.productMode !== '1')
+    return '这台服务不是产品模式';
+  const banned = ['噪声地板', '分歧度', 'Jaccard', 'ε=', '演示模式', '评测',
+                  'SDT', 'traceback', 'Traceback', 'LLMError', 'demo',
+                  '实验性', '原型', 'TODO', '⏳', 'hybrid', 'bm25'];
+  const text = document.body.innerText || '';
+  for (const w of banned) {
+    if (text.includes(w)) return '产品面上出现了禁词「' + w + '」';
+  }
+  if (/\bR\d{2}\b/.test(text)) return '产品面上出现了内部轮次编号';
+  const roleSel = document.getElementById('role-select');
+  if (!roleSel) return '没有角色下拉';
+  if ([...roleSel.options].some(o => o.value === 'researcher'))
+    return '研究者角色还留在下拉里';
+  for (const id of ['byok-box', 'quota-chip', 'retriever-mode',
+                    'rx-compare', 'manifest-footer', 'token-panel']) {
+    const el = document.getElementById(id);
+    if (el && el.offsetParent !== null) return '内部块「' + id + '」还看得见';
+  }
+  const disc = document.getElementById('footer-disclaimer');
+  if (!disc || disc.offsetParent === null) return '页脚免责声明不见了';
+  if (!(disc.textContent || '').includes('不作为医疗器械管理'))
+    return '免责声明少了产品性质界定那一句';
+  const ver = document.getElementById('footer-version');
+  if (!ver || !(ver.textContent || '').trim()) return '页脚没有版本号';
+  const de = document.documentElement;
+  if (de.scrollWidth > de.clientWidth + 1)
+    return '出现了横向滚动：' + de.scrollWidth + ' > ' + de.clientWidth;
+  return null;
+}"""
+
+#: 每态一条：确认这一态真的渲染出来了。
+PRODUCT_STATE_CHECK = {
+    "first": """() => {
+      const page = document.getElementById('consult-page');
+      if (!page.classList.contains('state-first')) return '不是首屏态';
+      const how = document.getElementById('how-to-use');
+      if (!how || how.offsetParent === null) return '首屏没有使用说明';
+      if (how.querySelectorAll('li').length !== 3) return '使用说明不是三行';
+      return null;
+    }""",
+    "running": """() => {
+      const sk = document.getElementById('chain-skeleton');
+      if (!sk || sk.offsetParent === null) return '加载态没有骨架屏';
+      const eta = document.getElementById('eta-note');
+      if (!eta || !(eta.textContent || '').trim()) return '加载态没有预计剩余那一行';
+      return null;
+    }""",
+    "insufficient": """() => {
+      if (!document.body.innerText.includes('请补充舌象'))
+        return '后端给的理由没显示出来';
+      return null;
+    }""",
+    "followup": """() => {
+      const asking = document.querySelectorAll('.col[data-state="asking"]');
+      if (asking.length !== 1) return '提问的列不是一列，是 ' + asking.length;
+      if (!asking[0].querySelector('.ask-input')) return '那一列里没有回答输入框';
+      return null;
+    }""",
+    "done": """() => {
+      const text = document.body.innerText || '';
+      if (text.length < 200) return '终态几乎没有内容';
+      const rec = document.getElementById('footer-record');
+      if (!rec || !(rec.textContent || '').includes('本次记录编号'))
+        return '页脚没有本次记录编号';
+      return null;
+    }""",
+}
+
+
+def run_product(wait_ms: int) -> int:
+    """产品模式全套截图：三档分辨率 × 三种角色 × 五种状态。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("缺 playwright：pip install playwright（浏览器本机已有，不要跑 "
+              "playwright install）", file=sys.stderr)
+        return 2
+
+    port = _free_port()
+    server = _start_server(port, product=True)
+    failures: list[str] = []
+    n = 0
+    try:
+        if not _wait_ready(f"http://127.0.0.1:{port}/health", time.monotonic() + 60):
+            print("服务 60 秒没起来", file=sys.stderr)
+            return 1
+        PRODUCT_OUT_DIR.mkdir(parents=True, exist_ok=True)
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(executable_path=_chromium_path())
+            for vp_name, viewport in PRODUCT_VIEWPORTS.items():
+                for role in PRODUCT_SCREENSHOT_ROLES:
+                    for state, setup in PRODUCT_STATE_SETUP.items():
+                        n += 1
+                        name = f"{vp_name}_{role}_{state}"
+                        page = browser.new_page(viewport=viewport)
+                        _seed_onboarding(page)
+                        errors: list[str] = []
+                        page.on("pageerror", lambda e: errors.append(str(e)))
+                        page.goto(f"http://127.0.0.1:{port}/app/index.html",
+                                  wait_until="networkidle")
+                        for var, value in (("R37_DONE_PAYLOAD", R37_DONE_PAYLOAD),
+                                           ("PATIENT_PAYLOAD", PATIENT_PAYLOAD),
+                                           ("COMPLAINT", COMPLAINT)):
+                            page.evaluate(
+                                f"window.{var} = {json.dumps(value, ensure_ascii=False)};")
+                        # 角色在**页面上选**，不是往 payload 里塞一个字段：
+                        # 这一套验的正是"产品面上这三个角色都长什么样"。
+                        page.evaluate(
+                            "(r) => { const s = document.getElementById('role-select');"
+                            " if (s) { s.value = r;"
+                            " if (typeof refreshSelect === 'function') refreshSelect(s);"
+                            " updateDisclaimer(); updateDoctorFieldsVisibility(); } }", role)
+                        js = setup.replace("$PAYLOAD", PRODUCT_PAYLOAD_BY_ROLE[role])
+                        page.evaluate(f"(async () => {{ {js} }})()")
+                        page.wait_for_timeout(wait_ms)
+                        out = PRODUCT_OUT_DIR / f"p_{name}.png"
+                        page.screenshot(path=str(out), full_page=True)
+                        verdict = (page.evaluate(f"({PRODUCT_FACE_CHECK})()")
+                                   or page.evaluate(f"({PRODUCT_STATE_CHECK[state]})()"))
+                        if verdict:
+                            failures.append(f"{name}：{verdict}")
+                        if errors:
+                            failures.append(f"{name}：页面里有 JS 错误 " + "；".join(errors))
+                        print(f"→ {out}{'  ✗ ' + verdict if verdict else '  ✓'}")
+                        page.close()
+            browser.close()
+    finally:
+        server.terminate()
+        server.wait(timeout=10)
+
+    if failures:
+        print("\n判据不过：\n  " + "\n  ".join(failures), file=sys.stderr)
+        return 1
+    print(f"\n产品模式 {n} 张全部通过")
+    return 0
+
+
 def run(only: str | None, wait_ms: int) -> int:
     try:
         from playwright.sync_api import sync_playwright
@@ -1702,10 +1952,11 @@ def run(only: str | None, wait_ms: int) -> int:
 
     names = [only] if only else list(STATES)
     port = _free_port()
-    server = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "api.main:app", "--host", "127.0.0.1",
-         "--port", str(port), "--log-level", "warning"],
-        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # R47：**这 34 态跑在内部模式下**（`PRODUCT_MODE=0`）。它们验的是研究面的
+    # 形状——三列集注、分歧读数、运行清单、研究者角色——产品模式下这些本来就
+    # 该看不见。产品形态另有一套（`--product`，三档分辨率 × 三种角色 × 五种
+    # 状态），两套分开存放，理由跟 tests/conftest.py 钉 PRODUCT_MODE=0 一样。
+    server = _start_server(port, product=False)
     failures: list[str] = []
     try:
         if not _wait_ready(f"http://127.0.0.1:{port}/health", time.monotonic() + 60):
@@ -1717,6 +1968,7 @@ def run(only: str | None, wait_ms: int) -> int:
             for name in names:
                 setup, check = STATES[name]
                 page = browser.new_page(viewport=VIEWPORT_OVERRIDES.get(name, VIEWPORT))
+                _seed_onboarding(page)
                 errors: list[str] = []
                 page.on("pageerror", lambda e: errors.append(str(e)))
                 page.goto(f"http://127.0.0.1:{port}/app/index.html", wait_until="networkidle")
@@ -1773,7 +2025,11 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", choices=list(STATES), help="只跑其中一种状态")
     ap.add_argument("--wait-ms", type=int, default=500, help="截图前再等多久（字体 swap）")
+    ap.add_argument("--product", action="store_true",
+                    help="改跑产品模式全套（三档分辨率 × 三种角色 × 五种状态）")
     args = ap.parse_args(argv)
+    if args.product:
+        return run_product(args.wait_ms)
     return run(args.only, args.wait_ms)
 
 

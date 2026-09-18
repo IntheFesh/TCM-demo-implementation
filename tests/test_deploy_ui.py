@@ -43,7 +43,9 @@ def test_byok_is_a_collapsed_line_of_small_text_not_a_dialog():
     html = load_html()
     topbar = html[html.index('<header id="topbar">'):html.index("</header>")]
     assert 'id="byok-box"' in topbar, "BYOK 不在顶栏里"
-    assert "<details id=\"byok-box\">" in topbar, "不是可收起的 details"
+    # R47：多了 `class="internal-only"`（§8.2 第 1 条，产品模式下整块不出现）。
+    # 判据没变——仍然是"可收起的 details"，只是标签上多了一个属性。
+    assert '<details id="byok-box" class="internal-only">' in topbar, "不是可收起的 details"
     assert "用自己的 API key（不限次数）" in topbar
     # details 默认收起：带 open 属性就等于一进来就摊开
     box = topbar[topbar.index('<details id="byok-box"'):]

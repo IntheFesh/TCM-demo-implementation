@@ -28,7 +28,8 @@ python -m scripts.collect_results --check    # 核对 README.md 和 eval/RESULTS
 |---|---|---|
 | 系统构成 | 五层：知识图谱 / RAG / SRC 推理链 / ReAct / 安全双闸 | 下一节 |
 | 外部基准 | SDT Test：chain 23.173 vs baseline 22.068，关安全否决 27.729 | 「外部基准」一节 |
-| 四种模式 | patient / doctor / student / researcher。**patient 拿不到 `formula_candidates`——那是安全边界，不是功能裁剪**，裁剪在服务端做（键根本不存在，不是存在但为空） | 「四种模式」一节 |
+| 四种模式 | patient / doctor / student / researcher。**patient 拿不到 `formula_candidates`——那是安全边界，不是功能裁剪**，裁剪在服务端做（键根本不存在，不是存在但为空）。**产品模式（`PRODUCT_MODE=1`，默认）下只剩前三种**，研究者那一档连同其余十五处研究面内容一起藏起来，能力保留在 `PRODUCT_MODE=0` | 「四种模式」一节、「产品模式」一节 |
+| 产品模式 | `PRODUCT_MODE=1`（默认）= 交付给医院的正式形态；`=0` = 内部研究面。**唯一分派点在 `core/product_mode.py`** | 「产品模式」一节 |
 | 三种后端 | api（开发评测）/ local（自部署）/ replay（演示） | 「三种后端」一节 |
 | 已知混杂与局限 | 12 条，一条都不省 | 「已知混杂与局限」一节 |
 | 如何复现 | 数据管线的命令序列，含 `graph_stats` 那个坑 | 「如何复现」一节 |
@@ -126,6 +127,37 @@ python -m eval.ablation --backend real --queries-path tests/queries.txt
 
 **假后端的内容指标一律不出数**（`content_metrics_valid: false`，Markdown 里印 ⏳）：
 它的产出是固定假文本，算出来的"带本体出处占比"只反映假数据长什么样。
+
+## 产品模式（R47）
+
+**能力不删，产品面不露。** 研究与评测的代码、对照模式、分歧读数全部留在
+仓库里（它们是申报材料与后续研究的资产），由一个环境变量决定这一次运行
+要不要把它们摆出来。
+
+```bash
+# 正式版（默认）：交付给医院的形态
+uvicorn api.main:app
+
+# 内部研究面：额度看板、检索方式选择、运行清单、研究者角色全部回来
+PRODUCT_MODE=0 uvicorn api.main:app
+```
+
+| | `PRODUCT_MODE=1`（默认） | `PRODUCT_MODE=0` |
+|---|---|---|
+| 角色 | 医师 / 学生 / 患者 | 上述三种 + 研究者（完整信息） |
+| 默认角色 | 医师 | 研究者 |
+| `/api/usage`、`/api/usage/validate-key` | **404**（不是 403——403 承认这个端点存在） | 正常应答 |
+| 顶栏 BYOK、额度、检索方式 | 不出现 | 出现 |
+| 用药对照带 + 噪声地板、运行清单、上下文面板 | 不出现；对照带换成「本方的依据强度」一句话 | 出现 |
+| 页脚 | 免责声明 + 版本号 + 本次记录编号 | 同左 |
+
+分派点只有 `core/product_mode.py` 一处（`is_product_mode()` /
+`require_internal()` / `resolve_role()`），前端的应用点只有 `applyProductMode()`
+一处。**内部功能在产品模式下被调用即抛错，不静默返回空**——静默是"半成品"
+观感的主要来源。
+
+术语与合规措辞见 `docs/glossary.md`，面向使用者的更新日志见 `CHANGELOG.md`，
+版本号只在 `core/version.py` 定义一处。
 
 ## 三种后端
 

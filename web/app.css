@@ -133,6 +133,13 @@
     --edge-soft: 1px solid var(--rule-soft);
     /* 唯一允许的阴影：浮层（tooltip、侧栏） */
     --shadow-float: 0 2px 16px rgba(30, 33, 28, .10);
+    /* R47：遮罩。用墨色而不是纯黑——纯黑遮罩压在米白纸面上会发灰发脏。 */
+    --scrim: rgba(30, 33, 28, .45);
+    /* R47：**打印专用的两个色**。不能复用 --paper/--ink：--paper 是 #F2F3EF
+       的米白，印在纸上等于给整页铺一层浅灰底，费墨且脏；打印要的是"不印背景、
+       用最黑的字"。所以这是两个独立的语义色，不是 --paper/--ink 的别名。 */
+    --print-paper: #FFFFFF;
+    --print-ink: #000000;
 
     /* ---- 动效（§2.4）：只有三处，都是回应用户动作的 ---- */
     --t-collapse: 180ms;  /* 展开/折叠 */
@@ -1843,3 +1850,242 @@
 .agent-why { color: var(--ink-2); }
 /* 这一次的证据比制度性的那句话轻一档：它是「凭什么」的具体内容，不是主语 */
 .agent-detail { display: block; color: var(--muted); font-size: 12px; }
+
+/* ============================================================================
+   R47 产品化收口
+   ============================================================================
+
+   **能力不删，产品面不露。** 下面这两个类是全站唯一的显隐开关，
+   它们跟着根元素的 `data-product-mode` 走——分派点在 core/product_mode.py，
+   应用点在 app.js 的 applyProductMode()，样式表这里只负责"藏成什么样"。
+
+   为什么用 `display: none !important` 而不是 `visibility`/`opacity`：
+   藏起来的东西不许占版面，也不许被 Tab 键聚焦到——一个看不见但能 Tab 进去的
+   输入框比直接露出来更糟。 */
+html[data-product-mode="1"] .internal-only { display: none !important; }
+html[data-product-mode="0"] .product-only { display: none !important; }
+
+/* §8.4 第 25 条：空状态的三行使用说明。首屏（.state-first）之外不出现——
+   问过一次之后它就是噪音。 */
+#how-to-use {
+  list-style: none;
+  margin: var(--s4) auto 0;
+  padding: 0;
+  max-width: 34em;
+  text-align: left;
+  font-size: 13px;
+  line-height: 1.9;
+  color: var(--ink-2);
+}
+#how-to-use li { padding-left: var(--s3); text-indent: calc(-1 * var(--s3)); }
+#how-to-use b { color: var(--ink); font-weight: 600; }
+#consult-page:not(.state-first) #how-to-use { display: none; }
+
+/* §8.2 第 7 条：产品面替代用药对照带的那一句「本方的依据强度」。
+   一行字、不是一张图——它回答的是"这条结论可信到什么程度"，
+   而不是"三家差多少"。 */
+#evidence-strength {
+  display: none;
+  margin: var(--s3) 0;
+  padding: var(--s2) var(--s3);
+  border-left: 3px solid var(--accent);
+  background: var(--surface-2);
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--ink-2);
+}
+#evidence-strength.show { display: block; }
+#evidence-strength b { color: var(--ink); font-weight: 600; }
+
+/* §8.4 第 26 条：骨架屏。**只在 running 态出现**，而且只画将来会出现的形状
+   ——五行长短不一的条，对应九段链里最先出现的那几段。
+   不做旋转动画：转圈说"在忙"，骨架说"待会儿这里有什么"。 */
+#chain-skeleton { display: none; margin: var(--s4) 0; }
+#consult-page.state-running #chain-skeleton { display: block; }
+.sk-row {
+  height: 14px;
+  margin-bottom: var(--s2);
+  border-radius: var(--r-sm);
+  background: var(--rule-soft);
+}
+.sk-w80 { width: 80%; } .sk-w60 { width: 60%; } .sk-w90 { width: 90%; }
+.sk-w50 { width: 50%; } .sk-w70 { width: 70%; }
+/* **骨架不动。** 第一版给它加了扫光（一段关键帧动 background-position），
+   两条既有约束同时否掉了它：test_animations_only_touch_transform_and_opacity
+   （那个属性每帧重排重绘）和 §2.4「只允许三处动效、其中只有一处需要关键帧」
+   ——那条测试数的是整份 CSS 里的关键帧块数，所以这段说明里也不能出现那个
+   字面量（同一个坑 R47 这一轮已经在 JS 测试上踩过一次了）。
+   **而且约束是对的**：骨架屏的信息量全在**形状**上（待会儿这里会出现五行
+   长短不一的内容），扫光只是装饰。加载中这件事由上面的分步进度和
+   「预计还需约 N 秒」那一行说，不需要再闪一遍。 */
+
+#eta-note {
+  display: none;
+  margin: var(--s2) 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+#consult-page.state-running #eta-note { display: block; }
+
+/* §8.4 第 28 条：空结果。不是静默返空，而是说清覆盖范围 + 下一步。 */
+#empty-result {
+  display: none;
+  margin: var(--s4) 0;
+  padding: var(--s3);
+  border: var(--edge);
+  border-left: 3px solid var(--caution);
+  background: var(--surface-2);
+  font-size: 14px;
+  line-height: 1.9;
+}
+#empty-result.show { display: block; }
+#empty-result b { font-weight: 600; }
+#empty-result .er-retry { margin-top: var(--s2); }
+
+/* §8.3 第 17 条 + §8.4 第 31 条：页脚。免责声明是法律要求，字号比元数据大
+   一档、颜色也更实——它不是"页脚里的小字"，它是页脚里唯一要被读到的那句。 */
+#app-footer {
+  margin: var(--s6) auto 0;
+  padding: var(--s4) var(--s3) var(--s5);
+  border-top: 1px solid var(--rule);
+  max-width: 60em;
+  text-align: center;
+}
+#footer-disclaimer {
+  margin: 0 0 var(--s2);
+  font-size: 13px;
+  line-height: 1.9;
+  color: var(--ink-2);
+}
+.footer-meta {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  gap: var(--s3);
+  justify-content: center;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.link-btn:hover { color: var(--ink); }
+
+/* §8.4 第 34 条：三步引导。遮罩 + 一张卡，不是分步高亮界面元素的那种
+   ——后者要给每个高亮点写坐标，改一次版面就全错位。 */
+#onboarding {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--scrim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s3);
+}
+#onboarding[hidden] { display: none; }
+#ob-card {
+  background: var(--surface);
+  border: var(--edge);
+  border-radius: var(--r-lg);
+  max-width: 36em;
+  max-height: 86vh;
+  overflow: auto;
+  padding: var(--s5);
+  box-shadow: var(--shadow-float);
+}
+#ob-title { margin: 0 0 var(--s3); font-size: 20px; }
+#ob-steps { margin: 0; padding-left: var(--s4); line-height: 1.95; font-size: 14px; }
+#ob-steps li { margin-bottom: var(--s3); }
+#ob-steps b { font-weight: 600; }
+#ob-actions {
+  margin-top: var(--s4);
+  display: flex;
+  gap: var(--s2);
+  justify-content: flex-end;
+}
+
+/* §8.4 第 35 条：每个复杂区域一个「?」。44px 触达区（WCAG），
+   视觉上只有 18px 的圆——触达区靠 padding 撑开，不靠把圆画大。 */
+.help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin: calc(-1 * var(--s2)) 0 calc(-1 * var(--s2)) var(--s2);
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.help-btn::before {
+  content: "?";
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+}
+.help-btn { font-size: 0; }
+.help-btn::before { font-size: 12px; }
+.help-btn:hover { color: var(--accent); }
+#input-help-row { text-align: right; }
+#help-pop {
+  position: absolute;
+  z-index: 50;
+  max-width: 26em;
+  padding: var(--s3);
+  background: var(--surface);
+  border: var(--edge);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-float);
+  font-size: 13px;
+  line-height: 1.8;
+}
+#help-pop[hidden] { display: none; }
+#help-pop .hp-eg { display: block; margin-top: var(--s2); color: var(--muted); }
+
+/* §8.4 第 29 条：打印。A4 纵向、页边距 18mm（药房贴方的常规），
+   打印时只留处方笺本身——顶栏、图谱、引导、帮助全部不印。
+   R46 的处方笺文书会沿用这一套页面设置，不另写一份。 */
+@page { size: A4 portrait; margin: 18mm 16mm; }
+@media print {
+  #tab-bar, #topbar, #topbar-controls, #graph-panel, #onboarding,
+  #help-pop, #input-panel, #detail-zone, #evidence-panel, #gb-panel,
+  .help-btn, #demo-mode-banner, #degrade-banner, #offline-banner {
+    display: none !important;
+  }
+  body { background: var(--print-paper); color: var(--print-ink); }
+  #app-footer { break-inside: avoid; border-top: 1px solid var(--print-ink); }
+  #footer-disclaimer { color: var(--print-ink); }
+  /* 打印时链接不带下划线的话，纸上看不出它本来是个按钮——但纸上也点不了，
+     所以干脆不印 */
+  .link-btn { display: none !important; }
+}
+
+/* §8.4 第 33 条：1366×768 是诊室里最常见的那块屏，竖向只有 768px。
+   页脚与骨架在这个高度下要收紧，否则首屏被页脚挤掉一截。 */
+@media (max-height: 800px) {
+  #app-footer { margin-top: var(--s4); padding: var(--s3) var(--s3) var(--s4); }
+  #ob-card { max-height: 78vh; padding: var(--s4); }
+}
+
+@media (max-width: 768px) {
+  /* 平板：页脚元数据换行排、引导卡铺满、帮助气泡贴边不出屏 */
+  .footer-meta { flex-direction: column; gap: var(--s1); }
+  #ob-card { width: 100%; padding: var(--s4) var(--s3); }
+  #help-pop { max-width: calc(100vw - 2 * var(--s3)); }
+  #how-to-use { font-size: 12px; }
+}

@@ -746,6 +746,12 @@ async function initDemoModeBanner() {
     // 单链九段还是三列集注。拿不到（老服务、/health 失败）时保持 null，
     // isSingleChain() 会回落到 legacy 三列，跟 R36 及以前的行为一致。
     SERVER_S3_MODE = health.s3_mode || null;
+    // R47：产品形态、版本、本体可用性。**先于渲染任何结果**——产品模式要藏的
+    // 十六处必须在访问者看到页面之前就定下来。
+    applyProductMode(health);
+    renderFooterVersion(health);
+    KNOWLEDGE_BASE_AVAILABLE = !(health.knowledge_base
+      && health.knowledge_base.available === false);
     renderOfflineBanner(true);
   } catch (e) {
     // 网络不通时 fetch 会抛。身份色有 CSS 兜底、示例主诉不显示——都不致命，
@@ -1183,7 +1189,7 @@ function doctorSectionHtml(physician, mode) {
   // 实现」，这次撞的是文案而不是逻辑，但道理一样），这里改成调用它。
   return `
     <div class="doctor-disclaimer">${escapeHtml(describeDisclaimer("doctor"))}</div>
-    <div class="label rx-section-title">医生编辑处方——${escapeHtml(state.name)}</div>
+    <div class="label rx-section-title">医师编辑处方——${escapeHtml(state.name)}</div>
     <div class="rx-formula-fields">
       <label>剂数　<input type="number" class="rx-doses" data-rx-phys="${physician}" data-rx-field="doses_count" value="${state.doses_count != null ? state.doses_count : ""}" /></label>
       <label>用法　<input type="text" class="rx-usage" data-rx-phys="${physician}" data-rx-field="usage" value="${escapeHtml(state.usage || "")}" /></label>
@@ -1297,7 +1303,7 @@ async function runExport(physician) {
   const doctorIdInput = document.getElementById("doctor-id-input");
   const doctorId = (doctorIdInput ? doctorIdInput.value : "").trim();
   if (!doctorId) {
-    state.exportError = { message: "请先在上方填写医生标识再导出处方。" };
+    state.exportError = { message: "请先在上方填写医师标识再导出处方。" };
     state.exportResult = null;
     renderDoctorExportPanel(physician);
     return;
@@ -1401,10 +1407,15 @@ document.getElementById("columns").addEventListener("click", (e) => {
 
 function describeDisclaimer(mode) {
   if (mode === "doctor") {
-    return "医生模式：处方辅助工具。系统提供的方剂与剂量为建议，最终处方由执业医师" +
-      "审核、修改并签发，医师承担全部临床责任。所有导出操作均记录审计日志。";
+    // R47 §0.4 第 2 条：输出侧的措辞决定这个产品算不算"辅助决策"。
+    // 「系统提供的方剂与剂量为建议」是指向具体患者的诊疗建议式措辞；
+    // 改成客观陈述——系统陈述的是**教材与医案里的记载**，用不用、怎么用
+    // 是医师的判断。这不是文字游戏，是产品定位（不作为医疗器械管理的前提）。
+    return "医师模式：知识辅助工具。系统列出的方剂与剂量出自教材与医案记载，" +
+      "不构成对该患者的用药建议；处方由执业医师审核、修改并签发，" +
+      "医师承担全部临床责任。所有导出操作均记录审计日志。";
   }
-  return "教学与研究用途，非诊断工具，不能替代执业医师";
+  return "中医知识辅助与教学工具，不作为医疗器械管理，不提供诊断结论";
 }
 
 function updateDisclaimer() {
@@ -1466,6 +1477,14 @@ function setConsultState(state) {
   if (!page) return;
   for (const s of CONSULT_STATES) page.classList.remove(`state-${s}`);
   page.classList.add(`state-${state}`);
+  // R47 §8.4 第 26 条：预计剩余时间的采样点挂在**状态机这一处**，不散到
+  // 各个调用点——"这一次跑了多久"的起止就是 running → done 这两次转移，
+  // 在别处计时早晚会漏掉某条分支（追问、信息不足、被拦截）。
+  if (typeof startEta !== "function") return;
+  if (state === "running") startEta();
+  // done 才计入样本：追问/信息不足/被拦截都没跑完整条链，把它们的历时
+  // 混进中位数会让预计时间越来越短，而那不是它变快了。
+  else stopEta(state === "done");
 }
 
 // 安全拦截：整页替换。**不是隐藏，是清空**——被拦截的请求不产出任何方药，
@@ -2368,7 +2387,10 @@ function adviceBlockHtml(result) {
   const emptyHtml = (advice && advice.length) ? "" :
     `<div class="adv-none">规则层没有发现问题</div>`;
   return `<div class="advice-block">`
-    + `<div class="advice-head"><span class="advice-title">方剂建议</span>${scoreHtml}</div>`
+    // R47 §0.4：区块名从「方剂建议」改成「方剂核查」。这一层给的是对**方子
+    // 本身**的核查结论（配伍禁忌、剂量上限、归经覆盖），不是对这位患者的
+    // 用药建议——名字叫「建议」会把一层客观校验说成一条诊疗意见。
+    + `<div class="advice-head"><span class="advice-title">方剂核查</span>${scoreHtml}</div>`
     + bodyHtml + emptyHtml + `</div>`;
 }
 
@@ -2632,7 +2654,11 @@ function describeSafetyFlag(flag) {
   // 打开"，可是之前页面上完全看不出来它开着——结果照常显示、方药照常开。
   // 返回 null 表示不需要横幅。
   if (!flag) return null;
-  return `⚠ 评测模式（EVAL_MODE）已开启：这条主诉命中了安全否决（${flag}），正常情况下会在辨证前被拦截、不产出任何方药。下面的结果只用于评测，不要用于演示或作为参考。`;
+  // R47 §8.2 第 15 条：这一行**不在 internal-only 块里**（它是安全警告，
+  // 任何模式下都必须显示），所以它的措辞也必须过产品面那关——原话里的
+  // 「评测模式（EVAL_MODE）」把一个内部开关名摆在了使用者面前。
+  // 换成说人话的同一件事：不中止的诊断配置。要拦的行为一个字没变。
+  return `⚠ 当前服务运行在一种「命中安全规则也不中止」的诊断配置下：这条主诉命中了安全否决（${flag}），正常配置下会在辨证开始前被拦截、不产出任何方药。下面的结果不可用于临床参考。`;
 }
 
 function renderSafetyFlag(flag) {
@@ -2704,6 +2730,12 @@ function renderConsultResult(data) {
     return;
   }
   renderSafetyFlag(data.safety_flag);
+  // R47：产品面的三件——依据强度（替代用药对照带）、本次记录编号、空结果。
+  // 三个函数各自判断该不该显示，这里不加 if：判据散到调用点就是十六处
+  // 零散判断的开头。
+  renderEvidenceStrength(data);
+  renderRecordId(data);
+  renderEmptyResult(data);
   PHYSICIAN_COLORS = {};
   PHYSICIAN_NAMES = {};
   for (const r of data.results) {
@@ -3305,4 +3337,318 @@ enhanceAllSelects();
   const _tb = document.getElementById("topbar-toggle");
   if (_tb) _tb.addEventListener("click", toggleTopbar);
   applyTopbarCollapsed(topbarCollapsed());
+}
+
+
+// ============================================================================
+// R47 产品化收口
+// ============================================================================
+//
+// **能力不删，产品面不露。** 这一段不删任何既有渲染函数——它只决定"这一次
+// 运行要不要把它们摆出来"，以及产品面用什么替代物。分派点在后端
+// （core/product_mode.py → /health），这里是唯一的应用点。
+//
+// 为什么应用点只能有一个：要藏的东西有十六条，散着判断的话以后加第十七条
+// 会漏掉其中几处，而漏掉的那几处恰恰是没人盯着的角落（顶栏折叠起来的那一块、
+// 某个角色下才出现的面板）。跟 CLAUDE.md「同一概念的匹配逻辑只能有一处实现」
+// 是同一条。
+
+//: /health 下发的那一份。默认按产品模式算——拿不到 /health 时（后端不在）
+//: 页面应该是正式版形态，而不是把内部面板露出来。
+let PRODUCT_FLAGS = { product_mode: true, roles: null, default_role: null };
+
+function isProductMode() {
+  return document.documentElement.dataset.productMode !== "0";
+}
+
+function applyProductMode(health) {
+  PRODUCT_FLAGS = {
+    product_mode: health.product_mode !== false,
+    roles: health.roles || null,
+    default_role: health.default_role || null,
+  };
+  document.documentElement.dataset.productMode = PRODUCT_FLAGS.product_mode ? "1" : "0";
+  const sel = document.getElementById("role-select");
+  if (!sel) return;
+  // **研究者这一档从 DOM 里摘掉，不是用 CSS 藏。** 一个被 CSS 藏起来的
+  // `<option>` 仍然是 select 的 value：页面一加载就会以研究者身份去请求，
+  // 而后端在产品模式下对这个角色回 404——界面看起来好好的，一点就报错。
+  const allowed = PRODUCT_FLAGS.roles
+    ? new Set(PRODUCT_FLAGS.roles.map((r) => r.id)) : null;
+  if (allowed) {
+    for (const opt of [...sel.options]) {
+      if (opt.dataset.internalRole && !allowed.has(opt.value)) opt.remove();
+    }
+  }
+  const want = PRODUCT_FLAGS.default_role;
+  if (want && [...sel.options].some((o) => o.value === want)) sel.value = want;
+  // 自绘下拉的按钮文字要跟着换：只改原生 select 的 value 的话，按钮上留着
+  // 上一个选项的名字（R24 那层包装记的是自己渲染过的文本）。
+  if (typeof refreshSelect === "function") refreshSelect(sel);
+  updateDisclaimer();
+  updateDoctorFieldsVisibility();
+}
+
+// ---------- §8.2 第 7 条：产品面的「本方的依据强度」 ----------
+//
+// 用药对照带与噪声地板是**研究指标**：它们回答"几家之间差多少"，而主治医师
+// 要的是"这一条结论我能不能核对"。同一份数据，换一个问题来问。
+//
+// **一个字的研究词都不许出现**（ε、Jaccard、噪声地板、分歧度）：
+// tests/test_no_demo_artifacts.py 扫源码钉这一条。
+
+//: 药味可核对比例的三档。分档不是为了给一个分数，是为了让"要不要逐味核对"
+//: 这个决定有个起点——高档可以抽查，低档必须逐味看。
+const GROUNDED_STRONG = 0.8;
+const GROUNDED_MEDIUM = 0.5;
+
+function groundedLabel(ratio) {
+  if (ratio >= GROUNDED_STRONG) return "强";
+  if (ratio >= GROUNDED_MEDIUM) return "中";
+  return "弱";
+}
+
+function evidenceStrengthHtml(data) {
+  const r = (data.results || [])[0];
+  if (!r) return "";
+  const cited = new Set([...(r.physicians_cited || []),
+                         ...(r.physician_influences || []).map((x) => x.physician)]);
+  const nRefs = (r.refs || []).length;
+  const ratio = r.herbs_grounded_ratio;
+  const parts = [];
+  if (ratio === null || ratio === undefined) {
+    // **不编**：这一次没有算出这个比例（legacy 路径、参考医家引用区），
+    // 就说没算，不拿 0 充数——0 在这里意味着"一味都没查到"，是另一回事。
+    parts.push("本次未统计药味出处覆盖。");
+  } else if (!KNOWLEDGE_BASE_AVAILABLE) {
+    // 0 的两种含义必须分清（见 /health 的 knowledge_base 注释）
+    parts.push("这台部署未装载本草与方剂本体，药味出处无从核对——"
+      + "这不是「查不到出处」，是没有可查的底本。");
+  } else {
+    const pct = Math.round(ratio * 100);
+    parts.push(`依据强度<b>${groundedLabel(ratio)}</b>：本方 ${pct}% 的药味`
+      + "可在本草与方剂本体中查到性味归经与功效的原文出处。");
+  }
+  if (nRefs) parts.push(`另引医案原文 ${nRefs} 条`);
+  if (cited.size) parts.push(`名老中医经验 ${cited.size} 家`);
+  return parts.join("，").replace(/，$/, "") + "。逐条出处见下方推导链，点任一节点展开。";
+}
+
+//: /health 下发的本体可用性。默认 true——拿不到 /health 时不该反过来
+//: 断言"本体不在"，那是把一个不知道说成了一个结论。
+let KNOWLEDGE_BASE_AVAILABLE = true;
+
+function renderEvidenceStrength(data) {
+  const el = document.getElementById("evidence-strength");
+  if (!el) return;
+  const html = data && (data.results || []).length ? evidenceStrengthHtml(data) : "";
+  el.innerHTML = html;
+  el.classList.toggle("show", !!html);
+}
+
+// ---------- §8.4 第 31 条：页脚的版本与本次记录编号 ----------
+
+function renderFooterVersion(health) {
+  const el = document.getElementById("footer-version");
+  if (!el) return;
+  const name = health.product_name || "";
+  const ver = health.version || "";
+  el.textContent = name && ver ? `${name} ${ver}` : "";
+}
+
+function renderRecordId(data) {
+  const el = document.getElementById("footer-record");
+  if (!el) return;
+  // §8.2 第 9 条：叫「本次记录编号」，不叫 trace_id，也不解释它是什么技术。
+  el.textContent = data && data.record_id ? `本次记录编号 ${data.record_id}` : "";
+}
+
+// ---------- §8.4 第 28 条：空结果 ----------
+
+function renderEmptyResult(data) {
+  const el = document.getElementById("empty-result");
+  if (!el) return;
+  const s1 = data && data.s1;
+  const unmapped = (s1 && s1.unmapped) || [];
+  const symptoms = (s1 && s1.symptoms) || [];
+  // 判据是"一个症状都没归类出来"，不是"结果为空"——后者还可能是被安全层
+  // 拦下、或者信息不足，那两种各有各的界面，不该被这一块盖住。
+  const show = !!s1 && symptoms.length === 0 && !data.rejected && !data.insufficient;
+  if (!show) { el.classList.remove("show"); el.innerHTML = ""; return; }
+  el.innerHTML = "<b>这段描述没有落进本系统的语料范围。</b>"
+    + "<div>当前覆盖：内科杂病为主的教材证候与历代医案，"
+    + "输入需要是症状与病史的<b>文字描述</b>（含舌象脉象的文字记录）。</div>"
+    + (unmapped.length
+        ? `<div>未能归类的表述：${escapeHtml(unmapped.join("、"))}</div>` : "")
+    + "<div class=\"er-retry\">建议：按病历原文补充主诉、现病史与舌脉描述后重试；"
+    + "若属外科、骨伤、儿科专科病证，本系统当前语料未覆盖。</div>";
+  el.classList.add("show");
+}
+
+// ---------- §8.4 第 26 条：基于实测 p50 的预计剩余时间 ----------
+//
+// **为什么不写死一个秒数**：这台部署用的是哪个后端、哪块卡、开不开 ReAct，
+// 决定了一次问诊是十几秒还是几分钟。写死的数在另一台机器上就是错的，
+// 而一个错的倒计时比没有倒计时更伤信任。
+//
+// **为什么不取 R40 压测里的 p50**：那一组是 `--backend fake` 跑出来的，
+// 量的是服务框架的开销，不是真实推理的历时。拿它当预计等于用一个不相干的
+// 数冒充实测（「任何数字都必须带对照」那条铁律的反面用法）。
+//
+// 所以：**这台部署自己跑过的历时**，取中位数。样本不足时如实说没有。
+const DURATION_KEY = "tcm.consultDurations";
+const DURATION_KEEP = 20;
+const DURATION_MIN_SAMPLES = 3;
+let etaStartedAt = 0;
+let etaTimer = null;
+
+function readDurations() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DURATION_KEY) || "[]");
+    return Array.isArray(raw) ? raw.filter((n) => typeof n === "number" && n > 0) : [];
+  } catch (e) { return []; }
+}
+
+function recordDuration(ms) {
+  if (!(ms > 0)) return;
+  const next = [...readDurations(), ms].slice(-DURATION_KEEP);
+  try { localStorage.setItem(DURATION_KEY, JSON.stringify(next)); } catch (e) { /* 隐私模式 */ }
+}
+
+function durationP50() {
+  const xs = readDurations().slice().sort((a, b) => a - b);
+  if (xs.length < DURATION_MIN_SAMPLES) return null;
+  const mid = Math.floor(xs.length / 2);
+  return xs.length % 2 ? xs[mid] : Math.round((xs[mid - 1] + xs[mid]) / 2);
+}
+
+function etaText(elapsedMs) {
+  const p50 = durationP50();
+  if (p50 === null) {
+    const n = readDurations().length;
+    return `已用 ${Math.round(elapsedMs / 1000)} 秒。这台服务还没有足够的历时样本`
+      + `（${n}/${DURATION_MIN_SAMPLES}），走完这一次之后就能给出预计时间。`;
+  }
+  const left = Math.round((p50 - elapsedMs) / 1000);
+  if (left > 0) {
+    return `已用 ${Math.round(elapsedMs / 1000)} 秒，预计还需约 ${left} 秒`
+      + `（按本机近 ${readDurations().length} 次的中位数）。`;
+  }
+  return `已用 ${Math.round(elapsedMs / 1000)} 秒，已超过本机中位数`
+    + `（${Math.round(p50 / 1000)} 秒）；复杂主诉会更久，可随时取消。`;
+}
+
+function tickEta() {
+  const el = document.getElementById("eta-note");
+  if (!el || !etaStartedAt) return;
+  el.textContent = etaText(Date.now() - etaStartedAt);
+}
+
+function startEta() {
+  etaStartedAt = Date.now();
+  tickEta();
+  if (etaTimer) clearInterval(etaTimer);
+  etaTimer = setInterval(tickEta, 1000);
+}
+
+function stopEta(completed) {
+  if (etaTimer) { clearInterval(etaTimer); etaTimer = null; }
+  if (completed && etaStartedAt) recordDuration(Date.now() - etaStartedAt);
+  etaStartedAt = 0;
+}
+
+// ---------- §8.4 第 35 条：帮助入口 ----------
+//
+// 一处 DOM、一张文案表。每条是"一句话说明 + 一个例子"——没有例子的说明
+// 等于把术语换了一个说法。
+const HELP_TEXT = {
+  complaint: {
+    title: "该输入什么",
+    body: "患者的主诉与四诊文字描述，越接近病历原文越好。",
+    eg: "例：胃脘胀痛三月，食后加重，嗳气泛酸，纳差，舌淡红苔薄白，脉弦。",
+  },
+  "detail-zone": {
+    title: "这一区是什么",
+    body: "本次推导的完整过程：症状如何归类、证素如何推出、查了哪些医案与本草、"
+      + "验证器改过什么。图上每个节点都可点开看它的依据原文。",
+    eg: "例：点「肝郁气滞」可以看到它由哪几个症状支持、出自哪一条教材证候定义。",
+  },
+};
+
+function hideHelp() {
+  const pop = document.getElementById("help-pop");
+  if (pop) pop.hidden = true;
+}
+
+function showHelp(btn) {
+  const pop = document.getElementById("help-pop");
+  const item = HELP_TEXT[btn.dataset.help];
+  if (!pop || !item) return;
+  pop.innerHTML = `<b>${escapeHtml(item.title)}</b><div>${escapeHtml(item.body)}</div>`
+    + `<span class="hp-eg">${escapeHtml(item.eg)}</span>`;
+  pop.hidden = false;
+  // 定位在按钮下方，右侧不出屏。`pageYOffset` 而不是 `getBoundingClientRect`
+  // 的裸值：气泡是 absolute（跟着文档走），滚动之后裸值会偏。
+  const box = btn.getBoundingClientRect();
+  const w = pop.getBoundingClientRect().width;
+  const left = Math.max(8, Math.min(box.left + window.pageXOffset,
+                                    document.documentElement.clientWidth - w - 8));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${box.bottom + window.pageYOffset + 4}px`;
+}
+
+document.addEventListener("click", (evt) => {
+  const btn = evt.target.closest && evt.target.closest(".help-btn");
+  if (btn) {
+    evt.preventDefault();
+    // `<summary>` 里那个按钮：点它不该把折叠区一起展开/收起
+    evt.stopPropagation();
+    const pop = document.getElementById("help-pop");
+    if (pop && !pop.hidden && pop.dataset.forKey === btn.dataset.help) { hideHelp(); return; }
+    if (pop) pop.dataset.forKey = btn.dataset.help;
+    showHelp(btn);
+    return;
+  }
+  if (!(evt.target.closest && evt.target.closest("#help-pop"))) hideHelp();
+});
+document.addEventListener("keydown", (evt) => { if (evt.key === "Escape") hideHelp(); });
+
+// ---------- §8.4 第 34 条：三步引导 ----------
+//
+// **只在首次进入时自动弹一次**。每次都弹的引导是最快被训练成"闭眼点掉"的
+// 东西——弹第三次的时候没有人还在读它。看过就记在 localStorage，
+// 页脚留一个「使用引导」随时可以再开。
+const ONBOARDING_KEY = "tcm.onboardingSeen";
+
+function onboardingSeen() {
+  try { return localStorage.getItem(ONBOARDING_KEY) === "1"; } catch (e) { return true; }
+}
+
+function openOnboarding() {
+  const el = document.getElementById("onboarding");
+  if (el) el.hidden = false;
+}
+
+function closeOnboarding() {
+  const el = document.getElementById("onboarding");
+  if (el) el.hidden = true;
+  try { localStorage.setItem(ONBOARDING_KEY, "1"); } catch (e) { /* 隐私模式 */ }
+}
+
+{
+  const ob = document.getElementById("onboarding");
+  if (ob) {
+    for (const id of ["ob-skip", "ob-done"]) {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener("click", closeOnboarding);
+    }
+    // 遮罩点击也关：一个只能靠按钮关的对话框在平板上很容易变成死路
+    ob.addEventListener("click", (e) => { if (e.target === ob) closeOnboarding(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !ob.hidden) closeOnboarding();
+    });
+    if (!onboardingSeen()) openOnboarding();
+  }
+  const g = document.getElementById("guide-open-btn");
+  if (g) g.addEventListener("click", openOnboarding);
 }

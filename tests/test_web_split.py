@@ -116,7 +116,22 @@ def test_the_head_no_longer_loads_cytoscape_synchronously():
 #:
 #: 这个数的用途是防"HTML 又长回 3574 行、改版面得在里面找 DOM"，不是卡到个位数。
 #: 每次提它都要在这里写明多出来的是什么，否则它会一轮一轮地被磨掉。
-INDEX_HTML_MAX_LINES = 272
+#:
+#: R47 从 272 提到 **362**（实际 358 行 + 4 行余量）。净增 89 行，其中 43 行是
+#: 注释，46 行是结构。逐块交代：
+#:   +8   `<html data-product-mode="1">` 与它的注释（为什么默认值站在正式版这边）
+#:   +9   顶栏三组内部控件各自的 `internal-only` 标记与注释（额度/BYOK/检索模式）
+#:   +3   研究者 option 的 `data-internal-role` 与注释（为什么要摘掉而不是 CSS 藏）
+#:   +13  题记的产品面/研究面两套措辞 + `#how-to-use` 三行（§8.4 第 25 条空状态）
+#:   +5   `#evidence-strength`（产品面替代用药对照带的那一句）与注释
+#:   +19  `#chain-skeleton` 骨架屏 + `#eta-note` 预计剩余（§8.4 第 26 条加载态）
+#:   +3   `#empty-result`（§8.4 第 28 条空结果不静默）
+#:   +14  `<footer id="app-footer">`：免责声明 + 版本 + 本次记录编号 + 引导入口
+#:   +20  `#onboarding` 三步引导对话框（§8.4 第 34 条）
+#:   +6   `#help-pop` 与两个 `?` 帮助按钮（§8.4 第 35 条）
+#: 全部是结构与文案，**一行逻辑都没有**——产品模式的分派在 core/product_mode.py，
+#: 应用到 DOM 上的那一处在 app.js 的 `applyProductMode()`。
+INDEX_HTML_MAX_LINES = 362
 
 
 def test_index_html_is_structure_only():
