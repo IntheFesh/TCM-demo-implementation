@@ -12,10 +12,20 @@ R51 补规则，不许把医案放回推导相凑数（那是回退，不是修�
 1. C 组验证器一次过率 ≥ A 组——"不模仿医案，结论照样能一次通过符号验证"。
 2. C 组 rule_refs 完整率（`derivation_completeness_ratio`）≥ 0.9——"推导链上
    每一步都真的挂着医理规则，不是空转"。
-3. C 与 D 的证型/治法/主方一致率 ≥ 0.9——验的是 R54 的不变式："事后佐证
-   不回流改推导"，C/D 唯一的差异就是要不要跑第三相佐证，结论不该跟着变。
+3. C 与 D 的证型/治法/主方一致率**不明显超过噪声地板**——验的是 R54 的
+   不变式："事后佐证不回流改推导"，C/D 唯一的差异就是要不要跑第三相佐证，
+   结论不该跟着变。**R61 改掉了这条门的判法**：原来跟绝对值 0.9 比，用户
+   真机实测出这条门在自由文本（`method`/治法）上必然不达标——两次独立
+   采样的措辞几乎不可能逐字相同，逐字相等量到的是采样方差，不是不变式
+   本身。现在跟 E 组（C 组的噪声地板复测，见 spec.py）比：
+   `C-D 分歧率 ≤ C-E 分歧率 + margin`（`GATE_CD_CONSISTENCY_MARGIN`）。
+   而且这条门**拆成三项分开判**（证型/主方/治法），不再合成一个布尔——
+   三项的可比较性不一样：证型是受控词表可以判"相等"，主方名归一后
+   （统一"加减/加味"后缀）也可以判"相等"，治法是自由文本只能判"相似度"
+   （字符级 Jaccard），把三者硬凑成一个"一致/不一致"会把"措辞不同"和
+   "真的推出了不同结论"混在一起——详见 `pair_consistency` 的文档字符串。
 
-**三条门都要求有效样本 ≥ `GATE_MIN_SAMPLE_SIZE`（R59，见 spec.py）**，低于这
+**门都要求有效样本 ≥ `GATE_MIN_SAMPLE_SIZE`（R59，见 spec.py）**，低于这
 个数一律判 `passed=None`（⏳ 样本不足），不管比率算出来是多少——`--limit 2`
 这类小样本探针把某条门的分母量成 1、比率算出 100%，那不是"测出来过了"，是
 "根本没测够"，真机 20 条 × 4 组才够格判定。
@@ -48,16 +58,19 @@ R51 补规则，不许把医案放回推导相凑数（那是回退，不是修�
 跟 R38 同一条诚实约束：这个沙盒没有真实 LLM 后端，`--backend fake` 只能验
 管道（四组分别设对了环境变量、跑通了四条路径、报告格式对不对），**不能**
 产出可信的内容指标——假后端的产出是固定假文本，"验证器一次过率" 算出来的
-只是假数据长什么样。真机 20 条主诉 × 4 组 = 80 次问诊——**单次墙钟没有
-一个可信数字**：R55 commit 留下两处互相矛盾的记录（"top3 档约 45 秒、
-full_context 档约 75 秒" vs 另一处"三档墙钟实测 264.6/276.3/208.9 秒"，
-量级差 3~4 倍），量出后者的工具 `scripts/compare_reasoning_tiers.py`
-在仓库里不存在，两处谁准核实不到。**不要用这两个数字估算时间/费用**，
-先跑 `--limit 2`（2 条 × 4 组 = 8 次问诊）拿到本机真实的 `elapsed_s_mean`，
-按比例估算 80 次的时长，具体方法见 `docs/ONSITE_R57_R58.md`。跑法见本
-文件顶部两行命令，`--sdt-dir` 指向用户自己的 TCMEval-SDT 本地 checkout
-（数据集不随本仓库分发，见 `eval/sdt/data.py`）。断点续跑、结果判读、
-C 组不达标时的诊断命令同样见 `docs/ONSITE_R57_R58.md`，不在这里重复。
+只是假数据长什么样。真机 20 条主诉 × 4 组 = 80 次问诊，**R61 加了 E 组
+（噪声地板对照）之后是 20 条 × 5 组 = 100 次**——多出的 20 次问诊全部是
+E 组（跟 C 组同配置的复测），只用来量 C-D 一致率闸门的噪声地板，不是新增
+一条独立的实验维度。**单次墙钟没有一个可信数字**：R55 commit 留下两处
+互相矛盾的记录（"top3 档约 45 秒、full_context 档约 75 秒" vs 另一处
+"三档墙钟实测 264.6/276.3/208.9 秒"，量级差 3~4 倍），量出后者的工具
+`scripts/compare_reasoning_tiers.py` 在仓库里不存在，两处谁准核实不到。
+**不要用这两个数字估算时间/费用**，先跑 `--limit 2`（2 条 × 5 组 =
+10 次问诊）拿到本机真实的 `elapsed_s_mean`，按比例估算 100 次的时长，
+具体方法见 `docs/ONSITE_R57_R58.md`。跑法见本文件顶部两行命令，
+`--sdt-dir` 指向用户自己的 TCMEval-SDT 本地 checkout（数据集不随本仓库
+分发，见 `eval/sdt/data.py`）。断点续跑、结果判读、C 组不达标时的诊断
+命令同样见 `docs/ONSITE_R57_R58.md`，不在这里重复。
 """
 from __future__ import annotations
 
@@ -73,11 +86,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from eval.ablation.spec import (
+    CONSISTENCY_PAIR,
     GATE_C_RULE_REFS_COMPLETENESS_MIN,
     GATE_C_VERIFIER_FIRST_PASS_VS,
-    GATE_CD_CONSISTENCY_MIN,
+    GATE_CD_CONSISTENCY_MARGIN,
     GATE_MIN_SAMPLE_SIZE,
     GROUPS,
+    NOISE_FLOOR_PAIR,
     R57Group,
     group_by_key,
 )
@@ -182,6 +197,74 @@ def _syndrome_method_formula(s3_structured) -> tuple[str | None, str | None, str
     return syn, method, formula
 
 
+#: R61 §1.3：治法方名里最常见的两种"在经典方基础上化裁"写法。只统一这两种，
+#: 不臆测更多写法（比如"化裁"）——CLAUDE.md 别过度设计，够用就好。
+_FORMULA_MODIFIER_SUFFIXES = ("加减", "加味")
+
+
+def _split_formula_suffix(name: str | None) -> tuple[str, str | None]:
+    """去掉方名两端与内部空白，拆出「基础方名」与「化裁后缀」（`_FORMULA_MODIFIER_SUFFIXES`
+    之一，没有则 `None`）。**两个不同的问题共用这一步拆分，但各自只取自己
+    要的那一半，不是同一次比较**（CLAUDE.md「同一概念只能有一处实现」的
+    例外情形，写清楚两者的区别）：
+
+      - C-D/C-E 一致率比较（`pair_consistency`）要回答"这两次采样说的是不是
+        同一张方"——"柴胡疏肝散加减"跟"柴胡疏肝散加味"该判成相同（只是
+        换了个近义后缀），"柴胡疏肝散"跟"黄芪建中汤加减"该判成不同（基础
+        方名本身不同）。这里要**同时看基础方名与后缀**（`_normalize_formula_for_comparison`
+        把后缀统一成"加减"一种写法再比，不丢掉"有没有化裁"这件事本身）。
+      - 本体命中率（`_formula_ontology_hit`，R61 §4）要回答"这个方名对应
+        本体 235 首方剂里的哪一条"——本体收录的是经典方**原名**，不带任何
+        化裁后缀，所以这里只要**基础方名**去查，后缀直接丢弃。
+    """
+    s = re.sub(r"\s+", "", name or "")
+    for suf in _FORMULA_MODIFIER_SUFFIXES:
+        if s.endswith(suf) and len(s) > len(suf):
+            return s[: -len(suf)], suf
+    return s, None
+
+
+def _normalize_formula_for_comparison(name: str | None) -> str:
+    """比较用：基础方名不变，把 `_FORMULA_MODIFIER_SUFFIXES` 里任意一种后缀
+    统一成"加减"这一种写法——"柴胡疏肝散加味"与"柴胡疏肝散加减"应该被
+    C-D 一致率判成相同（只是模型换了个近义词描述"化裁"这件事），不该被
+    字面不等拖累进"分歧"里。没有后缀的（`source=classic` 的原方）保持原样，
+    不强行补一个"加减"——"柴胡疏肝散"跟"柴胡疏肝散加减"仍然算不同
+    （一个是原方，一个明确说了做过加减，这个区别是有意义的，不能抹掉）。"""
+    if not name:
+        return ""
+    base, suf = _split_formula_suffix(name)
+    return base + "加减" if suf else base
+
+
+#: 治法/证型文本里常见的标点与空白，字符级 Jaccard 之前先剔掉——比的是
+#: "用词重叠程度"，标点不携带这个信息，留着只会稀释相似度。
+_PUNCT_RE = re.compile(r"[，。、；：“”‘’（）()\s]+")
+
+
+def _char_jaccard(a: str | None, b: str | None) -> float | None:
+    """治法（`method.principle`）是自由文本，两次独立采样几乎不可能逐字
+    相同——字符串相等在这上面测的是采样方差，不是"结论变了没变"（R61 §1.2，
+    跟 CLAUDE.md 已经记录过的两次教训——覆盖检查比字面子串、分歧度比证型
+    名字面相等——是同一类问题的第三次出现：**字面比较测不出"意思相不相同"**）。
+
+    改用字符级 Jaccard **相似度**（`|交集|/|并集|`，元素是去标点空白之后的
+    单字），报"有多像"而不是"是否相等"。**方向跟 `core/chain.py` 的
+    `herb_jaccard` 是反的**：那边报的是**距离**（`1 - 相似度`，语义是"两位
+    医家用药差多远"，好跟 ε 噪声地板的"差异上限"比大小）；这里报的是
+    **相似度本身**（语义是"这两段治法描述有多接近"，好跟 C-E 噪声地板的
+    "平均相似度"比大小）——都是同一个 Jaccard 系数，只是这里不取
+    `1 -`，别被两处名字都叫"jaccard"搞混方向。"""
+    if a is None or b is None:
+        return None
+    sa = set(_PUNCT_RE.sub("", a))
+    sb = set(_PUNCT_RE.sub("", b))
+    union = sa | sb
+    if not union:
+        return None
+    return round(len(sa & sb) / len(union), 4)
+
+
 def metrics_from_result(result: dict | None) -> dict:
     """R60 §2.5：一次问诊被 `SymbolicVeto` 拦下时 `result["results"]` 恒为
     `[]`（`core/chain.py::_stopped` 的既有设计——被拦的请求不产出任何方药），
@@ -247,7 +330,35 @@ def run_group(group: R57Group, complaints: list[dict], backend, *, progress=None
     return rows
 
 
-def aggregate(rows: list[dict], group: R57Group, *, content_valid: bool) -> dict:
+def _formula_ontology_hit_rate(rows: list[dict], *, content_valid: bool, ontology=None) -> dict | None:
+    """R61 §4：B→C 的净贡献不能只靠"看两条主诉肉眼觉得像不像真方"——
+    真机实测 B 组给出「疏肝和胃汤」「温中健脾和胃方」这类不存在的方名（按
+    治法现凑的字），C 组给出「柴胡疏肝散加减」「黄芪建中汤加减」这类真实
+    存在的经典方加减，这个差异**可以量化**：方名（去掉"加减/加味"这类
+    化裁后缀，见 `_split_formula_suffix`）能不能在方剂本体（235 首，
+    `core.ontology.get_ontology().formulas`）里查到。B/C 两组都算这个数，
+    报告里并排放，"模型是在编方名还是在真方基础上加减"就不再是定性描述。
+
+    **本体不可用**（`ontology.available` False，沙盒/新 clone 的常态）时
+    返回 `None`——不强行算出一个"0% 命中"，那会被误读成"这一组编的方名
+    特别多"，实际是"本体压根不在，谁也查不了"，跟 `rule_refs_applicable`
+    区分"不适用"与"0"是同一条诚实约束。"""
+    if not content_valid:
+        return None
+    from core.ontology import get_ontology
+
+    ont = ontology if ontology is not None else get_ontology()
+    if not ont.available:
+        return None
+    names = [r["metrics"]["formula"] for r in rows
+            if r.get("ok") and r["metrics"].get("has_output") and r["metrics"].get("formula")]
+    if not names:
+        return None
+    hits = sum(1 for name in names if ont.formula(_split_formula_suffix(name)[0]) is not None)
+    return _rate(hits, len(names))
+
+
+def aggregate(rows: list[dict], group: R57Group, *, content_valid: bool, ontology=None) -> dict:
     ok = [r for r in rows if r.get("ok")]
     with_output = [r for r in ok if r["metrics"].get("has_output")]
     grounded = [r["metrics"]["herbs_grounded_ratio"] for r in with_output
@@ -292,55 +403,134 @@ def aggregate(rows: list[dict], group: R57Group, *, content_valid: bool) -> dict
         "rule_refs_applicable": rule_refs_applicable,
         "rule_refs_note": rule_refs_note,
         "hallucination_rate": (_rate(hallu_runs, len(with_output)) if content_valid else None),
+        "formula_ontology_hit_rate": _formula_ontology_hit_rate(
+            rows, content_valid=content_valid, ontology=ontology),
         "llm_calls_mean": (round(statistics.fmean(calls), 3) if calls else None),
         "elapsed_s_mean": (round(statistics.fmean(wall), 3) if wall else None),
     }
 
 
-def pair_consistency(c_rows: list[dict], d_rows: list[dict], *, content_valid: bool) -> dict:
-    """C 与 D **按同一条主诉配对**比证型/治法/主方——这是 R54"绝不回头改
-    推导"这条不变式在消融层面的验证：C/D 唯一的旋钮差异是 `CORROBORATION`，
-    如果结论跟着变了，说明第三相事后佐证在哪里悄悄回流影响了推导，R54 的
-    不变式就被破坏了（`tests/test_corroboration.py` 用 sha256 在单次调用
-    层面钉过这件事；这里是消融层面、多条主诉上的复核，两处判据不是一回事：
-    单次调用层面测的是"这一次调用没有改"，这里测的是"跨样本看，会不会有
-    某种输入模式系统性地让结论漂移"——理论上前者保证了后者，但"理论上"
-    不是"实测过"，四组消融本来就是把"理论上"换成"实测过"这件事。"""
+def pair_consistency(rows_a: list[dict], rows_b: list[dict], *, content_valid: bool) -> dict:
+    """两组**按同一条主诉配对**比证型/治法/主方——**不合成一个单一布尔**
+    （R61 §1，替换了 R57 原来的实现）。这个函数不知道、也不关心自己在跟谁
+    比：`build_report` 既用它比 C 与 D（R54"绝不回头改推导"这条不变式在
+    消融层面的验证），也用它比 C 与 E（`spec.NOISE_FLOOR_PAIR`，C 组的
+    噪声地板复测）——同一份比较逻辑，不因为对象不同另写一套。
+
+    **为什么不能再判"三项都相等才算一致"**：用户真机实测，q1 在 C/D 两组
+    的 `syndrome`（肝胃气滞证）与 `formula`（柴胡疏肝散加减）字面完全相同，
+    整条记录仍被判"不一致"，唯一的原因是 `method`（治法）措辞不同——
+    "疏肝理气，和胃止痛" vs "疏肝解郁，理气和胃"。`method` 是自由文本，
+    两次独立采样几乎不可能逐字相同，逐字相等在这上面测的是**采样方差**，
+    不是"结论变了没变"——这是 CLAUDE.md 已经记两次的教训（覆盖检查比字面
+    子串、分歧度比证型名字面相等）第三次在新地方出现，判据是"这个判断此前
+    有没有人做过"，不是"这次的实现有没有 bug"。
+
+    三项因此**分开判、分开报**，用各自能承受的比较方式：
+      - `syndrome`：受控词表，逐字相等有意义，报命中率
+      - `formula`：主方名，归一后（`_normalize_formula_for_comparison`
+        统一"加减/加味"后缀）逐字相等，报命中率——化裁后缀的近义写法不该
+        被判成"选了不同的方"
+      - `method`：自由文本，逐字相等没有意义，报字符级 Jaccard **相似度**
+        均值（`_char_jaccard`），不报"相等/不相等"这种布尔
+
+    `pairs` 里带每条配对的三项原文，供报告并排列出（R61 §6 要求的
+    "q1 两组三项原文并排"），不是只报一个汇总数字。"""
     if not content_valid:
-        return {"value": None, "n": 0, "denominator": 0,
-                "note": "假后端：C/D 结论恒同一份固定假文本，这个比率没有意义"}
-    by_record_c = {r["record_id"]: r for r in c_rows if r.get("ok")}
-    by_record_d = {r["record_id"]: r for r in d_rows if r.get("ok")}
-    shared = sorted(set(by_record_c) & set(by_record_d))
-    match = 0
-    mismatches = []
+        return {"syndrome": None, "formula": None, "method_similarity": None,
+                "n_shared": 0, "pairs": [],
+                "note": "假后端：两组结论恒同一份固定假文本，这些数字没有意义"}
+    by_record_a = {r["record_id"]: r for r in rows_a if r.get("ok")}
+    by_record_b = {r["record_id"]: r for r in rows_b if r.get("ok")}
+    shared = sorted(set(by_record_a) & set(by_record_b))
+    syn_match = 0
+    formula_match = 0
+    method_sims: list[float] = []
+    pairs = []
     for rid in shared:
-        cm, dm = by_record_c[rid]["metrics"], by_record_d[rid]["metrics"]
-        c_tuple = (cm.get("syndrome"), cm.get("method"), cm.get("formula"))
-        d_tuple = (dm.get("syndrome"), dm.get("method"), dm.get("formula"))
-        if c_tuple == d_tuple and all(c_tuple):
-            match += 1
-        else:
-            mismatches.append({"record_id": rid, "c": c_tuple, "d": d_tuple})
-    return {**_rate(match, len(shared)), "mismatches": mismatches}
+        ma, mb = by_record_a[rid]["metrics"], by_record_b[rid]["metrics"]
+        syn_a, syn_b = ma.get("syndrome"), mb.get("syndrome")
+        formula_a, formula_b = ma.get("formula"), mb.get("formula")
+        method_a, method_b = ma.get("method"), mb.get("method")
+        syn_ok = bool(syn_a) and syn_a == syn_b
+        norm_a = _normalize_formula_for_comparison(formula_a)
+        norm_b = _normalize_formula_for_comparison(formula_b)
+        formula_ok = bool(norm_a) and norm_a == norm_b
+        sim = _char_jaccard(method_a, method_b)
+        if syn_ok:
+            syn_match += 1
+        if formula_ok:
+            formula_match += 1
+        if sim is not None:
+            method_sims.append(sim)
+        pairs.append({
+            "record_id": rid,
+            "syndrome": {"a": syn_a, "b": syn_b, "match": syn_ok},
+            "formula": {"a": formula_a, "b": formula_b, "match": formula_ok},
+            "method": {"a": method_a, "b": method_b, "similarity": sim},
+        })
+    return {
+        "syndrome": _rate(syn_match, len(shared)),
+        "formula": _rate(formula_match, len(shared)),
+        "method_similarity": (
+            {"value": round(statistics.fmean(method_sims), 4), "n": len(method_sims)}
+            if method_sims else None),
+        "n_shared": len(shared),
+        "pairs": pairs,
+    }
+
+
+def _gate(name: str, ok: bool | None, detail: str) -> dict:
+    return {"name": name, "passed": ok, "detail": detail}
+
+
+def _too_small(*sizes: int | None) -> bool:
+    """R59：任一份样本量缺失或低于 `GATE_MIN_SAMPLE_SIZE` 就判"样本不足"。
+    `--limit 2` 这类探针跑出来的 1/1、2/2 不该被拿去跟阈值比——那不是
+    "测出来通过了"，是"根本没测够"。R61 抽到模块级：`_relative_consistency_gate`
+    也要用同一条判据，不因为噪声地板对照是新加的就另写一遍。"""
+    return any(s is None or s < GATE_MIN_SAMPLE_SIZE for s in sizes)
+
+
+def _relative_consistency_gate(label: str, cd: dict | None, noise: dict | None,
+                               *, margin: float) -> dict:
+    """R61 §1.3：C-D 一致率不跟绝对值比，跟"同配置复测"的噪声地板比——
+    `cd`/`noise` 都是 `_rate()`（syndrome/formula）或均值（method_similarity）
+    出来的 `{"value", "n"[, "denominator"]}` 形状。`cd 的值 ≥ noise 的值
+    − margin` 才算过：C-D 的分歧不能明显比"两次独立采样、什么旋钮都没动"
+    还大。噪声地板本身没测出来（没跑 E 组，或 E 组样本不足）就整体判不了
+    （`None`），不能拿绝对阈值顶替——那正是这条闸门本来要移除的东西。"""
+    cd_v = (cd or {}).get("value")
+    noise_v = (noise or {}).get("value")
+    cd_n = (cd or {}).get("denominator", (cd or {}).get("n"))
+    noise_n = (noise or {}).get("denominator", (noise or {}).get("n"))
+    if cd_v is None or noise_v is None:
+        return _gate(label, None, "假后端或缺数据（没跑 E 组），量不到")
+    if _too_small(cd_n, noise_n):
+        return _gate(label, None,
+                     f"样本不足（C-D n={cd_n}, 噪声地板 C-E n={noise_n}，"
+                     f"都要 ≥{GATE_MIN_SAMPLE_SIZE}）——算出来的数字不代表任何东西")
+    passed = cd_v >= noise_v - margin
+    return _gate(label, passed,
+                 f"C-D={cd_v}（n={cd_n}） vs 噪声地板 C-E={noise_v}（n={noise_n}），"
+                 f"margin={margin}")
 
 
 def build_report(rows_by_group: dict[str, list[dict]], *, backend_info: dict,
-                 complaints: list[dict], content_valid: bool) -> dict:
-    groups = {k: aggregate(v, group_by_key(k), content_valid=content_valid)
+                 complaints: list[dict], content_valid: bool, ontology=None) -> dict:
+    """`ontology` 默认惰性用 `core.ontology.get_ontology()`（CLAUDE.md 的既有
+    约定）；测试注入一个 `available=False` 的替身，避免"零 LLM、零网络"的
+    判定测试在跑的时候意外解析磁盘上几千行的真实药理层数据。"""
+    groups = {k: aggregate(v, group_by_key(k), content_valid=content_valid, ontology=ontology)
              for k, v in rows_by_group.items()}
-    consistency = (pair_consistency(rows_by_group.get("C", []), rows_by_group.get("D", []),
-                                    content_valid=content_valid)
-                  if "C" in rows_by_group and "D" in rows_by_group else None)
-
-    def _gate(name: str, ok: bool | None, detail: str) -> dict:
-        return {"name": name, "passed": ok, "detail": detail}
-
-    def _too_small(*sizes: int | None) -> bool:
-        """R59：任一份样本量缺失或低于 `GATE_MIN_SAMPLE_SIZE` 就判"样本不足"。
-        `--limit 2` 这类探针跑出来的 1/1、2/2 不该被拿去跟阈值比——那不是
-        "测出来通过了"，是"根本没测够"。"""
-        return any(s is None or s < GATE_MIN_SAMPLE_SIZE for s in sizes)
+    cd_a, cd_b = CONSISTENCY_PAIR
+    nf_a, nf_b = NOISE_FLOOR_PAIR
+    c_vs_d = (pair_consistency(rows_by_group.get(cd_a, []), rows_by_group.get(cd_b, []),
+                               content_valid=content_valid)
+             if cd_a in rows_by_group and cd_b in rows_by_group else None)
+    c_vs_noise = (pair_consistency(rows_by_group.get(nf_a, []), rows_by_group.get(nf_b, []),
+                                   content_valid=content_valid)
+                 if nf_a in rows_by_group and nf_b in rows_by_group else None)
 
     gates = []
     a_fp_d = groups.get("A", {}).get("verifier_first_pass_rate")
@@ -378,18 +568,20 @@ def build_report(rows_by_group: dict[str, list[dict]], *, backend_info: dict,
         gates.append(_gate(
             f"C 组 rule_refs 完整率 ≥ {GATE_C_RULE_REFS_COMPLETENESS_MIN}", None,
             "假后端或缺数据，量不到"))
-    cd_n = (consistency or {}).get("denominator")
-    if consistency and consistency.get("value") is not None and not _too_small(cd_n):
-        gates.append(_gate(
-            f"C 与 D 一致率 ≥ {GATE_CD_CONSISTENCY_MIN}",
-            consistency["value"] >= GATE_CD_CONSISTENCY_MIN,
-            f"实测={consistency['value']}（n={cd_n}）"))
-    elif consistency and consistency.get("value") is not None:
-        gates.append(_gate(f"C 与 D 一致率 ≥ {GATE_CD_CONSISTENCY_MIN}", None,
-                           f"样本不足（n={cd_n}，要 ≥{GATE_MIN_SAMPLE_SIZE}）"))
-    else:
-        gates.append(_gate(f"C 与 D 一致率 ≥ {GATE_CD_CONSISTENCY_MIN}", None,
-                           (consistency or {}).get("note") or "缺数据，量不到"))
+    # R61：三项分开判——不再合成一个"C 与 D 一致率"布尔（理由见
+    # `pair_consistency` 文档字符串），每一项各自跟 C-E 噪声地板比。
+    gates.append(_relative_consistency_gate(
+        "C-D 证型一致率不明显低于噪声地板",
+        (c_vs_d or {}).get("syndrome"), (c_vs_noise or {}).get("syndrome"),
+        margin=GATE_CD_CONSISTENCY_MARGIN))
+    gates.append(_relative_consistency_gate(
+        "C-D 主方一致率不明显低于噪声地板",
+        (c_vs_d or {}).get("formula"), (c_vs_noise or {}).get("formula"),
+        margin=GATE_CD_CONSISTENCY_MARGIN))
+    gates.append(_relative_consistency_gate(
+        "C-D 治法相似度不明显低于噪声地板",
+        (c_vs_d or {}).get("method_similarity"), (c_vs_noise or {}).get("method_similarity"),
+        margin=GATE_CD_CONSISTENCY_MARGIN))
 
     # B→C 只差一个旋钮（THEORY_LAYER off→on，医案两组都不进推导），所以这个差值
     # 就是"医理规则层单独带来的净提升"——R51 存在的理由，用户要求单独报一次。
@@ -397,6 +589,15 @@ def build_report(rows_by_group: dict[str, list[dict]], *, backend_info: dict,
     theory_layer_net_contribution = (
         round(c_fp - b_fp, 4)
         if isinstance(c_fp, (int, float)) and isinstance(b_fp, (int, float)) else None)
+
+    # R61 §4：B→C 的净贡献不只是"验证器一次过率"这一个数——B 组编方名、
+    # C 组真方加减这件事，量化成"方名能在方剂本体里查到的比例"，同一个
+    # B→C 差值口径，跟上面那个并排报。
+    b_hit = (groups.get("B", {}).get("formula_ontology_hit_rate") or {}).get("value")
+    c_hit = (groups.get("C", {}).get("formula_ontology_hit_rate") or {}).get("value")
+    theory_layer_formula_hit_delta = (
+        round(c_hit - b_hit, 4)
+        if isinstance(c_hit, (int, float)) and isinstance(b_hit, (int, float)) else None)
 
     # R59：三分判定，不是拿 True/False 硬凑。**⏳ 不许被悄悄算成通过**——
     # 之前的写法是先把 passed=None 的门过滤掉再对剩下的做 all()，两条门过、
@@ -421,8 +622,10 @@ def build_report(rows_by_group: dict[str, list[dict]], *, backend_info: dict,
         "complaints": complaints,
         "groups": {g.key: {"name": g.name, "env": g.env, "describe": g.describe(),
                            **groups[g.key]} for g in GROUPS if g.key in groups},
-        "c_vs_d_consistency": consistency,
+        "c_vs_d_consistency": c_vs_d,
+        "c_vs_noise_floor": c_vs_noise,
         "b_to_c_verifier_first_pass_delta": theory_layer_net_contribution,
+        "b_to_c_formula_ontology_hit_delta": theory_layer_formula_hit_delta,
         "gates": gates,
         "all_gates_passed": all_gates_passed,
         "rows": rows_by_group,
@@ -461,21 +664,30 @@ def _fmt_rate(d: dict | None, suffix: str = "") -> str:
     return f"{text}（{detail}）"
 
 
+def _fmt_pair_cell(pair: dict, key: str) -> str:
+    """report 里"配对明细"表的一个单元格：两组各自的原文，逐字相同就不用
+    都印一遍。"""
+    a, b = pair[key]["a"], pair[key]["b"]
+    return f"「{a}」" if a == b else f"「{a}」 vs 「{b}」"
+
+
 def to_markdown(report: dict) -> str:
-    lines = ["# R57 消融：四组 × 五指标——证明「不靠模仿也能推」", ""]
+    lines = ["# R57 消融：五组 × 六指标——证明「不靠模仿也能推」", ""]
     b = report.get("backend") or {}
     lines.append(f"后端 `{b.get('id')}`（{b.get('model')}），{report.get('n_queries')} 条"
-                 "脾胃门主诉（SDT Train）。三条硬指标要求有效样本 "
+                 "脾胃门主诉（SDT Train）。硬指标要求有效样本 "
                  f"≥{GATE_MIN_SAMPLE_SIZE}，低于这个数一律判「样本不足」，"
-                 "不当作测出来了。")
+                 "不当作测出来了。E 组是 C 组的噪声地板复测（配置逐一相同），"
+                 "不是第五种实验条件。")
     if not report.get("content_metrics_valid"):
         lines.append("")
         lines.append("> ⚠ **这一份是假后端跑的**：内容指标（带本体出处占比、验证器一次过率、"
-                     "rule_refs 完整率、幻觉率、C/D 一致率）一律不出数，表里是 ⏳。"
-                     "能读的只有管道本身：四组是否各自设对了环境变量、跑通了没有报错。")
+                     "rule_refs 完整率、幻觉率、方名本体命中率、C/D 一致率）一律不出数，"
+                     "表里是 ⏳。能读的只有管道本身：各组是否各自设对了环境变量、跑通了"
+                     "没有报错。")
     lines += ["", "| 组 | 医理层/医案/事后佐证 | 药味占比 | 验证器一次过 | rule_refs 完整率 "
-                  "| 幻觉率 | 调用数 | 墙钟 |",
-             "|---|---|---|---|---|---|---|---|"]
+                  "| 方名本体命中率 | 幻觉率 | 调用数 | 墙钟 |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for g in GROUPS:
         row = (report.get("groups") or {}).get(g.key)
         if not row:
@@ -484,10 +696,11 @@ def to_markdown(report: dict) -> str:
         rr = row.get("rule_refs_completeness_rate")
         rr_cell = "不适用" if not row.get("rule_refs_applicable", True) else _fmt_rate(rr)
         hr = row.get("hallucination_rate")
+        hit = row.get("formula_ontology_hit_rate")
         lines.append(
             f"| {g.key} {g.name} | {g.describe().split('：', 1)[-1]} "
             f"| {_fmt_rate(row.get('herbs_grounded_ratio_mean'))} | {_fmt_rate(fp)} "
-            f"| {rr_cell} | {_fmt_rate(hr)} "
+            f"| {rr_cell} | {_fmt_rate(hit)} | {_fmt_rate(hr)} "
             f"| {_fmt(row.get('llm_calls_mean'))} | {_fmt(row.get('elapsed_s_mean'), ' s')} |")
     # R59：表格单元格里放不下长解释，"不适用"这三个字为什么不适用（A 组是
     # structured 没这个键、B 组是 THEORY_LAYER=off 没规则可引，两组理由不同）
@@ -500,21 +713,49 @@ def to_markdown(report: dict) -> str:
         lines.append("")
         for k, n, note in notes:
             lines.append(f"- rule_refs「不适用」（{k} {n}）：{note}")
-    lines.append("")
-    cons = report.get("c_vs_d_consistency") or {}
-    lines.append(f"**C 与 D 证型/治法/主方一致率**：{_fmt_rate(cons if cons.get('value') is not None else None)}"
-                + (f"——{cons['note']}" if cons.get("note") else ""))
-    if cons.get("mismatches"):
-        lines.append(f"不一致的 {len(cons['mismatches'])} 条：" +
-                     "、".join(m["record_id"] for m in cons["mismatches"][:10]))
-    lines += ["", "## 三条硬指标"]
+
+    b_hit = (report.get("b_to_c_formula_ontology_hit_delta"))
+    if b_hit is not None:
+        lines.append("")
+        lines.append(f"**B→C 方名本体命中率净提升**：{b_hit:+.4f}——"
+                     "B 组按治法现凑方名，C 组从经典方出发加减，这是医理规则层"
+                     "带来的净贡献第二个可统计指标（第一个是验证器一次过率，见下）。")
+
+    # R61：C-D 一致率不再合成一个布尔，三项（证型/主方/治法）分开报，
+    # 每项都跟 C-E 噪声地板并排列出——单看 C-D 的数字看不出"这个分歧是不是
+    # 正常的采样噪声"，必须跟地板比才有意义。
+    lines += ["", "## C-D 一致率 vs C-E 噪声地板"]
+    c_vs_d = report.get("c_vs_d_consistency") or {}
+    c_vs_noise = report.get("c_vs_noise_floor") or {}
+    if c_vs_d.get("note"):
+        lines.append(f"⏳ {c_vs_d['note']}")
+    else:
+        lines += ["", "| 维度 | C-D | C-E（噪声地板） |", "|---|---|---|"]
+        for key, label in (("syndrome", "证型一致率"), ("formula", "主方一致率"),
+                          ("method_similarity", "治法相似度（字符级 Jaccard 均值）")):
+            lines.append(f"| {label} | {_fmt_rate(c_vs_d.get(key))} "
+                        f"| {_fmt_rate(c_vs_noise.get(key))} |")
+        # §6 要求：把不一致的配对原文并排列出来，不是只报一个汇总数字。
+        mismatched = [p for p in c_vs_d.get("pairs") or []
+                     if not p["syndrome"]["match"] or not p["formula"]["match"]]
+        if mismatched:
+            lines += ["", f"不一致的 {len(mismatched)} 条（C vs D，三项原文并排）：", ""]
+            for p in mismatched[:10]:
+                lines.append(f"- **{p['record_id']}**")
+                lines.append(f"  - 证型：{_fmt_pair_cell(p, 'syndrome')}")
+                lines.append(f"  - 主方：{_fmt_pair_cell(p, 'formula')}")
+                sim = p["method"]["similarity"]
+                lines.append(f"  - 治法（相似度 {sim if sim is not None else '⏳'}）："
+                            f"「{p['method']['a']}」 vs 「{p['method']['b']}」")
+
+    lines += ["", "## 硬指标"]
     for g in report.get("gates") or []:
         mark = "⏳" if g["passed"] is None else ("✅" if g["passed"] else "❌")
         lines.append(f"- {mark} {g['name']}（{g['detail']}）")
     overall = report.get("all_gates_passed")
     lines.append("")
     lines.append("**总判定**：" + ("⏳ 还没有真机数，判不了" if overall is None
-                                 else ("✅ 三条全过" if overall else "❌ 至少一条没过——回 R51 补规则")))
+                                 else ("✅ 全过" if overall else "❌ 至少一条没过——回 R51 补规则")))
     for g in GROUPS:
         lines.append(f"- **{g.describe()}**")
     return "\n".join(lines) + "\n"
@@ -560,7 +801,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="备选：一份纯文本主诉文件（一行一条），不依赖 SDT 数据集")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 条（调试用）")
     ap.add_argument("--backend", default="fake", choices=["fake", "real"])
-    ap.add_argument("--groups", default="ABCD", help="跑哪几组，默认全跑")
+    ap.add_argument("--groups", default="ABCDE",
+                    help="跑哪几组，默认全跑（E 是 C 组的噪声地板复测，R61 新增）")
     ap.add_argument("--out", default=str(DEFAULT_OUT))
     ap.add_argument("--md", default=None)
     ap.add_argument("--no-warmup", dest="warmup", action="store_false")

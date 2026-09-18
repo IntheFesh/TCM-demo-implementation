@@ -48,29 +48,33 @@ def _write_group_report(tmp_path, group_key: str, *, syndrome="脾气虚证",
     return path
 
 
-def test_merging_four_single_group_files_recovers_all_four_groups(tmp_path):
-    paths = [_write_group_report(tmp_path, g) for g in "ABCD"]
+def test_merging_five_single_group_files_recovers_all_five_groups(tmp_path):
+    paths = [_write_group_report(tmp_path, g) for g in "ABCDE"]
     merged = merge(paths)
-    assert set(merged["rows"]) == {"A", "B", "C", "D"}
-    assert set(merged["groups"]) == {"A", "B", "C", "D"}
+    assert set(merged["rows"]) == {"A", "B", "C", "D", "E"}
+    assert set(merged["groups"]) == {"A", "B", "C", "D", "E"}
 
 
 def test_merged_report_computes_c_vs_d_consistency_from_raw_rows(tmp_path):
     """局部文件里没有 pair_consistency（那需要同时看到 C 和 D 的原始行）——
-    合并之后重新跑 build_report 才会算出来，这是「不是拼 JSON 文本」的证据。"""
+    合并之后重新跑 build_report 才会算出来，这是「不是拼 JSON 文本」的证据。
+    R61：一致率拆成三项（证型/主方/治法），不再是单个 `value`。"""
     paths = [_write_group_report(tmp_path, "C", syndrome="脾气虚证"),
             _write_group_report(tmp_path, "D", syndrome="脾气虚证")]
     for p in paths:
         assert json.loads(p.read_text(encoding="utf-8"))["c_vs_d_consistency"] is None
     merged = merge(paths)
-    assert merged["c_vs_d_consistency"]["value"] == 1.0
+    cons = merged["c_vs_d_consistency"]
+    assert cons["syndrome"]["value"] == 1.0
+    assert cons["formula"]["value"] == 1.0
+    assert cons["method_similarity"]["value"] == 1.0
 
 
 def test_merged_report_flags_a_real_c_vs_d_mismatch_across_files(tmp_path):
     paths = [_write_group_report(tmp_path, "C", syndrome="脾气虚证"),
             _write_group_report(tmp_path, "D", syndrome="脾阳虚证")]
     merged = merge(paths)
-    assert merged["c_vs_d_consistency"]["value"] == 0.0
+    assert merged["c_vs_d_consistency"]["syndrome"]["value"] == 0.0
 
 
 def test_mismatched_complaints_refuses_to_merge(tmp_path):

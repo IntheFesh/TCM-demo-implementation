@@ -27,6 +27,13 @@ R55_followup_checkpoint.md`「R57 消融若 C 组不达标」一节里的说法
 | C | **开** | 关 | 关 |
 | D | 开 | 关 | **开** |
 
+## R61：E 组不是第五种组合，是 C 组的复测
+
+E 组三个布尔跟 C **逐一相同**——它不是三维立方体上的第五个顶点，是同一个
+顶点上的第二次独立采样。任务书原文只有四组，E 是 R61 为了量出"两次独立
+采样在自由文本上天然会有多少分歧"而加的噪声地板对照，不改变实验设计本身
+的三个维度，见 `GATE_CD_CONSISTENCY_MARGIN` 与下面 `GROUPS` 的说明。
+
 ## 为什么不是自由的 2×2×2＝8 种组合
 
 `cases_in_derivation` 与 `theory_layer`/`corroboration` 不是独立的三个旋钮——
@@ -83,6 +90,17 @@ class R57Group:
 
 #: **A/B/C/D，顺序即定义顺序**。C 是核心组（"不靠模仿也能推"的直接证据），
 #: D 是最终形态（核心组 + 事后佐证，不回头改推导）。
+#:
+#: **R61 新增 E：C 组的噪声地板对照**（跟 C 组三个布尔逐一相同，配置上
+#: 是 C 的"复测"）。C 与 D 是两次**独立**的 LLM 采样，唯一的旋钮差异是
+#: `CORROBORATION`——但自由文本（尤其是 `method` 治法措辞）在两次独立采样
+#: 之间几乎不可能逐字相同，拿"逐字相等"去比较，量到的是**采样方差**，不是
+#: R54 那条"事后佐证不回流改推导"的不变式本身。E 组存在的意义就是量出
+#: "同一份配置，不跑第三相佐证，纯粹重复采样一次"的分歧率作为噪声地板——
+#: C 与 D 的分歧率只有明显**超过**这个地板，才说明是 `CORROBORATION` 这个
+#: 旋钮本身带来的差异，不是采样噪声（见 `eval/ablation/r57.py`
+#: `pair_consistency`/`GATE_CD_CONSISTENCY_MARGIN`）。同一套比较逻辑
+#: （`pair_consistency`）既用于 C-D，也用于 C-E，不是另写一套。
 GROUPS: tuple[R57Group, ...] = (
     R57Group("A", "现状模仿机制", theory_layer=False,
              cases_in_derivation=True, corroboration=False),
@@ -92,7 +110,14 @@ GROUPS: tuple[R57Group, ...] = (
              cases_in_derivation=False, corroboration=False),
     R57Group("D", "演绎+事后佐证（最终形态）", theory_layer=True,
              cases_in_derivation=False, corroboration=True),
+    R57Group("E", "纯演绎复测（C 噪声地板对照，配置同 C）", theory_layer=True,
+             cases_in_derivation=False, corroboration=False),
 )
+
+#: C-D/C-E 一致率比较的两端——**只在这里写一次**，`r57.py` 用这两个常量
+#: 取行，不各自硬编码 "C"/"D"/"E" 字符串。
+CONSISTENCY_PAIR = ("C", "D")
+NOISE_FLOOR_PAIR = ("C", "E")
 
 
 def group_by_key(key: str) -> R57Group:
@@ -106,7 +131,20 @@ def group_by_key(key: str) -> R57Group:
 #: 在这里——报告生成、验收脚本都读这几个常量，不各自重复写一遍阈值。
 GATE_C_VERIFIER_FIRST_PASS_VS = "A"          # C 组一次通过率 ≥ A 组
 GATE_C_RULE_REFS_COMPLETENESS_MIN = 0.9      # C 组 rule_refs 完整率 ≥ 0.9
-GATE_CD_CONSISTENCY_MIN = 0.9                # C 与 D 的证型/治法/主方一致率 ≥ 0.9
+
+#: **R61**：C 与 D 的一致率不再跟绝对值 0.9 比（`GATE_CD_CONSISTENCY_MIN`
+#: 已删除）——用户真机实测：q1 两组的证型、主方字面完全相同，唯独治法措辞
+#: 不同（"疏肝理气，和胃止痛" vs "疏肝解郁，理气和胃"），就被判"不一致"。
+#: `method` 是自由文本，两次独立采样几乎不可能逐字相同，逐字相等在这上面
+#: 测的是采样方差，不是不变式，拿它跟固定阈值比没有意义（详见
+#: `eval/ablation/r57.py::pair_consistency` 的文档字符串）。
+#:
+#: 改成**相对判据**：C-D 的分歧率不能明显超过 C-E（同配置复测，见 spec.py
+#: 顶部 GROUPS 的 R61 说明）测出来的噪声地板——`C-D 的一致率 ≥ C-E 的
+#: 一致率 − margin` 才算过。这条 margin 只留一点容差（用户建议 0.1），
+#: 不是把整条闸门变宽松：C-E 本身已经是"纯采样噪声"的上限，C-D 只要不明显
+#: 比它还分散就算过。
+GATE_CD_CONSISTENCY_MARGIN = 0.1
 
 #: R59：闸门判定要求的最小有效样本。**唯一出处**——`--limit 2` 这类小样本
 #: 探针把 C 组一次通过率量成 1（1/1）也会通过阈值比较，但那不是"判过了"，
