@@ -405,5 +405,24 @@ def test_s3_derived_has_no_top_level_case_fields():
     干脆没有这个字段，跟"新建 schema 不放松旧约束"是一回事）。"""
     assert "cited_case_ids" not in S3Derived.model_fields
     assert "physician_influences" not in S3Derived.model_fields
-    assert set(S3Derived.model_fields) == {
-        "organs", "syndrome", "method", "formula", "herb_choices", "note"}
+    # 医案相关字段**逐个点名**，不再断言"字段集恰好等于这六个"。
+    # R62 §3.2 往顶层加了 key_points/differential/modifications/self_assessment
+    # 四项，跟医案一点关系都没有；一条"字段集必须一字不差"的断言会在每一次
+    # 正常的新增上变红，而它本来要守的东西（这一相看不到医案）根本没被碰。
+    # 判据改成"这几个名字一个都不许出现"，加字段不会误红，真把医案字段抄回来
+    # 会当场红。
+    for banned in ("cited_case_ids", "physician_influences", "physician_source",
+                   "dose_evidence", "refs", "retrieved_case_ids"):
+        assert banned not in S3Derived.model_fields, (
+            f"{banned} 是医案检索那条路径上的字段，演绎推导这一相不该有它"
+        )
+
+
+def test_s3_derived_carries_the_four_r62_sections():
+    """R62 §3.2 的四项在顶层，且**都带默认值**——录制于 R52~R61 的 fixture
+    里没有这四个字段，必填会让每一份历史录制当场解析失败。"""
+    for name in ("key_points", "differential", "modifications", "self_assessment"):
+        assert name in S3Derived.model_fields
+        assert not S3Derived.model_fields[name].is_required(), (
+            f"{name} 不该是必填：R52~R61 的录制语料里没有这个字段"
+        )

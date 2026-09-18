@@ -117,3 +117,49 @@ def test_neither_the_legacy_nor_the_structured_prompt_was_touched():
          "prompts/v1/s3_syndrome.yaml", "prompts/v1/s3_structured.yaml"],
         cwd=PROMPTS_ROOT.parent, capture_output=True, text=True)
     assert r.stdout.strip() == "", "s3_syndrome.yaml / s3_structured.yaml 被改动了"
+
+
+# ---------- R62 §3.2：五步链之外的四项 ----------
+
+
+def test_the_prompt_asks_for_all_four_r62_sections(prompt):
+    """四项在 schema 里是带默认值的（历史录制里没有这几个字段，必填会让
+    每一份 fixture 当场解析失败）——所以"模型到底会不会填"完全取决于这份
+    prompt 有没有要。这条测试是那个要求的唯一守门人。"""
+    s = prompt["system"]
+    for field in ("key_points", "differential", "modifications", "self_assessment"):
+        assert field in s, f"prompt 里没有要求 {field}，schema 上它又是可选的，结果就是永远空着"
+
+
+def test_the_prompt_states_the_minimum_counts_for_differential_and_modifications(prompt):
+    """§3.2 原文：鉴别 ≥2 条。少于两条的"鉴别"说不出这个结论排除了什么，
+    而"排除了什么"正是判断可信度的依据。"""
+    s = prompt["system"]
+    assert "至少 2 条" in s
+    assert "至少 3 条" in s          # key_points
+
+
+def test_the_prompt_forbids_listing_the_conclusion_itself_as_a_differential(prompt):
+    """跟 `S3Derived._differential_excludes_other_syndromes` 是同一条约束的
+    两个入口：prompt 先说清楚，schema 再兜底。只有 schema 拦、prompt 不说，
+    模型会反复撞上这条校验，白白多跑 revise 轮次。"""
+    assert "不能填本次的结论证型" in prompt["system"]
+
+
+def test_the_modification_example_uses_the_same_item_shape_as_herb_items(prompt):
+    """加减建议里的药用 `item`（跟 herb_items 同形状），不是另起一组
+    herb/dose 字段——界面上这一条是可以一键写回处方表的。"""
+    s = prompt["system"]
+    example = s[s.index('"modifications"'):]
+    assert '"item"' in example
+    assert '"dose_unit"' in example
+
+
+def test_self_assessment_has_no_score_field(prompt):
+    """自评只呈现、不择优。示例里一旦出现一个可比大小的数，下游迟早拿它排序
+    ——而"模型自评"排出来的先后没有任何依据（R44 消除投票痕迹那一轮的教训）。"""
+    s = prompt["system"]
+    example = s[s.index('"self_assessment"'):]
+    example = example[:example.index("}") + 1]
+    for banned in ("score", "confidence", "rating", "评分", "置信"):
+        assert banned not in example

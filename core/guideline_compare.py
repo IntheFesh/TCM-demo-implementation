@@ -114,6 +114,74 @@ def entries_for(syndrome: str) -> list[GuidelineEntry]:
             if e.syndrome == name or e.syndrome.removesuffix("证") == stem]
 
 
+def textbook_formula_for(syndrome: str, *, ontology=None) -> dict | None:
+    """这个证型的**教材代表方及其组成**。零 LLM，全部现查。
+
+    R62 §8.1：患者角色看到的方是这一个，**不是模型为他拟的那一张**。
+    两者是不同性质的东西，这一点决定了整个患者模式的合规姿态：
+      - 模型拟的方是"针对这位患者的推荐治疗方案"——按《人工智能医用软件
+        产品分类界定指导原则》属第三类医疗器械，不能直接摆给患者；
+      - 教材代表方是"《方剂学》记载这个证型的代表方是什么"——教材上的
+        公开知识，摆出来是知识呈现，不是给这个人开方。
+    所以这个函数刻意**不接受任何患者信息**：它的输入只有证型名。
+    一旦它开始按年龄/体质调整组成，它就变成了前一种东西。
+
+    组成从方剂本体现查（`Ontology.formula`）。本体不可用或查不到这张方时，
+    返回的 `composition` 是空列表而不是编一份——界面据此显示"教材记载的
+    代表方是 X，本系统的方剂本体里暂时没有它的组成"，不是显示一张空方。
+    取不到教材推荐本身（这个证型不在 `guidelines.jsonl` 里）则返回 None，
+    跟"查到了但没有组成"分开（CLAUDE.md：工具返回空必须能区分三种情况）。
+
+    **两种来源，标签不同。** 教材推荐方案表只覆盖 52 个证型（285 行去重后），
+    查不到时再按方剂本体的**主治**检索一次。后者是更弱的线索，所以 `basis`
+    与 `basis_label` 明确标成另一套值——界面上必须看得出这张方是"教材点名的
+    代表方"还是"本体按主治检索到的方"，把两者写成同一句话就是把弱证据说成
+    强证据（CLAUDE.md：任何数字/结论都必须带它的对照基准）。
+    """
+    if ontology is None:
+        from core.ontology import get_ontology
+        ontology = get_ontology()
+    available = bool(getattr(ontology, "available", False))
+
+    entries = entries_for(syndrome)
+    e = entries[0] if entries and (entries[0].recommended_formula or "").strip() else None
+    if e is not None:
+        name, principle = e.recommended_formula, e.recommended_principle
+        disease, syn = e.disease, e.syndrome
+        source, span = e.source, e.span
+        basis, basis_label = BASIS_ID, BASIS_LABEL
+    else:
+        cands = ontology.formulas_for_syndrome(syndrome) if available else []
+        if not cands:
+            return None
+        f0 = cands[0]
+        name, principle, disease = f0.name, "", ""
+        syn = (syndrome or "").strip()
+        ref = next((r for r in (f0.refs.get("主治") or f0.refs.get("功用") or ()) if r.span), None)
+        source, span = (ref.book if ref else ""), (ref.span if ref else "")
+        basis, basis_label = "formulary_indication", "方剂本体（按主治检索）"
+
+    f = ontology.formula(name) if available else None
+    return {
+        "name": name,
+        "principle": principle,
+        "disease": disease,
+        "syndrome": syn,
+        # (药名, 剂量原文)。本体里没有这张方就是空列表，不是编一份。
+        "composition": [{"name": n, "dose": d} for n, d in (f.composition if f else ())],
+        "functions": list(f.functions) if f else [],
+        "indications": list(f.indications) if f else [],
+        "source": source,
+        "span": span,
+        "basis": basis,
+        "basis_label": basis_label,
+        "composition_available": bool(f and f.composition),
+        "note": ("" if (f and f.composition) else
+                 f"{basis_label}记载本证的代表方为「{name}」，"
+                 "本系统的方剂本体里暂时没有收录它的组成。"),
+    }
+
+
 def _principle_matches(ours: str, theirs: str) -> bool:
     """治法算不算一致。走同义表，不裸比字符串。
 

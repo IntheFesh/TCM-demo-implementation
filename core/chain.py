@@ -1353,6 +1353,28 @@ def _run_react_round(
     return s3_system + format_trace_for_s3(trace), trace, react_safety_flag
 
 
+def _emit_s3_draft(on_step: StepFn | None, raw) -> None:
+    """R62 §11.3：S3 一解析出来就把五步链整件发出去，别让界面等到 `done`。
+
+    **为什么不是把内容塞进 `s3_done`**：`s3_done` 是"这一次生成结束了"的时刻
+    标记，它的载荷是流式遥测（帧数、首字耗时），前端拿它推进进度条；而这里发
+    的是**内容**，前端拿它渲染②–⑥。两件事挤进一个事件，以后想在产品模式下
+    砍掉遥测（R56 已经砍过一次文案）就会连带把内容一起砍掉。
+
+    **`verified: false` 不是可选的礼貌性字段**：这份草稿后面还要过符号验证，
+    验证不过会被重开一轮、内容会变。前端必须能区分"推导出来了"和"核查过了"
+    ——把一份没验过的方药显示成终稿，正是这个项目从 R34 起一直在防的事。
+    """
+    if on_step is None:
+        return
+    on_step("s3_draft", {
+        "physician": SYNTHESIS_PHYSICIAN_ID,
+        "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+        "verified": False,
+        "s3_structured": raw.model_dump(),
+    })
+
+
 def _verify_and_revise(raw, s3_system: str, s3_schema, *, on_step: StepFn | None = None):
     """R34 闭环：验 → 有问题就带着**本体原文反例**重开 → 再验，最多
     `max_revise_rounds()` 轮。返回 `(最终 raw, 最终 s3, 每轮的验证结果, 重开次数)`。
@@ -1384,9 +1406,27 @@ def _verify_and_revise(raw, s3_system: str, s3_schema, *, on_step: StepFn | None
     revise_calls = 0
     s3 = _as_s3_syndrome(raw)
     limit = max_revise_rounds()
+    # R62 §11.3：`s3_done` 之后这一段最长能跑一整轮 LLM，而在此之前它一个事件
+    # 都不发——前端只能干等，用户读成"卡住了"。三个事件把这一段的每个边界都
+    # 标出来：开始、每一轮的结论、结束。
+    # **`verify_round` 跟既有的 `verify_revise` 不是同一件事**，不合并：
+    # `verify_round` 每轮都发（含"第一轮就过了"这种不会有 revise 的情况），
+    # 说的是"验完了，结论是这个"；`verify_revise` 只在**即将重开一轮**时发，
+    # 说的是"要回炉了"。合成一个就没法在界面上区分"验过了没问题"和"验过了
+    # 正在改"——而这两者的等待时长差着一整轮 LLM。
+    if on_step is not None:
+        on_step("verify_start", {"max_rounds": limit + 1})
     while True:
         result = verify_formula(raw)
         rounds.append(result)
+        if on_step is not None:
+            on_step("verify_round", {
+                "round": len(rounds), "status": result.status,
+                "n_veto": len(result.vetoes), "n_revise": len(result.revisables),
+                "rules": sorted({v.rule for v in result.violations}),
+                "checked_rules": list(result.checked_rules),
+                "n_unverifiable": len(result.unverifiable),
+            })
         if not result.violations or revise_calls >= limit:
             break
         feedback = format_violations_for_revise(result)
@@ -1406,6 +1446,15 @@ def _verify_and_revise(raw, s3_system: str, s3_schema, *, on_step: StepFn | None
         )
         s3 = _as_s3_syndrome(raw)
         revise_calls += 1
+    if on_step is not None:
+        # **veto 抛异常之前就发**：整次问诊要被否决时，前端也该看到"核查做完了"，
+        # 否则界面停在"核查中…"，而后面根本不会再来事件了。
+        on_step("verify_done", {
+            "rounds": len(rounds), "revise_calls": revise_calls,
+            "status": rounds[-1].status,
+            "n_veto": len(rounds[-1].vetoes), "n_revise": len(rounds[-1].revisables),
+            "first_pass": len(rounds) == 1 and not rounds[0].violations,
+        })
     if rounds[-1].vetoes:
         raise SymbolicVeto(rounds[-1].vetoes, llm_calls=revise_calls,
                            rounds=revise_calls)
@@ -1580,6 +1629,7 @@ def run_synthesis(
                             "physician_name": SYNTHESIS_PHYSICIAN_NAME,
                             **emitter.summary(),
                             "streaming_note": _streaming_note(len(candidates_scored))})
+    _emit_s3_draft(on_step, raw)
     # R34：符号验证闭环。**这一层取代了 legacy 那条"安全层拦截 → 重开一次"**
     # ——不是两个循环并存：那两条判据（配伍禁忌、超量）现在由验证器的
     # `incompatible_pair` / `dose_exceeds` 两条规则**委托给同一个 safety_output**
@@ -1764,6 +1814,7 @@ def run_derivation(
                             "physician_name": SYNTHESIS_PHYSICIAN_NAME,
                             **emitter.summary(),
                             "streaming_note": _streaming_note(len(candidates_scored))})
+    _emit_s3_draft(on_step, raw)
     # R34（延伸到 R52/R53）：同一套验证闭环，S3Derived 靠字段名跟 S3Structured
     # 保持一致这件事直接免费获得（core/formula_verifier.py 的十三条规则全是
     # 鸭子类型，含 R53 新增的四条医理一致性规则）。
@@ -1787,7 +1838,19 @@ def run_derivation(
     # R54 第三相：医案佐证。**必须在这里、在 s3/raw 已经定型之后调用**——
     # 前面已经过了 R53 的验证闭环，raw 不会再变，这里的调用顺序就是"绝不
     # 回头改推导"最直接的体现：corroborate() 拿到的是最终结论，改不了它。
+    # R62 §11.3 的第二段静默区：这一相要跑医案检索（向量/BM25/图），在慢机器上
+    # 是实打实的几秒钟，而此前它一个事件都不发。
+    if on_step is not None:
+        on_step("corroborate_start", {})
     corroboration = corroborate(raw, s1, s2, retriever_mode=retriever_mode)
+    corroboration_dict = corroboration.to_dict()
+    if on_step is not None:
+        on_step("corroborate_done", {
+            "enabled": corroboration_dict["enabled"],
+            "n_concordant": len(corroboration_dict["concordant"]),
+            "n_divergent": len(corroboration_dict["divergent"]),
+            "n_no_precedent": len(corroboration_dict["no_precedent"]),
+        })
 
     return {
         "physician": SYNTHESIS_PHYSICIAN_ID,
@@ -1799,7 +1862,7 @@ def run_derivation(
         # 通用字段名，`S3Derived` 跟 `S3Structured` 字段名相同，键名换了反而要
         # 前端多判一次"这是哪种模式"。
         "s3_structured": raw,
-        "corroboration": corroboration.to_dict(),
+        "corroboration": corroboration_dict,
         "physicians_cited": [],
         "herbs_grounded_ratio": raw.herbs_grounded_ratio(),
         "n_ontology_refs": len(raw.ontology_refs),

@@ -1392,6 +1392,103 @@ class HerbChoiceDerived(BaseModel):
         return self
 
 
+# ---------- R62 §3.2：演绎链之外还要交代的四件事 ----------
+#
+# 五步链（脏腑→证型→治法→方剂→药味）回答的是"这个结论怎么推出来的"。
+# R62 要补的四项回答的是另外四个问题，**四问四答，不是把五步链写得更细**：
+#
+#   key_points      这一例凭哪几条表现落在这个证上（学生要学的"辨证眼"）
+#   differential    排除了哪几个证、凭什么排除（判断可信度看的就是排除了什么）
+#   modifications   若见某症该怎么加减（医师要的可操作性）
+#   self_assessment 这次推导自己哪一环最弱（诚实交代，不用于择优）
+#
+# **四项全部带默认值，不是必填。** 理由不是"约束放松"（CLAUDE.md 那条铁律
+# 禁止的是把既有的 `Field(min_length=1)` 改成可选，这里一个既有字段都没动）：
+#   1. R52~R61 录制的全部 fixture 与 replay 语料里没有这四个字段，改成必填
+#      会让每一份历史录制当场解析失败——那等于把此前八轮的基线一次作废；
+#   2. 模型这一次确实说不出鉴别时，正确的产出是"本次没有给出鉴别"，
+#      不是逼它编两条凑数（跟 `insufficient` 是同一条纪律）。
+# 产品面不会因此出现空按钮：证型的鉴别在 `core/node_explain.py` 的
+# 「相似证型与鉴别点」一节里有一份**零 LLM、来自证候表**的数据，
+# 模型没给时界面展示那一份并注明来源，不是留白。
+
+
+class KeyPoint(BaseModel):
+    """一条辨证要点：患者的哪一句表现，说明了什么。
+
+    `point` 要求能对上主诉原文——它是给人看的"凭这句话"，不是对证型定义的
+    复述。校验落在 `_check_key_points_map_to_symptoms`（`S3Derived` 上），
+    不在这里：这个类自己看不到本次的症状列表。
+    """
+
+    point: str = Field(min_length=1)
+    maps_to: str = Field(min_length=1)
+
+
+class DifferentialItem(BaseModel):
+    """一条被排除的鉴别证型：排除了谁、凭什么排除。
+
+    依据的要求跟演绎链的五步**完全一致**（`rule_refs` 非空或显式
+    `insufficient`）——"排除"也是一个断言，说不出凭据的排除跟凭记忆编一个
+    结论没有区别。
+    """
+
+    syndrome: str = Field(min_length=1)
+    excluded_because: str = Field(min_length=1)
+    rule_refs: list[TheoryRef] = Field(default_factory=list)
+    insufficient: InsufficientNote | None = None
+
+    @model_validator(mode="after")
+    def _cites_or_flags(self) -> "DifferentialItem":
+        _require_rule_refs_or_insufficient(
+            f"鉴别（排除 {self.syndrome!r}）", self.rule_refs, self.insufficient)
+        return self
+
+
+class ModificationSuggestion(BaseModel):
+    """一条加减建议：若见某症，加/减某味药。
+
+    **药本身用 `HerbItem`，不另起一组 herb/dose/unit 字段**——界面上这一条是
+    可以一键写回处方表的，而处方表里的一味药就是 `HerbItem`。两处各写一份
+    会让"采纳之后剂量单位对不上"这种 bug 在两个 schema 之间来回跑
+    （CLAUDE.md 第 31 条：同一概念只能有一处实现）。`action="减"` 时
+    `item` 只用得上 `name`，其余字段留空是合法的。
+
+    依据拆成 `ontology_refs`（这味药的功效原文出自哪本书）与 `rule_refs`
+    （凭哪条医理规则该在这个兼症上动这味药）两类，**不合并成一个 `refs`**：
+    整个项目里这两者一直是两件事（见 `s3_derived.yaml` 那两节），
+    合并之后"这段原文是抄的还是编的"就没法单独回查了。
+    """
+
+    if_symptom: str = Field(min_length=1)
+    action: Literal["加", "减"]
+    item: HerbItem
+    why: str = Field(min_length=1)
+    ontology_refs: list[OntologyRef] = Field(default_factory=list)
+    rule_refs: list[TheoryRef] = Field(default_factory=list)
+    insufficient: InsufficientNote | None = None
+
+    @model_validator(mode="after")
+    def _cites_or_flags(self) -> "ModificationSuggestion":
+        _require_rule_refs_or_insufficient(
+            f"加减建议（{self.action}{self.item.name}）", self.rule_refs, self.insufficient)
+        return self
+
+
+class SelfAssessment(BaseModel):
+    """这次推导的自评。**只呈现，不参与择优**。
+
+    这一点必须写在类型上而不是只写在文档里：它没有任何数值字段，
+    也没有 confidence——一旦有了一个可比大小的数，下游迟早会拿它去排候选，
+    而"模型自评"排出来的先后没有任何依据（这正是 R44 消除投票痕迹那一轮的
+    教训）。三个字段全是文字，谁也没法拿它们排序。
+    """
+
+    weakest_link: str = Field(min_length=1)
+    uncovered_symptoms: list[str] = Field(default_factory=list)
+    next_direction: str = Field(min_length=1)
+
+
 class S3Derived(BaseModel):
     """R52 第一相：演绎推导的结果。**看不到任何医案**——`prompts/v1/s3_derived.yaml`
     全文没有参考医案块，模型只能依据 R51 医理规则层与本体推导；说不出依据
@@ -1416,11 +1513,38 @@ class S3Derived(BaseModel):
     method: MethodStepDerived
     formula: FormulaStepDerived
     herb_choices: list[HerbChoiceDerived] = Field(min_length=1)
+    #: R62 §3.2 的四项。为什么带默认值见上面那段注释。
+    key_points: list[KeyPoint] = Field(default_factory=list)
+    differential: list[DifferentialItem] = Field(default_factory=list)
+    modifications: list[ModificationSuggestion] = Field(default_factory=list)
+    self_assessment: SelfAssessment | None = None
     note: str | None = None
 
     @model_validator(mode="after")
     def _no_step_skipping(self) -> "S3Derived":
         _check_no_step_skipping(self.organs, self.syndrome, self.method, self.formula, self.herb_choices)
+        return self
+
+    @model_validator(mode="after")
+    def _differential_excludes_other_syndromes(self) -> "S3Derived":
+        """鉴别里不能把本次的结论自己列成"被排除的证"。
+
+        这不是吹毛求疵：模型真的会写出「鉴别：肝胃气滞证——本例即是」这种
+        条目，而界面上那一栏的标题是"排除了哪些证"，一条"排除了本证"会把
+        整个结论读反。判据只看证型名，不做同义归一——鉴别项要跟结论**字面
+        不同**才有意义，写法稍有出入（"肝胃气滞"vs"肝胃气滞证"）也该算同一个，
+        所以两边都去掉末尾的"证"再比。
+        """
+        def _bare(name: str) -> str:
+            return (name or "").strip().rstrip("证")
+
+        mine = _bare(self.syndrome.name)
+        for d in self.differential:
+            if _bare(d.syndrome) == mine:
+                raise ValueError(
+                    f"鉴别里出现了本次的结论证型 {d.syndrome!r}——鉴别这一栏列的是"
+                    "「排除了哪些证、凭什么排除」，把结论自己列进去会让整栏读反。"
+                )
         return self
 
     # ---- 派生视图：跟 `_S3StructuredBase` 同名同形状，下游按 hasattr 判断即可 ----
@@ -1687,3 +1811,119 @@ class Individualization(BaseModel):
 
     items: list[IndividualizationItem] = Field(default_factory=list)
     considered: list[str] = Field(default_factory=list)
+
+
+# ---------- R62 §3.3：三个轻量能力的输出形状 ----------
+#
+# 这三件事（问诊要点 / 编辑助手 / 组方检验）跟问诊主链的产出不是一类东西：
+# 主链产出的是"这次辨证的结论"，这三个产出的是"围着这次结论的一句建议"。
+# 所以它们不进 `S3Derived`，也不共用它的任何 schema——一旦共用，主链的防幻觉
+# 校验（每一步 rule_refs 或 insufficient）就会压到一句编辑提示上，而那句提示
+# 本来就不该承担"演绎依据"的角色。
+#
+# **但它们照样要说得出依据**：`basis` 全是 `Field(min_length=1)`。§7.3 原文
+# 「每条建议必须能追溯到本草本体的性味归经功效，查不到依据的药不许建议」。
+
+
+#: 一次处方改动的类别。**`Literal` 不是自由字符串**：前端要按类别决定
+#: 「采纳」时怎么写回表格（加一行 / 删一行 / 改某一格），拼错的类别会静默
+#: 变成一个点了没反应的按钮。
+FormulaChangeAction = Literal["加", "减", "改量", "改炮制", "改煎法"]
+
+
+class FormulaChange(BaseModel):
+    """一条可一键采纳的处方改动。
+
+    **药用 `HerbItem`，跟处方表里的一味药是同一个形状**——采纳这个动作就是
+    把 `item` 写进表里，两处形状不同的话"采纳之后剂量单位对不上"这种 bug
+    会在前后端之间来回跑（跟 `ModificationSuggestion.item` 同一条理由）。
+    `action="减"` 时只用得上 `item.name`。
+    """
+
+    action: FormulaChangeAction
+    item: HerbItem
+
+
+class AdviceOption(BaseModel):
+    """编辑助手给的一条可选处置（§7.3 第二层那三条带 [采纳] 的）。"""
+
+    #: 「若兼有郁热（口苦、舌红）」——**处置是有条件的**，条件不成立时这条
+    #: 不该被采纳。把条件写进结构里而不是塞在文字里，前端才能把它显示在
+    #: 按钮前面，而不是让医师从一段话里自己读出来。
+    condition: str = Field(min_length=1)
+    action_text: str = Field(min_length=1)
+    changes: list[FormulaChange] = Field(min_length=1)
+    basis: str = Field(min_length=1)
+
+
+class EditAdvice(BaseModel):
+    """§7.3 第二层：医师改了方之后右栏那条 AI 提示。
+
+    `comment` 只说**这一次改动**——不是重写整张方的评语。规格原文：
+    「只评价这次改动，不重写整个方」。
+    """
+
+    comment: str = Field(min_length=1)
+    options: list[AdviceOption] = Field(default_factory=list)
+
+
+class HerbRoleAnalysis(BaseModel):
+    """组方检验里对一味药的君臣佐使判断。
+
+    `role` 允许 None：分不清就说分不清，比硬派一个"佐"好（跟 `HerbItem.role`
+    同一条纪律）。
+    """
+
+    herb: str = Field(min_length=1)
+    role: Literal["君", "臣", "佐", "使"] | None = None
+    reason: str = Field(min_length=1)
+
+
+class MethodCoverageItem(BaseModel):
+    """治法的一个关键词有没有药对应上（§9.3「对治法的覆盖」）。"""
+
+    keyword: str = Field(min_length=1)
+    #: 覆盖这个关键词的药。空列表 = 这个关键词**没有药对应**，
+    #: 这正是 §9.3「缺什么」要报出来的那一类。
+    herbs: list[str] = Field(default_factory=list)
+    reason: str = Field(min_length=1)
+
+
+class ComposeGap(BaseModel):
+    """组方里缺的一项，带具体建议与依据，可一键采纳。"""
+
+    what: str = Field(min_length=1)
+    changes: list[FormulaChange] = Field(default_factory=list)
+    basis: str = Field(min_length=1)
+
+
+class ComposeAnalysis(BaseModel):
+    """§9.3 `[检验组方]` 里**只有模型给得出**的那几项。
+
+    **配伍禁忌、超剂量、寒热相悖、归经覆盖、功效重复不在这个 schema 里。**
+    那五条是 `core/formula_check.py` + `core/safety_output.py` +
+    `core/individualize.py` 已经在算的确定性规则，让模型再判一次只会出现
+    "规则说没问题、模型说有问题"这种两份说法打架的情况，而医师没有办法
+    判断该信哪一份（CLAUDE.md 第 31 条：同一个判断只能有一处实现）。
+    组方检验的返回里那几项**原样带着规则层的结论**，模型看得到它们、
+    可以在 `gaps` 里针对它们给替代药，但不重新下判断。
+    """
+
+    roles: list[HerbRoleAnalysis] = Field(default_factory=list)
+    method_coverage: list[MethodCoverageItem] = Field(default_factory=list)
+    gaps: list[ComposeGap] = Field(default_factory=list)
+    #: 这张方整体站不站得住的一句话。不是评分——§0 明确取消一切指标，
+    #: 而一个分数会立刻被拿去比较两张方的高下。
+    summary: str = Field(min_length=1)
+
+
+class IntakeHintItem(BaseModel):
+    """一条问诊要点（§5.4）。零 LLM 产出，但形状照样过 schema——
+    API 下发的东西都用 pydantic 承接，这一条不因为"没调模型"而例外。"""
+
+    ask: str = Field(min_length=1)
+    symptom: str = ""
+    why: str = Field(min_length=1)
+    safety_relevant: bool = False
+    information_gain: float | None = None
+    source: str = ""

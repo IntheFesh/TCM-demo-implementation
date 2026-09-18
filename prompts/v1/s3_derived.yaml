@@ -58,6 +58,45 @@ system: |
   herb_choices 的药名集合必须跟 formula.candidate.herb_items **完全一致**：
   方里有的药必须说得出理由，写了理由的药必须真的在方里。两边多一味少一味都会被退回。
 
+  ## 五步链之外还要交代的四件事
+
+  五步链回答"这个结论怎么推出来的"。下面四项回答另外四个问题，**都不是把五步链
+  写得更细**，每一项都要填：
+
+  6. **key_points（辨证要点）**：本例凭哪几条表现落在这个证上，**至少 3 条**。
+     - point：患者的那一条表现。**必须能在上面的症状列表里找到对应**，
+       照着症状原文写，不要换成证型定义里的套话
+     - maps_to：这一条表现说明了什么（对应哪一条病机）
+     例：{"point": "每因情志不畅而发", "maps_to": "肝失疏泄，情志为诱因"}
+
+  7. **differential（鉴别）**：排除了哪几个证、凭什么排除，**至少 2 条**。
+     一个说不出"排除了什么"的辨证结论没法判断可信度——这一项是给人核对用的，
+     不是凑字数。
+     - syndrome：被排除的那个证型名。**不能填本次的结论证型**（那会把整栏读反）
+     - excluded_because：凭本例的哪几条表现（或哪几条表现的缺席）排除它。
+       写"本例无口苦嘈杂，舌不红苔不黄"这种**可核对的具体依据**，
+       不要写"不太像"
+     - rule_refs / insufficient：跟五步链同样的要求，二选一必须有
+
+  8. **modifications（加减建议）**：若见某症该加/减哪一味药，**至少 2 条**，
+     每条都要能被医师直接采纳写进处方。
+     - if_symptom：出现哪个兼症时才加减。**是"若见…"，不是本例已有的症状**
+       ——本例已经有的症状应该在上面的方里就处理掉了
+     - action：加 或 减
+     - item：跟 herb_items 完全一样的字段结构（name/dose/dose_unit/processing/
+       decoction/role/function_in_formula）。action 为"减"时只填 name 即可
+     - why：为什么是这味药（药性怎么对上这个兼症，会不会碍着本方的主方向）
+     - ontology_refs / rule_refs / insufficient：要求跟上面各步一致
+
+  9. **self_assessment（自评）**：**这一项不参与任何择优，只是如实交代**，
+     所以宁可说得难看也不要说漂亮话。
+     - weakest_link：这次推导里依据最弱的是哪一环（哪一步只找到勉强沾边的规则、
+       哪一味药的本体引用没查到）
+     - uncovered_symptoms：症状列表里哪几条本次没有被解释进病机（没有就空数组）
+     - next_direction：若按此方三剂无效，下一步该往哪个方向想
+
+  这四项在格式示例里的位置见下面 herb_choices 之后。
+
   ## ontology_refs：本体引用（本草/方剂原文，跟医理规则是两件事）
 
   下面的知识块（若有）给出了本草与方剂条目的原文。你引用某味药的性味/归经/功效/
@@ -175,6 +214,29 @@ system: |
         "insufficient": null
       }
     ],
+    "key_points": [
+      {"point": "症状占位（照抄下面症状列表里的那一条）", "maps_to": "这条表现说明了什么"}
+    ],
+    "differential": [
+      {"syndrome": "被排除的证型占位（不能是上面 syndrome.name）",
+       "excluded_because": "凭本例的哪几条表现（或哪几条的缺席）排除它",
+       "rule_refs": [{"rule_id": "规则编号占位", "note": "这条规则怎么支持这次排除"}],
+       "insufficient": null}
+    ],
+    "modifications": [
+      {"if_symptom": "若见某兼症", "action": "加",
+       "item": {"name": "药名Y", "dose": 15.0, "dose_unit": "g", "processing": null,
+                "decoction": null, "role": null, "function_in_formula": "加它是为了什么"},
+       "why": "为什么是这味药，它会不会碍着本方的主方向",
+       "ontology_refs": [],
+       "rule_refs": [{"rule_id": "规则编号占位", "note": "凭哪条规则该在这个兼症上加它"}],
+       "insufficient": null}
+    ],
+    "self_assessment": {
+      "weakest_link": "这次推导里依据最弱的是哪一环",
+      "uncovered_symptoms": ["本次没有被解释进病机的症状，没有就空数组"],
+      "next_direction": "若三剂无效，下一步该往哪个方向想"
+    },
     "note": null
   }
 

@@ -3292,6 +3292,24 @@ function describeProgressEvent(name, data) {
     // 用户会把"S3 早就输出完了、还在走验证/佐证"读成"卡住了"（见本轮报告）。
     case "verify_revise":
       return `　⑨ 校验：第 ${data.round} 轮核对未通过（${data.rules.join("、")}），正在按反例重开…`;
+    // R62 §11.3：`s3_done` 之后还有核查与佐证两段，此前这两段一个事件都不发。
+    // 这里补上的是**边界**（开始/每轮结论/结束），不是把 verify_revise 说第二遍：
+    // verify_revise 只在"要回炉重开"时发，而第一轮就通过的那条路径此前
+    // 在界面上完全看不见，恰恰是最常见的那条。
+    case "verify_start":
+      return "　⑨ 校验：开始逐条核对方药与医理…";
+    case "verify_round":
+      return `　⑨ 校验：第 ${data.round} 轮 —— ` +
+        (data.n_veto || data.n_revise
+          ? `${data.n_veto} 条须改、${data.n_revise} 条待商榷（${(data.rules || []).join("、")}）`
+          : `${(data.checked_rules || []).length} 条规则全部通过`);
+    case "verify_done":
+      return `　⑨ 校验完成：${data.first_pass ? "一次通过" : `改了 ${data.revise_calls} 轮`}`;
+    case "corroborate_start":
+      return "　⑩ 医案对照：检索历史上有没有这么治过…";
+    case "corroborate_done":
+      if (data.enabled === false) return "　⑩ 医案对照：本次未启用";
+      return `　⑩ 医案对照：方向一致 ${data.n_concordant} 条、不一致 ${data.n_divergent} 条`;
     case "early_veto":
       return `　⚠ 初步提示：${data.reason || data.rule_label}（基于尚未输出完的药味清单，最终以完整校验为准）`;
     case "agent_step":
