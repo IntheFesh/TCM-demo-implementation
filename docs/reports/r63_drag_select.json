@@ -1,0 +1,53 @@
+[
+  {
+    "where": "中栏（整列横扫）",
+    "longtasks": 0,
+    "longtask_ms_max": 0,
+    "longtask_ms_total": 0,
+    "frames": 171,
+    "frame_ms_max": 22,
+    "frames_over_50ms": 0,
+    "selectionchange_events": 41,
+    "drag_wall_ms": 2000.3,
+    "selected_chars": 349
+  },
+  {
+    "where": "右栏释义（文字最密）",
+    "longtasks": 0,
+    "longtask_ms_max": 0,
+    "longtask_ms_total": 0,
+    "frames": 340,
+    "frame_ms_max": 18,
+    "frames_over_50ms": 0,
+    "selectionchange_events": 110,
+    "drag_wall_ms": 2017.5,
+    "selected_chars": 459
+  },
+  {
+    "where": "压力版中栏（51 个术语 / 1143 节点，跨自动滚动）",
+    "longtasks": 0,
+    "longtask_ms_max": 0,
+    "longtask_ms_total": 0,
+    "frames": 528,
+    "frame_ms_max": 18,
+    "frames_over_50ms": 0,
+    "selectionchange_events": 147,
+    "drag_wall_ms": 2000.3,
+    "selected_chars": 1013,
+    "terms": 51,
+    "dom_nodes": 1143
+  },
+  {
+    "where": "压力版 + 急症水印（.wm 旋转覆盖层）",
+    "longtasks": 0,
+    "longtask_ms_max": 0,
+    "longtask_ms_total": 0,
+    "frames": 704,
+    "frame_ms_max": 19,
+    "frames_over_50ms": 0,
+    "selectionchange_events": 192,
+    "drag_wall_ms": 2001.4,
+    "selected_chars": 1013,
+    "watermark_in_selection": false
+  }
+]
