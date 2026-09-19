@@ -83,14 +83,40 @@ def test_the_conclusion_is_that_the_gap_can_only_be_closed_by_re_extracting(gaps
 
 
 def test_the_recorded_attribution_is_in_the_repo(gaps):
-    """§5 第 2 条要报改前改后的缺口数字。改前的数字连归因一起存在仓库里。"""
+    """§5 第 2 条要报改前改后的缺口数字。两份快照都在仓库里。
+
+    **R64 把这条从"等于"改成"不大于"。** 原来它断言存下来的数字跟现算的相等
+    ——R64 合并开源数据之后归经从 598 掉到 534，它当场红了，而那是这一轮**想要**
+    发生的事。等于是个错判据：它把"数据变好了"和"数据被改坏了"报成同一种红。
+    现在 r63 那份是**基线快照**（R63 的结论，不再动），判据是"现在的缺口不许
+    比基线更大"——合并只能填空槽，任何谓词的缺口涨了都说明有东西被改坏了。
+    """
     import json
     from pathlib import Path
-    p = (Path(__file__).resolve().parent.parent / "docs" / "reports"
-         / "r63_ontology_gaps.json")
-    saved = json.loads(p.read_text(encoding="utf-8"))
-    assert saved["by_predicate"]["归经"]["n_missing"] == \
-        gaps["by_predicate"]["归经"]["n_missing"], "存下来的数字跟现算的对不上"
+    reports = Path(__file__).resolve().parent.parent / "docs" / "reports"
+    base = json.loads((reports / "r63_ontology_gaps.json").read_text(encoding="utf-8"))
+    now = json.loads((reports / "r64_ontology_gaps.json").read_text(encoding="utf-8"))
+    for p_, r in base["by_predicate"].items():
+        assert now["by_predicate"][p_]["n_missing"] <= r["n_missing"], (
+            f"{p_} 的缺口从 {r['n_missing']} 涨到 "
+            f"{now['by_predicate'][p_]['n_missing']}——合并只该填空槽")
+        assert gaps["by_predicate"][p_]["n_missing"] <= r["n_missing"], (
+            f"{p_} 现算的缺口比 R63 基线还大")
+    # 存下来的那份要跟现算的一致，否则报告里的数字是过期的
+    assert now["by_predicate"]["归经"]["n_missing"] == gaps["by_predicate"]["归经"]["n_missing"]
+
+
+def test_the_merge_only_ever_reduced_gaps_never_created_them(gaps):
+    """R64：合并之后**每一个谓词的缺口都不许上涨**，炮制那一项持平是允许的
+    （没有一个源带炮制）。这条是"只填空槽"在总量上的可观测后果。"""
+    import json
+    from pathlib import Path
+    base = json.loads((Path(__file__).resolve().parent.parent / "docs" / "reports"
+                       / "r63_ontology_gaps.json").read_text(encoding="utf-8"))
+    dropped = {p_: base["by_predicate"][p_]["n_missing"] - r["n_missing"]
+               for p_, r in gaps["by_predicate"].items()}
+    assert all(v >= 0 for v in dropped.values()), f"有谓词的缺口涨了：{dropped}"
+    assert sum(dropped.values()) > 0, "一个槽位都没填上，合并等于没做"
 
 
 # ---------- §3.3 第 4 步：兜底文案 ----------

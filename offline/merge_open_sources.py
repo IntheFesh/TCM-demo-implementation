@@ -83,10 +83,19 @@ def _span_ok(text: str) -> bool:
     return bool(re.sub(r"[\s。，、；：,.;:]+", "", text or ""))
 
 
-def _row(subject: str, predicate: str, value: str, *, book: str, source: str,
-         span: str) -> dict:
+def _row(subject: str, predicate: str, value: str, *, book: str, dataset: str,
+         span: str, kind: str) -> dict:
+    """一行三元组。字段名与 `MateriaMedicaRecord` / `FormularyRecord` 对齐。
+
+    **`source` 不是"从哪拿的"**，是 `Literal["classic", "modern"]`——古籍口径
+    还是现代教材口径。第一版把仓库路径写进 `source`，schema 当场拒掉，
+    那正是它该做的事。数据集出处走 `dataset`（R64 新增字段），
+    授权要按数据集追责，所以它必须独立成字段而不是拼在 `book` 里。
+    """
+    assert kind in ("classic", "modern"), kind
     return {"s": subject, "p": predicate, "o": value.strip(),
-            "book": book, "source": source, "source_span": span.strip()}
+            "book": book, "source": kind, "dataset": dataset,
+            "source_span": span.strip()}
 
 
 def _fillable(ont, name: str, predicate: str) -> bool:
@@ -105,7 +114,7 @@ def _nihaixia_herbs(repo: Path, ont) -> list[dict]:
     """
     data = json.loads((repo / "assets" / "data" / "herbs.json").read_text(encoding="utf-8"))
     book = "神农本草经（倪海厦人纪讲义校勘版）"
-    src = "nihaixia-app/assets/data/herbs.json (Apache-2.0)"
+    ds = "nihaixia-app/assets/data/herbs.json (Apache-2.0)"
     out: list[dict] = []
     for r in data["herbs"]:
         name = normalize_herb(r.get("name") or "")
@@ -126,7 +135,8 @@ def _nihaixia_herbs(repo: Path, ont) -> list[dict]:
             span = original or val
             if not _span_ok(span):
                 continue
-            out.append(_row(name, pred, val, book=book, source=src, span=span))
+            out.append(_row(name, pred, val, book=book, dataset=ds, span=span,
+                            kind="classic"))
     return out
 
 
@@ -137,12 +147,19 @@ def _nihaixia_formulas(repo: Path, ont) -> list[dict]:
     """
     data = json.loads((repo / "assets" / "data" / "formulas.json").read_text(encoding="utf-8"))
     book = "倪海厦人纪系列（伤寒论/金匮要略）"
-    src = "nihaixia-app/assets/data/formulas.json (Apache-2.0)"
+    ds = "nihaixia-app/assets/data/formulas.json (Apache-2.0)"
     have = {n.strip() for n in ont.formulas}
     out: list[dict] = []
     for f in data["formulas"]:
         name = (f.get("name") or "").strip()
         if not name or name in have:
+            continue
+        # 方名里带数字/「第」/括号的整条不收。`tests/test_ontology_coverage.py::
+        # test_no_formula_name_carries_a_chapter_prefix` 钉着"方名不含章节标记"
+        # ——它防的是抽取时把章节号粘进方名。这个数据集里「乳癌经验方第一方」
+        # 是真名不是artifact，但那条守卫分辨不出来，而**放宽一条守卫去换两首方
+        # 不值得**：守卫松了以后真的粘进章节号也就没人发现了。
+        if _CHAPTER_MARK_RE.search(name):
             continue
         comps = [c for c in (f.get("components") or []) if (c.get("name") or "").strip()]
         if not comps:
@@ -153,11 +170,12 @@ def _nihaixia_formulas(repo: Path, ont) -> list[dict]:
         for c in comps:
             dose = (c.get("dosage") or "").strip()
             out.append(_row(name, "组成", f"{c['name'].strip()}{(' ' + dose) if dose else ''}",
-                            book=book, source=src, span=span))
+                            book=book, dataset=ds, span=span, kind="classic"))
         for pred, val in (("主治", f.get("indication") or ""),
                           ("功用", f.get("explanation") or "")):
             if (val or "").strip():
-                out.append(_row(name, pred, val, book=book, source=src, span=span))
+                out.append(_row(name, pred, val, book=book, dataset=ds, span=span,
+                                kind="classic"))
     return out
 
 
@@ -247,7 +265,7 @@ _HERBS_ROW_RE = re.compile(r"^\s*\['([^']*)','([^']*)','([^']*)','([^']*)','([^'
 def _baodian_herbs(repo: Path, ont) -> list[dict]:
     """tcm-data.js 的 HERBS（305 味，中药学口径的性味/归经/功效/用量）→ 空槽。"""
     book = "中药学（zhongyao-xuexi-baodian 整理）"
-    src = "zhongyao-xuexi-baodian/tcm-data.js#HERBS"
+    ds = "zhongyao-xuexi-baodian/tcm-data.js#HERBS（仓库无 LICENSE）"
     out: list[dict] = []
     for line in (repo / "tcm-data.js").read_text(encoding="utf-8").splitlines():
         m = _HERBS_ROW_RE.match(line)
@@ -260,15 +278,22 @@ def _baodian_herbs(repo: Path, ont) -> list[dict]:
         span = line.strip().rstrip(",")
         for pred, val in (("性味", xw), ("归经", gj), ("功效", gx), ("用量", yl)):
             if val.strip() and _fillable(ont, name, pred) and _span_ok(span):
-                out.append(_row(name, pred, val, book=book, source=src, span=span))
+                out.append(_row(name, pred, val, book=book, dataset=ds, span=span,
+                                kind="modern"))
     return out
 
 
 def _baodian_bencao(repo: Path, ont) -> list[dict]:
     """bencao.js 的 BENCAO（《本草纲目》气味/主治）→ 性味与功效的空槽。
-    **带的是古籍出处**，所以 book 写《本草纲目》，不写整理者。"""
+
+    **本轮没用上。** 这个文件的键没加引号（`{gm:{...}}`），`_load_js_const`
+    的"括号配平 + json.loads"读不了它，而读它就得上 JS 解释器——对别人仓库里
+    的文件跑 eval 不做。实测它只能填 3 个槽位（性味 1、功效 2），
+    为 3 个槽位引入一个 eval 不值得。留着函数与这段说明，下一轮要是换了
+    正经的 JS 解析器再接上。
+    """
     data = _load_js_const(repo / "bencao.js", "BENCAO")
-    src = "zhongyao-xuexi-baodian/bencao.js"
+    ds = "zhongyao-xuexi-baodian/bencao.js（仓库无 LICENSE）"
     out: list[dict] = []
     for raw, d in data.items():
         name = normalize_herb(raw) or raw
@@ -278,9 +303,14 @@ def _baodian_bencao(repo: Path, ont) -> list[dict]:
         for pred, key in (("性味", "w"), ("功效", "z")):
             val = (gm.get(key) or "").strip()
             if val and _fillable(ont, name, pred) and _span_ok(val):
-                out.append(_row(name, pred, val, book="本草纲目", source=src, span=val))
+                out.append(_row(name, pred, val, book="本草纲目", dataset=ds, span=val,
+                                kind="classic"))
     return out
 
+
+#: 方名里的章节标记。跟 `test_no_formula_name_carries_a_chapter_prefix`
+#: 的正则一致——两边不一致的话合并进来的东西会当场把那条测试弄红。
+_CHAPTER_MARK_RE = re.compile(r"[0-9第章节（）()]")
 
 _GUIJING_RE = re.compile(r"(入|归)([^，。；\n]{1,20}?)经")
 
@@ -293,7 +323,8 @@ def _baodian_jianbie(repo: Path, ont) -> list[dict]:
     词表里认得出至少一个；认不出的整条跳过（"拆不干净的不硬塞"）。
     """
     data = _load_js_const(repo / "jianbie_extra.js", "JBI_EXTRA")
-    src = "zhongyao-xuexi-baodian/jianbie_extra.js（底层：中药世家 MedicineRecommendation, Apache-2.0）"
+    ds = ("zhongyao-xuexi-baodian/jianbie_extra.js"
+          "（底层：中药世家 MedicineRecommendation, Apache-2.0）")
     out: list[dict] = []
     for raw, d in data.items():
         name = normalize_herb(raw) or raw
@@ -304,14 +335,15 @@ def _baodian_jianbie(repo: Path, ont) -> list[dict]:
                           ("用量", (d.get("y") or "").strip())):
             if val and _fillable(ont, name, pred) and _span_ok(val):
                 out.append(_row(name, pred, val, book="中华本草（数据集整理）",
-                                source=src, span=val))
+                                dataset=ds, span=val, kind="modern"))
         if _fillable(ont, name, "归经") and s_field:
             m = _GUIJING_RE.search(s_field)
             if m:
                 organs = [x for x in MERIDIANS if x in m.group(2)]
                 if organs:
                     out.append(_row(name, "归经", "、".join(organs),
-                                    book="中华本草（数据集整理）", source=src, span=s_field))
+                                    book="中华本草（数据集整理）", dataset=ds,
+                                    span=s_field, kind="modern"))
     return out
 
 
@@ -319,7 +351,7 @@ SOURCES = {
     "nihaixia-herbs": _nihaixia_herbs,
     "nihaixia-formulas": _nihaixia_formulas,
     "baodian-herbs": _baodian_herbs,
-    "baodian-bencao": _baodian_bencao,
+    # "baodian-bencao": 见该函数的说明——文件读不了，且只值 3 个槽位
     "baodian-jianbie": _baodian_jianbie,
 }
 
@@ -376,7 +408,14 @@ def main(argv: list[str] | None = None) -> int:
     for p, n in by_pred.most_common():
         print(f"  {p}\t{n}")
     assert all(_span_ok(r["source_span"]) for r in rows), "有 span 为空的行漏进来了"
-    assert all(r["source"] for r in rows), "有 source 为空的行漏进来了"
+    assert all(r["dataset"] for r in rows), "有 dataset 为空的行漏进来了"
+    # **落盘前逐行过 schema**。第一版没这一步，`source` 写成仓库路径的 380 行
+    # 全都写进了文件，是 `tests/test_pharmacology_committed.py` 事后抓出来的
+    # ——那已经是"坏数据进了版本控制"之后。写之前挡住比写之后发现便宜得多。
+    from core.schemas import FormularyRecord, MateriaMedicaRecord
+    model = FormularyRecord if "formulas" in args.source else MateriaMedicaRecord
+    for r in rows:
+        model.model_validate(r)
     if args.write:
         path = FORMULARY_PATH if "formulas" in args.source else MATERIA_PATH
         _append_jsonl(path, rows)

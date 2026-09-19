@@ -248,9 +248,11 @@ E2 曾被口头引用成「lineage 0.420 vs cross 0.569，逐条成立 5/9」。
 | ε_online p95 | 0.7857 | 0.8571（表里写作 0.857） |
 | ε 三段 LLM 调用数 | 212 | 215 |
 | SDT Test chain | 23.173 / 50 | 22.833（对照：baseline 22.068、修复前 chain 21.702） |
-| 药理层抽取产出 | 本草 **9776** 条 | **R34 起可核**（两份 jsonl 已进版本控制）：`../data/standard/materia_medica.jsonl:pharmacology.n_materia_medica=9776`。⚠ R18-F~R33 这一格写的是手抄的 **10248**，比落盘这一份多 472 条——落盘的是 `c9ac580` 关思考模式重跑的**另一次抽取**，不是同一批 |
-| 药理层抽取产出 | 方剂 **3184** 条 | 同上：`../data/standard/formulary.jsonl:pharmacology.n_formulary=3184`。手抄值曾是 3737，多 553 条 |
-| 药理层归并后 | 本草 **1232** 味 / 方剂 **235** 首 | 三元组 9776/3184 条归并成条目数（`python -m core.ontology --stats`）。**3184 条一条不丢地归到 235 首方**（有测试钉住），所以 235 不是归并丢了东西——见 docs/reports/R34_report.md 第七节 |
+| 药理层抽取产出 | 本草 **10156** 条 | **R34 起可核**：`../data/standard/materia_medica.jsonl:pharmacology.n_materia_medica=10156`。⚠ 这个数含两拨来源：自有抽取 9776 条 + **R64 从开源数据集合并的 380 条**（按 `dataset` 字段可分开数）。⚠ R18-F~R33 这一格写的是手抄的 **10248**，那是 `c9ac580` 之前的**另一次抽取**，不是同一批 |
+| 药理层抽取产出 | 方剂 **5067** 条 | 同上：`../data/standard/formulary.jsonl:pharmacology.n_formulary=5067`。自有抽取 3184 条 + **R64 合并 1883 条**（nihaixia-app, Apache 2.0）。手抄值曾是 3737 |
+| 药理层归并后 | 本草 **1232** 味 / 方剂 **503** 首 | `python -m core.ontology --stats`。**本草数 R64 前后不变**（只填现有药的空槽、不新建药条）；方剂 235 → 503 是 R64 合并 nihaixia-app 的 268 首。⚠ **R38 那批消融数字是在 235 首方剂的本体上量的，知识块变了，重跑前不要跟 R64 之后的数并排放**（见 docs/reports/R64_changes.md） |
+| 本草空槽（R64 对照） | 3068 → **2688** | `python -m scripts.diagnose_ontology_gaps`：性味 189→181、归经 598→534、功效 49→41、用量 672→512、禁忌 770→630、炮制 790→790（三个源都不带炮制）。快照：`../docs/reports/r63_ontology_gaps.json`（改前）与 `r64_ontology_gaps.json`（改后） |
+| 药名归一缺口（R64 对照） | 19.3% → **18.2%** | `python -m scripts.check_herb_coverage`，验收线 ≤20%。合并 709 条开源别名（`../data/standard/herb_aliases_merged.tsv`） |
 | 本体对医案语料的覆盖 | 按种数 **39.8%**（230/578）/ 按次数 **70.4%**（3380/4799） | 分母是**医案里出现过的药名**，不是本体总药味 1232——两个口径必须分开报（R34b） |
 | 用药规律层（R35） | **1924** 条 | 零 LLM 统计，分母是 941 条定位内诊次 / 751 张有药的方，min_support=3：`../data/standard/prescribing_patterns.jsonl:patterns.n_patterns=1924`。按类型 herb 309 / herb_pair 1241 / dose 194 / modification 180 |
 | 其中剂量档 | **194** 条 | `../data/standard/prescribing_patterns.jsonl:patterns.n_dose=194`。对照：改剂量抽取之前只抓到 **69/751** 张方的剂量（9%），锚在已知药名上之后 **651/751**（87%）——见 docs/reports/R35_report.md 第二节 |

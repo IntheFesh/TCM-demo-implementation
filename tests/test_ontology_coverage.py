@@ -188,18 +188,45 @@ def test_no_formula_name_carries_a_chapter_prefix():
     assert bad == [], f"这些方名带了章节标记：{bad[:10]}"
 
 
+#: 名字短、又带两个方剂后缀，但**确实是一首方**的。逐条核过才进这张表：
+#: 「鳖甲煎丸」出自《金匮要略》，是把鳖甲煎（煎剂）做成丸——「煎」是制法
+#: 不是另一首方的后缀。R64 合并 nihaixia 的方剂集时它第一次出现。
+#: 这张表是**例外清单不是阈值**：放宽长度下限会让真的并方（「桂枝汤四逆汤」
+#: 这种）也一起放过，而逐条核过的例外不会。
+_SHORT_BUT_REAL: frozenset[str] = frozenset({
+    "鳖甲煎丸",            # 《金匮要略》：鳖甲煎（煎剂）做成丸，「煎」是制法
+    "猪膏发煎", "猪膏髪煎",  # 《金匮要略》：猪膏加乱发煎成，「膏」是药不是剂型
+                            # 两种写法都在（「发」的异体字「髪」），都是同一首方
+})
+
+
 def test_no_two_formulas_were_merged_into_one_name():
-    """34c 的另一个假设：方名归一把不同方并到一起了。**实测也不成立**
-    ——名字里出现两个方剂后缀的只有 3 条，且都是正常的长方名
-    （麻黄杏仁甘草石膏汤 / 竹叶石膏汤 / 大黄牡丹汤）。"""
+    """34c 的另一个假设：方名归一把不同方并到一起了。**实测不成立。**
+
+    **这个数字必须带它的语料规模**（CLAUDE.md：任何数字都要有对照基准）：
+      - 235 首方剂时：3 条（麻黄杏仁甘草石膏汤 / 竹叶石膏汤 / 大黄牡丹汤），
+        阈值定成 ≤5；
+      - R64 合并到 503 首后：10 条。多出来的 7 条逐条看过，**全是真的长方名**
+        ——小青龙加石膏汤、木防己去石膏加茯苓芒硝汤、半夏散及汤、鳖甲煎丸、
+        猪膏发煎（与异体字「猪膏髪煎」并存）、大黄牡丹皮汤。
+
+    阈值跟着语料规模走，不是放宽守卫：它守的是"归一把两首方并成一名"，
+    而这十条里没有一条是那种情况。**按比例给**（每 100 首方剂不超过 3 条），
+    这样下一次扩语料不用再改这个数，而真的出现并方时仍然会红。
+    """
     import re
 
     ont = get_ontology()
     if not ont.available:
         pytest.skip("药理层数据不在")
     multi = [n for n in ont.formulas if len(re.findall(r"[汤散丸饮丹膏煎]", n)) >= 2]
-    assert len(multi) <= 5, f"疑似并方的名字变多了：{multi}"
+    budget = max(5, round(len(ont.formulas) * 0.03))
+    assert len(multi) <= budget, (
+        f"疑似并方的名字 {len(multi)} 条，超过 {len(ont.formulas)} 首方剂对应的"
+        f"上限 {budget} 条：{multi}")
     for n in multi:
+        if n in _SHORT_BUT_REAL:
+            continue
         assert len(n) >= 5, f"「{n}」只有 {len(n)} 字却带两个后缀，可能真的是并了两方"
 
 
@@ -230,16 +257,27 @@ def test_the_formula_predicates_are_the_eight_expected_ones():
 
 
 def test_the_formula_count_is_not_silently_changed_by_this_round():
-    """34c：**只报数、先不改**（改归一会动已测量的数）。这条测试钉住本轮没改归一。
+    """方剂数与本草数不许被悄悄改动。
 
-    235 这个数一旦变了，R38 消融里依赖方剂本体的那部分就不可比——
-    改它必须是单独一轮，带前后对照。
+    **R64 有意把方剂数从 235 改成 503**（合并 nihaixia-app 的 Apache-2.0 方剂集，
+    268 首本体里没有的方）。这条测试原来的话是"改它必须是单独一轮，带前后对照"
+    ——R64 就是那一轮，前后对照写在 `docs/reports/R64_changes.md`。
+
+    **可比性影响要说清**：R38 那批消融数字是在 235 首方剂的本体上量的。
+    知识块的内容变了，那些数字**不再严格可比**——重跑之前不要把 R38 的数跟
+    R64 之后的数并排放。这不是"数字变差了"，是"量的东西变了"，
+    跟 R57 记录的 LoRA 可比性警告同一类。
+
+    **本草数仍然必须是 1232**：R64 §6 明确不扩药材总数，只填现有药的空槽。
+    这个数一变就说明"不新建药条"那道守卫破了——它守的是图谱节点数与一堆
+    已量过的凭据（覆盖率、ε、分歧度）。
     """
     ont = get_ontology()
     if not ont.available:
         pytest.skip("药理层数据不在")
-    assert len(ont.formulas) == 235, (
-        f"方剂数从 235 变成 {len(ont.formulas)}。如果这是有意的改动，"
+    assert len(ont.formulas) == 503, (
+        f"方剂数从 503 变成 {len(ont.formulas)}。如果这是有意的改动，"
         "请连同 R38 的可比性说明一起更新这条测试与报告第七节。"
     )
-    assert len(ont.herbs) == 1232, f"本草数从 1232 变成 {len(ont.herbs)}"
+    assert len(ont.herbs) == 1232, (
+        f"本草数从 1232 变成 {len(ont.herbs)}——R64 只填空槽，不许新建药条")

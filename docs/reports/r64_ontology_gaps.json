@@ -1,0 +1,173 @@
+{
+  "available": true,
+  "n_rows": 10156,
+  "n_herbs": 1232,
+  "n_raw_subjects": 1460,
+  "predicate_spellings": {
+    "性味": 2084,
+    "归经": 1383,
+    "功效": 3865,
+    "用量": 1060,
+    "炮制": 804,
+    "禁忌": 960
+  },
+  "unknown_predicate_spellings": {},
+  "by_predicate": {
+    "性味": {
+      "n_missing": 181,
+      "a_not_extracted": {
+        "n": 181,
+        "examples": [
+          "扁豆衣",
+          "生何首乌",
+          "生芥子",
+          "炒子",
+          "使君子仁",
+          "炒藜",
+          "生胡芦巴",
+          "苏子",
+          "苏子霜",
+          "生决明子"
+        ]
+      },
+      "b_name_mismatch": {
+        "n": 0,
+        "examples": []
+      },
+      "c_predicate_variant": {
+        "n": 0,
+        "examples": []
+      }
+    },
+    "归经": {
+      "n_missing": 534,
+      "a_not_extracted": {
+        "n": 534,
+        "examples": [
+          "墓头回",
+          "紫草茸",
+          "天山雪莲",
+          "扁豆衣",
+          "生何首乌",
+          "蟾皮",
+          "生芥子",
+          "炒子",
+          "使君子仁",
+          "炒藜"
+        ]
+      },
+      "b_name_mismatch": {
+        "n": 0,
+        "examples": []
+      },
+      "c_predicate_variant": {
+        "n": 0,
+        "examples": []
+      }
+    },
+    "功效": {
+      "n_missing": 41,
+      "a_not_extracted": {
+        "n": 41,
+        "examples": [
+          "生何首乌",
+          "炒子",
+          "生斑螯",
+          "米炒斑螯",
+          "生马钱子",
+          "砂炒脐带",
+          "烫水蛭",
+          "乌梢蛇肉",
+          "蕲蛇肉",
+          "北柴胡"
+        ]
+      },
+      "b_name_mismatch": {
+        "n": 0,
+        "examples": []
+      },
+      "c_predicate_variant": {
+        "n": 0,
+        "examples": []
+      }
+    },
+    "用量": {
+      "n_missing": 512,
+      "a_not_extracted": {
+        "n": 512,
+        "examples": [
+          "蚕沙",
+          "紫贝齿",
+          "木槿皮",
+          "樟脑",
+          "硼砂",
+          "生芥子",
+          "劳子",
+          "炒子",
+          "使君子仁",
+          "炒藜"
+        ]
+      },
+      "b_name_mismatch": {
+        "n": 0,
+        "examples": []
+      },
+      "c_predicate_variant": {
+        "n": 0,
+        "examples": []
+      }
+    },
+    "禁忌": {
+      "n_missing": 630,
+      "a_not_extracted": {
+        "n": 630,
+        "examples": [
+          "葱白",
+          "桑叶",
+          "葛花",
+          "淡豆豉",
+          "木贼",
+          "密蒙花",
+          "忍冬藤",
+          "山银花",
+          "野菊花",
+          "金荞麦"
+        ]
+      },
+      "b_name_mismatch": {
+        "n": 0,
+        "examples": []
+      },
+      "c_predicate_variant": {
+        "n": 0,
+        "examples": []
+      }
+    },
+    "炮制": {
+      "n_missing": 790,
+      "a_not_extracted": {
+        "n": 790,
+        "examples": [
+          "桂枝",
+          "紫苏叶",
+          "生姜",
+          "羌活",
+          "藁本",
+          "辛夷",
+          "葱白",
+          "胡荽",
+          "西河柳",
+          "薄荷"
+        ]
+      },
+      "b_name_mismatch": {
+        "n": 0,
+        "examples": []
+      },
+      "c_predicate_variant": {
+        "n": 0,
+        "examples": []
+      }
+    }
+  }
+}

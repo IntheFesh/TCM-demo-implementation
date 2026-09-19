@@ -37,7 +37,13 @@ KINDS = ("materia_medica", "formulary")
 # 现在这两个数是**可核的**（`pharmacology.n_materia_medica` /
 # `pharmacology.n_formulary` 两个凭据键直接数文件行数），所以它们从"手抄"
 # 变成了"落盘即判据"——这正是 RESULTS.md 那一节说的"文件一进来凭据键就自动生效"。
-EXPECTED_ROWS = {"materia_medica": 9776, "formulary": 3184}
+# **R64 第二次换这两个数**，理由同样留着：这一轮把三个开源数据集**合并**进来
+# （nihaixia-app Apache-2.0、zhongyao-xuexi-baodian），只填空槽、不覆盖，
+# 所以是纯追加：本草 9776 → 10156（+380），方剂 3184 → 5067（+1883）。
+# 跟上一次换数不同的是，这次**不是另一次抽取**，是同一份自有数据加上外部合并数据
+# ——合并来的每行都带 `dataset` 字段，按它就能把两拨分开数，见
+# `tests/test_merge_open_sources.py`。
+EXPECTED_ROWS = {"materia_medica": 10156, "formulary": 5067}
 
 
 # ---------- 落盘目录：必须是进版本控制的那个 ----------

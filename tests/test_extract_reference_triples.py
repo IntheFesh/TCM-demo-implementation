@@ -248,6 +248,8 @@ def test_formulary_entry_is_thin_and_uses_engine(tmp_path, monkeypatch, capsys):
     ef.main(["--input", str(_book(tmp_path)), "--source", "classic", "--book", "本经",
              "--out", str(out), "--limit", "1"])
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    # `dataset` 是 R64 加的字段：这一行是**我们自己抽的**，所以留空
+    # ——合并进来的行才填数据集出处（见 core/schemas.py 的说明）。
     assert rows == [{"s": "黄芪", "p": "组成", "o": "黄芪", "source_span": "黄芪",
-                     "source": "classic", "book": "本经", "_block": 0}]
+                     "source": "classic", "book": "本经", "dataset": "", "_block": 0}]
     assert "formulary：本经（classic）" in capsys.readouterr().out

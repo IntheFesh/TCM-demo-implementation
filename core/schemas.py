@@ -207,6 +207,12 @@ class MateriaMedicaRecord(BaseModel):
     source_span: str = Field(min_length=1)
     source: ReferenceSource
     book: str = Field(min_length=1)
+    #: R64：这条是从哪个**开源数据集**合并来的（仓库/文件 + 授权）。
+    #: 自己抽的行留空。**不能塞进 `source`**：那个字段是 `Literal["classic",
+    #: "modern"]`，回答的是"古籍口径还是现代教材口径"，不是"从哪拿的"
+    #: ——第一版把仓库路径写进 source，schema 当场拒掉（这正是它该做的）。
+    #: 授权要按数据集追责，所以它必须是独立字段，不是拼在 book 里的一段话。
+    dataset: str = ""
 
 
 # 君臣佐使从教材来（总纲 2.3）：M1 的 HerbItem.role 现在靠模型标，准确率未知，
@@ -237,6 +243,8 @@ class FormularyRecord(BaseModel):
     source_span: str = Field(min_length=1)
     source: ReferenceSource
     book: str = Field(min_length=1)
+    #: R64：同 `MateriaMedicaRecord.dataset`。
+    dataset: str = ""
 
 
 # ---------- R18-D：《脾胃论》立论层（确定性抽取，不是 LLM 输出） ----------
