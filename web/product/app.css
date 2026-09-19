@@ -432,3 +432,15 @@ html[data-role="patient"] table.rx input { pointer-events: none; background: var
   body { overflow: visible; background: #fff; }
   #col-mid { overflow: visible; }
 }
+
+/* R63 §1：经典方候选与「原方」标记。
+   新增元素才加的样式——版式、配色、字号一个都没动（定稿）。 */
+.rx-loaded { font-size: .9em; color: var(--ink-2); margin: 0 0 .4em; }
+.lc-chip { text-align: left; }
+.lc-chip .lc-name { display: block; }
+.lc-chip .lc-why { display: block; font-size: .82em; color: var(--ink-3); }
+.lc-search { display: flex; gap: .4em; margin-top: .5em; }
+.lc-search input { flex: 1 1 auto; min-width: 0; font: inherit; }
+.rx-orig { margin-left: .3em; font-size: .78em; color: var(--ink-3); white-space: nowrap; }
+.tpl-grp + .tpl-grp { margin-top: .5em; border-top: 1px solid var(--line); padding-top: .5em; }
+.tpl-grp-h { font-size: .82em; color: var(--ink-3); margin-bottom: .25em; }

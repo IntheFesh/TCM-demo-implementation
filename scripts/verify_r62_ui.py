@@ -369,9 +369,87 @@ def _check_lab(page, f: Failures) -> None:
     page.wait_for_timeout(1200)
     # 同一张方在两页上的红条必须逐字相同——这里只验它确实报出来了。
     f.check("十八反" in page.inner_text("#lab-check"), "实验室里十八反能报出来")
+    _check_classic_import(page, f)
     page.click("#tab-consult")
     page.wait_for_timeout(200)
     f.check(_visible(page, "#col-mid"), "能回到问诊页")
+
+
+def _check_classic_import(page, f: Failures) -> None:
+    """R63 §1 / §5 自查第 1 条：**选一个脾胃门的证 → 候选与该证相关 →
+    点一个 → 处方表立刻出药名与原方剂量，剂量旁有「原方」小字。**
+
+    这一条只能在真浏览器里验。后端单测能证明候选带着理由、组成带着剂量，
+    证明不了点下去之后表格里真的出现了行——R62 那个 bug 恰恰就在这一段：
+    端点、解析、渲染函数各自都对，中间少了一步把剂量搬过去。
+    """
+    # 脾胃门的证：选一个证名里带「脾」的，没有就退回第一个非空项。
+    picked = page.evaluate("""() => {
+      const sel = document.getElementById('lab-syndrome');
+      const hit = [...sel.options].find(o => o.value && /脾|胃/.test(o.value))
+               || [...sel.options].find(o => o.value);
+      if (!hit) return "";
+      sel.value = hit.value;
+      sel.dispatchEvent(new Event('change'));
+      return hit.value;
+    }""")
+    f.check(bool(picked), f"证候下拉里有可选的证（选了「{picked}」）")
+    page.wait_for_timeout(900)          # 等病位病性与教材治法带出来
+    page.click("#lab-classic")
+    page.wait_for_selector("#lab-classic-pop", state="visible")
+    page.wait_for_timeout(1200)
+    pop = page.inner_text("#lab-classic-pop")
+    chips = page.eval_on_selector_all("#lab-classic-pop [data-classic]", "els => els.length")
+    # 一个都匹配不到时**不给不相关的列表**，而要给按方名找的入口
+    f.check(chips > 0 or "方名" in pop, "候选有结果，或如实说没匹配到并给出按方名查找")
+    f.check(page.eval_on_selector_all("#lab-classic-pop input[type=search]",
+                                      "els => els.length") == 1, "方名搜索框在")
+    # **不许在这里 return。** 第一版就是"没候选就跳过剩下的"，于是这一条在
+    # 候选恒空的情况下照样绿——而候选恒空正是要查的那个 bug（证候下拉把展示名
+    # 当成了证型名，157 个证型的候选全空）。没候选就改走方名搜索，
+    # 载入那一段必须每次都真的跑一遍。
+    f.check(chips > 0, f"选「{picked}」时候选不为空（{chips} 个）")
+    if not chips:
+        page.fill("#lab-classic-q", "汤")
+        page.click("#lab-classic-pop [data-classic-search]")
+        page.wait_for_timeout(1200)
+        pop = page.inner_text("#lab-classic-pop")
+        chips = page.eval_on_selector_all("#lab-classic-pop [data-classic]", "els => els.length")
+        f.check(chips > 0, f"按方名搜「汤」有结果（{chips} 个）")
+        if not chips:
+            return
+    f.check(page.eval_on_selector_all("#lab-classic-pop .lc-why",
+                                      "els => els.every(e => e.textContent.trim())"),
+            "每个候选都写出了匹配理由")
+    # **解表剂那一堆的回归**：选的是脾胃门的证，候选里不该出现麻黄汤
+    if "脾" in picked or "胃" in picked:
+        f.check("麻黄汤" not in pop, f"选「{picked}」时候选里没有麻黄汤")
+    page.click("#lab-classic-pop [data-classic]")
+    page.wait_for_timeout(1200)
+    rows = page.eval_on_selector_all("#lab-body tr[data-i]", "els => els.length")
+    f.check(rows > 0, f"点候选之后处方表出现了 {rows} 行")
+    names = page.eval_on_selector_all(
+        '#lab-body input[data-f="name"]', "els => els.filter(e => e.value.trim()).length")
+    f.check(names > 0, f"这些行里有药名（{names} 味）")
+    f.check("已载入" in page.inner_text("#lab-loaded"), "表格上方有「已载入…」那行反馈")
+    # 剂量：本项目的方剂本体出自古籍，剂量是古制原文，所以数字框可能是空的，
+    # 但「原方」标记必须在——**那才是"剂量带过来了"的证据**。
+    tags = page.eval_on_selector_all("#lab-body .rx-orig", "els => els.length")
+    loaded = page.inner_text("#lab-loaded")
+    f.check(tags > 0 or "原书未记剂量" in loaded,
+            f"带原方剂量的行有「原方」小字（{tags} 处），或如实说原书未记剂量")
+    if tags:
+        first = page.eval_on_selector("#lab-body .rx-orig", "e => e.textContent")
+        f.check(bool(first.strip()), f"「原方」小字有内容（{first.strip()}）")
+        # 改一下剂量，标记就该消失——标记的意思是"这个数来自原书"。
+        row = page.eval_on_selector(
+            "#lab-body .rx-orig",
+            "e => [...document.querySelectorAll('#lab-body tr[data-i]')].indexOf(e.closest('tr'))")
+        page.fill(f'#lab-body tr:nth-child({row + 1}) input[data-f="dose"]', "9")
+        page.wait_for_timeout(600)
+        after = page.eval_on_selector_all(
+            f"#lab-body tr:nth-child({row + 1}) .rx-orig", "els => els.length")
+        f.check(after == 0, "改过剂量之后这一行的「原方」标记消失")
 
 
 def _check_roles(page, f: Failures) -> None:

@@ -182,11 +182,15 @@ def textbook_formula_for(syndrome: str, *, ontology=None) -> dict | None:
     }
 
 
-def _principle_matches(ours: str, theirs: str) -> bool:
+def principle_matches(ours: str, theirs: str) -> bool:
     """治法算不算一致。走同义表，不裸比字符串。
 
     覆盖检查那次撞墙（「水肿」vs「肿胀」判成未覆盖）就是裸比出来的；
     这里比的是治法，同一件事换个说法更常见（「疏肝理气」/「疏肝解郁」）。
+
+    R63 把它从 `_principle_matches` 改成公开名：经典方候选要按"这张方的功用
+    对不对得上当前治法"筛，问的是同一个问题，另写一套字面比对就是第四次
+    撞同一堵墙（CLAUDE.md 第 31 条）。
     """
     if not ours or not theirs:
         return False
@@ -278,7 +282,7 @@ def compare(
 
     # 治法
     matched = next((e for e in entries
-                    if _principle_matches(principle, e.recommended_principle)), None)
+                    if principle_matches(principle, e.recommended_principle)), None)
     if matched:
         aligned.append({"what": "治法",
                         "detail": f"与{BASIS_LABEL}一致：{matched.recommended_principle}",

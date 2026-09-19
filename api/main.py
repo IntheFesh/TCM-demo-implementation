@@ -73,6 +73,8 @@ from core.explanations import build_explanations
 from core.export_render import ExportContext, build_render_model, render_plain_text
 from core.export_render import render_print_html, render_record_text
 from core import history
+from core.classic_formulas import MAX_CANDIDATES
+from core.classic_formulas import candidates as classic_candidates
 from core.guideline_compare import coverage_stats, textbook_formula_for
 from core.preferences import (
     DOSAGE_FORMS,
@@ -589,10 +591,26 @@ def _persistent_graph_to_cytoscape(store) -> dict:
 
 def _node_payload(node_id: str, data: dict,
                   ambiguous: set[tuple[str, str]] | None = None) -> dict:
+    """节点的前端载荷。`label` 是显示名，`name` **刻意不下发**——图上要显示的
+    是带病名限定的那个（52 个证型重名），下发 `name` 等于给渲染层留一个
+    "显示错名字"的口子。
+
+    R63：证型另给一个 `syndrome_name`，装**规范证型名**。
+    理由是这个项目撞过的那个坑（SOURCES 第 31 条：展示名当 id 用，工具恒返回
+    空而不报错）在 R62 的组方实验室里又撞了一次——证候下拉拿 `label` 当证型名
+    传给 `/api/node_explain`、`/api/textbook_formula`、经典方候选，
+    174 个证型里 157 个带「\n（病名）」后缀，这三个端点全部匹配不到，
+    病位病性恒显「—」、经典方候选恒空。
+    **字段名刻意不叫 `name`**：叫 `name` 的话下一个写渲染的人会拿它当显示名，
+    就把"证型重名"那个问题又放回来了。叫 `syndrome_name` 只有一种读法
+    ——"这是那个证型的规范名，用来传给别的接口"。
+    """
     node_data = {"id": node_id, "label": _display_label(node_id, data, ambiguous)}
     for k, v in data.items():
         if k != "name":
             node_data[k] = v
+    if data.get("node_type") == "syndrome" and data.get("name"):
+        node_data["syndrome_name"] = data["name"]
     return {"data": node_data}
 
 
@@ -3375,6 +3393,24 @@ def api_preferences_put(req: PreferencesRequest, request: Request) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"preferences": prefs}
+
+
+@app.get("/api/classic_formulas")
+def api_classic_formulas(syndrome: str = "", method: str = "", locus: str = "",
+                         q: str = "", limit: int = MAX_CANDIDATES) -> dict:
+    """R63 §1：当前辨证目标下的经典方候选，组成连原方剂量一起给。
+
+    **筛选放在服务端**，不是前端拿全量再过滤：判据要复用「主治含这个证」
+    （`formulas_for_syndrome`）与「功用对这个治法」（`principle_matches`）
+    这两处既有实现，而它们都在 Python 里。前端另写一套字面匹配就是第四次
+    撞 CLAUDE.md 第 31 条那堵墙——R62 的 `fromClassic` 拿证型名当关键词丢进
+    方名搜索，脾胃门的证弹出一串解表剂，正是那个错法的后果。
+
+    问诊页的 `[调用模板▾]` 与组方实验室的「从经典方开始」**共用这一个端点**，
+    两处不会给出不同的候选。
+    """
+    return classic_candidates(syndrome=syndrome, method=method, locus=locus,
+                              query=q, limit=limit)
 
 
 @app.get("/api/textbook_formula")

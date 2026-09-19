@@ -557,6 +557,34 @@ function renderFormula(s3s, first, data) {
   renderRxTable();
 }
 
+/** R63 §1：经典方的组成 → 处方表的行。**组方实验室与问诊页共用这一份**
+ * （`window.TCMApp.classicToRx`）：两页各写一份的话，一页带剂量一页不带，
+ * 而"带不带剂量"恰好是这一轮要修的那件事。
+ * 解析（药名、剂量原文、克数）全在服务端 `core/classic_formulas.py`，
+ * 这里只搬字段。 */
+function classicToRx(composition) {
+  return (composition || []).map((c) => ({
+    name: c.name,
+    dose: c.dose == null ? null : c.dose,
+    dose_unit: c.dose_unit || "g",
+    dose_text: c.dose_text || "",
+    dose_is_original: !!c.dose_is_original,
+  }));
+}
+
+/** 剂量旁的「原方」小字。
+ *
+ * 古制（钱/两/枚/粒）**不换算**：本项目的方剂本体出自古籍原文，剂量一条都
+ * 不是克。换算要朝代与度量衡的判断，给一个错的克数比照原样写出来危险得多，
+ * 所以数字框留空、原文照显示。
+ * 医师改过这一味，标记就该消失——标记的意思是"这个数来自原书"。 */
+function doseTag(h) {
+  if (!h || !h.dose_is_original) return "";
+  return h.dose == null
+    ? `<span class="rx-orig">${esc(h.dose_text)}（原方）</span>`
+    : '<span class="rx-orig">原方</span>';
+}
+
 function renderRxTable() {
   const ro = S.role === "patient";
   $("rx-body").innerHTML = S.rx.map((h, i) => `
@@ -564,7 +592,7 @@ function renderRxTable() {
       <td class="rx-role">${esc(h.role || "")}</td>
       <td class="rx-name">${term(`herb::${h.name}`, h.name)}</td>
       <td class="rx-dose"><input type="number" step="0.5" min="0" value="${h.dose == null ? "" : esc(h.dose)}"
-          data-f="dose" ${ro ? "disabled" : ""}></td>
+          data-f="dose" ${ro ? "disabled" : ""}>${doseTag(h)}</td>
       <td class="rx-unit">${esc(h.dose_unit || "g")}</td>
       <td class="rx-proc"><input type="text" placeholder="炮制" value="${esc(h.processing || "")}"
           data-f="processing" ${ro ? "disabled" : ""}></td>
@@ -972,16 +1000,40 @@ function showPrevComparison() {
     <p class="hint-why">${diffs.length ? `本次已改：${esc(diffs.join("；"))}` : "本次还没有改动。"}</p>`);
 }
 
+/** 个人模板 + 本证相关的经典方。
+ *
+ * R63 §1.3 第 5 条：经典方在这里跟在组方实验室里**走同一个端点、同一套
+ * 载入逻辑**（`/api/classic_formulas` + `classicToRx`）。两处各写一套的话，
+ * 一处带原方剂量一处不带，而那正是这一轮要修的毛病。 */
 async function loadTemplates() {
+  $("tpl-pop").hidden = false;
+  $("tpl-pop").innerHTML = '<span class="lc-empty">检索中…</span>';
+  let mine = '<span class="lc-empty">还没有存过模板。</span>';
   try {
     const got = await api("/api/templates");
     S.templates = got.personal || [];
-    $("tpl-pop").hidden = false;
-    $("tpl-pop").innerHTML = S.templates.length
-      ? S.templates.map((t, i) =>
-        `<button class="pop-word" data-tpl="${i}">${esc(t.name)}${t.syndrome ? `（${esc(t.syndrome)}）` : ""}</button>`).join("")
-      : '<span class="lc-empty">还没有存过模板。</span>';
-  } catch (e) { $("tpl-pop").hidden = false; $("tpl-pop").textContent = e.message; }
+    if (S.templates.length) {
+      mine = S.templates.map((t, i) =>
+        `<button class="pop-word" data-tpl="${i}">${esc(t.name)}${t.syndrome ? `（${esc(t.syndrome)}）` : ""}</button>`).join("");
+    }
+  } catch (e) { mine = `<span class="lc-empty">${esc(e.message)}</span>`; }
+  let classics = "";
+  try {
+    const cf = await api("/api/classic_formulas?" + new URLSearchParams({
+      syndrome: currentSyndrome() || "", method: currentMethod() || "", limit: "6",
+    }));
+    S.classics = cf.items || [];
+    classics = S.classics.length
+      ? S.classics.map((it, i) => `
+          <button class="pop-word lc-chip" data-classic-tpl="${i}">
+            <span class="lc-name">${esc(it.name)}</span>
+            <span class="lc-why">${esc(it.reason)}</span>
+          </button>`).join("")
+      : `<span class="lc-empty">${esc(cf.note || "")}</span>`;
+  } catch (e) { classics = `<span class="lc-empty">${esc(e.message)}</span>`; }
+  $("tpl-pop").innerHTML =
+    `<div class="tpl-grp"><div class="tpl-grp-h">我的模板</div>${mine}</div>`
+    + `<div class="tpl-grp"><div class="tpl-grp-h">本证相关的经典方</div>${classics}</div>`;
 }
 
 async function saveTemplate() {
@@ -1075,6 +1127,18 @@ function bindGlobalClicks() {
         .then(loadRecords).catch(() => {});
       return;
     }
+    const ctpl = ev.target.closest("[data-classic-tpl]");
+    if (ctpl) {
+      const it = (S.classics || [])[Number(ctpl.dataset.classicTpl)];
+      if (it) {
+        S.rx = classicToRx(it.composition);
+        renderRxTable(); runRuleCheck();
+        $("op-status").textContent = `已载入 ${it.name}，共 ${S.rx.length} 味`
+          + (S.rx.some((h) => h.dose_is_original) ? "，剂量为原方剂量。" : "，原书未记剂量，请按需填写。");
+      }
+      $("tpl-pop").hidden = true;
+      return;
+    }
     const tpl = ev.target.closest("[data-tpl]");
     if (tpl) {
       const t2 = (S.templates || [])[Number(tpl.dataset.tpl)];
@@ -1105,6 +1169,12 @@ function bindRxEditing() {
     const i = Number(inp.closest("tr").dataset.i);
     const f = inp.dataset.f;
     S.rx[i][f] = f === "dose" ? (inp.value === "" ? null : Number(inp.value)) : (inp.value || null);
+    // 医师动过这一味，「原方」标记就不再成立——重绘让它消失。
+    if (f === "dose" && S.rx[i].dose_is_original) {
+      S.rx[i].dose_is_original = false;
+      S.rx[i].dose_text = "";
+      renderRxTable();
+    }
     runRuleCheck();       // 第一层：立刻
     askEditAdvice();      // 第二层：停 1.5 秒
   });
@@ -1291,6 +1361,8 @@ window.__saveTemplate = (name) => post("/api/templates", {
 
 window.TCMApp = {
   esc, post, api, term, explainTerm, rcForce, debounce,
+  // R63 §1：经典方载入与「原方」标记，组方实验室复用这两份，不另写
+  classicToRx, doseTag,
   getRx: () => S.rx.map((x) => ({ ...x })),
   setRx: (rx, syndrome, method) => {
     S.rx = rx.map((x) => ({ ...x }));

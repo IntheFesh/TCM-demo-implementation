@@ -19,17 +19,35 @@
   const L = { syndromes: [], rx: [], app: null };
   const $ = (id) => document.getElementById(id);
 
-  /** 证候表：从知识查询那一份取，不再单独拉一次。 */
+  /** 证候表：从知识查询那一份取，不再单独拉一次。
+   *
+   * **`value` 取 `data.syndrome_name`，显示文字取 `data.label`。** 两者刻意不同：
+   * 174 个证候里 52 个重名（「肝郁气滞证」分属四个病名，病机各不同），
+   * 所以 `_display_label` 给 label 补了「\n（病名）」——而那是**显示用的**，
+   * 后端注释里写着"只改 label，不动 name"。
+   *
+   * R62 这里把 label 当成了证型名。后果是整条链全断：157 个带病名的证型
+   * （174 里的 157）传出去的是「劳伤心脾证\n（遗精）」，
+   * `/api/node_explain?node=syn::…`、`/api/textbook_formula`、经典方候选
+   * 三个端点全部匹配不到——病位病性恒显「—」、治法不自动带出、
+   * 经典方候选恒空。**这正是 SOURCES 第 31 条那个坑的同一个形状**：
+   * 展示名当 id 用，工具恒返回空而不报错，单元测试测不出来
+   * （每个端点单独测都对，错的是传进去的那个字符串）。
+   */
   async function loadSyndromes() {
     try {
       const got = await window.TCMApp.api("/api/graph?node_types=syndrome&limit=400");
       L.syndromes = (got.graph.nodes || [])
-        .map((n) => (n.data && n.data.label) || "")
-        .filter(Boolean).sort();
+        .map((n) => ({
+          id: (n.data && (n.data.syndrome_name || n.data.label)) || "",
+          label: ((n.data && n.data.label) || "").replace(/\n/g, " "),
+        }))
+        .filter((x) => x.id)
+        .sort((a, b) => a.label.localeCompare(b.label, "zh"));
     } catch (e) { L.syndromes = []; }
-    const sel = $("lab-syndrome");
-    sel.innerHTML = '<option value="">—</option>' +
-      L.syndromes.map((s) => `<option value="${window.TCMApp.esc(s)}">${window.TCMApp.esc(s)}</option>`).join("");
+    const esc = window.TCMApp.esc;
+    $("lab-syndrome").innerHTML = '<option value="">—</option>' +
+      L.syndromes.map((s) => `<option value="${esc(s.id)}">${esc(s.label)}</option>`).join("");
   }
 
   /** §9.3 第 1 条：选证型自动带出该证的病位病性与教材治法。 */
@@ -59,40 +77,69 @@
     return hit ? String(hit).slice(key.length).replace(/^[：:]\s*/, "") : "";
   }
 
-  /** §9.3 第 2 条：从经典方起手——调方剂本体里的一张方当底子。 */
-  async function fromClassic() {
-    const q = $("lab-syndrome").value || $("lab-method").value;
+  /** §9.3 第 2 条 / R63 §1：从经典方起手。
+
+   * **候选由服务端按当前证型/治法/病位筛**（`/api/classic_formulas`）。
+   * R62 这里把证型名当关键词丢进方名搜索，脾胃门的证弹出一串解表剂——
+   * 判据在后端（主治含这个证、功用对这个治法），前端另写一套字面匹配
+   * 就是第四次撞同一堵墙，所以这里只负责把 `reason` 显示出来。
+   */
+  async function fromClassic(query) {
     const pop = $("lab-classic-pop");
     pop.hidden = false;
     pop.innerHTML = '<span class="lc-empty">检索中…</span>';
+    const qs = new URLSearchParams({
+      syndrome: $("lab-syndrome").value || "",
+      method: $("lab-method").value || "",
+      locus: $("lab-locus").textContent === "—" ? "" : $("lab-locus").textContent,
+      q: query || "",
+    });
     try {
-      const got = await window.TCMApp.api(
-        `/api/knowledge/search?kind=formula&limit=12&q=${encodeURIComponent(q || "汤")}`);
-      const items = ((got.groups || [])[0] || {}).items || [];
-      pop.innerHTML = items.length
-        ? items.map((it, i) => `<button class="pop-word" data-classic="${i}">${window.TCMApp.esc(it.title)}</button>`).join("")
-        : `<span class="lc-empty">${window.TCMApp.esc(got.note || "没有查到可用的经典方。")}</span>`;
-      L.classicHits = items;
+      const got = await window.TCMApp.api(`/api/classic_formulas?${qs}`);
+      L.classicHits = got.items || [];
+      pop.innerHTML = renderClassicPop(got, query || "");
     } catch (e) { pop.innerHTML = `<span class="lc-empty">${window.TCMApp.esc(e.message)}</span>`; }
+  }
+
+  /** 候选一个都没有时**不给不相关的列表**，给一个按方名找的入口。 */
+  function renderClassicPop(got, query) {
+    const esc = window.TCMApp.esc;
+    const box = `<div class="lc-search">
+        <input type="search" id="lab-classic-q" placeholder="按方名查找，如 柴胡"
+               value="${esc(query)}" autocomplete="off">
+        <button class="btn-min" data-classic-search="1">查找</button>
+      </div>`;
+    const chips = (got.items || []).map((it, i) => `
+      <button class="pop-word lc-chip" data-classic="${i}">
+        <span class="lc-name">${esc(it.name)}</span>
+        <span class="lc-why">${esc(it.reason)}</span>
+      </button>`).join("");
+    return chips
+      ? chips + box
+      : `<span class="lc-empty">${esc(got.note || "没有查到可用的经典方。")}</span>` + box;
   }
 
   async function adoptClassic(i) {
     const hit = (L.classicHits || [])[i];
     if (!hit) return;
     $("lab-classic-pop").hidden = true;
-    try {
-      const d = await window.TCMApp.api(
-        `/api/node_explain?node=${encodeURIComponent(`formula::${hit.title}`)}`);
-      const sec = (d.sections || []).find((s) => s.heading === "是什么");
-      const compo = pick((sec && sec.lines) || [], "组成");
-      // 组成是「柴胡 12g、白芍 9g」这种文本：**只取药名**，剂量留空让人自己定。
-      // 教材里的剂量是原方的，照抄进一张正在改的方里会让人以为那是这一次的
-      // 判断——而剂量恰恰是最该由医师决定的那一项。
-      L.rx = compo.split(/[、，,；;]/).map((s) => s.replace(/[\d.]+\s*(g|克|钱|两|分|枚|片)?/g, "").trim())
-        .filter(Boolean).map((name) => ({ name, dose: null, dose_unit: "g" }));
-      render();
-      check();
-    } catch (e) { $("lab-check").innerHTML = `<span class="chk-warn">${window.TCMApp.esc(e.message)}</span>`; }
+    // **剂量照带，并标明是原方剂量**（R63 §1.3）。R62 刻意抹掉了剂量，顾虑是
+    // 怕人误以为那是本次判断——顾虑对，做法错：空剂量的方只省了打药名。
+    // 带上并在表格里标「原方」，改一下标记就消失，两头都顾到了。
+    // 组成的解析（药名、剂量原文、克数）全在服务端，前端不再自己切文本。
+    L.rx = window.TCMApp.classicToRx(hit.composition);
+    const n = L.rx.length;
+    const withDose = L.rx.filter((h) => h.dose_is_original).length;
+    const src = hit.book ? `（《${hit.book.replace(/^《|》$/g, "")}》）` : "";
+    const doseWord = withDose === 0
+      ? "原书未记剂量，请按需填写"
+      : (withDose === n ? "剂量为原方剂量" : `其中 ${withDose} 味带原方剂量`);
+    $("lab-loaded").hidden = false;
+    $("lab-loaded").innerHTML =
+      `已载入 <b>${window.TCMApp.esc(hit.name)}</b>${window.TCMApp.esc(src)}，`
+      + `共 ${n} 味，${window.TCMApp.esc(doseWord)}。`;
+    render();
+    check();
   }
 
   function render() {
@@ -102,13 +149,17 @@
         <td class="rx-role">${esc(h.role || "")}</td>
         <td class="rx-name"><input type="text" value="${esc(h.name || "")}" data-f="name" placeholder="药名"></td>
         <td class="rx-dose"><input type="number" step="0.5" min="0"
-            value="${h.dose == null ? "" : esc(h.dose)}" data-f="dose"></td>
+            value="${h.dose == null ? "" : esc(h.dose)}" data-f="dose">${doseTag(h)}</td>
         <td class="rx-unit">g</td>
         <td class="rx-proc"><input type="text" placeholder="炮制" value="${esc(h.processing || "")}" data-f="processing"></td>
         <td class="rx-dec"><input type="text" placeholder="煎法" value="${esc(h.decoction || "")}" data-f="decoction"></td>
         <td><button class="rx-del" data-labdel="${i}" title="去掉这一味">✕</button></td>
       </tr>`).join("") || '<tr><td colspan="7" class="lc-empty">还没有药。点「+ 加味」或「从经典方开始」。</td></tr>';
   }
+
+  /** 剂量旁的「原方」小字**用问诊页那一份**（`window.TCMApp.doseTag`）——
+   * §9.4 的规矩：两页共用的东西一份实现。 */
+  const doseTag = (h) => window.TCMApp.doseTag(h);
 
   function profile() {
     const age = $("lab-age").value;
@@ -207,23 +258,41 @@
   function bind() {
     $("lab-syndrome").onchange = onSyndromeChange;
     $("lab-add").onclick = () => { L.rx.push({ name: "", dose: null, dose_unit: "g" }); render(); };
-    $("lab-classic").onclick = fromClassic;
+    $("lab-classic").onclick = () => fromClassic("");
     $("lab-verify").onclick = verify;
     $("lab-to-consult").onclick = () => {
       window.TCMApp.setRx(L.rx.filter((h) => h.name), $("lab-syndrome").value, $("lab-method").value);
       window.TCMApp.showPage("consult");
     };
+    $("lab-classic-pop").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && ev.target.id === "lab-classic-q") {
+        ev.preventDefault();
+        fromClassic(ev.target.value);
+      }
+    });
     $("lab-body").addEventListener("input", (ev) => {
       const inp = ev.target.closest("input[data-f]");
       if (!inp) return;
       const i = Number(inp.closest("tr").dataset.i);
       const f = inp.dataset.f;
       L.rx[i][f] = f === "dose" ? (inp.value === "" ? null : Number(inp.value)) : (inp.value || null);
+      // 医师动过这一味，「原方」标记就不再成立——重绘让它消失。
+      if ((f === "dose" || f === "name") && L.rx[i].dose_is_original) {
+        L.rx[i].dose_is_original = false;
+        L.rx[i].dose_text = "";
+        render();
+      }
       check();
     });
     document.addEventListener("click", (ev) => {
       const del = ev.target.closest("[data-labdel]");
       if (del) { L.rx.splice(Number(del.dataset.labdel), 1); render(); check(); return; }
+      const search = ev.target.closest("[data-classic-search]");
+      if (search) {
+        const box = document.getElementById("lab-classic-q");
+        fromClassic(box ? box.value : "");
+        return;
+      }
       const cls = ev.target.closest("[data-classic]");
       if (cls) { adoptClassic(Number(cls.dataset.classic)); return; }
       const gap = ev.target.closest("[data-gap]");

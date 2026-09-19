@@ -59,12 +59,27 @@ _DOSE_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[~～\-—－至]\s*(\d+(?:\.\d+
 _DOSE_SINGLE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:g|克)")
 #: 功效/主治/组成里的并列分隔符。
 _SPLIT_RE = re.compile(r"[，,、；;。\s]+")
-#: 组成条目里的剂量部分：「柴胡 12g」「白芍9克」「炙甘草六钱」
-_COMPOSITION_ITEM_RE = re.compile(r"^(.*?)\s*([\d一二三四五六七八九十]+(?:\.\d+)?\s*(?:g|克|钱|两|分|枚|片|条|只)?)?$")
+#: 组成条目里的剂量部分：「柴胡 12g」「白芍9克」「炙甘草六钱」「柴胡半斤」
+#: R63：数词与单位表跟下面的 `_DOSE_ONLY_RE` **对齐**。此前两条正则对"什么算
+#: 一个剂量"给的答案不一样（这条不认「半」「斤」「升」「粒」），于是
+#: 「柴胡半斤」整段被当成药名，一键导入经典方时处方表里出现一味叫「柴胡半斤」
+#: 的药。同一个判断在同一个文件里有两套词表，迟早会这样对不上。
+_COMPOSITION_ITEM_RE = re.compile(
+    r"^(.*?)\s*([\d一二三四五六七八九十半]+(?:\.\d+)?\s*"
+    r"(?:g|克|钱|两|分|枚|片|条|只|粒|升|斤|合|尺)?)?$")
 #: 整段只有剂量、没有药名。方剂书里「柴胡 12g、黄芩 9g」用空格分药名与剂量，
 #: 而 `_SPLIT_RE` 把空白也当分隔符，剂量会被切成独立一段跟药名走散——
 #: 不认出这种段就会把剂量**静默丢掉**，而 R34 的 dose_exceeds 读的正是这个数。
-_DOSE_ONLY_RE = re.compile(r"^[\d一二三四五六七八九十百]+(?:\.\d+)?\s*(?:g|克|钱|两|分|枚|片|条|只|ml|毫升)?$")
+#:
+#: R63：单位表补了古制的「升斤合尺粒」、数词补了「半」。原因是漏掉的单位不是
+#: 少一个剂量那么轻——认不出来的那一段会被当成**一味药**接着往下走，方剂本体里
+#: 因此凭空多出「一升」「半斤」「四十粒」这类药名（实测 28 条）。一键导入经典方
+#: 时它们会变成处方表里的空行，比丢一个剂量显眼得多。
+#: 「半」进数词类不会误伤「半夏」：整段要全部由数词加一个可选单位组成才算命中，
+#: 而「夏」不在单位表里。
+_DOSE_ONLY_RE = re.compile(
+    r"^[\d一二三四五六七八九十百半]+(?:\.\d+)?\s*"
+    r"(?:g|克|钱|两|分|枚|片|条|只|粒|升|斤|合|尺|ml|毫升)?$")
 
 OntologyKind = Literal["materia_medica", "formulary"]
 
@@ -178,6 +193,22 @@ def parse_effects(values: list[str]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def parse_dose_g(text: str) -> float | None:
+    """一段剂量原文 → 克数。区间取上界，单值取该值，一段里有多个取最大。
+
+    **古制（钱/两/枚/粒）一律返回 None**，不换算：换算要朝代与度量衡的判断，
+    给一个错的克数比留空危险得多（`parse_composition` 的注释是同一条理由）。
+
+    R63 从 `parse_dose_max_g` 里抽出来——经典方一键导入要问的是"这一味的
+    剂量是多少克"，跟"这味药的用量上限是多少"是同一个解析问题的两种用法，
+    不能各写一份（CLAUDE.md：同一概念的匹配逻辑只能有一处实现）。
+    """
+    vals = [float(m.group(2)) for m in _DOSE_RANGE_RE.finditer(text or "")]
+    if not vals:
+        vals = [float(m.group(1)) for m in _DOSE_SINGLE_RE.finditer(text or "")]
+    return max(vals) if vals else None
+
+
 def parse_dose_max_g(values: list[str]) -> float | None:
     """用量原文 → 克数上限。区间取上界，单值取该值，取所有条目里的**最大值**。
 
@@ -187,14 +218,9 @@ def parse_dose_max_g(values: list[str]) -> float | None:
     """
     best: float | None = None
     for v in values:
-        vals: list[float] = []
-        for m in _DOSE_RANGE_RE.finditer(v):
-            vals.append(float(m.group(2)))
-        if not vals:
-            vals = [float(m.group(1)) for m in _DOSE_SINGLE_RE.finditer(v)]
-        for x in vals:
-            if best is None or x > best:
-                best = x
+        x = parse_dose_g(v)
+        if x is not None and (best is None or x > best):
+            best = x
     return best
 
 
