@@ -358,6 +358,13 @@ async function runConsult() {
         if (name === "stream_id") { streamId = data.stream_id; continue; }
         if (name === "error") { throw new Error(data.detail || "服务端错误"); }
         if (name === "done") { finish(data); continue; }
+        if (name === "need_input") {
+          // §11.2 把追问默认设成 0 轮，所以这条几乎不会来。**但必须接**：
+          // 不接的话后端会在 `ANSWER_TIMEOUT_SECONDS`（300 秒）上干等一个
+          // 永远不来的回答——那正是这一轮要消灭的"卡住"，而且是最长的那一种。
+          askFollowUp(streamId, data);
+          continue;
+        }
         if (name === "s3_draft") {
           // §11.3：②–⑥ 现在就渲染，⑦ 显示"核对中…"，不让整页等到最后。
           S.draft = data.s3_structured;
@@ -381,6 +388,36 @@ async function runConsult() {
     checkRequired();
     if (!$("go-status").textContent.startsWith("出错")) $("go-status").textContent = "";
   }
+}
+
+/** 追问：右栏出问题 + 一个输入框，答完 POST 回去。
+
+ *  钉住时也强制换（`rcForce`）——这是一个**在等回答**的阻塞状态，
+ *  把它藏在钉住的释义后面会让整条流看起来卡住。 */
+function askFollowUp(streamId, data) {
+  const q = data.question || "";
+  rcForce("需要补充一句", `
+    <p>${esc(q)}</p>
+    <div class="go-row">
+      <input id="fu-answer" type="text" placeholder="有 / 没有 / 具体描述">
+      <button id="fu-send" class="btn-min">回答</button>
+    </div>
+    <p class="hint-why">不回答也可以——等一会儿系统会按"未提供"继续推导。</p>`);
+  const send = async () => {
+    const answer = ($("fu-answer").value || "").trim();
+    if (!answer || !streamId) return;
+    $("fu-send").disabled = true;
+    try {
+      await post(`/api/consult/stream/${encodeURIComponent(streamId)}/answer`, { answer });
+      rcForce("需要补充一句", `<p>${esc(q)}</p><p class="hint-why">已回答：${esc(answer)}</p>`);
+    } catch (e) {
+      $("fu-send").disabled = false;
+      rcForce("需要补充一句", `<p>${esc(q)}</p><p class="chk-warn">${esc(e.message)}</p>`);
+    }
+  };
+  $("fu-send").onclick = send;
+  $("fu-answer").addEventListener("keydown", (ev) => { if (ev.key === "Enter") send(); });
+  $("fu-answer").focus();
 }
 
 /* ═════════ 6. 渲染结果 ═════════ */

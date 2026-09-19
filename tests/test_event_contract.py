@@ -62,13 +62,29 @@ def _backend_emitted_events() -> set[str]:
     return names
 
 
-def _frontend_handled_events() -> set[str]:
-    """扫 web/app.js 里全部 `case "x"` 与 `name === "x"`。
+#: 要扫的前端。**两份都扫**：R62 的产品面是 `web/product/app.js`
+#: （`PRODUCT_MODE=1` 下加载的那一份），旧 `web/app.js` 在内部研究版下
+#: 仍然是上线代码。只扫其中一份的话，另一份漏掉一个事件不会有人发现，
+#: 而"漏掉一个事件"的表现恰恰是用户读成"卡住了"。
+FRONTEND_FILES = ("web/app.js", "web/product/app.js")
+
+
+def _frontend_handled_events(path: str | None = None) -> set[str]:
+    """扫前端里全部 `case "x"` 与 `name === "x"`。
 
     两种写法对应两条不同的分派路径（见 app.js 里 `describeProgressEvent`/
     `columnStepForEvent` 的 `switch` 和主读取循环的 `if/else if` 链），
-    合并统计因为二者都算"这个事件名被认出来了"。"""
-    src = _read("web/app.js")
+    合并统计因为二者都算"这个事件名被认出来了"。
+
+    不传 `path` 时是**两份前端的交集**——一个事件必须在每一份里都有处理才算
+    覆盖了。取并集就会出现"新页面接了、旧页面没接"照样绿的情况。"""
+    if path is None:
+        sets = [_frontend_handled_events(p) for p in FRONTEND_FILES]
+        out = sets[0]
+        for s2 in sets[1:]:
+            out &= s2
+        return out
+    src = _read(path)
     names: set[str] = set()
     names |= set(re.findall(r'case\s+"([a-z0-9_]+)"\s*:', src))
     names |= set(re.findall(r'name\s*===\s*"([a-z0-9_]+)"', src))
@@ -167,3 +183,19 @@ def test_the_scanner_itself_sees_the_events_with_digits_in_their_names():
     for name in ("s1_done", "s2_done", "s3_start", "s3_delta", "s3_done"):
         assert name in backend, f"{name} 应该被扫描器认出来，它在 core/chain.py 里确实发了"
         assert name in frontend, f"{name} 前端确实有处理，扫描器却没认出来"
+
+
+def test_the_product_frontend_handles_every_event_too():
+    """R62 起有两份前端：`web/product/app.js`（产品模式加载的那一份）与
+    `web/app.js`（内部研究版）。**两份都要认得全部事件**——只扫一份的话，
+    另一份漏掉一个事件不会有人发现，而漏掉的表现正是用户读成"卡住了"。"""
+    backend = _backend_emitted_events() - PROTOCOL_EVENTS
+    for path in FRONTEND_FILES:
+        missing = backend - _frontend_handled_events(path)
+        assert not missing, f"{path} 没有认出这些后端事件：{sorted(missing)}"
+
+
+def test_the_product_frontend_handles_the_protocol_frames_as_well():
+    src = _read("web/product/app.js")
+    for name in sorted(PROTOCOL_EVENTS - {"usage"}):
+        assert f'name === "{name}"' in src, f"{name} 在产品面的 SSE 读取循环里没有分支"
