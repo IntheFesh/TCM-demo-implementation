@@ -317,6 +317,7 @@ async function runConsult() {
   $("btn-go").disabled = true; $("btn-cancel").hidden = false;
   $("go-status").textContent = "推导中…";
   $("redflag-bar").hidden = true; $("triage-page").hidden = true;
+  $("veto-bar").hidden = true; S.veto = null; setExportBlocked(false, "");
   const progress = {};
   let streamId = ""; let fallbackTimer = null; let resolved = false;
 
@@ -450,12 +451,15 @@ function renderResult(data) {
   const s3s = first.s3_structured || {};
   const s3 = first.s3 || {};
 
-  // 红旗与拦截（§8.2）
+  // 红旗与拦截（§8.2）。**验证否决不走这里**——它在下面的 renderVetoBar()：
+  // R65 之前两条路合成了一条，医师于是看到「请尽快就医…本页不提供方药内容」，
+  // 而那是患者遇到危重征象的措辞，跟"方没通过核查"毫无关系。
   if (data.rejected || (data.triage && S.role === "patient")) {
     renderTriagePage(data);
     return;
   }
   $("triage-page").hidden = true;
+  renderVetoBar(data.verification_block);
   if (data.safety_flag) {
     $("redflag-bar").hidden = false;
     $("redflag-bar").innerHTML = `<h3>⚠ 本例含危重征象：${esc(data.safety_flag)}</h3>
@@ -481,10 +485,60 @@ function renderResult(data) {
   rcShow("问诊要点提示", '<p class="rc-empty">结论已出。点中间任意术语，这里给出它的释义与出处。</p>');
 }
 
+/** R65：验证否决的黄条。**完整推导与方剂照常显示**，只是导出禁用。
+ *
+ * 医师是专业人员，需要的是"完整分析 + 指出哪一味有问题"，自己判断要不要用；
+ * 把整方扣下来是把医师当成了需要被保护的患者。
+ * 文案全部由服务端给（`core/veto_text.py` 一处实现）——前端不做规则 id 到
+ * 人话的映射，那样迟早会漂，而漂掉的表现就是界面上又出现 `herb_source_fabricated`。
+ */
+function renderVetoBar(block) {
+  const bar = $("veto-bar");
+  S.veto = block || null;
+  if (!block) {
+    bar.hidden = true;
+    setExportBlocked(false, "");
+    return;
+  }
+  bar.hidden = false;
+  // **填内容，不重建骨架**：骨架静态写在 index.html 里，否则 `#veto-detail`
+  // 只在有 detail 时才存在，`tests/test_product_ui.py` 那条"脚本碰到的 id
+  // 都得在 HTML 里"就会红——而它红得有道理：一个只在某个分支下才存在的
+  // id，任何一处 `$()` 拿它都可能拿到 null。
+  $("veto-head").textContent = "⚠ " + (block.banner || "系统核查未通过");
+  bar.querySelector(".vb-more").hidden = !(block.detail || []).length;
+  $("veto-detail").hidden = true;
+  setExportBlocked(!!block.export_blocked,
+    "本次核查未通过，导出已暂时禁用。请人工复核标红的药味后再使用。");
+}
+
+/** 导出三档 + 生成记录一起禁用。**理由要写在界面上**——一个点不动的按钮
+ *  而不说为什么，比禁用本身更让人困惑。 */
+function setExportBlocked(blocked, why) {
+  for (const id of ["op-export", "op-record"]) {
+    const el = $(id);
+    if (!el) continue;
+    el.disabled = blocked;
+    el.title = blocked ? why : "";
+  }
+  $("op-status").textContent = blocked ? why : $("op-status").textContent;
+}
+
 function renderTriagePage(data) {
   const t = data.triage || {};
   $("result-zone").hidden = true;
+  $("veto-bar").hidden = true;
   $("triage-page").hidden = false;
+  // **两种来源两套措辞。** 「请尽快就医」「本页不提供方药内容」这两句只属于
+  // 危重征象那一条路（`tests/test_veto_presentation.py` 扫源码钉着这件事）；
+  // 验证否决走的是「本次未能给出可供参考的方剂」，因为那跟"你的症状危险"
+  // 是两件完全不同的事，患者该做的也不同。
+  const vb = data.verification_block;
+  if (vb && vb.kind === "verification") {
+    $("triage-page").innerHTML = `<h2 class="card-h">本次未能给出可供参考的方剂</h2>
+      <p>${esc(vb.patient_notice || data.reject_reason || "")}</p>`;
+    return;
+  }
   $("triage-page").innerHTML = `<h2 class="card-h">请尽快就医</h2>
     <p>${esc(data.reject_reason || "所述症状中含有需要尽快就医的征象。")}</p>
     ${t.dept ? `<p>建议就诊科室：${esc(t.dept)}</p>` : ""}
@@ -587,8 +641,11 @@ function doseTag(h) {
 
 function renderRxTable() {
   const ro = S.role === "patient";
+  // R65：被核查点名的药味标红并在旁边写原因。**原因文字由服务端给**
+  // （`core/veto_text.py::SHORT_REASON`），前端不认识规则 id。
+  const flagged = ((S.veto && S.veto.herb_reasons) || {});
   $("rx-body").innerHTML = S.rx.map((h, i) => `
-    <tr data-i="${i}">
+    <tr data-i="${i}"${flagged[h.name] ? ' class="rx-flagged"' : ""}>
       <td class="rx-role">${esc(h.role || "")}</td>
       <td class="rx-name">${term(`herb::${h.name}`, h.name)}</td>
       <td class="rx-dose"><input type="number" step="0.5" min="0" value="${h.dose == null ? "" : esc(h.dose)}"
@@ -598,7 +655,8 @@ function renderRxTable() {
           data-f="processing" ${ro ? "disabled" : ""}></td>
       <td class="rx-dec"><input type="text" placeholder="煎法" value="${esc(h.decoction || "")}"
           data-f="decoction" ${ro ? "disabled" : ""}></td>
-      <td class="rx-fn">${esc(h.function_in_formula || "")}</td>
+      <td class="rx-fn">${esc(h.function_in_formula || "")}${
+        flagged[h.name] ? `<span class="rx-flag-why">⚠ ${esc(flagged[h.name])}</span>` : ""}</td>
       <td>${ro ? "" : `<button class="rx-del" data-del="${i}" title="去掉这一味">✕</button>`}</td>
     </tr>`).join("") || '<tr><td colspan="8" class="lc-empty">方里还没有药。</td></tr>';
 }
@@ -1149,6 +1207,18 @@ function bindGlobalClicks() {
         renderRxTable(); runRuleCheck();
       }
       $("tpl-pop").hidden = true;
+      return;
+    }
+    const vd = ev.target.closest("[data-veto-detail]");
+    if (vd) {
+      const box = $("veto-detail");
+      box.hidden = !box.hidden;
+      // 技术细节（规则 id、本体原文、模型写的原文）**只有内部角色拿得到**
+      // ——服务端在 `detail` 为空时前端也就没得显示，不是前端自己藏起来。
+      box.innerHTML = ((S.veto && S.veto.detail) || []).map((d) =>
+        `<p class="ne-src">${esc(d.rule || "")}｜${esc((d.herbs || []).join("、"))}
+          ｜${esc(d.reason || "")}${d.counterexample ? `｜本体原文：${esc(d.counterexample)}` : ""}</p>`
+      ).join("") || '<p class="ne-src">这一档角色不提供技术细节。</p>';
       return;
     }
     const fx = ev.target.closest(".fx-btn");

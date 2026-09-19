@@ -74,6 +74,11 @@ from core.export_render import ExportContext, build_render_model, render_plain_t
 from core.export_render import render_print_html, render_record_text
 from core import history
 from core.classic_formulas import MAX_CANDIDATES
+from core.veto_text import DOCTOR_BANNER
+from core.veto_text import PATIENT_NOTICE as VETO_PATIENT_NOTICE
+from core.veto_text import flagged_herbs as veto_flagged_herbs
+from core.veto_text import herb_reasons as veto_herb_reasons
+from core.veto_text import summarize as veto_summary
 from core.classic_formulas import candidates as classic_candidates
 from core.guideline_compare import coverage_stats, textbook_formula_for
 from core.preferences import (
@@ -1402,13 +1407,61 @@ def _consult_response(outcome: dict, role: Role = "researcher") -> dict:
         # undefined 悄悄进渲染。
         "explanations": {"terms": [], "by_id": {}, "n": 0, "n_total": 0,
                          "n_available": 0, "truncated": False, "note": ""},
+        # R65：验证否决的呈现块。**恒有这个键**（四个分支同一套键那条纪律）——
+        # None 表示"这次核查没有否决项"，不是"这个功能不存在"。
+        "verification_block": None,
     }
 
-    if outcome["rejected"]:
-        # 安全否决命中：S2/S3 从未被调用，没有 results 可以拼图，直接返回空图。
+    veto = outcome.get("verification_veto") or []
+    if outcome["rejected"] and not veto:
+        # **安全否决**：S2/S3 从未被调用，没有 results 可以拼图，直接返回空图。
+        # `reject_reason` 这条路上是安全层写的话（危重症状），可以直接给用户。
         return _filter_response_by_role(
             {**base, "rejected": True, "reject_reason": outcome["reject_reason"]}, role, []
         )
+
+    if veto:
+        # **验证否决**：跟安全否决走两条路（R65）。
+        #
+        # 用户真机截图里这两条走成了一条，界面于是对医师说「请尽快就医…
+        # 本页不提供方药内容」——那是患者遇到危重征象的措辞，跟"方没通过核查"
+        # 毫无关系；而且把 `herb_source_fabricated` 直接印了出来。
+        # 根因是同一个：`SymbolicVeto.reason` 那句话是写给日志与研究模式的
+        # （带规则 id、带轮数），却被响应原样转给了前端。
+        #
+        # 现在：
+        #   - `verification` 字段带**人话**（`core.veto_text`，一处实现），
+        #     规则 id 只出现在 `verification.detail`，而那一段只给内部角色；
+        #   - 医师/学生**照常拿到完整推导与方剂**，另给 `export_blocked` 与
+        #     要标红的药味——医师是专业人员，需要的是"完整分析 + 指出哪一味
+        #     有问题"，不是什么都不给；
+        #   - 患者仍然不下发方药，措辞是「本次未能给出可供参考的方剂」。
+        internal = role not in ("doctor", "student", "patient")
+        block = {
+            "kind": "verification",
+            "summary": veto_summary(veto),
+            "banner": DOCTOR_BANNER.format(summary=veto_summary(veto)),
+            "patient_notice": VETO_PATIENT_NOTICE,
+            "flagged_herbs": veto_flagged_herbs(veto),
+            "herb_reasons": veto_herb_reasons(veto),
+            "export_blocked": True,
+            # 规则 id、本体原文、模型写的原文对照——「查看详情」展开才显示，
+            # 且只给内部角色（研究模式与排障）。产品三角色拿不到这一段。
+            "detail": [dict(v) for v in veto] if internal else [],
+        }
+        if role == "patient":
+            return _filter_response_by_role(
+                {**base, "rejected": True,
+                 "reject_reason": VETO_PATIENT_NOTICE,
+                 "verification_block": {**block, "detail": [],
+                                        "flagged_herbs": [], "herb_reasons": {}}},
+                role, [])
+        # 医师/学生/内部：**不走 rejected 分支**，继续往下拼完整响应。
+        # `rejected` 明确置 False——它在前端的含义是"整页拦截"，
+        # 而这一条恰恰是"不要整页拦截"。方不可下发这件事由
+        # `verification_block.export_blocked` 表达。
+        base = {**base, "rejected": False, "reject_reason": None,
+                "verification_block": block}
 
     if outcome.get("retrieval_error"):
         # 选的检索模式这台机器上没有对应数据。单独一个分支而不是混进
@@ -1997,7 +2050,13 @@ def _serialize_result(r: dict) -> dict:
         # `hallucinated` 是**服务端**用全集算完的结论，不受这里裁剪影响——
         # 裁剪只改"下发多少"，不改"验了什么"。
         **_refs_block(r),
-        "hallucinated": r["hallucinated"],
+        # `.get` 而不是 `r["hallucinated"]`：R65 起这个函数多了第三类调用方
+        # ——**没通过符号验证的草稿**（`core/chain.py` 的 veto 分支，医师要看到
+        # 完整推导才能判断哪一味有问题）。那条路上医案检索根本没跑过，所以
+        # "有没有编造的医案 id"这件事无从谈起，默认空列表是如实的：
+        # 不是"查过了没有"，是"这一版没有引用任何医案"（同一分支里
+        # `corroboration` 恒 None，理由相同）。
+        "hallucinated": r.get("hallucinated", []),
         # X2 输出侧安全校验结果，前端据此挂红/黄标签
         "safety_output": r.get("safety_output"),
         # G2 取证轨迹。不开 ReAct 时是 None；开了要如实带出来——ReAct 的卖点

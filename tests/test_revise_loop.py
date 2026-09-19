@@ -207,12 +207,29 @@ def test_the_reopen_prompt_does_not_carry_unverifiable_items(run, ont):
 
 # ---------- veto 残余不下发 ----------
 
-def test_a_remaining_veto_blocks_the_whole_consult(run):
+def test_a_remaining_veto_marks_the_consult_rejected_and_carries_the_draft(run):
+    """R65 改了这条的契约：以前推理链在 veto 残余时把草稿直接丢掉
+    （`results == []`），于是**任何角色**都只能看到一句"本页不提供方药内容"。
+    医师是专业人员，需要的是完整推理链 + 指出哪一味有问题，自己判断要不要
+    用——把方药整个抹掉等于把医师当成需要被保护的患者。
+
+    所以草稿现在**一定**要带出推理链，交给 `api/main.py::_consult_response`
+    按角色决定给谁看（患者仍然什么方药都不给）。分角色是展示层的事，推理链
+    不认识角色——它只负责如实说"这次没通过核查"并把证据带上。
+    「不下发」这件事本身改由 `tests/test_veto_presentation.py` 在 API 层钉住。"""
     out, _llm = run([dict(herbs=("甘草", "甘遂"))])
-    assert out["results"] == [], "veto 残余时不产出任何方药"
     assert out["rejected"] is True
-    assert "符号验证" in out["reject_reason"]
-    assert "incompatible_pair" in out["reject_reason"]
+    # R65：`reject_reason` 改成人话了（`core.veto_text`）。这里断言的是**新契约**
+    # ——说清是哪两味药、犯了哪条医理，而**不许**出现规则 id：这句话会经
+    # `agent_trace` 发给所有角色，印 id 就是产品面漏 id（那正是这轮修的事）。
+    assert "甘草" in out["reject_reason"] and "甘遂" in out["reject_reason"]
+    assert "十八反" in out["reject_reason"] or "十九畏" in out["reject_reason"]
+    assert "incompatible_pair" not in out["reject_reason"]
+    assert out["results"], "草稿要带出来，不能在推理链里就丢掉"
+    r = out["results"][0]
+    assert r["verification_failed"] is True, "要明确标成没通过核查，不能看起来像正常结果"
+    assert r["s3_structured"] is not None, "医师要看的是五步链，不只是结论卡"
+    assert r["corroboration"] is None, "没过核查就不给医案佐证，那会抬高它的可信度"
 
 
 def test_the_veto_response_lists_the_violations_with_counterexamples(run):

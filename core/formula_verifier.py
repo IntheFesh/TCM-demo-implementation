@@ -556,10 +556,36 @@ def check_herb_not_in_ontology(s3, ont) -> tuple[list[Violation], list[Unverifia
     return out, [], ["herb_not_in_ontology"]
 
 
+# 一段重合的话要长到什么程度，才算"足以指认它是谁的原文"。R65 定的下限：
+# 本体里存在 5 条只有 1 个字的 span（小麦·归经="心"、粳米·归经="胃" 等）和
+# 209 条只有 2 个字的，双向子串下"含'胃'字"就等于"命中粳米的原文"——全本体
+# 10134 条 span 里有 18.8% 含这四个字。归属判定必须比匹配判定严，理由见
+# `_find_span_owner`。
+_MIN_ATTRIBUTABLE_OVERLAP = 6
+
+
+def _span_overlap(span: str, text: str) -> str | None:
+    """双向子串匹配**唯一的**实现，返回重合的那一段（嵌套时即较短的那个），
+    没重合返回 `None`。
+
+    双向而不是相等：模型照抄时可能只抄了其中一句（本体原文往往是一整段），
+    要求逐字相等会把正确的引用判成编造。
+
+    返回重合段而不是 `bool`：判"这段话是谁的"时要看重合部分有多长（见
+    `_find_span_owner`），而这跟"有没有重合"是同一次比较——分成两个函数
+    各比一遍，就会出现同一对文本在一处算命中、另一处算没命中。"""
+    span, text = span.strip(), text.strip()
+    if not span or not text:
+        return None
+    if span in text:
+        return span
+    if text in span:
+        return text
+    return None
+
+
 def _span_matches_any(span: str, texts: list[str]) -> bool:
-    """双向子串——模型照抄时可能只抄了其中一句（本体原文往往是一整段），
-    要求逐字相等会把正确的引用判成编造。"""
-    return any(span in t or t in span for t in texts if t)
+    return any(_span_overlap(span, t) for t in texts if t)
 
 
 def _find_same_herb_other_predicate(span: str, refs: dict, *, exclude_predicate: str) -> str | None:
@@ -575,26 +601,53 @@ def _find_same_herb_other_predicate(span: str, refs: dict, *, exclude_predicate:
 
 
 def _find_span_owner(span: str, ont, *, exclude_name: str) -> tuple[str, str] | None:
-    """R60 T3 vs T1 的分界：在全本体范围内（排除这味药自己）找这段话**真的
-    存在**在哪味药、哪条原文里。找到了 → 这段话是本体里真实存在的原文，只是
-    被安到了另一味药头上，这才是真正的张冠李戴（T3，veto 没有反驳空间）；
-    找不到 → 本体全范围内哪儿都没有这段话，大概率是模型自己转述/概括出来的
-    （T1，不是查得到却硬要赖给别的药，程度上跟 T3 不是一件事，见
-    `check_herb_source_paraphrased`）。
+    """R60 T3 vs T1 的分界：在全本体范围内（排除这味药自己）找这段话**能不能
+    指认给**另一味药。指认得出 → 这段话是本体里真实存在的原文，只是被安到了
+    另一味药头上，这才是真正的张冠李戴（T3，veto 没有反驳空间）；指认不出
+    → 大概率是模型自己转述/概括出来的（T1，见 `check_herb_source_paraphrased`）。
+
+    R65 修：光有"重合"不够，必须**指认得出**。原先只要 `_span_overlap` 命中
+    就算找到主人，实测把 200 条**本体自己的真实原文**拿去查，146 条（73%）
+    被判给了别的药——因为本草原文里大半是格式化短语：「归肺、胃经。」「味苦，
+    平」「煎服，9~15g」这种话几十味药逐字相同，再加上本体里存在 1~2 字的
+    span（「胃」「心」「胎漏」），双向子串必然命中。于是模型只要引文跟自己
+    这味药的收录版本差一点（换了个版本、少抄一句），就会从 T1（revise，还有
+    改的机会）直接跳成 T3（veto，整张方废掉）——这是用户真机上「肝胃气滞」
+    一类主诉整页被拦的根因，跟产品/消融两条路径的配置无关（两边配置实测逐项
+    相同）。
+
+    所以"指认"要同时满足两条，缺一条就退回 T1：
+
+    1. **重合段够长**（`_MIN_ATTRIBUTABLE_OVERLAP`）。1~2 个字的重合不携带
+       归属信息，「含'胃'字」不等于「抄了粳米的原文」。
+    2. **主人唯一**。同一段话在别的药身上出现两次以上，说明它是通用表述，
+       本来就不属于谁——指认不出主人，就没有"这段话真正属于 X"这句反例可写，
+       而 T3 的 veto 全靠这句反例立住（见
+       `test_t3_cross_herb_veto_names_the_true_owner`）。
+
+    两条都是**归属**判据，不是匹配判据：匹配统一走 `_span_overlap`，这里只
+    在匹配之上加"够不够格指认"。判不准时一律退 T1 而不是 T3——revise 给模型
+    一次改的机会，veto 直接废掉整张方，误判的代价不对等。
 
     扫全本体（约 1200 味 × 数条 refs）是这次验证里最贵的一步，但只在**已经
     对不上自己这味药**之后才会走到，一次验证顶多几十次，不值得为它另建
     反向索引。
     """
+    owners: dict[str, str] = {}
     for other_name, other_herb in ont.herbs.items():
         if other_name == exclude_name:
             continue
         for rs in other_herb.refs.values():
             for r in rs:
-                t = r.span.strip()
-                if t and (span in t or t in span):
-                    return other_name, t
-    return None
+                ov = _span_overlap(span, r.span)
+                if ov is None or len(ov) < _MIN_ATTRIBUTABLE_OVERLAP:
+                    continue
+                owners.setdefault(other_name, r.span.strip())
+                if len(owners) > 1:
+                    return None  # 通用表述，指认不出主人 → 退 T1
+    if len(owners) != 1:
+        return None
+    return next(iter(owners.items()))
 
 
 def check_herb_source_fabricated(s3, ont) -> tuple[list[Violation], list[Unverifiable], list[str]]:

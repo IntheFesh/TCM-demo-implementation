@@ -1,0 +1,107 @@
+{
+  "n_herbs": 1232,
+  "n_spans": 10134,
+  "min_attributable_overlap": 6,
+  "span_len_hist_le12": {
+    "1": 5,
+    "2": 209,
+    "3": 255,
+    "4": 1112,
+    "5": 428,
+    "6": 320,
+    "7": 317,
+    "8": 355,
+    "9": 341,
+    "10": 507,
+    "11": 352,
+    "12": 385
+  },
+  "one_char_spans": [
+    "宣",
+    "心",
+    "胃",
+    "鼻"
+  ],
+  "n_tiny_spans": 122,
+  "baseline_before_r65": {
+    "wrong": 146,
+    "n": 200,
+    "rate": 0.73
+  },
+  "contaminated_by_one_char_spans": 1901,
+  "n_sampled": 200,
+  "n_misattributed": 15,
+  "misattribution_rate": 0.075,
+  "examples": [
+    {
+      "herb": "香加皮",
+      "predicate": "性味",
+      "span": "【药性】辛、苦，温；有毒。归肝、肾、心经。",
+      "misattributed_to": "龟甲",
+      "owner_span": "归肝、肾、心经。"
+    },
+    {
+      "herb": "赤芍",
+      "predicate": "归经",
+      "span": "【药性】苦，微寒。归肝经。",
+      "misattributed_to": "青箱子",
+      "owner_span": "【药性】苦，微寒。归肝经。"
+    },
+    {
+      "herb": "秦",
+      "predicate": "归经",
+      "span": "【药性】辛、苦，平。归胃、肝、胆经。",
+      "misattributed_to": "秦艽",
+      "owner_span": "辛、苦，平。归胃、肝、胆经。"
+    },
+    {
+      "herb": "黄芪",
+      "predicate": "用量",
+      "span": "煎服， $10\\sim30\\mathrm{g}$ 。",
+      "misattributed_to": "苎麻根",
+      "owner_span": "【用法用量】煎服， $10\\sim30\\mathrm{g}$ 。外用适量，煎汤外洗，或鲜品捣敷。"
+    },
+    {
+      "herb": "北豆根",
+      "predicate": "性味",
+      "span": "本品性味苦寒，有小毒；归肺、胃、大肠经。",
+      "misattributed_to": "瓜萎",
+      "owner_span": "归肺、胃、大肠经。"
+    },
+    {
+      "herb": "车前子",
+      "predicate": "归经",
+      "span": "归肝、肾、肺、小肠经。",
+      "misattributed_to": "车前草",
+      "owner_span": "甘，寒；归肝、肾、肺、小肠经。"
+    },
+    {
+      "herb": "甘草",
+      "predicate": "用量",
+      "span": "煎服， $2\\sim10\\mathrm{g}$ 。",
+      "misattributed_to": "麻黄",
+      "owner_span": "【用法用量】煎服， $2\\sim10\\mathrm{g}$ 。"
+    },
+    {
+      "herb": "龙骨",
+      "predicate": "用量",
+      "span": "【用法用量】煎服， $15\\sim30\\mathrm{g}$ ，先煎。外用适量。",
+      "misattributed_to": "大叶紫珠",
+      "owner_span": "煎服， $15\\sim30\\mathrm{g}$"
+    },
+    {
+      "herb": "蓝实",
+      "predicate": "功效",
+      "span": "久服，头不白、轻身",
+      "misattributed_to": "秦皮",
+      "owner_span": "久服，头不白、轻身"
+    },
+    {
+      "herb": "蕲蛇",
+      "predicate": "功效",
+      "span": "【功效】祛风，通络，止痉。",
+      "misattributed_to": "乌梢蛇",
+      "owner_span": "【功效】祛风，通络，止痉。"
+    }
+  ]
+}

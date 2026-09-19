@@ -1456,8 +1456,11 @@ def _verify_and_revise(raw, s3_system: str, s3_schema, *, on_step: StepFn | None
             "first_pass": len(rounds) == 1 and not rounds[0].violations,
         })
     if rounds[-1].vetoes:
-        raise SymbolicVeto(rounds[-1].vetoes, llm_calls=revise_calls,
-                           rounds=revise_calls)
+        # `draft` 是扁平那份（结论卡读它），`draft_raw` 是五步链原件
+        # （产品前端的推导链、方剂表、加减建议全读它）。两份都带上：
+        # 只带一份的话医师那边要么没有结论要么没有方。
+        raise SymbolicVeto(rounds[-1].vetoes, draft=s3, draft_raw=raw,
+                           llm_calls=revise_calls, rounds=revise_calls)
     return raw, s3, rounds, revise_calls
 
 
@@ -1474,22 +1477,44 @@ class SymbolicVeto(Exception):
     `violations` 带上，好让响应里能如实说出是哪几条——不是一句"验证失败"。
     """
 
-    def __init__(self, violations, llm_calls: int = 0, rounds: int = 0):
+    def __init__(self, violations, llm_calls: int = 0, rounds: int = 0,
+                 draft=None, draft_raw=None):
         self.violations = tuple(violations)
         self.llm_calls = llm_calls
         self.rounds = rounds
+        #: R65：**被否决的那版方也要带出来。** 原来这里只带 violations，
+        #: `consult()` 于是只能返回 `results: []`——医师什么都看不到。
+        #: 医师是专业人员，需要的是"完整分析 + 指出哪一味有问题"，自己判断
+        #: 要不要用；把方整个扣下来是把医师当成了需要被保护的患者。
+        #: 患者侧照旧不下发（裁剪在 `api/main.py` 的角色层，不在这里）——
+        #: 这个类只负责**把事实带全**，给谁看是上层的判断。
+        self.draft = draft
+        self.draft_raw = draft_raw
         detail = "；".join(f"[{v.rule}] {v.reason}" for v in self.violations)
         super().__init__(f"符号验证有 {len(self.violations)} 条不可下发的问题"
                         f"（已重开 {rounds} 轮）：{detail}")
 
     @property
     def reason(self) -> str:
-        """给响应用的一句人话。**不含本体原文**——那是给模型看的反例，
-        对患者来说是噪音；界面要看细节时读 `verification` 字段。"""
-        rules = "、".join(dict.fromkeys(v.rule for v in self.violations))
-        return (f"这张方在符号验证中有不可下发的问题（{rules}），"
-                f"系统已按本体原文重开 {self.rounds} 轮仍未消除，因此不给出方药。"
-                "请换用人工复核，或补充更多症状信息后重试。")
+        """给响应用的一句人话。
+
+        **R65 改：规则 id 一律走 `core.veto_text` 转成人话。** 之前这里直接把
+        `v.rule` 拼进字符串，于是 `herb_source_fabricated` 印在了用户屏幕上
+        ——不只在 `reject_reason` 上，还经由 `agent_trace` 的 detail 传给了
+        **所有**角色（agent_trace 是刻意给所有角色的，见 `_consult_response`）。
+        产品面文案过滤只做在 `verification_block` 上是不够的：**只要还有第二处
+        拼装错误文案，就还有第二条绕过过滤的路**（这正是 R62 §7.2 之后又漏了
+        一次的原因）。所以转换放在这个 property 里——它是这句话唯一的产地。
+
+        技术版（带规则 id、带轮数）留在 `str(exc)` 里给日志与研究模式，
+        跟这一句分开：两者回答的不是同一个问题，一个给人看、一个给排障看。
+
+        措辞上也不再说"因此不给出方药"——医师/学生那侧现在照常看到方，
+        只是禁用导出。这句话要对三个角色都成立，所以只说"不可直接下发"。
+        """
+        from core.veto_text import summarize
+        return (f"{summarize(self.violations)}。系统已按本草原文重开 "
+                f"{self.rounds} 轮仍未消除，这张方不可直接下发，请人工复核。")
 
 
 #: 结构化模式下这份结论在 `results` 里的身份。
@@ -2768,8 +2793,30 @@ def consult(
             + sum(r["react_trace"].llm_calls for r in results if r["react_trace"])
         )
         stop = trace.record("symbolic_veto", veto.reason)
+        # R65：**把被否决的那版推导带出来。** 原来这里走 `_stopped` 的默认
+        # `results: []`，于是医师角色下界面什么都没有——而医师需要的恰恰是
+        # "完整分析 + 指出哪一味有问题"，自己判断要不要用。
+        # 患者侧仍然不下发，但**裁剪发生在 `api/main.py` 的角色层**，不在这里：
+        # 这一层只负责把事实带全，"给谁看多少"是上层的判断
+        # （跟 `_filter_response_by_role` 那条边界一致）。
+        veto_results = []
+        if veto.draft_raw is not None:
+            veto_results = [{
+                "physician": SYNTHESIS_PHYSICIAN_ID,
+                "physician_name": SYNTHESIS_PHYSICIAN_NAME,
+                "s2": s2,
+                "s3": veto.draft,
+                "s3_structured": veto.draft_raw,
+                "corroboration": None,
+                # 这一版没通过核查，所以**不给佐证也不给规律**：那两样是
+                # "这张方有依据"的呈现，摆在一张没过核查的方旁边会抬高它。
+                "physicians_cited": [],
+                "refs": [],
+                "verification_failed": True,
+            }]
         return _stopped(
             stop, s2=s2, followup=followup, residual=residual,
+            results=veto_results,
             # **`rejected` 仍然是 True**：方不下发这件事对调用方来说跟安全拦截
             # 一样是"这次没有方"。区别在 `safety_flag`（留给安全层，不复用——
             # 它的语义是"危重症状"，而这里的原因是"方不合规"）与

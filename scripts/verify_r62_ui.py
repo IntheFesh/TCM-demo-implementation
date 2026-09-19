@@ -82,6 +82,7 @@ def run(keep_shots: bool) -> int:
             print("服务没起来", file=sys.stderr)
             return 1
         OUT_DIR.mkdir(parents=True, exist_ok=True)
+        _fill_veto_copy()
         with sync_playwright() as pw:
             browser = pw.chromium.launch(executable_path=_chromium_path())
             for label, w, h in VIEWPORTS:
@@ -99,6 +100,7 @@ def run(keep_shots: bool) -> int:
                 _check_with_injected_result(page, fails)
                 _check_knowledge_overlay(page, fails)
                 _check_lab(page, fails)
+                _check_veto_presentation(page, fails)
                 _check_roles(page, fails)
                 _check_zoom(page, fails, w, h, label)
 
@@ -210,6 +212,50 @@ _INJECT = """
   });
 })()
 """
+
+
+#: R65：同一份数据 + 一个验证否决块。**复用 `_INJECT` 的 s3s**——被否决的
+#: 那一版方跟正常那一版形状完全一样（这正是这轮的要点：医师看到的是同一个
+#: 界面，只多了黄条与标红），另造一份会让这条检查测到一个不存在的形状。
+#:
+#: 文案从 `core.veto_text` 现取而不是在这里抄一份：抄一份的话文案改了这里
+#: 不会红，等于这条检查在验一个过时的字符串。
+_INJECT_VETO = _INJECT.replace(
+    "    guideline: null\n  });",
+    """    guideline: null,
+    verification_block: {
+      kind: "verification",
+      summary: __VETO_SUMMARY__,
+      banner: __VETO_BANNER__,
+      patient_notice: __VETO_PATIENT__,
+      flagged_herbs: ["柴胡"],
+      herb_reasons: {"柴胡": __VETO_SUMMARY__},
+      export_blocked: true,
+      detail: []
+    }
+  });""")
+
+
+def _fill_veto_copy() -> None:
+    """把 `core.veto_text` 的真实文案填进注入脚本。延迟到调用时做而不是在
+    模块顶层：`core.veto_text` 会拉起本体层，导入这个脚本不该付那个代价。"""
+    global _INJECT_VETO, _ALL_RULE_IDS
+    import json as _json
+
+    from core.formula_verifier import ALL_RULES
+    from core.veto_text import DOCTOR_BANNER, PATIENT_NOTICE, summarize
+
+    v = [{"rule": "herb_source_fabricated", "herbs": ["柴胡"]}]
+    summary = summarize(v)
+    for k, val in (("__VETO_SUMMARY__", summary),
+                   ("__VETO_BANNER__", DOCTOR_BANNER.format(summary=summary)),
+                   ("__VETO_PATIENT__", PATIENT_NOTICE)):
+        _INJECT_VETO = _INJECT_VETO.replace(k, _json.dumps(val, ensure_ascii=False))
+    _ALL_RULE_IDS = tuple(ALL_RULES)
+
+
+#: 十三条规则 id，`_fill_veto_copy()` 里从 `core.formula_verifier` 现取。
+_ALL_RULE_IDS: tuple[str, ...] = ()
 
 
 def _check_with_injected_result(page, f: Failures) -> None:
@@ -450,6 +496,63 @@ def _check_classic_import(page, f: Failures) -> None:
         after = page.eval_on_selector_all(
             f"#lab-body tr:nth-child({row + 1}) .rx-orig", "els => els.length")
         f.check(after == 0, "改过剂量之后这一行的「原方」标记消失")
+
+
+def _check_veto_presentation(page, f: Failures) -> None:
+    """R65 自查：验证否决**不能**整页拦截，规则 id **不能**出现在界面上。
+
+    CLAUDE.md 那条铁律的又一个实例：后端 JSON 测试
+    （`tests/test_veto_presentation.py`，55 条全绿）测的是响应字段，
+    测不出渲染层有没有把黄条画出来、有没有把那一味标红——R42/M5 两次
+    都是"后端全绿、浏览器里是错的"。所以这一段必须真的把带
+    `verification_block` 的数据喂进 `__renderInjected` 跑一遍真实 DOM。
+    """
+    page.evaluate(_INJECT_VETO)
+    page.wait_for_timeout(1800)
+
+    # 一、**没有**整页拦截：结果区还在，方剂表还在，四味药一味不少
+    f.check(_visible(page, "#result-zone"), "验证否决后结果区仍然显示（不整页拦截）")
+    f.check(not _visible(page, "#triage-page"), "验证否决不跳到红旗整页")
+    rows = page.eval_on_selector_all("#rx-body tr", "els => els.length")
+    f.check(rows == 4, f"方剂四味药全在（实得 {rows} 行）")
+    f.check("肝胃不和证" in page.inner_text("#cc-syndrome"), "结论卡照常有证型")
+
+    # 二、黄条在，且**不是**红旗条
+    f.check(_visible(page, "#veto-bar"), "顶部出现核查未通过的黄条")
+    f.check(not _visible(page, "#redflag-bar"), "红旗条不出现（那是危重症状专用）")
+    bar = page.inner_text("#veto-bar")
+    for banned in ("请尽快就医", "本页不提供方药内容"):
+        f.check(banned not in bar, f"黄条里不出现红旗专用语「{banned}」")
+
+    # 三、出问题的那一味标红 + 原因就在旁边
+    flagged = page.eval_on_selector_all(
+        "#rx-body tr.rx-flagged .term, #rx-body tr.rx-flagged td:first-child",
+        "els => els.map(e => e.textContent.trim())")
+    f.check(any("柴胡" in x for x in flagged), f"出问题的药味标红（实得 {flagged}）")
+    why = page.eval_on_selector_all("#rx-body .rx-flag-why",
+                                    "els => els.map(e => e.textContent)")
+    f.check(why and any(w.strip() for w in why), "标红那一味旁边给出原因")
+
+    # 四、导出禁用，且说了为什么
+    f.check(page.eval_on_selector("#op-export", "e => e.disabled") is True,
+            "导出按钮被禁用")
+    f.check(bool(page.eval_on_selector("#op-export", "e => e.title")),
+            "禁用的导出按钮要说明原因（hover 提示）")
+
+    # 五、**整页扫一遍**：十三条规则 id 一个都不许出现在可见文字里。
+    # 扫 innerText 而不是 innerHTML：要的是"用户能读到什么"。
+    text = page.inner_text("body")
+    for rule in _ALL_RULE_IDS:
+        f.check(rule not in text, f"界面上不出现规则 id「{rule}」")
+
+    # 六、「查看详情」展开之后也不许漏——产品角色的 detail 是空的，
+    # 展开只会看到人话。这一条钉住"展开"不是一个绕过过滤的后门。
+    if _visible(page, "[data-veto-detail]"):
+        page.click("[data-veto-detail]")
+        page.wait_for_timeout(300)
+        text2 = page.inner_text("body")
+        for rule in _ALL_RULE_IDS:
+            f.check(rule not in text2, f"展开详情后仍不出现「{rule}」")
 
 
 def _check_roles(page, f: Failures) -> None:

@@ -444,3 +444,16 @@ html[data-role="patient"] table.rx input { pointer-events: none; background: var
 .rx-orig { margin-left: .3em; font-size: .78em; color: var(--ink-3); white-space: nowrap; }
 .tpl-grp + .tpl-grp { margin-top: .5em; border-top: 1px solid var(--line); padding-top: .5em; }
 .tpl-grp-h { font-size: .82em; color: var(--ink-3); margin-bottom: .25em; }
+
+/* R65：验证否决的提示条。**黄色、不是红色整页**——核查没过是一个待核项，
+   不是急症。`.redflag` 那套（红色）留给危重征象，两者刻意不共用样式。 */
+.vetobar {
+  background: #fdf6e3; border: 1px solid #e3d5a8; border-left: 4px solid #c99a2e;
+  border-radius: 5px; padding: .7em 1em; margin-bottom: .9em; color: #6b5316;
+}
+.vetobar h3 { margin: 0 0 .3em; font-size: 1em; font-family: var(--serif); }
+.vetobar .vb-more { background: none; border: none; padding: 0; font: inherit;
+  color: var(--accent); cursor: pointer; text-decoration: underline; }
+.rx tr.rx-flagged { background: #fdf3f2; }
+.rx tr.rx-flagged .rx-name { color: var(--danger); font-weight: 600; }
+.rx .rx-flag-why { color: var(--danger); font-size: .8em; white-space: nowrap; }

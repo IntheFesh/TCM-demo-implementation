@@ -127,6 +127,14 @@
     </section>
 
     <div id="redflag-bar" class="redflag" role="alert" hidden></div>
+    <!-- R65：验证否决的黄条。**跟 #redflag-bar 是两个元素**，不是同一个换 class：
+         共用一个容器的话，"哪套措辞用在哪条路径上"就只能靠调用处自觉，
+         而那正是这次串味的原因。 -->
+    <div id="veto-bar" class="vetobar" role="status" hidden>
+      <h3 id="veto-head"></h3>
+      <button class="vb-more" data-veto-detail="1" hidden>查看详情</button>
+      <div id="veto-detail" hidden></div>
+    </div>
     <section id="triage-page" class="card triage" role="alert" hidden></section>
 
     <div id="result-zone" hidden>
