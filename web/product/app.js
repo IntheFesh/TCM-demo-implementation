@@ -1127,7 +1127,19 @@ function bindAll() {
   bindSettings();
 
   $("complaint").addEventListener("input", () => { checkRequired(); askIntakeHints(); });
-  ["pf-age", "pf-sex"].forEach((id) => $(id).addEventListener("input", checkRequired));
+  // **改患者信息要重跑规则核查。** §5.2 的判据是"填了妊娠而方中有妊娠禁忌药
+  // 必须报警"——而医师常常是**先出了方、再回头补上妊娠这一项**。只在改药时
+  // 重跑的话，那条红条永远不会出现，而"人这一维真的接进去了"这件事就只在
+  // 接口层成立、在界面上不成立。
+  const PROFILE_FIELDS = ["pf-age", "pf-sex", "pf-stage", "pf-const",
+                          "pf-comorb", "pf-allergy", "pf-meds"];
+  PROFILE_FIELDS.forEach((id) => {
+    $(id).addEventListener("change", () => {
+      checkRequired();
+      if (S.rx.length) runRuleCheck();
+    });
+    $(id).addEventListener("input", checkRequired);
+  });
   $("btn-go").onclick = runConsult;
   $("btn-cancel").onclick = () => { if (S.abort) S.abort.abort(); };
 
@@ -1227,6 +1239,26 @@ window.addEventListener("DOMContentLoaded", boot);
 /* 给 lab.js / knowledge.js 用的最小接口。**刻意只暴露这几个**：
  * 两个模块要的是"把方送过来/送回去"和"点了术语给我渲染"，
  * 不是整个 S。暴露 S 的话，那两份会开始直接改问诊页的状态。 */
+/* 验收脚本用的三个钩子。**只给 `scripts/verify_r62_ui.py` 用**，产品面
+ * 的任何一条路径都不调它们。
+ *
+ * 存在的理由跟 `scripts/screenshot_states.py` 一样：跑一次真问诊要分钟级
+ * 和真钱，而"改一味药有没有红条""载入此方标题变不变"这些判据的差别
+ * **完全在前端**——后端只是给出不同形状的响应体。喂一份构造好的响应体
+ * 进来，测的仍然是上线那份 js + css + 真浏览器排版。
+ *
+ * 刻意挂在 `window.__` 前缀下而不是塞进 `TCMApp`：后者是 lab.js 与
+ * knowledge.js 的正式接口，把测试钩子混进去，下一个人会当它是正式接口用。 */
+window.__renderInjected = (data) => renderResult(data);
+window.__setHerbName = (i, name) => {
+  S.rx[i] = { ...(S.rx[i] || { dose_unit: "g" }), name };
+  renderRxTable(); runRuleCheck();
+};
+window.__saveTemplate = (name) => post("/api/templates", {
+  name, syndrome: currentSyndrome(), herb_items: S.rx,
+  doses_count: Number($("fm-doses").value) || null, usage: $("fm-usage").value,
+});
+
 window.TCMApp = {
   esc, post, api, term, explainTerm, rcForce, debounce,
   getRx: () => S.rx.map((x) => ({ ...x })),
