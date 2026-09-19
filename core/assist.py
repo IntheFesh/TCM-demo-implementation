@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 
 from core.llm import get_llm, load_prompt, render
 from core.ontology import parse_effects
-from core.schemas import ComposeAnalysis, EditAdvice, HerbItem
+from core.schemas import ComposeAnalysis, EditAdvice, FollowUpAdvice, HerbItem
 from core.tools import question_candidates
 
 # ---------- 时间预算（§11 那张表） ----------
@@ -57,6 +57,9 @@ from core.tools import question_candidates
 HINTS_BUDGET_S = 3.0
 ADVICE_BUDGET_S = 5.0
 COMPOSE_BUDGET_S = 8.0
+#: 复诊调方（§6.2）。跟组方检验同一档——它要读上一诊的整张方
+#: 再跟这次的变化对着看，比评价一次局部改动重。
+FOLLOWUP_BUDGET_S = 8.0
 
 #: 问诊要点最多给几条。§5.4 原文「≤5 条」。再多医师不会看，
 #: 而且候选列表越长，排在后面的那几条信息增益已经很低了。
@@ -357,3 +360,37 @@ def _rule_layer(herb_items, syndrome: str, profile: dict | None) -> dict:
         # 给 `_violations_text` 用的那一份，跟下发给前端的是同一批数据。
         "findings": findings,
     }
+
+
+# ---------- 4. 复诊调方（§6.2） ----------
+
+
+def follow_up_advice(*, prev_herbs, changes_text: str, syndrome: str = "",
+                     principle: str = "", doses_count: int | None = None,
+                     usage: str = "", profile: dict | None = None,
+                     preferences_text: str = "",
+                     budget_s: float = FOLLOWUP_BUDGET_S) -> AssistResult:
+    """复诊：根据服药后的变化判断该不该改方、怎么改。
+
+    **这不是重新辨一次证**（§6.2 原话：复诊时推导目标变了）。所以它不走
+    `s3_derived`——那份 prompt 与 schema 回答的是"这个证怎么从症状推出来"，
+    它的五步链校验对一次「效不更方」的判断完全不适用；而且给那份 prompt
+    加条件分支会让 R52~R61 的消融数字不再可比。
+
+    `changes_text` 空就直接返回：没有"服药后的变化"就无从判断效没效，
+    编一个判断出来比留白危险——「效不更方」意味着原方续服。
+    """
+    if not (changes_text or "").strip():
+        return AssistResult(ok=True, data={
+            "note": "还没有写下服药后的变化——写下这次患者说的症状变化，这里会给出是守方还是调方。"})
+    return _run_light_llm(
+        "assist_followup", FollowUpAdvice, budget_s,
+        syndrome=syndrome or "（上一诊未记证型）",
+        principle=principle or "（上一诊未记治法）",
+        doses_count=doses_count if doses_count is not None else "未记",
+        usage=usage or "未记",
+        prev_herbs=_herbs_text(prev_herbs),
+        profile=_profile_text(profile),
+        changes_text=changes_text.strip(),
+        preferences=preferences_text or "（这位使用者还没有设置用药习惯）",
+    )

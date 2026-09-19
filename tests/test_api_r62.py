@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 import api.main as api_main
 from core import history
 from core import preferences as prefs
+from core.assist import AssistResult
 
 
 @pytest.fixture
@@ -253,3 +254,70 @@ def test_the_textbook_formula_endpoint_separates_two_kinds_of_empty(client):
     assert ok["available"] is True and ok["name"] and ok["basis"]
     miss = client.get("/api/textbook_formula", params={"syndrome": "查无此证"}).json()
     assert miss["available"] is False and miss["note"]
+
+
+# ---------- §6.2 / §12 第 7 项：复诊调方 ----------
+
+
+def _record_a_visit(client, record_id="R7"):
+    client.post("/api/records", json={
+        "record_id": record_id, "doctor_id": "dr_a", "patient_ref": "张三",
+        "complaint": "胃脘胀痛", "syndrome": "肝胃不和证", "method": "疏肝和胃",
+        "herb_items": [_herb("柴胡", 10.0)], "doses_count": 7, "usage": "日一剂"})
+
+
+def _consult_req(**kw):
+    return api_main.ConsultRequest(complaint="服药七剂后胀痛减轻，仍口苦", **kw)
+
+
+def test_a_first_visit_has_no_follow_up_section_at_all(client):
+    """没点「载入此方」就没有上一诊。这个键**根本不存在**，不是存在但为空
+    ——界面据它决定要不要把标题改成「复诊调方（第 N 诊）」。"""
+    out = api_main._attach_follow_up({}, _consult_req(), "doctor")
+    assert "follow_up_advice" not in out
+
+
+def test_a_previous_record_that_is_gone_says_so_instead_of_silently_starting_over(client):
+    """记录被删了、编号打错了——都要如实说。静默退回初诊会让医师以为
+    系统读到了上一诊，而屏幕上恰好什么都看不出来。"""
+    out = api_main._attach_follow_up(
+        {}, _consult_req(previous_record_id="R404"), "doctor")
+    got = out["follow_up_advice"]
+    assert got["ok"] is False and "R404" in got["error"]
+
+
+def test_the_follow_up_reads_the_stored_prescription_not_just_its_summary(client, monkeypatch):
+    """R62 前只存结论摘要，复诊就无从比较两诊的方。这条盯着那次存储扩容
+    真的被用上了：判断依据必须是上一诊**逐味药**，不是那行证型文字。"""
+    _record_a_visit(client)
+    seen = {}
+    monkeypatch.setattr(api_main, "follow_up_advice",
+                        lambda **kw: (seen.update(kw), AssistResult(ok=True))[1])
+    api_main._attach_follow_up({}, _consult_req(previous_record_id="R7"), "doctor")
+    assert [h["name"] for h in seen["prev_herbs"]] == ["柴胡"]
+    assert seen["syndrome"] == "肝胃不和证" and seen["principle"] == "疏肝和胃"
+    assert seen["doses_count"] == 7 and seen["usage"] == "日一剂"
+    assert "口苦" in seen["changes_text"], "送进去的是这次的变化，不是上一诊的主诉"
+
+
+def test_a_patient_gets_the_verdict_but_not_the_per_herb_changes(client, monkeypatch):
+    """跟 individualization / formula_candidates 是同一条边界。判断与理由
+    照常给——"这次要不要接着吃"正是患者最该知道的事。"""
+    _record_a_visit(client)
+    monkeypatch.setattr(api_main, "follow_up_advice", lambda **kw: AssistResult(
+        ok=True, data={"verdict": "守法调量", "reason": "胀痛减轻，证未变",
+                       "changes": [{"action": "加", "item": {"name": "黄连"}, "why": "口苦未除"}]}))
+    for role, has_changes in (("doctor", True), ("patient", False)):
+        got = api_main._attach_follow_up(
+            {}, _consult_req(previous_record_id="R7"), role)["follow_up_advice"]
+        assert got["verdict"] == "守法调量" and got["reason"]
+        assert ("changes" in got) is has_changes
+
+
+def test_with_nothing_written_about_the_change_it_declines_to_judge():
+    """「效不更方」意味着原方续服——没写服药后的变化就编一个判断出来，
+    比留白危险得多。这条路上一次模型都不调。"""
+    from core.assist import follow_up_advice as raw
+    out = raw(prev_herbs=[{"name": "柴胡", "dose": 10.0}], changes_text="   ")
+    assert out.ok and out.used_llm is False and "verdict" not in out.data
+    assert out.data["note"]

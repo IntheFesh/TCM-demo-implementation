@@ -481,6 +481,11 @@ def test_render_rejects_missing_placeholders_for_every_prompt():
                         "herbs", "diff", "violations", "n_min", "n_max"},
         "assist_compose": {"syndrome", "principle", "profile", "preferences",
                            "herbs", "rule_findings"},
+        # R62 §6.2：复诊调方。它跟上面两个同类（不重新辨证），但多拿一份
+        # 上一诊的方与本次改动（$prev_herbs / $changes_text），因为"效不更方"
+        # 这个判断的依据全在两诊之差里，不在当下这一诊的症状里。
+        "assist_followup": {"syndrome", "principle", "doses_count", "usage",
+                            "prev_herbs", "profile", "changes_text", "preferences"},
     }
     for path in (PROMPTS_ROOT / "v1").glob("*.yaml"):
         found = set(re.findall(r"(?<!\$)\$\{?([A-Za-z_]\w*)\}?", load_prompt(path.stem)["system"]))

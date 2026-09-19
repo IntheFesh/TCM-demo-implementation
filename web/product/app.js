@@ -333,6 +333,9 @@ async function runConsult() {
       signal: S.abort.signal,
       body: JSON.stringify({
         complaint, role: S.role, patient_profile: patientProfile(),
+        // 载入过上一诊的方时，这次就是复诊：后端据此多给一项
+        // follow_up_advice（效不更方 / 守法调量 / 改法换方）。
+        previous_record_id: S.followUpRecordId || "",
       }),
     });
     if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
@@ -469,6 +472,7 @@ function renderResult(data) {
   renderFormula(s3s, first, data);
   renderMods(s3s);
   renderGuideline(data.guideline);
+  renderFollowUp(data.follow_up_advice);
   renderBasis(s3s);
   renderCases(first.corroboration);
   renderSelf(s3s);
@@ -680,6 +684,27 @@ function renderMods(s3s) {
       <span class="mod-why">${esc(m.why)}</span>
       <button class="btn-min" data-mod="${i}">采纳</button>
     </li>`).join("") : '<li class="lc-empty">本次未产出加减建议。</li>';
+}
+
+/** §6.2：复诊时的调方建议。三种判断对应三种后续动作，所以判断本身
+ *  单独一行、可执行的改动带 [采纳]。 */
+function renderFollowUp(a) {
+  const sec = $("sec-followup");
+  if (!a || (!a.verdict && !a.error && !a.note)) { sec.hidden = true; return; }
+  sec.hidden = false;
+  if (a.error || a.note) {
+    $("followup-body").innerHTML = `<p class="rc-empty">${esc(a.error || a.note)}</p>`;
+    return;
+  }
+  S.followUpChanges = a.changes || [];
+  $("followup-body").innerHTML = `
+    <p><b class="mod-do">${esc(a.verdict)}</b>　${esc(a.reason)}</p>
+    ${(a.based_on || []).length
+      ? `<p class="hint-why">凭：${esc(a.based_on.join("；"))}</p>` : ""}
+    ${(a.changes || []).length
+      ? `<p>${esc(a.changes.map((c) => `${c.action} ${(c.item || {}).name}`).join("；"))}
+         <button class="btn-min" data-followup="1">采纳</button></p>` : ""}
+    ${a.next_visit ? `<p class="hint-why">随诊：${esc(a.next_visit)}</p>` : ""}`;
 }
 
 function renderGuideline(g) {
@@ -919,6 +944,7 @@ function loadPastFormula(recordId) {
   S.rx = prev.map((x) => ({ ...x }));
   S.rxBase = prev.map((x) => ({ ...x }));
   S.followUpFrom = prev;
+  S.followUpRecordId = recordId;
   $("result-zone").hidden = false;
   $("sec-formula").querySelector(".card-h").textContent =
     `⑤ 复诊调方（第 ${group.n + 1} 诊）`;
@@ -1039,6 +1065,10 @@ function bindGlobalClicks() {
     }
     const load = ev.target.closest("[data-load]");
     if (load) { loadPastFormula(load.dataset.load); return; }
+    if (ev.target.closest("[data-followup]")) {
+      applyChanges(S.followUpChanges || []);
+      return;
+    }
     const drop = ev.target.closest("[data-drop]");
     if (drop) {
       api(`/api/records/${encodeURIComponent(drop.dataset.drop)}`, { method: "DELETE" })

@@ -62,9 +62,11 @@ from core.emr_writer import (
 from core.assist import (
     ADVICE_BUDGET_S,
     COMPOSE_BUDGET_S,
+    FOLLOWUP_BUDGET_S,
     HINTS_BUDGET_S,
     compose_verify,
     edit_advice,
+    follow_up_advice,
     intake_hints,
 )
 from core.explanations import build_explanations
@@ -352,6 +354,12 @@ class ConsultRequest(TextOnlyInput):
     # 表单只是另一种录入方式，二者可互转（见 core/intake.py）。
     intake: IntakeForm | None = None
     patient_profile: PatientProfile | None = None
+    #: R62 §6.2 / §12 第 7 项：复诊。给了上一诊的记录编号，这次就不是初诊
+    #: ——`complaint` 写的是"服药后症状变化、新出现的症状"，响应里多一项
+    #: `follow_up_advice`（效不更方 / 守法调量 / 改法换方）。
+    #: **推导本身不变**：这一项是在推导之外另跑一次评估，不是给
+    #: `s3_derived` 加一个条件分支（那会让 R52~R61 的消融数字不再可比）。
+    previous_record_id: str = ""
 
 
 def demo_mode_info() -> dict | None:
@@ -1252,6 +1260,7 @@ def api_consult(
     # 而且额度是"站点计量"、不是"这次问诊的结果"，混进结果体会让两件事纠缠。
     # 完整看板在 GET /api/usage。
     _record_history(out := _consult_response(outcome, role=role), req)
+    out = _attach_follow_up(out, req, role)
     snap = _usage_block(request, decision)
     response.headers["X-Usage-Mode"] = decision.mode
     response.headers["X-Usage-Remaining-Calls"] = str(snap["remaining_calls"])
@@ -1717,7 +1726,8 @@ def api_consult_stream(
             # 往里加一个只有流式路径才有的键会让那份契约分叉。
             if stream.dropped_deltas:
                 stream.emit("deltas_dropped", {"n": stream.dropped_deltas})
-            _done = _consult_response(outcome, role=_req_role)
+            _done = _attach_follow_up(
+                _consult_response(outcome, role=_req_role), req, _req_role)
             _record_history(_done, req)
             # R55 渲染断链兜底：结果**先**进这张短期缓存再发 `done` 事件——
             # 顺序反过来的话，`done` 发出去和缓存写入之间有一个窗口，前端的
@@ -1813,6 +1823,44 @@ def api_consult_stream_result(stream_id: str) -> dict:
             detail="没有这个 stream_id 的已完成结果（可能还没跑完，或者已经过期）",
         )
     return done
+
+
+def _attach_follow_up(response: dict, req: "ConsultRequest", role: Role) -> dict:
+    """复诊时在响应里补一项 `follow_up_advice`（§12 第 7 项）。
+
+    **在推导之外另跑一次**，不是给 `s3_derived` 加条件分支：两者问的不是
+    同一个问题（见 `core/assist.py::follow_up_advice`），而且动那份 prompt
+    会让 R52~R61 的消融基线不再可比。
+
+    上一诊查不到时如实说，不静默当初诊处理——医师是点了「载入此方」才
+    进到这条路径的，悄悄退回初诊会让他以为系统读到了上一诊。
+    """
+    rid = (req.previous_record_id or "").strip()
+    if not rid:
+        return response
+    rows = [r for r in history.list_consults(limit=10_000) if r.get("record_id") == rid]
+    if not rows:
+        response["follow_up_advice"] = {
+            "ok": False, "used_llm": False,
+            "error": f"查不到编号 {rid} 的上一诊记录，本次按初诊处理。"}
+        return response
+    prev = rows[0]
+    out = follow_up_advice(
+        prev_herbs=prev.get("herb_items") or [],
+        changes_text=_effective_complaint(req),
+        syndrome=prev.get("syndrome") or "", principle=prev.get("method") or "",
+        doses_count=prev.get("doses_count"), usage=prev.get("usage") or "",
+        profile=(req.patient_profile.model_dump() if req.patient_profile else None),
+        budget_s=FOLLOWUP_BUDGET_S,
+    )
+    # 患者角色拿不到 `changes`（逐条点名药味），跟 `formula_candidates`
+    # 是同一条安全边界；判断本身与理由照常给——那是"这次要不要继续吃"，
+    # 正是患者最该知道的事。
+    data = out.to_dict()
+    if role == "patient":
+        data.pop("changes", None)
+    response["follow_up_advice"] = data
+    return response
 
 
 def _filter_stream_event_for_role(name: str, data: dict, role: Role) -> dict:

@@ -1927,3 +1927,33 @@ class IntakeHintItem(BaseModel):
     safety_relevant: bool = False
     information_gain: float | None = None
     source: str = ""
+
+
+# ---------- R62 §6.2：复诊调方 ----------
+#
+# 复诊时推导目标变了：**不是重新辨一次证，是根据服药后的变化评估并建议调方**。
+# 这跟初诊是两个不同的问题，所以不塞进 `S3Derived`——那份 schema 回答的是
+# "这个证怎么推出来的"，而它的五步链校验（不可跳步）对一次"效不更方"的
+# 判断完全不适用。
+
+#: 三种判断（§6.2 原文）。**`Literal` 而不是自由文本**：界面上这三种对应
+#: 三种不同的后续动作（原方续服 / 只调剂量 / 重新拟方），一个拼错的判断
+#: 会变成一个没有后续动作的空结论。
+FollowUpVerdict = Literal["效不更方", "守法调量", "改法换方"]
+
+
+class FollowUpAdvice(BaseModel):
+    """一次复诊的调方建议。
+
+    `changes` 可以为空：「效不更方」这个判断本来就意味着不改任何东西，
+    强制非空会逼模型在一张该续服的方上编出一处改动。
+    """
+
+    verdict: FollowUpVerdict
+    reason: str = Field(min_length=1)
+    #: 服药后的变化里，哪几条支持这个判断。逐条对应患者这次说的话，
+    #: 跟 `KeyPoint.point` 同一条纪律：说得出凭哪句话，才是可核的结论。
+    based_on: list[str] = Field(default_factory=list)
+    changes: list[FormulaChange] = Field(default_factory=list)
+    #: 下次什么时候再看。空串 = 这次没给随诊安排，不编一个出来。
+    next_visit: str = ""
