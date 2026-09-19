@@ -111,6 +111,18 @@ SECTION_ORDER = (
 #: 而归经缺失恰恰意味着验证器的 `meridian_coverage` 那条规则对它恒不可判。
 MATERIA_PREDICATES = ("性味", "归经", "功效", "用量", "炮制", "禁忌")
 
+#: 缺到第几项才补那句"条目尚不完整"。R63 §3.3 第 4 步定的是"超过四项为空"。
+#: 缺一两项时不补：那句话是给"这味药在本系统里基本是空的"用的，
+#: 每味药都挂一句会变成背景噪音，读者就不再看它了。
+MISSING_PREDICATE_FOOTER_AT = 4
+
+#: 那一句。**说清数据来源，不说覆盖率**——R63 §3.3 第 4 步原话。
+#: 归因见 `docs/reports/r63_ontology_gaps.json`：3068 个空槽位**全部**是
+#: "抽取时没抽到那句原文"（名字对不上 0 个、谓词写法不同 0 个），
+#: 所以这句话说的"条目尚不完整"是准确的，不是托词。
+MATERIA_COVERAGE_FOOTER = (
+    "本系统的本草数据以《中药学》《临床中药学》为主，部分药材的条目尚不完整。")
+
 #: 方剂层的八个谓词，同理。
 FORMULARY_PREDICATES = ("组成", "功用", "主治", "君药", "臣药", "佐药", "使药", "加减")
 
@@ -358,12 +370,19 @@ def _herb_sections(name: str, *, ontology=None, patterns_limit: int = 3) -> list
             pharm.append(f"禁忌：{'、'.join(herb.contraindications)}")
         missing = [p for p in MATERIA_PREDICATES if not herb.has(p)]
         if missing:
-            # **缺哪个谓词必须列出来**：缺归经意味着验证器的归经规则对它恒不可判，
-            # 而只显示"有的那几条"会让它看起来跟一味齐全的药一样完整。
-            pharm.append(f"本体里缺这几个谓词：{'、'.join(missing)}"
-                         f"（全库同类缺口：" + "、".join(
-                             f"{p} {stats['missing_predicate_counts'].get(p, 0)}/{stats['n_herbs']} 味"
-                             for p in missing) + "）")
+            # **缺哪个谓词要说**：只显示"有的那几条"会让一味缺归经的药看起来跟
+            # 一味齐全的药一样完整，而缺归经恰恰意味着验证器的归经规则对它恒不可判
+            # （那条判断在「医理规则可验证性」一节里逐条写着）。
+            #
+            # R63 §3.3 第 4 步：**这里不再报全库缺口的数字。** 原来那句是
+            # "（全库同类缺口：归经 598/1232 味）"——R62 §7 明令产品面不出现
+            # 统计口径，而且医师读到的不是"本体覆盖率"，是"这系统案例不足"
+            # （用户原话就是这么反馈的）。数字要看的人去
+            # `python -m core.ontology --stats` 或 `scripts/diagnose_ontology_gaps.py`，
+            # 那是开发者的口径，不该摆在释义面板里。
+            pharm.append(f"本体收录的条目里没有：{'、'.join(missing)}")
+            if len(missing) > MISSING_PREDICATE_FOOTER_AT:
+                pharm.append(MATERIA_COVERAGE_FOOTER)
         out.append(_section("药理", pharm, source="药理层三元组（本草）"))
         spans = []
         for pred in MATERIA_PREDICATES:

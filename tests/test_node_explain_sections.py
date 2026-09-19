@@ -111,7 +111,16 @@ def test_an_element_says_which_of_the_nine_layers_it_sits_on():
 
 def test_the_herb_pharmacology_section_lists_the_missing_predicates():
     """只显示有的那几条会让一味缺归经的药看起来跟一味齐全的药一样完整，
-    而归经缺失恰恰意味着验证器的归经规则对它恒不可判。"""
+    而归经缺失恰恰意味着验证器的归经规则对它恒不可判。
+
+    **R63 §3.3 第 4 步改了这一条的后半截。** 原来还要求那句话带上全库基准
+    （"全库同类缺口：归经 598/1232 味"），理由是 CLAUDE.md 那条"任何数字都
+    必须带对照"。现在整个数字都不出现了，那条铁律因此**不再适用**
+    ——它管的是"摆出来的数字要有基准"，不是"必须摆一个数字出来"。
+    改的原因是 R62 §7 明令产品面不出现统计口径，而实测医师读到那句话得到的
+    印象正是"这系统案例不足"（用户原话），不是"本体覆盖率如此"。
+    要看数字的人去 `python -m scripts.diagnose_ontology_gaps`。
+    """
     # 找一味"本体里有、但至少缺一个谓词"的药——全库都齐全的话这条测不到东西
     from core.ontology import get_ontology
 
@@ -120,11 +129,18 @@ def test_the_herb_pharmacology_section_lists_the_missing_predicates():
                    if any(not h.has(p) for p in MATERIA_PREDICATES)), None)
     if target is None:
         pytest.skip("本体里每味药的六个谓词都齐全，这条测不到东西")
+    missing = [p for p in MATERIA_PREDICATES if not ont.herb(target).has(p)]
     sec = _sections(f"herb::某方::{target}")["药理"]
     joined = "".join(sec["lines"])
-    assert "本体里缺这几个谓词" in joined, joined
-    # 缺口要带**全库基准**（"这一味缺"和"全库 1319/1458 味都缺"是两回事）
-    assert "全库同类缺口" in joined and "/" in joined
+    # 缺哪几项要说得出**具体是哪几项**，不是一句笼统的"资料不全"
+    for p in missing:
+        assert p in joined, f"{target} 缺 {p} 却没说：{joined}"
+    # 而且不许用占位符冒充内容
+    assert "暂无" not in joined and "案例不足" not in joined
+    # 也不许在产品面上报全库统计
+    import re
+    assert "全库" not in joined
+    assert not re.search(r"\d+/\d+ 味", joined), f"释义里又出现了覆盖率数字：{joined}"
 
 
 def test_the_pharmacology_section_is_not_a_second_copy_of_what_is_what():
