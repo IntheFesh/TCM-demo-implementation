@@ -6,6 +6,10 @@
 from __future__ import annotations
 
 import re
+import threading
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
 
 _PAREN_RE = re.compile(r"[（(][^）)]*[）)]")
 # 剂量写法实测有「一钱半」「钱半」「一钱五分」——原来的正则只认「数字+单位」，
@@ -178,9 +182,56 @@ def strip_dose_and_parens(herb: str) -> str:
     return _DOSE_RE.sub("", s).strip()
 
 
+#: R64：从开源数据批量合并来的别名表。**跟 `HERB_ALIASES` 分成两份是有意的**：
+#: 上面那张是逐条人工审过的（R59 建的），这张是批量合并的，两者的可信度不同，
+#: 混进一个字面量里以后就分不清哪条是审过的了。查的时候人工那份**优先**。
+#: 生成方式见 `offline/merge_open_sources.py --source baodian-alias`。
+MERGED_ALIASES_PATH = ROOT / "data" / "standard" / "herb_aliases_merged.tsv"
+
+_merged: dict[str, str] | None = None
+_merged_lock = threading.Lock()
+
+
+def merged_aliases() -> dict[str, str]:
+    """惰性读那张 TSV（CLAUDE.md：加载文件的对象一律惰性初始化）。
+
+    **文件缺失返回空表，不抛**——跟 `effect_synonyms` 那张表刻意相反：
+    那张表缺了会让一条验证规则恒假且没人发现，这张表缺了只是少认几个别名，
+    归一照常работает，退化是可见的（`scripts/check_herb_coverage.py` 的数字会涨）。
+    """
+    global _merged
+    if _merged is None:
+        with _merged_lock:
+            if _merged is None:
+                table: dict[str, str] = {}
+                if MERGED_ALIASES_PATH.exists():
+                    for raw in MERGED_ALIASES_PATH.read_text(encoding="utf-8").splitlines():
+                        line = raw.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        cols = line.split("\t")
+                        if len(cols) < 2 or cols[0] == "别名":
+                            continue
+                        table[cols[0].strip()] = cols[1].strip()
+                _merged = table
+    return _merged
+
+
+def reset_merged_aliases_for_tests() -> None:
+    global _merged
+    _merged = None
+
+
 def _alias(s: str) -> str | None:
-    """查别名表：原样查一次，剥掉后缀再查一次。"""
-    return HERB_ALIASES.get(s) or HERB_ALIASES.get(_HERB_SUFFIX.sub("", s).strip())
+    """查别名表：原样查一次，剥掉后缀再查一次。
+
+    **人工审过的那份先查**（`HERB_ALIASES`），合并来的那份后查——同一个写法
+    两边都有时以人工那份为准。
+    """
+    stripped = _HERB_SUFFIX.sub("", s).strip()
+    merged = merged_aliases()
+    return (HERB_ALIASES.get(s) or merged.get(s)
+            or HERB_ALIASES.get(stripped) or merged.get(stripped))
 
 
 def normalize_herb(herb: str) -> str:
