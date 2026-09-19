@@ -491,6 +491,11 @@ async def health(response: Response) -> dict:
         # **前端不自己判断**——它读不到环境变量，也不该按 URL 猜。页面上
         # 那十六处要藏的东西全部由这一个布尔值分派（core/product_mode.py）。
         **product_flags(),
+        # R62 §1.4 页脚那句固定文案。**由服务端给**：它是合规文本，
+        # 前端抄一份意味着改一处漏一处，而漏掉的那一处正是患者看到的那一屏。
+        # 跟病历文书用的是同一段（`core/emr_writer.DISCLAIMER` 面向"生成内容
+        # 须由执业医师审核"，这一句面向产品定位），两句不同但都只此一处。
+        "disclaimer": PRODUCT_DISCLAIMER,
         # 页脚那一行。产品名与版本只有 core/version.py 一处定义。
         "version": VERSION,
         "product_name": PRODUCT_NAME,
@@ -507,9 +512,25 @@ async def health(response: Response) -> dict:
     }
 
 
+#: 产品模式下的入口页。R62 §4.0：`web/` 下的页面重写，**旧文件保留但产品
+#: 模式下不加载**。两份并存而不是原地改：R1~R61 的截图、演示脚本、以及
+#: 32 份前端测试全都指着旧那一份，把它就地换掉等于把此前所有轮次的验收
+#: 一次作废；而 `PRODUCT_MODE=0` 的内部研究版仍然要用它（对照模式、分歧度
+#: 读数那些面板只长在旧页面上）。
+#: §1.4 页脚固定那一句。
+PRODUCT_DISCLAIMER = (
+    "本系统为中医知识学习与辅助工具，不作为医疗器械管理，不提供诊断结论；"
+    "所生成内容须由执业医师审核后方可用于临床。")
+
+PRODUCT_ENTRY = "/app/product/index.html"
+INTERNAL_ENTRY = "/app/index.html"
+
+
 @app.get("/")
 def root() -> RedirectResponse:
-    return RedirectResponse(url="/app/index.html")
+    """根路径按产品形态分流。**服务端决定，不让前端猜**——前端读不到
+    环境变量，按 URL 猜会在反向代理后面猜错。"""
+    return RedirectResponse(url=PRODUCT_ENTRY if is_product_mode() else INTERNAL_ENTRY)
 
 
 @app.get("/api/trajectories/{physician}")
