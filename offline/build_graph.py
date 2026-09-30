@@ -1,0 +1,369 @@
+"""从 data/standard/syndromes.jsonl 建知识图谱骨架。
+
+证候定义有两类来源，source 字段按可信度分档如实标注（见
+core.schemas.SyndromeDefinition 的文档字符串），没有一条标 "gb_standard"：
+
+  - 人工录入的脾胃相关证候（不带 disease 字段）。GB/T 16751.2 原文拿不到全文
+    （网页版可在线读、不可批量下载），这些条目由 7 个独立、可核验、彼此不矛盾的
+    来源交叉确认后录入：WFCMS 国际标准、两篇同行评审论文（各带 GB/T 15657 官方
+    编码）、一份团体标准公示稿、医学教育网、39健康网、百度百科。
+  - 教材条目（source="textbook"，带 disease 字段），由
+    offline/build_syndrome_textbook.py 从中医内科学教材解析而来。
+
+**不编造证候定义。** 这个项目的地基是"从真实来源忠实抽取"，图谱骨架尤其如此——
+它是医家层权重、检索、ReAct 智能体全部依赖的结构，编造的定义会让下游所有
+"图谱证实了 XX"的结论都变成幻觉，比某一条案例数据出错严重得多。
+
+结构来自标准，权重来自数据：build_graph() 只建 symptom / element / syndrome 三类
+节点和 indicates / composes / is_a 三类边，全部标 source=定义本身的 source；
+attach_cases() 再把 cases.json 的医案挂成 case 节点（能对上证候名的连 evidences
+边）；医家层权重由 offline/graph_stats.py 从这张图算出后写回。
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import json
+from pathlib import Path
+
+from core.graph.store import NetworkXStore
+from core.physicians import PHYSICIANS
+from core.schemas import SyndromeDefinition
+
+STANDARD_PATH = Path(__file__).resolve().parent.parent / "data" / "standard" / "syndromes.jsonl"
+GRAPH_OUT_PATH = Path(__file__).resolve().parent.parent / "data" / "graph.json"
+
+DEFAULT_FILTER_KEYWORDS = ["脾", "胃", "肝", "肠", "中焦"]
+
+
+def load_syndrome_definitions(path: Path = STANDARD_PATH) -> list[SyndromeDefinition]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"未找到 {path}。图谱骨架的数据来自人工核对过的标准证候定义与教材证候，"
+            "这个文件需要先准备好——每行一个 SyndromeDefinition 的 JSON。"
+            "不能用编造的证候定义代替：这个项目"
+            "的防幻觉设计要求图谱骨架和医案数据一样，必须来自可核实的真实来源。"
+        )
+    defs = []
+    with path.open("r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                defs.append(SyndromeDefinition.model_validate_json(line))
+            except Exception as e:  # noqa: BLE001 - 报出具体哪一行坏了，方便人工核对时定位
+                raise ValueError(f"{path}:{lineno} 不是合法的 SyndromeDefinition：{e}") from e
+    return defs
+
+
+def filter_by_keywords(
+    defs: list[SyndromeDefinition], keywords: list[str] | None
+) -> list[SyndromeDefinition]:
+    """按病位关键词缩小到脾胃相关子集。keywords 为空/None 时不过滤。"""
+    if not keywords:
+        return defs
+    return [
+        d
+        for d in defs
+        if any(
+            kw in d.name or kw in d.definition or kw in d.location
+            for kw in keywords
+        )
+    ]
+
+
+def build_graph(defs: list[SyndromeDefinition]) -> NetworkXStore:
+    """把证候定义列表建成图。symptom<->element 的 indicates 边是从"同一条证候定义
+    里症状和证素共同出现"这个结构关系里合理推出来的（国标本身没有给症状到证素的
+    直接映射表，只给了"这个证候的主症/次症是什么"+"这个证候的病位/病性是什么"），
+    是一个粗粒度但站得住脚的骨架级默认值；医家层权重（core/graph/weights.py）
+    再用医案数据在它上面加权。"""
+    store = NetworkXStore()
+
+    for d in defs:
+        syn_id = f"syndrome::{d.code}"
+        store.add_node(
+            syn_id,
+            node_type="syndrome",
+            name=d.name,
+            code=d.code,
+            is_category=d.is_category,
+            definition=d.definition,
+            tongue_pulse=d.tongue_pulse,
+            # 证候表条目多，候选池会被摊薄；disease 供 core.tools.syndrome_posterior
+            # 的 disease_hint 参数收窄候选。人工录入的条目没有 disease，取 None；
+            # 下游按 None 分组就是"不属于任何 disease_hint 收窄范围"，不会被误收窄掉。
+            disease=d.disease,
+        )
+
+        if d.parent:
+            store.add_edge(
+                syn_id, f"syndrome::{d.parent}", edge_type="is_a", source=d.source
+            )
+
+        elements = [(loc, "location") for loc in d.location] + [
+            (nat, "nature") for nat in d.nature
+        ]
+        for elem_name, category in elements:
+            elem_id = f"element::{elem_name}"
+            store.add_node(elem_id, node_type="element", name=elem_name, category=category)
+            store.add_edge(elem_id, syn_id, edge_type="composes", source=d.source)
+
+        symptoms = [(s, True) for s in d.cardinal_symptoms] + [
+            (s, False) for s in d.secondary_symptoms
+        ]
+        for sym_name, is_cardinal in symptoms:
+            sym_id = f"symptom::{sym_name}"
+            store.add_node(sym_id, node_type="symptom", name=sym_name)
+            for elem_name, _category in elements:
+                elem_id = f"element::{elem_name}"
+                store.add_edge(
+                    sym_id,
+                    elem_id,
+                    # key 里必须带 code：同一对 (症状, 证素) 会被多条证候定义各写
+                    # 一次（「纳呆 提示 胃」SP-02/SP-03/SP-05 都写了），共用
+                    # key="indicates" 的话后写的会盖掉先写的，via_syndrome 和
+                    # is_cardinal 一起丢。
+                    edge_key=f"indicates::{d.code}",
+                    edge_type="indicates",
+                    source=d.source,
+                    via_syndrome=d.code,
+                    is_cardinal=is_cardinal,
+                )
+
+    return store
+
+
+# 语料库门类关键词，用来检查 syndromes.jsonl 有没有覆盖到语料库实际涉及的病症范围。
+# **从 split_cases.BOOKS 的 gates 派生，不手抄一份**：手抄的词表会跟语料漂移——多出
+# 哪本书都没有的门类、漏掉某本书的门类，覆盖检查报的就不是真实语料范围。
+# 便血/吐血单独保留：它们对应 tests/queries.txt 里安全否决那条测试主诉。
+def _corpus_gate_keywords() -> list[str]:
+    from offline.split_cases import BOOKS
+
+    seen: dict[str, None] = {}
+    for cfg in BOOKS.values():
+        for g in cfg["gates"]:
+            seen.setdefault(g, None)
+    for extra in ("便血", "吐血"):
+        seen.setdefault(extra, None)
+    return list(seen)
+
+
+CORPUS_GATE_KEYWORDS = _corpus_gate_keywords()
+
+
+def check_corpus_coverage(
+    defs: list[SyndromeDefinition], gate_keywords: list[str] = CORPUS_GATE_KEYWORDS
+) -> dict:
+    """语义匹配，经由 core.syndrome_norm 的 SYNONYMS 表——不是字面子串匹配。
+    字面子串会把"水肿"/"木旺乘土"/"土虚木乘"/"大便溏稀"/"胃脘隐痛"这类古籍
+    门类名和标准用语的等价写法判成未覆盖，报出一堆假阴性。所以两边都先过
+    SYNONYMS 归一化再比较概念，归一化逻辑只在 core/syndrome_norm.py 一处维护，
+    这里不重复一套字面规则。
+
+    分 strict/broad 两档：strict 只查 location + cardinal_symptoms
+    这两个"定义性"字段，broad 额外查 nature/secondary_symptoms/name/definition。
+    两档都要报——用来区分"这门类是真空白"还是"只是在次症或病机描述里提到，
+    没写进主症"，不能只报一个让人误判。"""
+    from core.syndrome_norm import canonical, normalize
+
+    canonical_keywords = [canonical(kw) for kw in gate_keywords]
+
+    strict_hits: dict[str, list[str]] = {kw: [] for kw in gate_keywords}
+    broad_hits: dict[str, list[str]] = {kw: [] for kw in gate_keywords}
+
+    for d in defs:
+        strict_text = "".join(d.location + d.cardinal_symptoms)
+        broad_text = "".join(
+            d.location + d.nature + d.cardinal_symptoms + d.secondary_symptoms
+            + [d.name, d.definition]
+        )
+        strict_concepts = normalize(strict_text)
+        broad_concepts = normalize(broad_text)
+        for kw, canon in zip(gate_keywords, canonical_keywords):
+            if canon in strict_concepts:
+                strict_hits[kw].append(d.code)
+            if canon in broad_concepts:
+                broad_hits[kw].append(d.code)
+
+    return {
+        "strict_hits": {kw: v for kw, v in strict_hits.items() if v},
+        "strict_uncovered": [kw for kw in gate_keywords if not strict_hits[kw]],
+        "broad_uncovered": [kw for kw in gate_keywords if not broad_hits[kw]],
+        "wording_gap_only": [
+            kw for kw in gate_keywords if not strict_hits[kw] and broad_hits[kw]
+        ],
+    }
+
+
+def attach_cases(store: NetworkXStore, cases_path: Path) -> dict:
+    """把 cases.json 里的医案作为 case 节点挂进图。
+
+    case 节点的价值主要不在 count_support/λ1。清代医案的症状表述与国标术语
+    字面重合极少，证型体系同样几乎不相交（多数医案没有证型字段，有的也多是
+    "胃阳虚""悬饮""关格"这类古籍用词）。所以 evidences 边能建的很少，λ1 接近 0，
+    这是数据的客观性质，不是代码缺陷。
+
+    case 节点真正要服务的是：检索语料、ReAct 的 search_cases 工具、前端证据链
+    侧栏——这些只需要 case 节点存在并按 physician 可查，不要求它跟标准证候对齐。
+    """
+    with cases_path.open("r", encoding="utf-8") as f:
+        cases = json.load(f)
+
+    syn_name_to_id = {
+        data["name"]: node_id
+        for node_id, data in store.g.nodes(data=True)
+        if data.get("node_type") == "syndrome"
+    }
+
+    stats = {"cases": 0, "evidences_edges": 0, "syndrome_matched": 0, "syndrome_unmatched": 0}
+    for c in cases:
+        case_id = f"case::{c['case_id']}"
+        # case 节点必须写 name：api/main.py::_persistent_graph_to_cytoscape 取
+        # data.get("name", node_id) 作标签，图谱浏览器的 gbSearch 按 label 做中文
+        # 子串匹配。标签若是 case::ye_tianshi_0012、wu_jutong-0000-p0-0 这种原始
+        # id，医案层打开之后搜任何中文都搜不到一个医案节点。
+        syndrome = c.get("syndrome")
+        # 标签里放能被中文搜到的东西：医家中文名 + 证型（有就用，搜索能按证型命中）；
+        # 多数医案没有证型，就退回前两个症状。都没有就只剩 case_id，如实如此，不编。
+        pname = (PHYSICIANS.get(c["physician"]) or {}).get("name") or c["physician"]
+        tail = syndrome or "、".join((c.get("symptoms") or [])[:2])
+        case_label = f"{pname}·{c['case_id']}" + (f"（{tail}）" if tail else "")
+        store.add_node(
+            case_id,
+            node_type="case",
+            name=case_label,
+            physician=c["physician"],
+            symptoms=c.get("symptoms") or [],
+            syndrome=syndrome,
+            case_group_id=c.get("case_group_id"),
+            visit_index=c.get("visit_index"),
+        )
+        stats["cases"] += 1
+
+        syn = c.get("syndrome")
+        if syn:
+            target = syn_name_to_id.get(syn)
+            if target:
+                store.add_edge(case_id, target, edge_type="evidences", source="case")
+                stats["evidences_edges"] += 1
+                stats["syndrome_matched"] += 1
+            else:
+                stats["syndrome_unmatched"] += 1
+    return stats
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="从 syndromes.jsonl 建知识图谱骨架")
+    parser.add_argument(
+        "--filter-keywords",
+        nargs="*",
+        default=DEFAULT_FILTER_KEYWORDS,
+        help="按病位关键词过滤，默认脾/胃/肝/肠/中焦；传空列表不过滤",
+    )
+    parser.add_argument("--standard-path", type=Path, default=STANDARD_PATH)
+    parser.add_argument("--out", type=Path, default=GRAPH_OUT_PATH)
+    parser.add_argument(
+        "--cases-path", type=Path, default=Path("cases.json"),
+        help="医案 cases.json 路径；存在则挂入 case 节点，传 --cases-path /dev/null 可跳过",
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="建完图接着跑 graph_stats（写回医家层权重）和 build_element_index（证素索引）"
+             "——这三步是一件事，漏一步不报错但会静默退化",
+    )
+    args = parser.parse_args(argv)
+
+    defs = load_syndrome_definitions(args.standard_path)
+    filtered = filter_by_keywords(defs, args.filter_keywords)
+    store = build_graph(filtered)
+
+    # 空文件也算"没有医案"：--help 里写着 `--cases-path /dev/null` 可以跳过挂医案，
+    # 但 /dev/null 是存在的，只判 exists() 会走进 attach_cases 然后在 json.load
+    # 上崩掉——文档里给的用法直接跑不通。
+    if args.cases_path and args.cases_path.is_file() and args.cases_path.stat().st_size > 0:
+        cstats = attach_cases(store, args.cases_path)
+        print(
+            f"挂入医案：{cstats['cases']} 条 case 节点，"
+            f"evidences 边 {cstats['evidences_edges']} 条"
+            f"（证型可对齐 {cstats['syndrome_matched']}，"
+            f"对不齐 {cstats['syndrome_unmatched']}）"
+        )
+    else:
+        print(f"未挂入医案（{args.cases_path} 不存在或为空），图中无 case 节点，λ1 将全为 0")
+
+    # 医案三元组 data/case_triples.jsonl 不挂进这张图：它的消费方是 core/tools.py 的
+    # query_case_graph()，直接读 jsonl 做子串匹配，不经过 NetworkXStore——见
+    # offline/extract_case_triples.py 模块文档字符串。两条管道各自独立。
+
+    store.save(args.out)
+
+    print(f"读入 {len(defs)} 条证候定义，过滤后 {len(filtered)} 条")
+    print(f"图谱节点数：{store.g.number_of_nodes()}  边数：{store.g.number_of_edges()}")
+
+    node_type_counts: dict[str, int] = {}
+    for _, data in store.g.nodes(data=True):
+        node_type_counts[data.get("node_type")] = node_type_counts.get(data.get("node_type"), 0) + 1
+    print(f"节点类型分布：{node_type_counts}")
+
+    edge_type_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    for _, _, data in store.g.edges(data=True):
+        edge_type_counts[data.get("edge_type")] = edge_type_counts.get(data.get("edge_type"), 0) + 1
+        source_counts[data.get("source")] = source_counts.get(data.get("source"), 0) + 1
+    print(f"边类型分布：{edge_type_counts}")
+    print(f"边来源分布：{source_counts}")
+
+    import networkx as nx
+
+    is_a_edges = [
+        (u, v) for u, v, d in store.g.edges(data=True) if d.get("edge_type") == "is_a"
+    ]
+    is_a_subgraph = nx.DiGraph(is_a_edges)
+    print(f"is_a 子图无环：{nx.is_directed_acyclic_graph(is_a_subgraph)}")
+
+    coverage = check_corpus_coverage(filtered)
+    print("\n=== 语料库门类覆盖检查（对 syndromes.jsonl 的 location/cardinal_symptoms） ===")
+    print(f"严格匹配命中：{coverage['strict_hits']}")
+    print(f"严格未覆盖（location/cardinal_symptoms 都对不上）：{coverage['strict_uncovered']}")
+    print(f"仅措辞差异（严格对不上，但在 nature/次症/病机描述里提到过，不是真空白）：{coverage['wording_gap_only']}")
+    print(f"完全未覆盖（严格 + 宽泛都对不上）：{coverage['broad_uncovered']}")
+
+    print(f"\n已写出 {args.out}")
+
+    if args.all:
+        _run_downstream()
+    else:
+        # **只建图不跑后两步会静默退化**：graph_stats 的名字听起来像只读统计，实际
+        # 会把 weight_by_physician 写回图；不跑它，追问的贝叶斯后验会退化成先验而
+        # **不报任何错**。build_element_index 同理——不跑，graph 检索模式拿不到
+        # element_index.json，只在真正切到那个模式时才炸。
+        print("\n⚠ 只跑了建图这一步。graph_stats（写回医家层权重）和 "
+              "build_element_index（证素索引）没跑：λ1 会全为 0、追问的后验会退化成"
+              "先验、graph 检索模式不可用，**而且都不报错**。三步一起跑用 --all。",
+              file=sys.stderr)
+
+
+def _run_downstream() -> None:
+    """建图之后的两步。任一步失败就退出码非 0——"图建好了但权重没写回"这种半成品
+    状态比彻底失败更危险：后面每一步都能跑，只是结果悄悄退化。"""
+    from offline import build_element_index, graph_stats
+
+    for label, entry in (("graph_stats（写回医家层权重）", graph_stats.main),
+                         ("build_element_index（证素索引）", build_element_index.main)):
+        print(f"\n=== {label} ===")
+        try:
+            entry([])
+        except SystemExit as e:  # argparse/脚本自己退出，非 0 就是失败
+            if e.code not in (0, None):
+                print(f"✗ {label} 退出码 {e.code}，后面的步骤不再跑", file=sys.stderr)
+                raise
+        except Exception as e:  # noqa: BLE001 - 哪一步挂的要说清楚，不能只甩一个栈
+            print(f"✗ {label} 失败：{type(e).__name__}: {e}", file=sys.stderr)
+            raise
+
+
+if __name__ == "__main__":
+    main()

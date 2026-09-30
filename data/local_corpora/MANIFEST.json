@@ -1,0 +1,92 @@
+{
+  "generated_by": "scripts/normalize_local_corpora.py（幂等；重跑不改内容就不写文件）",
+  "note": "out_of_scope / copyright_status 是 LOCAL_CORPORA 里的人工声明，scope_stats 是数出来给人看的依据；两者的关系见 scripts/normalize_local_corpora.py 模块文档",
+  "entries": [
+    {
+      "kind": "case_docx",
+      "encoding": "docx",
+      "origin": "李可肿瘤医案汇编（脑瘤/鼻硬结症/宫颈癌等），现代出版物；版权受限，不随仓库分发，需自行获取",
+      "copyright_status": "copyrighted",
+      "out_of_scope": true,
+      "scope_reason": "整份是肿瘤医案，不在脾胃门定位内；且含十八反配伍（海藻反甘草），抽成医案后 has_incompatible_pair 会命中——两个标记各管各的",
+      "pharmacology_source": false,
+      "pharmacology_reason": "医案没有性味/归经/功效/用量这些字段（同王云启那条），开头几块还是目录页",
+      "file": "local_corpora/李可医案.docx",
+      "bytes": 85550,
+      "sha256": "ce5ed7952a5002559fa2a5d8fa2d4ab02356dd2159b22ed4708a3b907262d6e1",
+      "derived_text": "local_corpora/李可医案.txt",
+      "scope_stats": {
+        "n_paragraphs": 556,
+        "spleen_stomach_paragraphs": 42,
+        "spleen_stomach_rate": 0.0755,
+        "oncology_paragraphs": 224,
+        "oncology_rate": 0.4029,
+        "incompatible_pair_paragraphs": 105,
+        "incompatible_pairs": {
+          "海藻 反 甘草": 75,
+          "乌头 反 半夏": 51,
+          "乌头 反 贝母": 34,
+          "五灵脂 反 人参": 24,
+          "乌头 反 瓜蒌": 3,
+          "丁香 反 郁金": 1
+        },
+        "note": "比例的分母是非空段落数（docx）或空行分段的块数（txt）；脾胃门词表 = core.syndrome_norm.SYNONYMS，肿瘤词表 = offline.assess_case_scope.ONCOLOGY_HINTS，反药判定 = core.safety_output.check_incompatible"
+      }
+    },
+    {
+      "kind": "case_docx",
+      "encoding": "docx",
+      "origin": "《王云启治癌验案录》，现代出版的肿瘤科医案集；版权受限，不随仓库分发，需自行获取",
+      "copyright_status": "copyrighted",
+      "out_of_scope": true,
+      "scope_reason": "肿瘤科医案，不在本项目脾胃门定位内；含脾胃门门类词的段落比例见 scope_stats。接入时标 out_of_scope",
+      "pharmacology_source": false,
+      "pharmacology_reason": "药理层抽的是「性味/归经/功效/用量/禁忌/炮制」，医案里没有这些字段。转出来的 txt 开头大量是目录页和序言，拿它运行抽取只会浪费调用",
+      "file": "local_corpora/王云启医案.docx",
+      "bytes": 2409099,
+      "sha256": "e18b61af4895605fbfd1a95d32e81287318b8b8447c655f7cac761fb5c20d8eb",
+      "derived_text": "local_corpora/王云启医案.txt",
+      "scope_stats": {
+        "n_paragraphs": 1599,
+        "spleen_stomach_paragraphs": 211,
+        "spleen_stomach_rate": 0.132,
+        "oncology_paragraphs": 746,
+        "oncology_rate": 0.4665,
+        "incompatible_pair_paragraphs": 4,
+        "incompatible_pairs": {
+          "乌头 反 贝母": 2,
+          "乌头 反 半夏": 2,
+          "乌头 反 瓜蒌": 2,
+          "乌头 反 白及": 2
+        },
+        "note": "比例的分母是非空段落数（docx）或空行分段的块数（txt）；脾胃门词表 = core.syndrome_norm.SYNONYMS，肿瘤词表 = offline.assess_case_scope.ONCOLOGY_HINTS，反药判定 = core.safety_output.check_incompatible"
+      }
+    },
+    {
+      "kind": "classic_text",
+      "encoding": "utf-8",
+      "origin": "《脾胃论》金·李东垣，现代排印本的电子文本；原著公有领域，排印本不随仓库分发，需自行获取。文件头的版权页/CIP 等非正文内容由切块预过滤按结构跳过",
+      "copyright_status": "public_domain",
+      "out_of_scope": false,
+      "scope_reason": "脾胃门理论原典，在定位内",
+      "pharmacology_source": false,
+      "pharmacology_reason": "它是理论专著 + 方论，按空行切出来方名和组成不在同一块（切块验证打得出来），而 s（方名）不过 source_span 核验——喂进去等于让模型猜方名，正是 heading 模式要堵的那个洞。要接入它，需要先按「方名 + 组成」配对切块",
+      "file": "local_corpora/脾胃论.txt",
+      "bytes": 152385,
+      "sha256": "6416c23be443114a3bc93a0c111a759cd60a4fc628b49966228f5523c31d8c30",
+      "derived_text": null,
+      "scope_stats": {
+        "n_paragraphs": 671,
+        "spleen_stomach_paragraphs": 147,
+        "spleen_stomach_rate": 0.2191,
+        "oncology_paragraphs": 0,
+        "oncology_rate": 0.0,
+        "incompatible_pair_paragraphs": 2,
+        "incompatible_pairs": {
+          "乌头 反 半夏": 2
+        },
+        "note": "比例的分母是非空段落数（docx）或空行分段的块数（txt）；脾胃门词表 = core.syndrome_norm.SYNONYMS，肿瘤词表 = offline.assess_case_scope.ONCOLOGY_HINTS，反药判定 = core.safety_output.check_incompatible"
+      }
+    }
+  ]
+}
