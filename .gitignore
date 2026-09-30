@@ -1,0 +1,71 @@
+# ---------- 环境与密钥 ----------
+# .env 及其任何衍生文件（.bak / .old / .local …）都含 LLM_API_KEY，不进版本控制。
+.env
+.env*
+!.env.example
+# 编辑器交换文件可能包含 .env 的内容
+*.swp
+*.swo
+*.swn
+*.swm
+
+# ---------- Python / 工具缓存 ----------
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+# ---------- 开发工具的本地配置 ----------
+.claude/
+CLAUDE.md
+.cursor/
+.idea/
+.vscode/
+
+# ---------- 数据 ----------
+# *.jsonl 整体忽略，只对人工整理的静态参考表（data/standard/）与 SDT 运行台账开例外。
+# 新增的静态参考表放在 data/standard/ 下，否则不会进入版本控制。
+*.jsonl
+!data/standard/*.jsonl
+!eval/sdt/test_run_log.jsonl
+# 审计日志含医师标识与患者引用，是运行时的敏感数据。单独列出，不依赖上面那条宽规则。
+data/audit.jsonl
+
+# 离线管线的生成物：可以由仓库内的输入重新生成
+data/graph.json
+data/jieba_dict.txt
+data/case_triples.jsonl
+data/element_index.json
+extract_warnings.json
+# 语料向量的磁盘缓存（文件名带输入的 sha256，删除后可重建）
+data/cache/
+
+# 古籍原文与教材，按 README 的说明另行下载
+books/
+
+# 本地语料（版权受限的现代出版物、非公开来源的排印本电子文本）及其派生文件：
+# 不随仓库分发，使用者自行获取后放入对应路径；只有声明清单 MANIFEST.json 进版本控制
+data/local_corpora/*
+!data/local_corpora/MANIFEST.json
+data/cases_li_ke.json
+data/cases_wang_yunqi.json
+# offline/merge_reference_cases.py 写盘前的备份
+cases.json.bak.*
+
+# ---------- 评测与脚本输出 ----------
+out/
+eval/report.json
+eval/report.md
+eval/mes/items.json
+eval/mes/answer_key.json
+eval/mes/collected.json
+# 性能基准与剖析脚本的输出只反映运行它的那台机器，不进版本控制
+eval/bench/
+eval/profile/
+eval/frontend/

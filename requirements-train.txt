@@ -1,0 +1,16 @@
+# LoRA 训练（scripts/train_lora.py）的依赖，不放进 requirements.txt：只做推理与测试的
+# 环境不需要 torch / transformers 这一套，而且 torch 的 CUDA 版本必须与显卡匹配。
+# 训练机上先按 pytorch.org 的说明安装与显卡匹配的 torch，再安装本文件：
+#
+#     pip install -r requirements.txt -r requirements-train.txt
+#
+# 安装后可以先确认 torch 能识别显卡：
+#     python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+
+transformers>=4.44
+peft>=0.12
+accelerate>=0.33
+datasets>=2.20
+
+# 不依赖 trl：scripts/train_lora.py 直接用 transformers.Trainer 并自行 tokenize，
+# 训练循环是标准的，不需要 trl 提供的额外约定。

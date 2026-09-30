@@ -1,0 +1,12 @@
+# lint 基线。规则集只取语法级错误、未使用的名字、重复的字典键（E4/E7/E9/F），
+# 不启用风格类规则：本仓库的注释以中文说明为主，较短的行宽只会把注释切碎。
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# pytest 夹具约定：`def test_x(fake_llm)` 的参数名与模块级夹具函数同名，
+# ruff 会报"重定义未使用的名字"（F811），这正是 pytest 注入夹具的方式。
+"tests/*" = ["F811"]

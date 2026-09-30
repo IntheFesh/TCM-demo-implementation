@@ -1,0 +1,20 @@
+# 运行与测试所需依赖的版本下限。生产部署建议在验证过的环境里
+# `pip freeze > requirements.lock` 锁定版本，部署时 `pip install -r requirements.lock`。
+openai>=1.40
+pydantic>=2.7
+pyyaml>=6.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sentence-transformers>=3.0
+numpy>=1.26
+networkx>=3.2
+rank-bm25>=0.2
+jieba>=0.42
+pytest>=8.0
+
+# 只有把 .docx 医案转成 txt 时才需要（offline/docx_to_text.py）。
+# 包名是 python-docx，import 名是 docx；`pip install docx` 装到的是一个同名的废弃包。
+python-docx
+
+# 只有跑 TCMEval-SDT 评测时才需要：官方 evaluate.py 在模块顶层 import 了 pandas。
+pandas
