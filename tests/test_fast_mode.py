@@ -1,0 +1,247 @@
+"""FAST_MODE 联动的离线测试。
+
+这个开关同时管四件事：ReAct 步数上限降到 FAST_MODE_MAX_STEPS、追问轮数降到 0、
+残差辨证整体关闭、S3 采样次数降到 1。各处必须同时生效——只关一半的开关是陷阱：
+用户以为省了预算，实际还在花。
+
+前三处各一条测试，外加一条集成测试（对比 llm_calls 的具体数字，也覆盖采样次数
+这一处），另加一条钉住"各处读的是同一个判定函数"的结构测试。
+"""
+import pytest
+
+from core import chain, react
+from core.followup import fast_mode_enabled
+from core.schemas import ReActStep, S3Syndrome
+from tests.test_chain import FakeRetriever, ReActFakeLLM, _affirm_unless_dangerous, _fake_cases
+
+
+@pytest.fixture(autouse=True)
+def _pin_two_physicians(monkeypatch):
+    from core.physicians import PHYSICIANS as REG
+
+    monkeypatch.setattr(chain, "PHYSICIANS", {k: REG[k] for k in ("ye_tianshi", "wu_jutong")})
+
+
+def _s3(cid):
+    return S3Syndrome(syndrome="脾胃气虚", reasoning="x", treatment_principle="健脾益气",
+                      cited_case_ids=[cid], herbs=["党参", "白术"])
+
+
+# ---------- 三处各一条 ----------
+
+
+def test_fast_mode_caps_react_steps(monkeypatch):
+    """第 1 处：ReAct 步数上限降到 FAST_MODE_MAX_STEPS。"""
+    class NeverFinishLLM:
+        """永远不 finish，让循环一直跑到撞上限——这样测出来的就是上限本身。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            self.calls += 1
+            return ReActStep(thought="再查一个", action="query_graph",
+                             action_input={"node": f"纳呆{self.calls}"})
+
+    fake = NeverFinishLLM()
+    monkeypatch.setattr(react, "get_llm", lambda: fake)
+
+    monkeypatch.delenv("FAST_MODE", raising=False)
+    normal = react.run_react(name="叶天士", symptoms="纳差", elements_summary="脾")
+    assert len(normal.steps) == react.MAX_STEPS == 5
+
+    fake.calls = 0
+    monkeypatch.setenv("FAST_MODE", "1")
+    fast = react.run_react(name="叶天士", symptoms="纳差", elements_summary="脾")
+    assert len(fast.steps) == react.FAST_MODE_MAX_STEPS == 2
+    assert fast.terminated_by == "max_steps"
+
+
+def test_explicit_max_steps_beats_fast_mode(monkeypatch):
+    """显式传的数字优先于环境变量——跟 use_react / eval_mode 一致。"""
+    class NeverFinishLLM:
+        def __init__(self):
+            self.n = 0
+
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            # 每步换一个 node：连续重复同一个调用会触发 no_progress 提前终止，
+            # 那样测出来的就不是步数上限了
+            self.n += 1
+            return ReActStep(thought="t", action="query_graph",
+                             action_input={"node": f"纳呆{self.n}"})
+
+    # 复用同一个实例：写成 lambda: NeverFinishLLM() 的话每步都新建对象、self.n
+    # 一直归零，node 名不变会触发 no_progress 提前终止，测出来就不是步数上限了
+    fake = NeverFinishLLM()
+    monkeypatch.setattr(react, "get_llm", lambda: fake)
+    monkeypatch.setenv("FAST_MODE", "1")
+    trace = react.run_react(name="叶天士", symptoms="纳差", elements_summary="脾", max_steps=4)
+    assert len(trace.steps) == 4
+
+
+def test_fast_mode_skips_followup(monkeypatch):
+    """第 2 处：追问轮数降到 0。"""
+    from core.followup import run_followup
+
+    asked = []
+    monkeypatch.setenv("FAST_MODE", "1")
+    result = run_followup(["纳差"], ["脾"], lambda q: asked.append(q) or "有")
+    assert result.rounds == 0
+    assert result.stopped_by == "fast_mode"
+    assert asked == [], "开了 FAST_MODE 一个问题都不该问"
+
+
+def test_fast_mode_disables_residual(monkeypatch):
+    """第 3 处：残差辨证整体关闭，哪怕未解释症状占比远超阈值。"""
+    from core.schemas import ElementHit, S1Normalize, S2Elements
+
+    # 4 条症状只有 1 条被解释 -> 未解释 3 条、占比 75%，远超 RESIDUAL_THRESHOLD
+    s1 = S1Normalize(symptoms=["纳差", "乏力", "腹胀", "便溏"])
+    s2 = S2Elements(elements=[ElementHit(element="脾", kind="location",
+                                         supporting_symptoms=["纳差"], confidence="high")])
+    calls = []
+    monkeypatch.setattr(chain, "infer_elements", lambda x: calls.append(1) or S2Elements())
+
+    monkeypatch.delenv("FAST_MODE", raising=False)
+    assert chain.run_residual(s1, s2) is not None, "正常模式下这组输入应该触发残差"
+    assert len(calls) == 1, "残差要真的多花一次 S2"
+
+    calls.clear()
+    monkeypatch.setenv("FAST_MODE", "1")
+    assert chain.run_residual(s1, s2) is None
+    assert calls == [], "关掉之后一次调用都不该发生"
+
+
+# ---------- 集成：调用数的具体对比 ----------
+
+
+def _consult_calls(monkeypatch, **env):
+    for k, v in env.items():
+        if v is None:
+            monkeypatch.delenv(k, raising=False)
+        else:
+            monkeypatch.setenv(k, v)
+
+    class NeverFinishLLM(ReActFakeLLM):
+        """ReAct 每步都不 finish，逼它跑满步数——这样两种模式的差值才是上限差值，
+        不受"模型偶然早收尾"影响。每步换一个 node：连续重复同一个调用会触发
+        no_progress 提前终止。"""
+
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            if schema is ReActStep:
+                self.calls.append("ReActStep")
+                return ReActStep(thought="再查", action="query_graph",
+                                 action_input={"node": f"纳呆{len(self.calls)}"})
+            return super().generate(system, user, schema, temperature, **kwargs)
+
+    fake = NeverFinishLLM({"叶天士": _s3("ye_tianshi-001"), "吴鞠通": _s3("wu_jutong-001")})
+    monkeypatch.setattr(chain, "get_llm", lambda: fake)
+    monkeypatch.setattr(react, "get_llm", lambda: fake)
+    monkeypatch.setattr(chain, "get_retriever", lambda: FakeRetriever(_fake_cases()))
+    # 不能无脑答"有"：候选池里第一条未问过的安全相关症状一定会被问到（安全相关
+    # 候选不受收敛门槛约束），答"有"会被 check_safety 真实拦截、consult 提前
+    # 终止，测不到这条测试真正要测的 ReAct 步数/S2 重跑次数。见
+    # tests/test_chain.py::_affirm_unless_dangerous 的说明。
+    outcome = chain.consult("纳差乏力", use_react=True, ask_fn=_affirm_unless_dangerous)
+    return outcome, fake
+
+
+def test_fast_mode_integration_cuts_llm_calls(monkeypatch):
+    """一次完整 consult（开 ReAct + 有提问渠道）两种模式的调用数对比。
+
+    默认配置（S3 只采 1 次）下：
+      正常模式 16 次 = S1 1 + S2 1 + 追问后重跑 S2 1 + 残差 S2 1
+                       + 两位医家各 (ReAct 5 步 + S3 **1 次采样**) = 4 + 12
+      FAST_MODE 8 次 = S1 1 + S2 1 + 两位医家各 (ReAct 2 步 + S3 1) = 2 + 6
+                       （追问 0 轮所以不重跑 S2、残差整体关闭）
+
+    `S3_BEST_OF_N` 调高时，正常模式的 S3 调用数按倍数增加，而 FAST_MODE 一侧
+    不变——best-of-N 在 FAST_MODE 下固定降到 1（第四处降级）。所以默认配置下
+    "采样降到 1"这一处不构成差异点（另外三处才是：追问轮数、残差、ReAct 步数），
+    调高采样次数它才拉开差距。两个数都不许手抄——下面的断言从
+    `s3_best_of_n()` 与医家数推出来。
+    """
+    normal, fake_n = _consult_calls(monkeypatch, FAST_MODE=None)
+    normal_calls = normal["manifest"]["llm_calls"]
+
+    fast, fake_f = _consult_calls(monkeypatch, FAST_MODE="1")
+    fast_calls = fast["manifest"]["llm_calls"]
+
+    # 期望值从旋钮推出来，不写死：`S3_BEST_OF_N` 的默认值一变，写死的数就会红在
+    # 跟 FAST_MODE 毫无关系的地方。
+    from core.llm import s3_best_of_n
+
+    n_phys = len(normal["results"])
+    n = s3_best_of_n()          # 正常模式下的采样次数（默认 1）
+    expect_normal = 4 + n_phys * (5 + n)      # S1+S2+追问重跑+残差 + 每位 (ReAct 5 步 + S3 n 次)
+    expect_fast = 2 + n_phys * (2 + 1)        # S1+S2 + 每位 (ReAct 2 步 + S3 1 次)
+    assert normal_calls == expect_normal, f"正常模式实际 {normal_calls} 次：{fake_n.calls}"
+    assert fast_calls == expect_fast, f"FAST_MODE 实际 {fast_calls} 次：{fake_f.calls}"
+    assert fast_calls < normal_calls
+    # 三处降级都体现在调用数里
+    assert fake_f.calls.count("ReActStep") == 4, "两位医家各 2 步"
+    assert fake_f.calls.count("S2Elements") == 1, "追问不重跑 S2、残差不跑"
+    # 第四处（采样次数）的直接判据：FAST_MODE 下每位医家只采一次
+    assert fake_f.calls.count("S3Syndrome") == 2, "两位医家各一次 S3（FAST_MODE 下采样固定降到 1）"
+    assert fake_n.calls.count("S3Syndrome") == n_phys * n, \
+        f"正常模式每位医家各采 {n} 次"
+    assert fast["followup"].stopped_by == "fast_mode"
+    assert fast["residual"] is None
+    # 关键：省了调用不等于不出结果，两位医家照样出方
+    assert len(fast["results"]) == 2
+
+
+# ---------- 结构：三处读的是同一个判定 ----------
+
+
+def test_all_three_paths_read_the_same_judgment_function():
+    """闸门：三处代码路径都调 core.followup.fast_mode_enabled，不各写一套
+    os.environ.get("FAST_MODE") 的判断。"""
+    import inspect
+
+    for mod in (chain, react):
+        src = inspect.getsource(mod)
+        assert "fast_mode_enabled" in src, f"{mod.__name__} 没调用统一判定函数"
+        assert 'environ.get("FAST_MODE"' not in src, f"{mod.__name__} 自己读了环境变量"
+        assert "environ['FAST_MODE'" not in src
+
+
+def test_fast_mode_enabled_accepts_common_truthy_forms(monkeypatch):
+    for truthy in ("1", "true", "TRUE", "yes"):
+        monkeypatch.setenv("FAST_MODE", truthy)
+        assert fast_mode_enabled() is True, truthy
+    for falsy in ("0", "no", "", "off"):
+        monkeypatch.setenv("FAST_MODE", falsy)
+        assert fast_mode_enabled() is False, falsy
+    monkeypatch.delenv("FAST_MODE", raising=False)
+    assert fast_mode_enabled() is False
+
+
+def test_prompt_remaining_counter_follows_the_fast_mode_cap(monkeypatch):
+    """prompt 里的「还剩 N 步」必须跟着降级后的上限走，不能还报 5。
+
+    这个计数器会实质影响模型什么时候收尾（docs/DESIGN_NOTES.md §6）。
+    上限降到 2 却告诉模型"还剩 5 步"，它会按 5 步规划、必然被截断，轨迹看起来
+    像"模型不会收尾"，实际是被上限卡死的——所以被上限截断
+    （`terminated_by=max_steps`）跟模型自己收尾要分开看。
+    """
+    seen = []
+
+    class RecordingLLM:
+        def __init__(self):
+            self.n = 0
+
+        def generate(self, system, user, schema, temperature=0.0, **kwargs):
+            seen.append(system)
+            self.n += 1
+            return ReActStep(thought="t", action="query_graph",
+                             action_input={"node": f"纳呆{self.n}"})
+
+    fake = RecordingLLM()
+    monkeypatch.setattr(react, "get_llm", lambda: fake)
+    monkeypatch.setenv("FAST_MODE", "1")
+    react.run_react(name="叶天士", symptoms="纳差", elements_summary="脾")
+
+    assert len(seen) == react.FAST_MODE_MAX_STEPS == 2
+    assert "还剩 2 步" in seen[0], seen[0][-200:]
+    assert "还剩 1 步" in seen[1], seen[1][-200:]

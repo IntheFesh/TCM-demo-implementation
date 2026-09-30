@@ -1,0 +1,250 @@
+"""图谱浏览器页签（web/graph.js 里的 gb* 函数）前端代码的离线测试。
+
+用 node 跑真实上线的前端脚本（跟别的前端测试同一个模式），只测不需要真实
+cytoscape 就能验证的部分：gbBuildIndex 的索引构建。像 gbAddNodes/gbExpandNode/
+gbSearch/gbToggleLayer/gbApplyPhysicianWeighting 这些函数内部都会调
+真实 cytoscape 实例的方法（cy.add/cy.getElementById/cy.nodes().filter(...)/
+ele.style(...)），DOM 代理桩测不出来——桩对象对任何属性访问、任何调用都返回
+自己，`cy.nodes().filter(...)` 这类链式调用不会抛异常也不会报出任何有意义的
+错误，测出来的只是"没崩"，测不出"filter 出来的到底是不是我要的那几个节点"。
+这部分交给真实 Playwright + 真实 cytoscape 验证（scripts/screenshot_states.py），不在这里
+用桩硬凑一份看起来测了、实际什么都没测到的测试。
+"""
+import json
+import subprocess
+
+from pathlib import Path
+from tests.web_harness import DOM_STUB, js_tmp, load_app_js
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+
+def _run_node(js_tail: str) -> str:
+    script = load_app_js()
+    proc = subprocess.run(
+        ["node", js_tmp(DOM_STUB + script + "\n" + js_tail)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, f"node 执行失败：\nstdout={proc.stdout}\nstderr={proc.stderr}"
+    return proc.stdout
+
+
+def _sample_graph_data() -> dict:
+    return {
+        "graph": {
+            "nodes": [
+                {"data": {"id": "a", "label": "A", "node_type": "symptom"}},
+                {"data": {"id": "b", "label": "B", "node_type": "element"}},
+                {"data": {"id": "c", "label": "C", "node_type": "syndrome"}},
+            ],
+            "edges": [
+                {"data": {"id": "a::b::indicates", "source": "a", "target": "b", "edge_type": "indicates"}},
+                {"data": {"id": "b::c::composes", "source": "b", "target": "c", "edge_type": "composes"}},
+            ],
+        },
+    }
+
+
+def test_gb_build_index_maps_all_nodes():
+    js = f"""
+    gbGraphData = {json.dumps(_sample_graph_data(), ensure_ascii=False)};
+    gbBuildIndex();
+    process.stdout.write(JSON.stringify([...gbIndex.nodeById.keys()].sort()));
+    """
+    assert json.loads(_run_node(js)) == ["a", "b", "c"]
+
+
+def test_gb_build_index_edges_are_bidirectional():
+    """节点 b 既是 a->b 这条边的终点、又是 b->c 这条边的起点——两条边都要能
+    从 b 这一侧查到，展开 b 节点时才能同时露出 a 和 c 这两个方向的邻居。"""
+    js = f"""
+    gbGraphData = {json.dumps(_sample_graph_data(), ensure_ascii=False)};
+    gbBuildIndex();
+    const out = {{
+      edgesOfA: gbIndex.edgesByNode.get("a").map((e) => e.data.id),
+      edgesOfB: gbIndex.edgesByNode.get("b").map((e) => e.data.id).sort(),
+      edgesOfC: gbIndex.edgesByNode.get("c").map((e) => e.data.id),
+    }};
+    process.stdout.write(JSON.stringify(out));
+    """
+    out = json.loads(_run_node(js))
+    assert out["edgesOfA"] == ["a::b::indicates"]
+    assert out["edgesOfB"] == ["a::b::indicates", "b::c::composes"]
+    assert out["edgesOfC"] == ["b::c::composes"]
+
+
+def test_gb_build_index_node_with_no_edges_has_no_entry():
+    """孤立节点（假设图里存在）在 edgesByNode 里不该有条目——gbExpandNode 对
+    这种节点会用 `|| []` 兜底，这里钉住"没有条目"这个前提本身是真的，不是
+    凭空假设。"""
+    graph_data = {
+        "graph": {
+            "nodes": [{"data": {"id": "lonely", "label": "孤立", "node_type": "symptom"}}],
+            "edges": [],
+        },
+    }
+    js = f"""
+    gbGraphData = {json.dumps(graph_data, ensure_ascii=False)};
+    gbBuildIndex();
+    process.stdout.write(JSON.stringify(gbIndex.edgesByNode.has("lonely")));
+    """
+    assert json.loads(_run_node(js)) is False
+
+
+# ============================================================================
+# 图谱浏览器的交互规则：首屏、展开/收起、布局、按门类浏览、搜索
+# ============================================================================
+#
+# 这一批同样守着文件开头那条纪律：**只测不需要真实 cytoscape 就能验的部分**。
+# "首屏真的只有证素""枢纽真的在内圈""再点真的收起"这类要看渲染结果的，
+# 交给 `scripts/screenshot_states.py --only browser_home / browser_expanded`
+# （真浏览器、真 cytoscape，每种带 DOM 判据）。这里测的是数据流与常量表。
+
+
+def _graph_js() -> str:
+    return (ROOT / "web" / "graph.js").read_text(encoding="utf-8")
+
+
+def test_the_home_screen_asks_for_elements_not_syndromes():
+    """首屏铺**证素**，不铺证型。
+
+    首屏铺证型的话是一堆互不相连、全同色的方块，cose 只能摊成几排：证型之间
+    本来就没有边，力导向对一堆孤立节点只能摊平，那张图不传达任何东西。
+    证素数量少，而且每个证型都挂在证素下面。"""
+    src = _graph_js()
+    body = src[src.index("async function loadGraphBrowserData"):]
+    body = body[:body.index("let growToken")]
+    assert "node_types=element" in body
+    assert "node_types=syndrome" not in body
+
+
+def test_the_element_limit_is_a_named_constant_not_a_literal():
+    """证素数量是数据决定的。写死一个数的话，教材扩充后多出来的
+    那几个会**静默不显示**——而"少了几个枢纽"这件事在图上看不出来。"""
+    src = _graph_js()
+    assert "const GB_ELEMENT_LIMIT" in src
+    assert "node_types=element&limit=${GB_ELEMENT_LIMIT}" in src
+
+
+def test_expansion_is_layered_element_to_syndrome_to_symptom():
+    """展开是分层的：点证素 → 证型，点证型 → 症状。
+
+    **不筛类型的后果**：枢纽证素（如「肝」）的邻居里证型只占一小部分，其余
+    基本都是症状。不筛的话点一下就是一大批症状铺满画布，又回到一屏摊平的
+    方块。"""
+    out = json.loads(_run_node("process.stdout.write(JSON.stringify(GB_EXPAND_TARGET));"))
+    assert out == {"element": "syndrome", "syndrome": "symptom", "symptom": "element"}
+
+
+def test_the_type_filter_is_applied_by_the_server_not_the_client():
+    """筛在前端意味着先把全部邻居拉回来再扔掉大部分，而且 `limit` 会先在
+    服务端把想要的那些截掉——**截断发生在筛之前**，结果是"限 N 个邻居里
+    恰好有几个证型就显示几个"，而那个数完全取决于 networkx 的遍历顺序。
+    这种错不报错，只让人以为脾没几个证型。"""
+    src = _graph_js()
+    assert "node_types=${encodeURIComponent(want)}" in src
+    import inspect
+
+    import api.main as api_main
+    sig = inspect.signature(api_main.api_graph_neighbors)
+    assert "node_types" in sig.parameters
+
+
+def test_the_neighbors_endpoint_filters_by_type():
+    """端点层面：带 `node_types=syndrome` 时只返回证型，总数小于不筛类型时的总数。"""
+    from fastapi.testclient import TestClient
+
+    import api.main as api_main
+    client = TestClient(api_main.app)
+    all_ = client.get("/api/graph/neighbors", params={"node": "element::肝"}).json()
+    syn = client.get("/api/graph/neighbors",
+                     params={"node": "element::肝", "node_types": "syndrome"}).json()
+    assert syn["page"]["total"] < all_["page"]["total"]
+    assert all(n["data"]["node_type"] == "syndrome" for n in syn["graph"]["nodes"])
+
+
+def test_clicking_an_expanded_node_collapses_it():
+    """展开过的节点再点一次要收起：首屏是一批证素，每个展开出一批证型，
+    点开三四个就又变成一屏摊平的方块，没有收起就只能重置视图。"""
+    src = _graph_js()
+    body = src[src.index("async function gbExpandNode"):]
+    body = body[:body.index("function gbRelayout")]
+    assert "gbExpanded.has(nodeId)" in body and "gbCollapseNode(nodeId)" in body
+
+
+def test_collapse_only_removes_what_this_node_brought_in():
+    """一个证型可能同时挂在两个证素下面。按"邻居"删会把另一个证素展开出来的
+    东西也删掉——图上表现为"我明明没动那一支，它却少了一半"。"""
+    src = _graph_js()
+    body = src[src.index("function gbCollapseNode"):]
+    body = body[:body.index("\n}\n")]
+    assert "gbExpanded.get(nodeId)" in body
+    assert "some((ids) => ids.includes(id))" in body
+
+
+def test_the_layout_puts_the_hubs_on_the_inner_ring():
+    """环形布局，证素在内圈。
+
+    为什么不是 cose：cose 是力导向，摆出来的位置取决于连边的拉扯，
+    "谁是枢纽"在图上看不出来——而这张图的整个心智模型就是"从证素往外长"。
+
+    布局用 `preset` + 自己算位置，而不是 cytoscape 内置的 `concentric`：
+    concentric 不接受半径下限、扇形范围、椭圆，内圈枢纽会挤成中心一个点、
+    外圈的证型摊成整圆。
+    位置对不对由**纯函数判据**管（tests/test_ui_select_fill_and_rings.py 那一组），
+    这里只钉住"不是力导向、也不是随机摆"这件事。
+    """
+    src = _graph_js()
+    body = src[src.index("function gbRelayout"):]
+    body = body[:body.index("function gbRingLegendText")]
+    assert 'name: "preset"' in body
+    assert "gbLayoutPositions(" in body, "位置要由那个纯函数算，不是就地拍"
+    assert "gbHubIds.has(id)" in body, "内外圈按是不是枢纽来分"
+    # 节点太多时退回 grid：力导向/环形对上千节点都会卡住浏览器。
+    assert "GB_COSE_MAX_NODES" in body and '"grid"' in body
+
+
+def test_browse_by_category_is_offered_and_load_more_is_not():
+    """用「按门类浏览」，而不是「加载更多证型」。
+
+    「加载更多」回答的是"再给我一批"，而用户想问的是"脾的证型有哪些"。
+    翻页在一堆互不相连的证型上没有意义：翻到第 3 页看到的还是一堆孤立方块。"""
+    src = _graph_js()
+    assert "function gbBrowseCategory" in src
+    assert "gbLoadMoreSyndromes" not in src
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'id="gb-category-select"' in html
+    assert 'id="gb-more"' not in html
+
+
+def test_the_category_list_is_built_from_the_location_elements():
+    """门类 = 证候表的 `location` 字段（脾/胃/肝/肠/中焦……）。**图里已经有
+    这一层**：build_graph 把每个 location 建成一个 category="location" 的证素
+    节点。所以「按门类浏览」= 展开那个证素——复用同一条路径，不另写一套按门类
+    拉数据的逻辑（docs/ARCHITECTURE.md §4）。"""
+    src = _graph_js()
+    body = src[src.index("function populateGbCategorySelect"):]
+    body = body[:body.index("async function gbBrowseCategory")]
+    assert 'n.data.category !== "location"' in body
+    expand = src[src.index("async function gbBrowseCategory"):]
+    expand = expand[:expand.index("function renderGbLambda1Note")]
+    assert "gbExpandNode(elementId)" in expand
+
+
+def test_the_category_select_hides_itself_when_there_is_nothing_to_browse():
+    """一个门类都没有时藏起来，不留一个只有默认提示项的空下拉——那是点了没反应的
+    控件，跟"切换到医案层"按钮在没有医案层时藏起来是同一条理由。"""
+    src = _graph_js()
+    assert "sel.hidden = sel.options.length <= 1;" in src
+
+
+def test_search_goes_to_the_server_and_reports_the_total():
+    """搜索走服务端：本地只有已加载的那部分，在本地搜等于"只在画布上已经有的
+    东西里找"——搜不到的时候用户会以为图里没有，其实是没搜过。"""
+    src = _graph_js()
+    body = src[src.index("async function gbSearch"):]
+    body = body[:body.index("async function gbToggleLayer")]
+    assert "/api/graph/search?q=" in body
+    assert "找到 ${page.total} 个匹配节点" in body
+    assert "gb-search-hit" in body and "fit:" in body

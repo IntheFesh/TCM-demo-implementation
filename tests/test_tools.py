@@ -1,0 +1,1003 @@
+"""工具层的离线测试。不需要网络、不需要 API key、秒级跑完——工具层是
+确定性的，这一点本身就是设计约束（见 core/tools.py 模块文档字符串）。
+
+医案三元组由离线管线生成、不进版本控制，对应的用例用合成数据（tmp_path +
+monkeypatch 路径）覆盖代码路径：读文件、按医家过滤、按症状匹配、带 source_span
+返回。这四条路径跟真实数据长什么样无关。
+"""
+import json
+
+import pytest
+
+from core import tools
+from core.graph.store import NetworkXStore
+from core.tools import (
+    MIN_INFORMATION_GAIN,
+    is_safety_relevant,
+    SHIWEN_QUESTIONS,
+    TOOLS,
+    ask_user,
+    check_residual,
+    lookup_standard,
+    phrase_question,
+    query_case_graph,
+    query_graph,
+    question_candidates,
+    run_tool,
+    syndrome_posterior,
+    tools_manifest,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_caches():
+    tools.reset_tool_caches()
+    yield
+    tools.reset_tool_caches()
+
+
+# ---------- 注册表本身 ----------
+
+def test_tools_registry_shape():
+    # query_materia_medica 是药理层工具（查本草三元组）；注册表的工具集合是固定的。
+    assert set(TOOLS) == {
+        "query_graph", "query_case_graph", "search_cases",
+        "lookup_standard", "check_residual", "query_materia_medica", "ask_user",
+    }
+    for key, spec in TOOLS.items():
+        assert spec.name == key, "注册表的 key 必须等于 ToolSpec.name，否则模型按名字调不到"
+        assert spec.description.strip()
+        assert callable(spec.fn)
+
+
+def test_tools_manifest_carries_parameters():
+    manifest = {m["name"]: m for m in tools_manifest()}
+    assert len(manifest) == len(TOOLS)
+    props = manifest["query_graph"]["parameters"]["properties"]
+    assert "node" in props and "edge_type" in props
+
+
+def test_description_defined_only_in_registry():
+    """工具描述只在 TOOLS 里定义一次。prompt 侧一旦手抄一份，模型看到的和代码
+    里的就会分叉——这条钉住"prompt 里的工具清单由 tools_manifest() 渲染"。"""
+    from pathlib import Path
+
+    prompts_dir = Path(__file__).resolve().parent.parent / "prompts"
+    for yaml_file in prompts_dir.rglob("*.yaml"):
+        text = yaml_file.read_text(encoding="utf-8")
+        for spec in TOOLS.values():
+            assert spec.description not in text, f"{yaml_file.name} 手抄了 {spec.name} 的描述"
+
+
+# ---------- run_tool 的参数校验 ----------
+
+def test_run_tool_unknown_name():
+    out = run_tool("nonexistent_tool", {})
+    assert "error" in out
+    assert "query_graph" in out["available_tools"]
+
+
+def test_run_tool_non_dict_args():
+    assert "error" in run_tool("query_graph", ["口苦"])
+
+
+@pytest.mark.parametrize("name,bad_args", [
+    ("query_graph", {}),                                  # 缺必填 node
+    ("query_graph", {"node": ""}),                        # min_length=1
+    ("query_graph", {"node": "口苦", "limit": 0}),         # ge=1
+    ("query_graph", {"node": "口苦", "limit": 999}),       # le=200
+    ("search_cases", {"query": "胃痛"}),                   # 缺 physician
+    ("search_cases", {"query": "胃痛", "physician": "ye_tianshi", "k": 99}),
+    ("lookup_standard", {}),
+    ("lookup_standard", {"query": ""}),
+    ("check_residual", {"symptoms": []}),                 # min_length=1
+    ("check_residual", {}),
+    ("ask_user", {"question": "有没有口苦？"}),             # 缺 reason
+    ("ask_user", {"question": "", "reason": "分不开"}),
+    ("query_case_graph", {"limit": -1}),
+])
+def test_run_tool_rejects_bad_args_without_raising(name, bad_args):
+    out = run_tool(name, bad_args)
+    assert "error" in out, f"{name} 收到非法参数 {bad_args} 应该返回 error 而不是正常结果"
+    assert "expected_parameters" in out
+
+
+def test_run_tool_happy_path_returns_result_not_error():
+    out = run_tool("ask_user", {"question": "有没有口苦？", "reason": "分不开湿热与虚寒"})
+    assert out["terminate"] is True
+
+
+# ---------- query_graph ----------
+
+def test_query_graph_missing_node_returns_empty():
+    out = query_graph("这个症状图里绝对没有")
+    assert out["found"] is False
+    assert out["neighbors"] == []
+    assert out["near_matches"] == []
+
+
+def test_query_graph_missing_node_suggests_near_matches():
+    """模型查「口苦」查不到就会放弃，而图里有「口干或口苦」。
+    只回一句"没有这个节点"会把它逼进死胡同，必须给出可以重查的近似名。
+
+    这里故意不直接用"口苦"当 query：「口苦」本身是图里
+    一个独立的标准症状节点（教材原文把它拆成了单字症状，它不只藏在
+    「口干或口苦」这个并列名里），"口苦"精确查得到，测不出 near_matches
+    这条兜底路径。换成患者口语里常见的带垫词写法（"总是觉得口苦"）——
+    这种口语化整句几乎不可能精确等于某个标准症状名，但仍然按片段包含
+    「口苦」，能稳定触发同一条近似匹配逻辑，不会随词表继续扩表又被撞穿。"""
+    out = query_graph("总是觉得口苦")
+    assert out["found"] is False
+    assert "口干或口苦" in out["near_matches"]
+    assert "near_matches" in out["note"]
+    # 给出来的名字必须真的能查到，否则等于换个地方把模型带死
+    assert query_graph(out["near_matches"][0])["found"] is True
+
+
+def test_query_graph_symptom_returns_indicates_out_edges():
+    out = query_graph("两胁胀满")
+    assert out["found"] is True
+    assert out["node_type"] == "symptom"
+    kinds = {n["edge_type"] for n in out["neighbors"]}
+    assert kinds == {"indicates"}
+    assert {n["name"] for n in out["neighbors"]} >= {"肝", "胃", "气滞"}
+    assert all(n["weight"] is not None for n in out["neighbors"])
+
+
+def test_query_graph_syndrome_needs_in_edges():
+    """证候节点没有出边（composes 是 element->syndrome）。只返回出边的话
+    「这个证候由哪些证素构成」永远是空——这正是 in_neighbors 存在的理由。"""
+    out = query_graph("肝胃不和证")
+    assert out["found"] is True
+    composes = [n for n in out["neighbors"] if n["edge_type"] == "composes"]
+    assert {n["name"] for n in composes} == {"肝", "胃", "气滞"}
+    assert all(n["direction"] == "in" for n in composes)
+
+
+def test_query_graph_accepts_raw_node_id():
+    assert query_graph("element::脾")["found"] is True
+
+
+def test_query_graph_edge_type_filter():
+    out = query_graph("肝胃不和证", edge_type="indicates")
+    assert out["neighbors"] == []
+
+
+def test_query_graph_limit_truncates_but_reports_total():
+    out = query_graph("element::脾", limit=2)
+    assert len(out["neighbors"]) == 2
+    assert out["total_neighbors"] > 2
+
+
+def test_query_graph_physician_selects_weight():
+    out = query_graph("两胁胀满", physician="ye_tianshi")
+    assert all(isinstance(n["weight"], float) for n in out["neighbors"])
+
+
+# ---------- query_case_graph（合成数据） ----------
+
+TRIPLES = [
+    {"case_id": "ye_tianshi-0001-p1-0", "physician": "ye_tianshi",
+     "s": "患者", "p": "表现为", "o": "脘痛", "source_span": "脘痛不食，脉弦。"},
+    {"case_id": "ye_tianshi-0001-p1-0", "physician": "ye_tianshi",
+     "s": "脘痛", "p": "治以", "o": "疏肝和胃", "source_span": "此肝木犯胃，宜苦辛通降。"},
+    {"case_id": "wu_jutong-0002-p1-0", "physician": "wu_jutong",
+     "s": "患者", "p": "表现为", "o": "脘痛", "source_span": "胃痛甚，喜按。"},
+    {"case_id": "wu_jutong-0002-p1-0", "physician": "wu_jutong",
+     "s": "疏肝和胃", "p": "用药", "o": "柴胡", "source_span": "柴胡三钱。"},
+]
+
+
+@pytest.fixture
+def triples_file(tmp_path, monkeypatch):
+    path = tmp_path / "case_triples.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(t, ensure_ascii=False) for t in TRIPLES) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools, "CASE_TRIPLES_PATH", path)
+    tools.reset_tool_caches()
+    return path
+
+
+def test_query_case_graph_missing_file_is_not_an_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, "CASE_TRIPLES_PATH", tmp_path / "nope.jsonl")
+    tools.reset_tool_caches()
+    out = query_case_graph(symptom="脘痛")
+    assert out["available"] is False
+    assert out["triples"] == []
+    assert "offline/extract_case_triples.py" in out["note"]
+
+
+def test_query_case_graph_reads_file(triples_file):
+    out = query_case_graph()
+    assert out["available"] is True
+    assert out["total_matched"] == 4
+
+
+def test_query_case_graph_filters_by_physician(triples_file):
+    out = query_case_graph(physician="wu_jutong")
+    assert out["total_matched"] == 2
+    assert {t["physician"] for t in out["triples"]} == {"wu_jutong"}
+
+
+def test_query_case_graph_matches_symptom_in_subject_or_object(triples_file):
+    out = query_case_graph(symptom="脘痛")
+    assert out["total_matched"] == 3  # 两条宾语命中 + 一条主语命中
+
+
+def test_query_case_graph_matches_modern_phrasing_against_classical_case_text(triples_file):
+    """医案三元组存的是原文古文简写「脘痛」，患者/S1
+    normalize 用的是现代标准说法「胃脘胀痛」——两个词面上没有公共子串
+    （胃脘胀痛 ≠ 脘痛 的任何连续片段），字面双向包含/并列拆分都够不到。
+    core.syndrome_norm.SYNONYMS 已经把「胃脘胀痛」和「脘痛」都归到同一个
+    canonical 概念"胃痛"，_symptom_text_matches 字面匹配失败后兜底查这张表，
+    两种说法应该查到同样的 3 条。"""
+    out = query_case_graph(symptom="胃脘胀痛")
+    assert out["total_matched"] == 3
+    assert out["total_matched"] == query_case_graph(symptom="脘痛")["total_matched"]
+
+
+def test_query_case_graph_does_not_over_match_unrelated_symptoms(triples_file):
+    """兜底走 SYNONYMS 不能变成"什么都匹配"——跟"脘痛"完全不相关、也没有
+    登记在 SYNONYMS 里的症状词依然应该查不到任何三元组。"""
+    out = query_case_graph(symptom="嗳气")
+    assert out["total_matched"] == 0
+
+
+def test_query_case_graph_returns_source_span(triples_file):
+    out = query_case_graph(symptom="脘痛", physician="ye_tianshi")
+    assert all(t["source_span"] for t in out["triples"]), \
+        "source_span 是「这条结论出自原文哪一句」的唯一凭据，不能丢"
+    assert out["triples"][0]["source_span"].startswith("脘痛不食")
+
+
+def test_query_case_graph_predicate_and_case_id_filters(triples_file):
+    assert query_case_graph(predicate="用药")["total_matched"] == 1
+    assert query_case_graph(case_id="ye_tianshi-0001-p1-0")["total_matched"] == 2
+
+
+def test_query_case_graph_limit(triples_file):
+    out = query_case_graph(limit=1)
+    assert len(out["triples"]) == 1
+    assert out["total_matched"] == 4
+
+
+def test_query_case_graph_survives_bad_lines(tmp_path, monkeypatch):
+    """三元组文件是机器生成的，一行坏了不该让整个工具不可用。"""
+    path = tmp_path / "case_triples.jsonl"
+    path.write_text(
+        json.dumps(TRIPLES[0], ensure_ascii=False) + "\n{ 这不是 json\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools, "CASE_TRIPLES_PATH", path)
+    tools.reset_tool_caches()
+    out = query_case_graph()
+    assert out["available"] is True
+    assert out["total_matched"] == 1
+    assert "无法解析" in out["note"]
+
+
+# ---------- search_cases ----------
+
+def test_search_cases_without_corpus_is_unavailable_not_crash(monkeypatch):
+    """检索器不可用要变成 available=false，不能崩。用 monkeypatch 固定这个条件：
+    直接调 get_retriever() 的话，结果取决于当前机器上有没有 cases.json——有就会
+    真的建出检索器，测不到"不可用"这条分支。"""
+    import core.retrieval as retrieval
+
+    def _no_corpus():
+        raise FileNotFoundError("未找到 cases.json。请先运行 offline.extract_cases")
+
+    monkeypatch.setattr(retrieval, "get_retriever", _no_corpus)
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
+    assert out["available"] is False
+    assert "cases.json" in out["note"]
+
+
+def test_search_cases_description_warns_score_is_dense_only():
+    """search_cases 返回给模型的 score 字段是稠密相似度
+    （core/retrieval.py::_case_to_text 那一路），不是最终排序依据——hybrid 模式下
+    一条医案可能因为 BM25 精确匹配关键词而排到前面，score 却很低。ReAct 的
+    observation 是这个返回值原样 json.dumps 进 S3 prompt
+    （core/react.py::_observation_text），模型看得到这个数字；没有提示的话，
+    容易被误导成"score 低 = 这条不相关"而漏掉一条真实有用的先例。所以工具描述
+    要把"score 低不代表不相关"说清楚：只改模型读到的说明文字，不改返回值的形状。"""
+    manifest = {m["name"]: m for m in tools_manifest()}
+    description = manifest["search_cases"]["description"]
+    assert "score" in description
+    assert "不代表" in description or "不是最终排序依据" in description
+
+
+def test_search_cases_does_not_waste_an_adaptive_min_score_probe(monkeypatch):
+    """search_cases 从不显式传 mode 给 adaptive_min_score/retriever.search()
+    （core/tools.py 里这两次调用都没有 mode 关键字），这跟
+    core/chain.py::_search_cases 默认路径同理，该跳过探测；这条测试钉住这一点。"""
+    import core.retrieval as retrieval
+
+    class _CountingRetriever(retrieval.Retriever):
+        def __init__(self):
+            self.call_count = 0
+
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            self.call_count += 1
+            return []
+
+    r = _CountingRetriever()
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: r)
+
+    run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
+
+    assert r.call_count == 1, "不该多出一次探测调用——search_cases 从不请求 dense 模式"
+
+
+# ---------- physician 参数填中文名也要能查到（唯一解析入口） ----------
+#
+# 模型填 'physician': '叶天士'，而医案库按 id（ye_tianshi）存：如果医案层工具
+# 不解析，调用会全部静默返回空——工具没报错、结构合法、available:true，
+# 对着"静默空返回"写的测试全是绿的（docs/ARCHITECTURE.md §5）。这组测试用合成
+# 数据钉住：physician 存 id、工具传中文名、返回必须非空；解析失败要报
+# error 不是静默空；空返回的三种情况分开。
+
+
+def test_query_case_graph_accepts_chinese_physician_name(triples_file):
+    out = query_case_graph(physician="叶天士")
+    assert out["available"] is True
+    assert out["total_matched"] == 2
+    assert {t["physician"] for t in out["triples"]} == {"ye_tianshi"}
+    assert "error" not in out
+
+
+def test_query_case_graph_unknown_physician_returns_error_not_silent_empty(triples_file):
+    from core.physicians import PHYSICIANS
+
+    out = query_case_graph(physician="华佗")
+    assert out["available"] is True
+    assert out["triples"] == []
+    assert "华佗" in out["error"]
+    for pid, info in PHYSICIANS.items():  # 报错必须列出可用值，模型才能自我纠正
+        assert f"{pid}({info['name']})" in out["error"]
+
+
+def test_query_case_graph_no_match_reports_scanned_count(triples_file):
+    """数据在、确实没匹配（三种"空"里的第三种）：note 里的"已查 N 条"告诉模型
+    确实查了、不是没查。N 是过了 physician 过滤之后的条数——wu_jutong 在合成数据里有 2 条。"""
+    out = query_case_graph(symptom="不存在的症状", physician="wu_jutong")
+    assert out["available"] is True
+    assert out["triples"] == []
+    assert "error" not in out
+    assert "已查 2 条三元组" in out["note"]
+
+
+def test_search_cases_accepts_chinese_physician_name(monkeypatch):
+    """检索器只认 id：工具传中文名，到检索器那里必须已经是 ye_tianshi。"""
+    import core.retrieval as retrieval
+    from core.schemas import CaseRecord
+
+    seen = []
+
+    class _R(retrieval.Retriever):
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            seen.append(physician)
+            if physician != "ye_tianshi":
+                return []
+            return [(CaseRecord(case_id="ye_tianshi-0001-p1-0", case_group_id="g",
+                                physician="ye_tianshi", raw="原文", symptoms=["胃脘胀痛"]), 0.9)]
+
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: _R())
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "叶天士"})
+    assert seen == ["ye_tianshi"]
+    assert out["available"] is True
+    assert [c["case_id"] for c in out["cases"]] == ["ye_tianshi-0001-p1-0"]
+
+
+def test_search_cases_unknown_physician_returns_error_before_touching_retriever(monkeypatch):
+    import core.retrieval as retrieval
+
+    def _must_not_be_called():
+        raise AssertionError("physician 解析失败时不该去碰检索器")
+
+    monkeypatch.setattr(retrieval, "get_retriever", _must_not_be_called)
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "华佗"})
+    assert out["available"] is True
+    assert out["cases"] == []
+    assert "华佗" in out["error"] and "ye_tianshi(叶天士)" in out["error"]
+
+
+def test_search_cases_no_hit_reports_scanned_count(monkeypatch):
+    import core.retrieval as retrieval
+
+    class _R(retrieval.Retriever):
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            return []
+
+        def case_count(self, physician):
+            return 495
+
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: _R())
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
+    assert out["available"] is True and out["cases"] == [] and "error" not in out
+    assert "已查 495 条医案" in out["note"]
+
+
+def test_search_cases_no_hit_with_unknown_count_says_unknown_not_a_made_up_number(monkeypatch):
+    """假检索器（Retriever 基类默认 case_count=None）不知道条数——老实说未知，
+    不编一个 0 或别的数进 note。"""
+    import core.retrieval as retrieval
+
+    class _R(retrieval.Retriever):
+        def search(self, query, physician, k=3, min_score=0.0, **kwargs):
+            return []
+
+    monkeypatch.setattr(retrieval, "get_retriever", lambda: _R())
+    out = run_tool("search_cases", {"query": "胃脘胀痛", "physician": "ye_tianshi"})
+    assert "条数未知" in out["note"]
+    assert "已查 0 条" not in out["note"]
+
+
+def test_case_layer_tool_descriptions_say_id_and_list_every_registered_physician():
+    """两个医案层工具的 physician 参数描述从 PHYSICIANS 动态生成，不写死某几位
+    医家：注册表里有哪些医家就列哪些，而且要说填 id、不是中文名。"""
+    from core.physicians import PHYSICIANS
+
+    manifest = {m["name"]: m for m in tools_manifest()}
+    for tool in ("search_cases", "query_case_graph"):
+        desc = manifest[tool]["parameters"]["properties"]["physician"]["description"]
+        assert "id" in desc and "不是中文名" in desc, tool
+        for pid, info in PHYSICIANS.items():
+            assert pid in desc and info["name"] in desc, f"{tool} 的描述漏了 {pid}"
+
+
+# ---------- query_materia_medica（合成数据） ----------
+
+MATERIA_MEDICA = [
+    {"s": "黄芪", "p": "性味", "o": "甘，微温", "source_span": "甘，微温。", "source": "modern", "book": "中药学"},
+    {"s": "黄芪", "p": "性味", "o": "味甘微温", "source_span": "味甘微温", "source": "classic", "book": "神农本草经"},
+    {"s": "黄芪", "p": "用量", "o": "9～30g", "source_span": "9～30g。", "source": "modern", "book": "中药学"},
+    {"s": "甘草", "p": "禁忌", "o": "反海藻", "source_span": "反海藻", "source": "modern", "book": "中药学"},
+]
+
+
+@pytest.fixture
+def materia_medica_file(tmp_path, monkeypatch):
+    path = tmp_path / "materia_medica.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(t, ensure_ascii=False) for t in MATERIA_MEDICA) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools, "MATERIA_MEDICA_PATH", path)
+    tools.reset_tool_caches()
+    return path
+
+
+def test_query_materia_medica_missing_file_is_unavailable_not_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, "MATERIA_MEDICA_PATH", tmp_path / "nope.jsonl")
+    tools.reset_tool_caches()
+    out = run_tool("query_materia_medica", {"herb": "黄芪"})
+    assert out["available"] is False and out["triples"] == []
+    assert "extract_materia_medica" in out["note"]
+
+
+def test_query_materia_medica_normalizes_herb_and_keeps_classic_and_modern_apart(materia_medica_file):
+    out = run_tool("query_materia_medica", {"herb": "炙黄芪三钱"})  # 炮制前缀+剂量归一后 = 黄芪
+    assert out["available"] is True and out["herb"] == "黄芪"
+    assert out["total_matched"] == 3
+    assert {(t["source"], t["book"]) for t in out["triples"]} == {("modern", "中药学"), ("classic", "神农本草经")}
+    assert all(t["source_span"] for t in out["triples"])  # 出处原样带出
+
+    classic_only = run_tool("query_materia_medica", {"herb": "黄芪", "source": "classic"})
+    assert [t["o"] for t in classic_only["triples"]] == ["味甘微温"]
+    dose_only = run_tool("query_materia_medica", {"herb": "黄芪", "predicate": "用量"})
+    assert [t["o"] for t in dose_only["triples"]] == ["9～30g"]
+
+
+def test_query_materia_medica_no_match_reports_scanned_count(materia_medica_file):
+    out = run_tool("query_materia_medica", {"herb": "人参", "source": "modern"})
+    assert out["available"] is True and out["triples"] == [] and "error" not in out
+    assert "已查 3 条三元组" in out["note"]  # modern 一共 3 条
+
+
+def test_query_materia_medica_rejects_out_of_vocabulary_predicate_and_source(materia_medica_file):
+    assert "error" in run_tool("query_materia_medica", {"herb": "黄芪", "predicate": "别名"})
+    assert "error" in run_tool("query_materia_medica", {"herb": "黄芪", "source": "ancient"})
+
+
+def test_query_materia_medica_description_is_registered_and_mentions_sources():
+    manifest = {m["name"]: m for m in tools_manifest()}
+    desc = manifest["query_materia_medica"]["description"]
+    assert "classic" in desc and "modern" in desc and "source_span" in desc
+
+
+# ---------- lookup_standard ----------
+
+def test_lookup_standard_by_code_and_name():
+    assert lookup_standard("SP-01")["definition"]["name"] == "肝胃不和证"
+    assert lookup_standard("肝胃不和证")["definition"]["code"] == "SP-01"
+
+
+def test_lookup_standard_partial_unique_match():
+    # 用"脾虚气滞"举例：它是 SP-02，词表继续扩表也不太可能长出另一个包含这四个字的
+    # 证候名。"胃阴虚"不行——SP-09「胃阴虚证」和 TB-285「脾胃阴虚证」都含这个子串，
+    # partial match 不唯一，测的就变成"歧义"了。
+    out = lookup_standard("脾虚气滞")
+    assert out["found"] is True
+    assert out["definition"]["name"] == "脾虚气滞证"
+
+
+def test_lookup_standard_not_found_lists_candidates():
+    # 候选数不写死：证候表会继续扩充，所以从同一份数据源动态取数
+    # （测试不能跟词表规模耦合）。
+    expected_total = len(tools._load_standard())
+    out = lookup_standard("完全不存在的证")
+    assert out["found"] is False
+    assert len(out["candidates"]) == expected_total
+    # 结构化对象，不是拼好的 "SP-01 肝胃不和证" 字符串——模型拿到拼好的
+    # 字符串会把整串当 query 传回来，然后查不到，白烧一步。
+    assert out["candidates"][0] == {"code": "SP-01", "name": "肝胃不和证"}
+    assert "不要把两个拼在一起" in out["hint"]
+
+
+@pytest.mark.parametrize("q", ["SP-01 肝胃不和证", "SP-01肝胃不和证", "肝胃不和证（SP-01）"])
+def test_lookup_standard_accepts_code_plus_name(q):
+    """模型照抄 candidates 回传是最可能的下一步动作，两头都要堵上。"""
+    assert lookup_standard(q)["definition"]["code"] == "SP-01"
+
+
+# ---------- check_residual ----------
+
+def test_check_residual_splits_explained_and_unexplained():
+    # 用"手足心热"举例：单一匹配、只指向 胃/阴虚，不跟肝/气滞沾边，不受子串碰撞
+    # 影响。"大便干结"不行——图里有一个独立节点"大便干"，恰好是它的字面前缀，
+    # 片段匹配器会把两者的 indicates 目标都算进来，"大便干"那条边指向肝/气滞，
+    # "大便干结"就被误判成已解释。
+    out = check_residual(["两胁胀满", "手足心热"], ["肝", "气滞"])
+    assert out["explained"] == ["两胁胀满"]
+    assert out["unexplained"] == ["手足心热"]
+    assert out["coverage"] == 0.5
+
+
+def test_check_residual_off_graph_not_counted_as_unexplained():
+    """图里查无此症 ≠ 没被证素解释。混为一谈会把覆盖率算成假数。"""
+    out = check_residual(["两胁胀满", "夜寐多梦纷纭"], ["肝"])
+    assert out["off_graph"] == ["夜寐多梦纷纭"]
+    assert out["unexplained"] == []
+    assert out["coverage"] == 1.0
+    assert out["coverage_denominator"] == 1
+
+
+def test_check_residual_no_elements_explains_nothing():
+    out = check_residual(["两胁胀满"], [])
+    assert out["explained"] == []
+    assert out["coverage"] == 0.0
+
+
+def test_check_residual_all_off_graph_gives_none_coverage():
+    out = check_residual(["完全不着边的一句话"], ["肝"])
+    assert out["coverage"] is None
+
+
+def test_check_residual_matches_symptom_fragment():
+    """患者说「胃脘胀满」，标准症状名是「胃脘胀满或疼痛」——不做片段匹配就对不上。"""
+    out = check_residual(["胃脘胀满"], ["肝"])
+    assert out["explained"] == ["胃脘胀满"]
+
+
+# ---------- ask_user ----------
+
+def test_ask_user_terminate_marker():
+    out = ask_user("有没有口苦？", "湿热与虚寒分不开")
+    assert out["terminate"] is True
+    assert out["question"] == "有没有口苦？"
+    assert out["reason"]
+
+
+def test_only_ask_user_terminates():
+    """终止标记只能由 ask_user 给出。别的工具意外带上 terminate，
+    ReAct 循环会在还没查完的时候提前停。"""
+    assert query_graph("两胁胀满").get("terminate") is None
+    assert check_residual(["两胁胀满"], ["肝"]).get("terminate") is None
+    assert lookup_standard("SP-01").get("terminate") is None
+
+
+# ---------- 提问措辞 ----------
+
+@pytest.mark.parametrize("symptom,expected", [
+    ("口臭", "有没有口臭？"),
+    ("胃脘胀满或疼痛", "有没有胃脘胀满或疼痛？"),
+    ("每因情志不畅而发作或加重", "是否每因情志不畅而发作或加重？"),
+    ("腹痛即泻，泻后痛减", "是否腹痛即泻，泻后痛减？"),
+    ("腹部积块质软不坚，固定不移", "有没有这样的表现：腹部积块质软不坚，固定不移？"),
+])
+def test_phrase_question(symptom, expected):
+    assert phrase_question(symptom) == expected
+
+
+# ---------- 后验与信息增益 ----------
+
+def _synthetic_store() -> NetworkXStore:
+    """三个证候的小图，用来钉住信息增益的数学性质，不受真实数据变动影响。
+
+      X 证：证素 {甲}，主症 s_x（只有它有）
+      Y 证：证素 {甲}，主症 s_y（只有它有）
+      Z 证：证素 {乙}，主症 s_z
+      s_all：三个证候都列为主症
+    """
+    store = NetworkXStore()
+    for code, elems, syms in [
+        ("X", ["甲"], ["s_x", "s_all"]),
+        ("Y", ["甲"], ["s_y", "s_all"]),
+        ("Z", ["乙"], ["s_z", "s_all"]),
+    ]:
+        syn_id = f"syndrome::{code}"
+        store.add_node(syn_id, node_type="syndrome", name=f"{code}证", code=code,
+                       is_category=False)
+        for e in elems:
+            store.add_node(f"element::{e}", node_type="element", name=e)
+            store.add_edge(f"element::{e}", syn_id, edge_type="composes", source="manual")
+        for s in syms:
+            store.add_node(f"symptom::{s}", node_type="symptom", name=s)
+            for e in elems:
+                store.add_edge(
+                    f"symptom::{s}", f"element::{e}",
+                    edge_key=f"indicates::{code}", edge_type="indicates",
+                    source="manual", via_syndrome=code, is_cardinal=True,
+                    weight_by_physician={"ye_tianshi": 1.0, "wu_jutong": 1.0},
+                )
+    return store
+
+
+def test_posterior_uniform_without_elements():
+    post = syndrome_posterior([], _synthetic_store())
+    assert set(post) == {"X", "Y", "Z"}
+    assert all(abs(p - 1 / 3) < 1e-9 for p in post.values())
+
+
+def test_posterior_concentrates_on_matching_elements():
+    post = syndrome_posterior(["甲"], _synthetic_store())
+    assert post["X"] == pytest.approx(post["Y"])
+    assert post["X"] > post["Z"]
+
+
+def test_posterior_does_not_penalise_unobserved_elements():
+    """追问阶段信息本来就不全，「该证候还要求一个我还没问到的证素」不该扣分——
+    那个证素正是接下来要问出来的东西。"""
+    store = NetworkXStore()
+    store.add_node("syndrome::A", node_type="syndrome", name="A证", code="A", is_category=False)
+    store.add_node("syndrome::B", node_type="syndrome", name="B证", code="B", is_category=False)
+    for e, syn in [("甲", "A"), ("甲", "B"), ("乙", "B")]:
+        store.add_node(f"element::{e}", node_type="element", name=e)
+        store.add_edge(f"element::{e}", f"syndrome::{syn}", edge_type="composes", source="manual")
+    post = syndrome_posterior(["甲"], store)
+    assert post["A"] == pytest.approx(post["B"])
+
+
+def test_ig_prefers_discriminating_symptom_over_universal_one():
+    """s_all 三个证候都有 -> 答案不改变后验 -> 增益应当约等于 0，被过滤掉；
+    s_x 只有 X 证有 -> 能真正分叉。"""
+    out = question_candidates([], _synthetic_store(), k=5)
+    symptoms = [c["symptom"] for c in out]
+    assert "s_all" not in symptoms
+    assert set(symptoms) == {"s_x", "s_y", "s_z"}
+
+
+def test_ig_is_higher_when_question_splits_the_live_hypotheses():
+    """已知证素「甲」把后验压到 X/Y 两个证候上。此时 s_x 能把它们分开，
+    s_z 指向的 Z 证已经几乎不可能——前者的增益必须严格更高。"""
+    store = _synthetic_store()
+    out = {c["symptom"]: c["information_gain"] for c in question_candidates(["甲"], store, k=5)}
+    assert out["s_x"] > out["s_z"]
+
+
+def test_prior_entropy_drops_as_elements_accumulate():
+    """证素越多，"到底是哪个证候"的不确定性越小。
+
+    注意不能顺手断言"最高信息增益也随之下降"——那不成立：均匀分布在 3 个证候上
+    时（H=1.585 bit）最好的二元问题只能切出 1:2 的不平衡划分（增益 0.65），
+    收缩到 2 个证候后（H≈1.06 bit）同一个问题切的是接近 1:1 的划分（增益 0.71），
+    反而更高。二元问题的增益上限是 1 bit，跟先验熵不是同向关系。"""
+    store = _synthetic_store()
+    assert question_candidates([], store, k=1)[0]["prior_entropy"] > \
+        question_candidates(["甲"], store, k=1)[0]["prior_entropy"]
+
+
+def test_ig_never_exceeds_its_upper_bounds():
+    """真正的单调性约束：一个二元问题的信息增益不可能超过先验熵，也不可能
+    超过 1 bit（答案只有"有/没有"两种）。任何一条被违反都说明公式写错了。"""
+    for elements in ([], ["甲"], ["肝", "胃", "气滞"]):
+        store = _synthetic_store() if elements != ["肝", "胃", "气滞"] else None
+        for c in question_candidates(elements, store, k=10):
+            if c["source"] != "graph_ig":
+                continue
+            assert 0 < c["information_gain"] <= min(c["prior_entropy"], 1.0) + 1e-9
+
+
+def test_yes_and_no_branches_point_to_different_syndromes():
+    top = question_candidates(["甲"], _synthetic_store(), k=1)[0]
+    assert top["if_yes_top"] != top["if_no_top"], "分不了叉的问题不该排在第一"
+
+
+def test_candidates_respect_k_and_are_sorted():
+    out = question_candidates([], _synthetic_store(), k=2)
+    assert len(out) == 2
+    assert out[0]["information_gain"] >= out[1]["information_gain"]
+
+
+def test_known_and_asked_symptoms_are_excluded():
+    store = _synthetic_store()
+    assert "s_x" not in [c["symptom"] for c in question_candidates([], store, k=5,
+                                                                  known_symptoms=["s_x"])]
+    assert "s_y" not in [c["symptom"] for c in question_candidates([], store, k=5,
+                                                                   asked=["s_y"])]
+
+
+def test_known_symptom_substring_also_excluded():
+    """患者说「胃脘胀满」，就不该再问「有没有胃脘胀满或疼痛？」。"""
+    out = question_candidates(["肝", "胃", "气滞"], k=5, known_symptoms=["胃脘胀满"])
+    assert "胃脘胀满或疼痛" not in [c["symptom"] for c in out]
+
+
+def test_safety_relevant_flag_uses_the_safety_layer():
+    """一旦患者答"有"就会触发 S2 之前安全否决的问题，必须被标出来——追问的
+    回答要先跑 check_safety 再更新后验，不能当成普通症状喂回去
+    （docs/ARCHITECTURE.md §3）。判据复用 core/safety.py 的表，这里只钉住
+    "确实被标出来了"。"""
+    assert is_safety_relevant("吐血色红或紫黯，常夹食物残渣") is True
+    assert is_safety_relevant("便血") is True
+    assert is_safety_relevant("口干或口苦") is False
+
+    out = question_candidates(["胃", "阴虚", "津伤", "热"], k=5)
+    flags = {c["symptom"]: c["safety_relevant"] for c in out if c["source"] == "graph_ig"}
+    assert any(flags.values()), "胃热壅盛证的吐血主症应当进候选并被标为安全相关"
+    assert not all(flags.values())
+
+
+def test_fallback_entries_carry_no_safety_flag_key_confusion():
+    """后备条目没有对应的标准症状，safety_relevant 也就无从谈起——
+    保持 graph_ig 分支独有，避免下游拿一个恒为 False 的假字段做判断。"""
+    out = question_candidates([], None, k=1)
+    assert "safety_relevant" not in out[0] or out[0].get("symptom") is not None
+
+
+def test_known_symptom_exclusion_reuses_residual_matcher():
+    """排除已知症状和 check_residual 用的是同一个片段匹配器。同一个模块里两套
+    "这条症状算不算已经知道了"的判断迟早分叉，所以这条钉住它们一致。"""
+    known = ["大便溏薄"]
+    excluded = {c["symptom"] for c in question_candidates(["脾", "气虚", "湿"], k=20,
+                                                          known_symptoms=known)}
+    matched = {
+        (tools.get_graph_store().get_node(i) or {}).get("name")
+        for i in tools._match_graph_symptoms(tools.get_graph_store(), "大便溏薄")
+    }
+    assert matched, "「大便溏薄」应当能匹配到图里的标准症状节点"
+    assert not (matched & excluded), f"匹配器认得的症状不该还出现在候选里：{matched & excluded}"
+
+
+def test_deterministic():
+    a = question_candidates(["肝", "胃", "气滞"], k=3)
+    b = question_candidates(["肝", "胃", "气滞"], k=3)
+    assert a == b
+
+
+# ---------- 十问歌后备的 5 条触发条件 ----------
+
+def _is_fallback(out):
+    return out and all(c["source"] == "shiwen_fallback" for c in out)
+
+
+def test_fallback_when_graph_missing(monkeypatch, tmp_path):
+    """触发条件 1：图谱文件不存在。"""
+    monkeypatch.setattr(tools, "GRAPH_PATH", tmp_path / "nope.json")
+    tools.reset_tool_caches()
+    out = question_candidates(["肝"], k=3)
+    assert _is_fallback(out)
+    assert "图谱不可用" in out[0]["fallback_reason"]
+
+
+def test_fallback_when_no_hypothesis_space():
+    """触发条件 2：图里没有非类目证候节点 / 没有 indicates 边。"""
+    store = NetworkXStore()
+    store.add_node("syndrome::C", node_type="syndrome", name="类目词", code="C",
+                   is_category=True)
+    out = question_candidates([], store, k=3)
+    assert _is_fallback(out)
+    assert "假设空间" in out[0]["fallback_reason"]
+
+
+def test_fallback_when_candidate_pool_exhausted():
+    """触发条件 3：图里的标准症状全部已问过或已由患者陈述。"""
+    store = _synthetic_store()
+    out = question_candidates([], store, k=3, asked=["s_x", "s_y", "s_z", "s_all"])
+    assert _is_fallback(out)
+    assert "已全部问过" in out[0]["fallback_reason"]
+
+
+def test_fallback_when_posterior_collapsed():
+    """触发条件 4：后验塌缩到单一证候，任何问题增益都是 0。"""
+    store = NetworkXStore()
+    store.add_node("syndrome::A", node_type="syndrome", name="A证", code="A", is_category=False)
+    store.add_node("element::甲", node_type="element", name="甲")
+    store.add_edge("element::甲", "syndrome::A", edge_type="composes", source="manual")
+    store.add_node("symptom::s1", node_type="symptom", name="s1")
+    store.add_edge("symptom::s1", "element::甲", edge_type="indicates", source="manual",
+                   via_syndrome="A", is_cardinal=True,
+                   weight_by_physician={"ye_tianshi": 1.0, "wu_jutong": 1.0})
+    out = question_candidates([], store, k=3)
+    assert _is_fallback(out)
+    assert "塌缩" in out[0]["fallback_reason"]
+
+
+def test_fallback_when_all_gains_are_zero():
+    """触发条件 5：候选证候的症状集合完全重合，图上区分不了它们。"""
+    store = NetworkXStore()
+    for code in ("A", "B"):
+        store.add_node(f"syndrome::{code}", node_type="syndrome", name=f"{code}证",
+                       code=code, is_category=False)
+        store.add_node("element::甲", node_type="element", name="甲")
+        store.add_edge("element::甲", f"syndrome::{code}", edge_type="composes", source="manual")
+        store.add_node("symptom::s1", node_type="symptom", name="s1")
+        store.add_edge("symptom::s1", "element::甲", edge_key=f"indicates::{code}",
+                       edge_type="indicates", source="manual",
+                       via_syndrome=code, is_cardinal=True,
+                       weight_by_physician={"ye_tianshi": 1.0, "wu_jutong": 1.0})
+    out = question_candidates([], store, k=3)
+    assert _is_fallback(out)
+    assert "约等于 0" in out[0]["fallback_reason"]
+
+
+def test_fallback_follows_shiwen_order_and_skips_asked_topics(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, "GRAPH_PATH", tmp_path / "nope.json")
+    tools.reset_tool_caches()
+    out = question_candidates([], None, k=3, asked=["寒热"])
+    assert [c["topic"] for c in out] == ["汗", "头身", "二便"]
+    assert [t for t, _ in SHIWEN_QUESTIONS][:2] == ["寒热", "汗"]
+
+
+def test_fallback_entries_have_no_fake_numbers(monkeypatch, tmp_path):
+    """后备问题没有信息增益可言，必须留 None——填一个假数比不填危害大。"""
+    monkeypatch.setattr(tools, "GRAPH_PATH", tmp_path / "nope.json")
+    tools.reset_tool_caches()
+    out = question_candidates([], None, k=3)
+    assert all(c["information_gain"] is None and c["p_yes"] is None for c in out)
+
+
+def test_min_information_gain_is_a_small_positive_threshold():
+    assert 0 < MIN_INFORMATION_GAIN < 1e-3
+
+
+# ---------- 容错与匹配一致性 ----------
+
+def test_run_tool_turns_tool_exceptions_into_error_dicts(monkeypatch):
+    """工具内部的意外（模型加载失败、文件坏行）不能炸掉整条 ReAct/consult。"""
+    def boom(**kw):
+        raise RuntimeError("模型加载失败")
+
+    monkeypatch.setattr(TOOLS["lookup_standard"], "fn", boom) if False else None
+    spec = TOOLS["lookup_standard"]
+    monkeypatch.setitem(TOOLS, "lookup_standard", type(spec)(
+        name=spec.name, description=spec.description, input_schema=spec.input_schema, fn=boom))
+    out = run_tool("lookup_standard", {"query": "x"})
+    assert "error" in out and "模型加载失败" in out["error"]
+
+
+def test_query_case_graph_skips_non_object_rows_and_rows_without_source_span(tmp_path, monkeypatch):
+    path = tmp_path / "t.jsonl"
+    path.write_text("\n".join([
+        json.dumps({"case_id": "a", "physician": "ye_tianshi", "s": "脘痛", "p": "治以", "o": "疏肝",
+                    "source_span": "原文"}, ensure_ascii=False),
+        "[1, 2]",
+        json.dumps({"case_id": "b", "physician": "ye_tianshi", "s": "脘痛", "p": "治以", "o": "疏肝"},
+                   ensure_ascii=False),  # 缺 source_span
+        json.dumps({"case_id": "c", "physician": "ye_tianshi", "s": "", "p": "x", "o": "",
+                    "source_span": "原文"}, ensure_ascii=False),  # 主宾都空
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(tools, "CASE_TRIPLES_PATH", path)
+    tools.reset_tool_caches()
+    out = query_case_graph(symptom="脘痛")
+    assert out["available"] is True
+    assert [t["case_id"] for t in out["triples"]] == ["a"]
+    assert "无法解析" in out["note"] and "缺 source_span" in out["note"]
+
+
+def test_query_graph_resolves_unique_partial_syndrome_name():
+    """lookup_standard 认「脾虚气滞」→「脾虚气滞证」，query_graph 也必须认，
+    否则同一个词两个工具给出相反答案（docs/ARCHITECTURE.md §4）。
+
+    跟上面 test_lookup_standard_partial_unique_match 用同一个例子：
+    "胃阴虚"不唯一部分匹配（同时命中"胃阴虚证"和"脾胃阴虚证"），不能拿来测这一条。"""
+    assert query_graph("脾虚气滞")["found"] is True
+    assert query_graph("脾虚气滞")["name"] == "脾虚气滞证"
+
+
+def test_generic_fragments_do_not_match_everything():
+    """「疼痛」「胀痛」单独不指向任何具体症状；否则任何含「疼痛」的主诉都会命中
+    三条胃脘疼痛节点。"""
+    store = tools.get_graph_store()
+    names = {store.get_node(i)["name"] for i in tools._match_graph_symptoms(store, "头痛剧烈疼痛")}
+    assert not {n for n in names if "胃脘" in n or "脘腹" in n}
+    # 带部位的片段仍然要能匹配
+    assert "胃脘胀满或疼痛" in {store.get_node(i)["name"] for i in tools._match_graph_symptoms(store, "胃脘胀满")}
+
+
+# ---------- _symptom_text_matches：字面够不到时兜底查 SYNONYMS ----------
+#
+# query_case_graph 查患者现代说法「胃脘胀痛」时，医案三元组存的是原文古文简写
+# 「脘痛」——两者字面没有公共子串，这是术语映射问题（docs/DESIGN_NOTES.md §2），
+# 只在 core.syndrome_norm.SYNONYMS 已经登记过的门类词范围内处理，不是系统性解决方案。
+
+
+def test_symptom_text_matches_falls_back_to_synonyms_when_literal_match_fails():
+    """核心回归：「脘痛」和「胃脘胀痛」没有公共子串（字面双向包含、并列
+    片段拆分都够不到），但两者在 core.syndrome_norm.SYNONYMS 里都归到
+    canonical 概念"胃痛"——兜底查这张表后应该判定为匹配。"""
+    assert "脘痛" not in "胃脘胀痛" and "胃脘胀痛" not in "脘痛"  # 确认字面确实够不到
+    assert tools._symptom_text_matches("脘痛", "胃脘胀痛") is True
+    assert tools._symptom_text_matches("胃脘胀痛", "脘痛") is True  # 双向都要成立
+
+
+def test_symptom_text_matches_does_not_over_match_via_synonyms_fallback():
+    """SYNONYMS 兜底不能变成"什么都匹配"——没有登记在同一个 canonical 概念下
+    的词依然不该匹配，包括完全不相关的症状词。"""
+    assert tools._symptom_text_matches("脘痛", "嗳气") is False
+    assert tools._symptom_text_matches("口苦", "纳差") is False
+
+
+def test_symptom_text_matches_literal_match_takes_priority():
+    """SYNONYMS 只是兜底，不改变字面匹配的行为——直接子串命中的情况照常成立。"""
+    assert tools._symptom_text_matches("胃脘胀满", "胃脘胀满或疼痛") is True
+    assert tools._symptom_text_matches("胃脘胀满或疼痛", "胃脘胀满") is True
+
+
+def test_posterior_and_candidates_use_the_same_physician_weights():
+    a = syndrome_posterior(["胃", "肝"], physician="ye_tianshi")
+    b = syndrome_posterior(["胃", "肝"], physician="wu_jutong")
+    assert set(a) == set(b)  # λ1≡0 时两者数值相同；这里钉的是参数能传进去且不崩
+
+
+# ---------- disease_hint 收窄候选池（core.tools._scope_by_disease） ----------
+
+
+def test_scope_by_disease_no_hint_returns_full_index():
+    index = {"A": {"disease": None}, "B": {"disease": "胃痛"}, "C": {"disease": "痞满"}}
+    assert tools._scope_by_disease(index, None) == index
+
+
+def test_scope_by_disease_keeps_untagged_and_matching_drops_other_diseases():
+    """未标 disease 的条目（人工核对录入、不绑病名的那批）不管 disease_hint 是什么
+    都要保留；标了病名的条目只有跟 disease_hint 一致才留，标了别的病名的要被排除。"""
+    index = {
+        "untagged": {"disease": None},
+        "same_disease": {"disease": "胃痛"},
+        "other_disease": {"disease": "痞满"},
+        "pad1": {"disease": None},
+        "pad2": {"disease": None},
+    }
+    scoped = tools._scope_by_disease(index, "胃痛")
+    assert set(scoped) == {"untagged", "same_disease", "pad1", "pad2"}
+    assert "other_disease" not in scoped
+
+
+def test_scope_by_disease_falls_back_to_full_pool_when_too_few_candidates():
+    """病名判断本身可能错（match_disease 是规则打分，不是精确诊断）；收窄后
+    候选不足 3 条时，把真正的证候排除在外的代价比候选池大更严重，宁可退回
+    全量。"""
+    index = {"A": {"disease": "胃痛"}, "B": {"disease": "痞满"}}
+    assert tools._scope_by_disease(index, "胃痛") == index  # 命中的只有 1 条，< 3，退回全量
+
+
+def test_syndrome_posterior_and_question_candidates_share_disease_scoping():
+    """两处必须用同一份收窄后的候选池，否则"这个问题预期得到多少 bit"（在收窄
+    候选池上算）和"答完后验变成什么"（如果没收窄，在全量候选池上算）就不是
+    同一个假设空间下的数字（见 core/tools.py 的 `_scope_by_disease`）。"""
+    elements = ["胃", "阴虚", "津伤", "热"]
+    disease_hint = "胃痛"
+    posterior = syndrome_posterior(elements, disease_hint=disease_hint)
+    candidates = question_candidates(elements, k=20, disease_hint=disease_hint)
+    index = tools._syndrome_index(tools.get_graph_store())
+    scoped = tools._scope_by_disease(index, disease_hint)
+    assert set(posterior) == set(scoped)
+    # question_candidates 里出现的 if_yes_top/if_no_top 也只能来自这同一份候选池
+    for c in candidates:
+        if c["source"] != "graph_ig":
+            continue
+        assert c["if_yes_top"] in {info["name"] for info in scoped.values()}
+        assert c["if_no_top"] in {info["name"] for info in scoped.values()}

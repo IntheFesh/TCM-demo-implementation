@@ -1,0 +1,770 @@
+"""符号验证器（core/formula_verifier.py）的十三条规则。
+
+**每条规则都要能指着本体原文说出哪里不对**——"生成—外部验证—回灌"这类闭环
+能起作用，靠的正是这种指着原文的反例，也是这一层跟既有两层（safety_output
+判"能不能发"、formula_check 判"拟得好不好"）的分界线。所以这个文件里每一条
+断言违规的测试，都同时断言 `counterexample` 里有本体原文。
+
+数据用**就地构造的合成本体**：真实的两份 jsonl 在版本控制里，但测试
+不该依赖它们的具体内容——那份数据会随抽取脚本变，而这些测试要钉的是规则逻辑。
+另有一组 `test_with_the_real_ontology_*` 的测试拿真数据跑（数据不在时跳过），
+验的是"规则在真实覆盖率下会落进哪一档"。
+"""
+from __future__ import annotations
+
+import pytest
+
+from core.formula_verifier import (
+    ALL_RULES,
+    MAX_REVISE_ROUNDS,
+    REVISE_RULES,
+    THEORY_RULES,
+    VETO_RULES,
+    RULE_FUNCS,
+    Unverifiable,
+    VerificationResult,
+    Violation,
+    format_violations_for_revise,
+    max_revise_rounds,
+    ontology_coverage_of_corpus,
+    verifier_metrics,
+    verify_formula,
+)
+from core.ontology import Ontology
+from core.schemas import S3Structured
+
+
+# ---------- 夹具 ----------
+
+def _row(s, p, o, *, book="中药学"):
+    return {"s": s, "p": p, "o": o, "book": book, "source": "modern",
+            "source_span": f"【{p}】{o}"}
+
+
+@pytest.fixture
+def ont() -> Ontology:
+    """一份够小、够全的合成本体：四味药，性味/归经/功效/用量齐备。"""
+    return Ontology(materia_rows=[
+        _row("党参", "性味", "甘，平"), _row("党参", "归经", "归脾、肺经"),
+        _row("党参", "功效", "补中益气、健脾益肺"), _row("党参", "用量", "9~30g"),
+        _row("白术", "性味", "苦、甘，温"), _row("白术", "归经", "归脾、胃经"),
+        _row("白术", "功效", "健脾益气、燥湿利水"), _row("白术", "用量", "6~12g"),
+        _row("柴胡", "性味", "苦、辛，微寒"), _row("柴胡", "归经", "归肝、胆经"),
+        _row("柴胡", "功效", "疏肝解郁、和解表里"), _row("柴胡", "用量", "3~10g"),
+        _row("石膏", "性味", "辛、甘，大寒"), _row("石膏", "归经", "归肺、胃经"),
+        _row("石膏", "功效", "清热泻火、除烦止渴"), _row("石膏", "用量", "15~60g"),
+    ], formulary_rows=[], patterns=[])
+
+
+def mk(herbs, *, roles=None, doses=None, refs=None, organ="脾",
+       syn="脾胃气虚证", method="健脾益气", targets=("脾失健运",),
+       effect="补中益气") -> S3Structured:
+    roles = roles if roles is not None else ["君"] + ["臣"] * (len(herbs) - 1)
+    doses = doses if doses is not None else [9.0] * len(herbs)
+    items = [{"name": h, "dose": d, "role": r} for h, d, r in zip(herbs, doses, roles)]
+    return S3Structured(
+        organs=[{"organ": organ, "supporting_symptoms": ["纳差"],
+                 "pathogenesis": "脾失健运"}],
+        syndrome={"name": syn, "from_organs": [organ], "reasoning": "x",
+                  "reasoning_plain": "y"},
+        method={"principle": method, "from_syndrome": syn, "targets": list(targets)},
+        formula={"from_method": method, "candidate": {
+            "name": "方", "source": "composed", "confidence": "high",
+            "rationale": "x", "herb_items": items}},
+        herb_choices=[{"item": it, "for_element": organ, "effect_cited": effect,
+                       "ontology_refs": (refs or {}).get(it["name"], [])}
+                      for it in items],
+        physician_influences=[{"physician": "ye_tianshi", "step": "formula",
+                               "contribution": "x", "cited_case_ids": ["a"]}],
+        cited_case_ids=["a"])
+
+
+def _rules(result, severity=None):
+    return sorted({v.rule for v in result.violations
+                   if severity is None or v.severity == severity})
+
+
+# ---------- 规则表本身 ----------
+
+def test_thirteen_rules_split_into_three_veto_and_ten_revise():
+    """十三条规则：本体九条 + 医理一致性四条。veto 三条判的是具体、可核实的危险或
+    欺骗（配伍相反、超量、引用的原文张冠李戴），其余十条是 revise。"""
+    assert len(ALL_RULES) == 13
+    assert len(VETO_RULES) == 3 and len(REVISE_RULES) == 10
+    assert set(VETO_RULES) == {"incompatible_pair", "dose_exceeds", "herb_source_fabricated"}
+    assert set(REVISE_RULES) == {
+        "herb_not_in_ontology", "herb_source_paraphrased",
+        "meridian_coverage", "nature_conflict", "effect_matches_method", "role_structure",
+        "principle_matches_syndrome", "method_not_contraindicated",
+        "pathomechanism_consistent", "role_structure_by_rule",
+    }
+    assert set(VETO_RULES) & set(REVISE_RULES) == set(), "一条规则不能又是 veto 又是 revise"
+
+
+def test_every_rule_has_an_implementation_and_vice_versa():
+    assert set(RULE_FUNCS) == set(ALL_RULES)
+    assert list(RULE_FUNCS) == list(ALL_RULES), "字典顺序要跟 ALL_RULES 一致（报告顺序）"
+
+
+def test_severity_is_a_property_of_the_rule_not_of_the_instance():
+    """级别写死在规则上：同一条规则在两处有两种后果的话，"要不要下发"
+    就取决于是谁构造了那个 Violation。"""
+    with pytest.raises(ValueError) as e:
+        Violation(rule="incompatible_pair", severity="revise", herbs=("甘草",),
+                  reason="x", counterexample="y")
+    assert "级别固定是 veto" in str(e.value)
+    with pytest.raises(ValueError):
+        Violation(rule="role_structure", severity="veto", herbs=(), reason="x",
+                  counterexample="y")
+
+
+def test_an_unknown_rule_is_rejected():
+    with pytest.raises(ValueError):
+        Violation(rule="我编的规则", severity="veto", herbs=(), reason="x",
+                  counterexample="y")
+    with pytest.raises(ValueError):
+        Unverifiable(rule="我编的规则", herbs=(), missing_predicate="x", reason="y")
+
+
+def test_an_empty_counterexample_is_rejected():
+    """一条要回灌给模型的违规必须能指着本体原文说出哪里不对。"""
+    for blank in ("", "   ", "\n"):
+        with pytest.raises(ValueError) as e:
+            Violation(rule="role_structure", severity="revise", herbs=(),
+                      reason="没有君药", counterexample=blank)
+        assert "空反例等于没有反例" in str(e.value)
+
+
+def test_unverifiable_requires_saying_what_is_missing():
+    for kw, reason in (("", "有理由"), ("归经", "")):
+        with pytest.raises(ValueError):
+            Unverifiable(rule="meridian_coverage", herbs=(), missing_predicate=kw,
+                         reason=reason)
+
+
+# ---------- veto 三条 ----------
+
+def test_incompatible_pair_vetoes_and_quotes_the_pair(ont):
+    r = verify_formula(mk(["甘草", "甘遂", "白术"]), ontology=ont)
+    assert "incompatible_pair" in _rules(r, "veto")
+    v = next(v for v in r.violations if v.rule == "incompatible_pair")
+    assert set(v.herbs) == {"甘草", "甘遂"}
+    assert v.counterexample.strip()
+    assert r.status == "vetoed" and r.passed is False
+
+
+def test_incompatible_pair_delegates_to_safety_output_not_a_second_table(ont):
+    """全部配伍对过一遍。**判据整个来自 `core.safety_output.INCOMPATIBLE_PAIRS`**
+    ——验证器不持第二份配伍表（十八反十九畏只有一处实现，docs/DESIGN_NOTES.md §5）。"""
+    from core.safety_output import INCOMPATIBLE_PAIRS
+
+    src = (__import__("pathlib").Path("core/formula_verifier.py")
+           .read_text(encoding="utf-8"))
+    assert "INCOMPATIBLE_PAIRS = " not in src, "不许在验证器里重新定义配伍表"
+    assert "check_incompatible" in src
+    missed = []
+    for pair in INCOMPATIBLE_PAIRS:
+        a, b = sorted(pair)
+        r = verify_formula(mk([a, b, "白术"]), ontology=ont)
+        if "incompatible_pair" not in _rules(r, "veto"):
+            missed.append((a, b))
+    assert missed == [], f"这些配伍对没被查出来：{missed}"
+
+
+def test_dose_exceeds_vetoes_with_the_limit_and_the_prescribed_amount(ont):
+    r = verify_formula(mk(["附子", "白术"], doses=[60.0, 9.0]), ontology=ont)
+    assert "dose_exceeds" in _rules(r, "veto")
+    v = next(v for v in r.violations if v.rule == "dose_exceeds")
+    assert "60.0" in v.counterexample and "15.0g" in v.counterexample
+    assert "上限" in v.counterexample
+
+
+def test_a_dose_within_the_limit_does_not_fire(ont):
+    r = verify_formula(mk(["附子", "白术"], doses=[9.0, 9.0]), ontology=ont)
+    assert "dose_exceeds" not in _rules(r)
+
+
+def test_a_missing_dose_is_unverifiable_not_a_pass(ont):
+    """「没写剂量」不是「剂量合规」。"""
+    s3 = mk(["附子", "白术"], doses=[None, 9.0])
+    r = verify_formula(s3, ontology=ont)
+    assert "dose_exceeds" not in _rules(r)
+    u = [u for u in r.unverifiable if u.rule == "dose_exceeds"]
+    assert len(u) == 1 and u[0].herbs == ("附子",)
+    assert u[0].missing_predicate == "剂量"
+    assert "不是" in u[0].reason
+
+
+def test_herb_source_fabricated_vetoes_a_span_stolen_from_another_herb(ont):
+    """`herb_source_fabricated` 只判**张冠李戴**（T3）——引用的原文
+    必须是本体里**真实存在**的一段话，只是被安到了另一味药头上，才算编造。
+    这里把"白术"的真实功效原文安到"党参"头上，本体全范围内能找到它真正的
+    主人，这才是查不到反驳空间的编造。（如果模型写的话本体全范围都找不到，
+    那是转述，落 `herb_source_paraphrased`，见下面 T1 那组测试。）"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "健脾益气、燥湿利水"}]}  # 这段真实原文属于"白术"，不属于"党参"
+    r = verify_formula(mk(["党参", "白术"], refs=refs), ontology=ont)
+    assert "herb_source_fabricated" in _rules(r, "veto")
+    v = next(v for v in r.violations if v.rule == "herb_source_fabricated")
+    assert "健脾益气、燥湿利水" in v.counterexample, "要把模型写的那段引出来"
+    assert "白术" in v.counterexample, "要点名这段话真正属于哪味药"
+    assert v.refs and v.refs[0].span == "健脾益气、燥湿利水"
+
+
+def test_herb_source_fabricated_accepts_a_real_span_even_if_only_partially_quoted(ont):
+    """span 用双向子串比而不是相等：本体原文往往是一整段，模型照抄时可能只抄一句，
+    要求逐字相等会把正确的引用判成编造。"""
+    for span in ("补中益气", "【功效】补中益气、健脾益肺", "补中益气、健脾益肺"):
+        refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                          "span": span}]}
+        r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
+        assert "herb_source_fabricated" not in _rules(r), f"「{span}」被误判成编造"
+
+
+def test_a_herb_absent_from_the_ontology_is_revise_not_veto(ont):
+    """药不在本体里是数据覆盖面问题，不是模型编造，定成 veto 会让几乎每张方被否掉
+    ——所以是 `herb_not_in_ontology`，revise 级，不是 veto。它是真正的 `Violation`
+    而不是 `Unverifiable`，见下一条测试。"""
+    r = verify_formula(mk(["鲤鱼", "党参"]), ontology=ont)
+    assert "herb_not_in_ontology" not in _rules(r, "veto")
+    assert "herb_not_in_ontology" in _rules(r, "revise")
+    v = next(v for v in r.violations
+            if v.rule == "herb_not_in_ontology" and v.herbs == ("鲤鱼",))
+    assert "不是模型编造" not in v.reason or "覆盖不全" in v.reason  # 措辞允许变，但不能说是编造
+    assert "本体共收录" in v.counterexample and "4" in v.counterexample  # 夹具本体 4 味药
+
+
+def test_a_herb_absent_from_the_ontology_actually_reaches_the_revise_feedback(ont):
+    """药不在本体里必须是 `Violation` 而不是 `Unverifiable`：
+    `format_violations_for_revise` 明确不把 `unverifiable` 写进反馈——定成后者的话
+    模型永远不知道这味药查不到，没有机会换一味写法更规范的药。所以它必须真的
+    能走到反馈文本里。"""
+    r = verify_formula(mk(["鲤鱼", "党参"]), ontology=ont)
+    feedback = format_violations_for_revise(r)
+    assert "鲤鱼" in feedback
+    assert "herb_not_in_ontology" in feedback
+
+
+def test_herb_not_in_ontology_and_herb_source_fabricated_never_both_fire(ont):
+    """结构上不可能重叠：一味药要么解析不到（`herb_not_in_ontology`），要么
+    解析到了才可能被判张冠李戴（`herb_source_fabricated`）——不需要额外的
+    去重判据，这条测试钉住"不需要"这件事本身没有被破坏。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "健脾益气、燥湿利水"}]}  # 白术的真实原文，安到党参头上
+    r = verify_formula(mk(["鲤鱼", "党参", "白术"], refs=refs), ontology=ont)
+    fired_not_in_ontology = {v.herbs for v in r.violations if v.rule == "herb_not_in_ontology"}
+    fired_fabricated = {v.herbs for v in r.violations if v.rule == "herb_source_fabricated"}
+    assert fired_not_in_ontology & fired_fabricated == set()
+    assert fired_not_in_ontology == {("鲤鱼",)}
+    assert fired_fabricated == {("党参",)}
+
+
+def test_a_herb_with_no_refs_at_all_is_unverifiable(ont):
+    r = verify_formula(mk(["党参"]), ontology=ont)
+    u = [u for u in r.unverifiable if u.rule == "herb_source_fabricated"]
+    assert len(u) == 1 and u[0].missing_predicate == "ontology_refs"
+    assert "不算编造，算没引" in u[0].reason
+
+
+def test_a_ref_to_a_predicate_the_ontology_lacks_is_unverifiable(ont):
+    """模型引了「党参的禁忌」，而本体里党参没有禁忌这一项——对不了，不是编造。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "禁忌",
+                      "span": "孕妇慎用"}]}
+    r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
+    assert "herb_source_fabricated" not in _rules(r, "veto")
+    assert any(u.missing_predicate == "禁忌" for u in r.unverifiable)
+
+
+# ---------- herb_source_fabricated 只判张冠李戴 ----------
+#
+# 引用的原文对不上有四类：T1 转述、T2 谓词错配、T3 张冠李戴、T4 谓词本身未收。
+# 只有 T3 是没有反驳空间的编造，其余三类都不能 veto，否则大多数并非编造的引用
+# 会把整张方否掉。下面按这四类各配测试，钉住"只有 T3 才 veto"这件事。
+
+def test_t1_paraphrased_content_falls_to_revise_not_veto(ont):
+    """T1：模型写的是自己归纳的话，本体全范围内（这味药、其余所有药）都
+    找不到这段话——落 `herb_source_paraphrased`，revise，不是编造。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "补气生血、安神定志"}]}  # 本体哪味药都没有这句
+    r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
+    assert "herb_source_fabricated" not in _rules(r)
+    assert "herb_source_paraphrased" in _rules(r, "revise")
+    v = next(v for v in r.violations if v.rule == "herb_source_paraphrased")
+    assert "补气生血、安神定志" in v.counterexample
+    assert "补中益气" in v.counterexample, "反例要带上本体里真正的原文，模型才能照抄改"
+
+
+def test_t1_paraphrased_feedback_actually_reaches_the_revise_loop(ont):
+    """跟 `herb_not_in_ontology` 同一条理由：转述必须真的进回灌反馈，
+    模型才有机会照抄本体原文重填。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "补气生血、安神定志"}]}
+    r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
+    feedback = format_violations_for_revise(r)
+    assert "党参" in feedback
+    assert "herb_source_paraphrased" in feedback
+
+
+def test_t1_paraphrased_does_not_also_veto(ont):
+    """T1 跟 T3 必须是同一次比对的两个互斥结论，不能一条 ref 同时挨了
+    revise 又挨了 veto。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "补气生血、安神定志"}]}
+    r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
+    assert not [v for v in r.violations
+                if v.rule == "herb_source_fabricated" and v.herbs == ("党参",)]
+
+
+def test_t2_wrong_predicate_slot_is_silently_accepted(ont):
+    """T2：内容是真的，只是模型填错了谓词——把党参的归经原文填进了"功效"这一
+    项。内容能在党参自己的"归经"谓词下找到，不算编造，也不算转述，直接放过，
+    不产出任何 Violation/Unverifiable（这是故意的，见
+    `check_herb_source_fabricated` 的模块级文档字符串）。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "归脾、肺经"}]}  # 这是党参"归经"的原文，不是"功效"的
+    r = verify_formula(mk(["党参"], refs=refs), ontology=ont)
+    assert "herb_source_fabricated" not in _rules(r)
+    assert "herb_source_paraphrased" not in _rules(r)
+    assert not [u for u in r.unverifiable if u.herbs == ("党参",)]
+
+
+def test_t2_wrong_predicate_slot_does_not_depend_on_which_predicate_is_swapped(ont):
+    """同一类错配换一对谓词（性味 ↔ 用量）也要一样放过——不是只对某一对
+    谓词生效的特例判据。"""
+    refs = {"白术": [{"kind": "herb", "name": "白术", "predicate": "用量",
+                      "span": "苦、甘，温"}]}  # 这是白术"性味"的原文，不是"用量"的
+    r = verify_formula(mk(["白术"], refs=refs), ontology=ont)
+    assert "herb_source_fabricated" not in _rules(r)
+    assert "herb_source_paraphrased" not in _rules(r)
+
+
+def test_t2_wrong_predicate_slot_is_distinct_from_t3_cross_herb(ont):
+    """T2（同一味药填错谓词）跟 T3（引了另一味药的真实原文）不能混——同一段
+    话如果既是"党参自己某个谓词的原文"又刚好跟"另一味药的原文"字面重合，
+    优先按同一味药内部的谓词错配处理（T2 放过），不误判成张冠李戴。"""
+    # 构造一个只在同一味药内部搬错谓词、跟其余药完全不重合的例子，反向确认
+    # "只要同味药内命中就不会走到全本体搜索那一步"（`_find_span_owner` 不会
+    # 被调用到，即使被调用到也该在党参自己身上先找到）。
+    refs = {"柴胡": [{"kind": "herb", "name": "柴胡", "predicate": "用量",
+                      "span": "疏肝解郁、和解表里"}]}  # 柴胡"功效"的原文，填进了"用量"
+    r = verify_formula(mk(["柴胡"], refs=refs), ontology=ont)
+    assert "herb_source_fabricated" not in _rules(r)
+    assert "herb_source_paraphrased" not in _rules(r)
+
+
+def test_t3_cross_herb_veto_names_the_true_owner(ont):
+    """T3 的反例必须点名"这段话真正属于哪味药"，不能只说"找不到"——反驳
+    空间是"这段话确实存在，但不是你的"，模型要能照着这句话去核对。"""
+    refs = {"石膏": [{"kind": "herb", "name": "石膏", "predicate": "功效",
+                      "span": "疏肝解郁、和解表里"}]}  # 柴胡的真实功效原文
+    r = verify_formula(mk(["石膏", "柴胡"], refs=refs), ontology=ont)
+    v = next(v for v in r.violations if v.rule == "herb_source_fabricated")
+    assert v.herbs == ("石膏",)
+    assert "柴胡" in v.counterexample
+
+
+def test_t4_predicate_missing_for_this_herb_takes_priority_over_a_coincidental_match(ont):
+    """T4：这味药这个谓词本身没有收录——即使模型写的话恰好跟别的药某个
+    谓词字面重合，"这个谓词在这味药身上缺失"这件事本身就该先报出来，不需要
+    等到全本体搜索都失败才承认查不了（本体 4 味药夹具都没有"炮制"这一项，
+    是测这条判据的天然缺口）。"""
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "炮制",
+                      "span": "疏肝解郁、和解表里"}]}  # 恰好是柴胡的功效原文，但问的是"炮制"
+    r = verify_formula(mk(["党参", "柴胡"], refs=refs), ontology=ont)
+    assert "herb_source_fabricated" not in _rules(r)
+    assert "herb_source_paraphrased" not in _rules(r)
+    assert any(u.rule == "herb_source_fabricated" and u.missing_predicate == "炮制"
+              for u in r.unverifiable)
+
+
+# ---------- revise 四条 ----------
+
+def test_meridian_coverage_fires_when_no_herb_reaches_the_organ(ont):
+    r = verify_formula(mk(["党参", "白术"], organ="肝", syn="肝郁气滞证",
+                          method="疏肝理气", targets=("肝气郁结",)), ontology=ont)
+    assert "meridian_coverage" in _rules(r, "revise")
+    v = next(v for v in r.violations if v.rule == "meridian_coverage")
+    assert "归脾、肺经" in v.counterexample or "归脾、胃经" in v.counterexample
+    assert r.status == "revise_needed"
+
+
+def test_meridian_coverage_passes_when_one_herb_reaches_it(ont):
+    r = verify_formula(mk(["柴胡", "党参"], organ="肝", syn="肝郁气滞证",
+                          method="疏肝理气", targets=("肝气郁结",),
+                          effect="疏肝解郁"), ontology=ont)
+    assert "meridian_coverage" not in _rules(r)
+    assert "meridian_coverage" in r.checked_rules
+
+
+def test_meridian_coverage_is_unverifiable_when_no_herb_has_a_meridian():
+    """**一味都判不了的时候不出违规**：那时"没覆盖"只是"不知道"，
+    报一条违规会让模型去改一个本来可能对的方。"""
+    thin = Ontology(materia_rows=[_row("鲤鱼", "功效", "利水消肿")],
+                    formulary_rows=[], patterns=[])
+    r = verify_formula(mk(["鲤鱼"]), ontology=thin)
+    assert "meridian_coverage" not in _rules(r)
+    assert "meridian_coverage" not in r.checked_rules
+    assert any(u.rule == "meridian_coverage" and u.missing_predicate == "归经"
+               for u in r.unverifiable)
+
+
+def test_meridian_coverage_is_unverifiable_when_the_organ_is_not_a_known_location(ont):
+    r = verify_formula(mk(["党参"], organ="玄府", syn="玄府闭塞"), ontology=ont)
+    assert any(u.rule == "meridian_coverage" and u.missing_predicate == "病位"
+               for u in r.unverifiable)
+
+
+def test_nature_conflict_fires_with_the_nature_spans(ont):
+    r = verify_formula(mk(["石膏", "石膏", "石膏", "石膏", "石膏"],
+                          syn="脾胃虚寒证", method="温中散寒", targets=("中焦寒盛",),
+                          effect="清热泻火"), ontology=ont)
+    # 同一味药重复五次：check_thermal_consistency 看主方前 6 味的寒凉药占比
+    assert "nature_conflict" in _rules(r, "revise")
+    v = next(v for v in r.violations if v.rule == "nature_conflict")
+    assert "大寒" in v.counterexample, "反例要带本草性味原文"
+
+
+def test_nature_conflict_is_unverifiable_when_the_syndrome_has_no_direction(ont):
+    """证型没有明确寒热方向、或寒热错杂时这条规则**不适用**——不是通过。"""
+    r = verify_formula(mk(["党参"], syn="脾胃气虚证"), ontology=ont)
+    u = [u for u in r.unverifiable if u.rule == "nature_conflict"]
+    assert len(u) == 1 and u[0].missing_predicate == "证型寒热方向"
+    assert "不是通过，是判不了" in u[0].reason
+
+
+def test_nature_conflict_skips_mixed_cold_and_heat(ont):
+    r = verify_formula(mk(["石膏"] * 5, syn="上热下寒证"), ontology=ont)
+    assert "nature_conflict" not in _rules(r)
+    assert any(u.rule == "nature_conflict" for u in r.unverifiable)
+
+
+def test_effect_matches_method_goes_through_the_synonym_table(ont):
+    """治法「疏肝理气」要能匹配功效写「疏肝解郁」的柴胡——裸子串比匹配不上，
+    那条规则就变成恒假（见 core/effect_synonyms.py 的文档）。"""
+    r = verify_formula(mk(["柴胡"], organ="肝", syn="肝郁气滞证",
+                          method="疏肝理气", targets=("肝气郁结",),
+                          effect="疏肝解郁"), ontology=ont)
+    assert "effect_matches_method" not in _rules(r)
+    assert "effect_matches_method" in r.checked_rules
+
+
+def test_effect_matches_method_fires_when_nothing_matches(ont):
+    r = verify_formula(mk(["石膏"], organ="肺", syn="肺气虚证",
+                          method="温中散寒", targets=("中焦寒盛",)), ontology=ont)
+    assert "effect_matches_method" in _rules(r, "revise")
+    v = next(v for v in r.violations if v.rule == "effect_matches_method")
+    assert "清热泻火" in v.counterexample
+
+
+def test_effect_matches_method_needs_only_one_matching_herb(ont):
+    """一味药对不上不算违规：佐使药本来就可能针对兼夹症。"""
+    r = verify_formula(mk(["党参", "石膏"]), ontology=ont)
+    assert "effect_matches_method" not in _rules(r)
+
+
+# ---------- 治法/targets 是并列复句，要先拆句再展开 ----------
+# `expand_effect` 查不到整段复句在同义词表里的条目时，会把整段复句原样当一个词
+# 收进 keys；本体里柴胡的功效是切过的短词（"疏肝解郁"），`k in e` 拿一整段复句
+# 去比一个短词，长的永远不会是短的子串——即使柴胡的功效原文原原本本含着
+# "疏肝解郁"四个字，也会被判成"没有一味药对得上"。真实治法几乎总是写成并列复句
+# （"疏肝解郁，理气和胃"），所以这不是边界情况，是主路径。
+
+def test_effect_matches_method_splits_a_compound_principle_before_expanding(ont):
+    """治法「疏肝解郁，理气和胃」是并列复句——柴胡的功效原文「疏肝解郁」
+    对得上前半句，但整段复句当一个词去比对不上柴胡切过的短功效词。
+    先切句再展开，前半句单独匹配上就该判通过。"""
+    r = verify_formula(mk(["柴胡"], organ="肝", syn="肝气郁结，胃失和降证",
+                          method="疏肝解郁，理气和胃", targets=("肝气郁结",),
+                          effect="疏肝解郁"), ontology=ont)
+    assert "effect_matches_method" not in _rules(r)
+    assert "effect_matches_method" in r.checked_rules
+
+
+def test_effect_matches_method_compound_principle_still_fires_when_truly_nothing_matches(ont):
+    """拆句是为了不误杀对得上的，不是把这条规则拆到形同虚设——复句里哪一句
+    都对不上任何药的功效，还是要判 revise。"""
+    r = verify_formula(mk(["石膏"], organ="肺", syn="肺气虚证",
+                          method="温中散寒，回阳救逆", targets=("中焦寒盛",)),
+                       ontology=ont)
+    assert "effect_matches_method" in _rules(r, "revise")
+    v = next(v for v in r.violations if v.rule == "effect_matches_method")
+    assert "清热泻火" in v.counterexample
+
+
+def test_effect_matches_method_splits_a_compound_target_before_expanding(ont):
+    """跟 principle 同一个问题：`targets` 里的描述也常是并列复句。这里让
+    第二句「疏肝解郁」逐字等于柴胡的真实功效——`expand_effect` 恒自带
+    "包含自己"这一条（不查表也能自匹配），只要句子切对了，不管同义词表
+    收不收这个词都该匹配上；切不对（复句当一个词）就连自匹配都够不上。"""
+    r = verify_formula(mk(["柴胡"], organ="肝", syn="肝郁兼有寒证",
+                          method="温阳散寒", targets=("中焦虚寒，疏肝解郁",),
+                          effect="疏肝解郁"), ontology=ont)
+    assert "effect_matches_method" not in _rules(r)
+
+
+def test_role_structure_requires_a_sovereign_herb(ont):
+    r = verify_formula(mk(["党参", "白术"], roles=["臣", "臣"]), ontology=ont)
+    assert "role_structure" in _rules(r, "revise")
+    v = next(v for v in r.violations if v.rule == "role_structure")
+    assert "没有君药" in v.reason
+    assert "君 0 味" in v.counterexample
+
+
+def test_role_structure_rejects_too_many_sovereigns(ont):
+    r = verify_formula(mk(["党参", "白术", "柴胡", "石膏"],
+                          roles=["君"] * 4), ontology=ont)
+    assert "role_structure" in _rules(r, "revise")
+    assert "都是君等于没有君" in next(
+        v for v in r.violations if v.rule == "role_structure").reason
+
+
+def test_role_structure_rejects_adjuncts_outnumbering_the_core(ont):
+    """佐使药多于君臣药时，多出来的往往是无依据的加减。"""
+    r = verify_formula(mk(["党参", "白术", "柴胡", "石膏"],
+                          roles=["君", "佐", "佐", "使"]), ontology=ont)
+    v = next(v for v in r.violations if v.rule == "role_structure")
+    assert "佐使共 3 味，多于君臣 1 味" in v.reason
+
+
+def test_role_structure_is_unverifiable_when_no_role_is_labelled(ont):
+    r = verify_formula(mk(["党参", "白术"], roles=[None, None]), ontology=ont)
+    assert "role_structure" not in _rules(r)
+    u = [u for u in r.unverifiable if u.rule == "role_structure"]
+    assert len(u) == 1 and u[0].missing_predicate == "role"
+
+
+def test_role_structure_does_not_depend_on_the_ontology(ont):
+    """role 是模型自己标的，这条规则不查本体——空本体下它照样判得了。
+    （空本体会在 verify_formula 那一层短路，所以这里直接调规则函数。）"""
+    empty = Ontology(materia_rows=[], formulary_rows=[], patterns=[])
+    v, u, c = RULE_FUNCS["role_structure"](mk(["党参"], roles=["臣"]), empty)
+    assert c == ["role_structure"] and v and not u
+
+
+# ---------- 每条违规都带本体原文 ----------
+
+@pytest.mark.parametrize("label,s3kw", [
+    ("配伍禁忌", dict(herbs=["甘草", "甘遂", "白术"])),
+    ("超剂量", dict(herbs=["附子", "白术"], doses=[60.0, 9.0])),
+    ("编造出处", dict(herbs=["党参"], refs={"党参": [
+        {"kind": "herb", "name": "党参", "predicate": "功效", "span": "回阳救逆"}]})),
+    ("归经覆盖", dict(herbs=["党参", "白术"], organ="肝", syn="肝郁气滞证",
+                      method="疏肝理气", targets=("肝气郁结",))),
+    ("寒热相悖", dict(herbs=["石膏"] * 5, syn="脾胃虚寒证", method="温中散寒",
+                      targets=("中焦寒盛",), effect="清热泻火")),
+    ("君臣结构", dict(herbs=["党参", "白术"], roles=["臣", "臣"])),
+])
+def test_every_violation_carries_a_nonempty_counterexample(ont, label, s3kw):
+    r = verify_formula(mk(**s3kw), ontology=ont)
+    assert r.violations, f"{label} 这一组没有产出任何违规"
+    for v in r.violations:
+        assert v.counterexample.strip(), f"{label} 的 {v.rule} 反例是空的"
+        assert len(v.counterexample) > 10, f"{label} 的 {v.rule} 反例太短，指不出东西"
+
+
+# ---------- passed / status 的定义 ----------
+
+def test_passed_requires_unverifiable_to_be_empty():
+    """`passed` = 无 veto、无 revise、**且 unverifiable 为空**。
+    少了第三条，"已验证通过"这句话在覆盖不全的本体上依然成立。"""
+    clean = VerificationResult(checked_rules=ALL_RULES)
+    assert clean.passed is True and clean.status == "verified"
+    partial = VerificationResult(unverifiable=(Unverifiable(
+        rule="meridian_coverage", herbs=("鲤鱼",), missing_predicate="归经",
+        reason="本体里没有这味药"),), checked_rules=("role_structure",))
+    assert partial.passed is False
+    assert partial.status == "partially_verified"
+
+
+def test_status_orders_by_severity():
+    veto = Violation(rule="dose_exceeds", severity="veto", herbs=("附子",),
+                     reason="超量", counterexample="上限 15g，本方 60g")
+    rev = Violation(rule="role_structure", severity="revise", herbs=(),
+                    reason="没有君药", counterexample="君 0 味")
+    unv = Unverifiable(rule="nature_conflict", herbs=(), missing_predicate="性味",
+                       reason="本体没有性味")
+    assert VerificationResult(violations=(veto, rev), unverifiable=(unv,)).status == "vetoed"
+    assert VerificationResult(violations=(rev,), unverifiable=(unv,)).status == "revise_needed"
+    assert VerificationResult(unverifiable=(unv,)).status == "partially_verified"
+    assert VerificationResult().status == "verified"
+
+
+def test_an_unavailable_ontology_puts_only_the_ontology_rules_in_unverifiable():
+    """药理层数据不在的环境里，本体那九条规则「符号验证通过」必须报成
+    「一条都没验」——否则那句话在没有本体的环境里恒真，而它恒真时毫无意义。
+
+    本体不可用**不该连累医理规则层那四条**（数据源不是一回事，见
+    `verify_formula` 的文档字符串）——`ONTOLOGY_RULES` 全部进 unverifiable，
+    `THEORY_RULES` 该跑还跑（这里不替换 `load_theory`，用的是仓库里真实的
+    `data/standard/tcm_theory.jsonl`，跟真实部署一致）。
+    """
+    from core.formula_verifier import ONTOLOGY_RULES
+
+    empty = Ontology(materia_rows=[], formulary_rows=[], patterns=[])
+    r = verify_formula(mk(["党参"]), ontology=empty)
+    assert r.ontology_available is False
+    assert set(r.checked_rules) == set(THEORY_RULES)
+    assert {u.rule for u in r.unverifiable} == set(ONTOLOGY_RULES)
+    assert r.passed is False and r.status in ("partially_verified", "revise_needed")
+
+
+def test_an_unavailable_theory_layer_puts_only_the_theory_rules_in_unverifiable(
+    monkeypatch, ont):
+    """跟上一条对称：医理规则层不在时，只有 `THEORY_RULES` 那四条进
+    unverifiable，本体那九条该跑还跑。"""
+    import core.formula_verifier as fv
+
+    monkeypatch.setattr(fv, "load_theory", lambda: ())
+    r = verify_formula(mk(["党参"]), ontology=ont)
+    assert r.theory_available is False
+    assert set(r.checked_rules) & set(THEORY_RULES) == set()
+    assert {u.rule for u in r.unverifiable} >= set(THEORY_RULES)
+
+
+def test_to_dict_is_json_serialisable_and_keeps_the_counts(ont):
+    import json
+
+    d = verify_formula(mk(["甘草", "甘遂"]), ontology=ont).to_dict()
+    assert json.dumps(d, ensure_ascii=False)
+    assert d["status"] == "vetoed" and d["n_veto"] >= 1
+    assert d["violations"][0]["counterexample"]
+    assert set(d) >= {"status", "passed", "ontology_available", "checked_rules",
+                      "n_veto", "n_revise", "n_unverifiable"}
+
+
+def test_to_dict_includes_checked_rule_labels_for_the_product_checklist(ont):
+    """产品界面要把逐条校验摆成核对清单，每条要有中文名。
+    `violations`/`unverifiable` 里的条目各自带一份 `rule_label`，但**通过**
+    的那些规则只在 `checked_rules` 里、是裸 id——前端不该为它们另建一张
+    ALL_RULES→中文名的表（那是 `rule_label()` 已经有的同一张表的第二份
+    实现），所以这里补一份 `{rule: label}` 映射。"""
+    from core.formula_verifier import rule_label
+
+    d = verify_formula(mk(["甘草", "甘遂"]), ontology=ont).to_dict()
+    assert "checked_rule_labels" in d
+    for rule in d["checked_rules"]:
+        assert d["checked_rule_labels"][rule] == rule_label(rule)
+
+
+# ---------- 回灌文本 ----------
+
+def test_the_revise_feedback_lists_vetoes_and_revisables_separately(ont):
+    r = verify_formula(mk(["甘草", "甘遂"], roles=["臣", "臣"]), ontology=ont)
+    text = format_violations_for_revise(r)
+    assert "必须解决" in text and "需要修正" in text
+    assert "incompatible_pair" in text and "role_structure" in text
+    assert "依据：" in text
+
+
+def test_the_revise_feedback_omits_unverifiable(ont):
+    """本体缺数据时模型改方也改不出数据来，写进去只会让它去改一个本来可能对的地方。"""
+    r = verify_formula(mk(["鲤鱼", "党参"], roles=["臣", "臣"]), ontology=ont)
+    assert r.unverifiable, "这一组应当有判不了的条目"
+    text = format_violations_for_revise(r)
+    assert "鲤鱼" not in text or "role_structure" in text
+    for u in r.unverifiable:
+        assert u.reason not in text, "unverifiable 的理由不该出现在回灌文本里"
+
+
+def test_no_violations_means_no_feedback_text():
+    assert format_violations_for_revise(VerificationResult()) == ""
+
+
+# ---------- 三指标（含分母的定义） ----------
+
+def test_herbs_grounded_ratio_denominator_is_this_formula_not_the_ontology(ont):
+    """本体收录 1232 味 vs 这张方的药味数——两个完全不同的分母。"""
+    from core.formula_verifier import herbs_grounded_ratio
+
+    refs = {"党参": [{"kind": "herb", "name": "党参", "predicate": "功效",
+                      "span": "补中益气"}]}
+    s3 = mk(["党参", "白术"], refs=refs)
+    assert herbs_grounded_ratio(s3) == 0.5, "1 味有引用 / 共 2 味"
+    assert herbs_grounded_ratio(s3) == s3.herbs_grounded_ratio(), "转发，不是第二份实现"
+    doc = herbs_grounded_ratio.__doc__ or ""
+    assert "不是本体总药味数" in doc and "1232" in doc
+
+
+def test_ontology_coverage_of_corpus_reports_both_ratios():
+    """只报按种数会低估它对真实问诊的支撑，只报按次数会掩盖长尾缺口。"""
+    cov = ontology_coverage_of_corpus()
+    if not cov.get("available"):
+        pytest.skip(f"语料不在：{cov.get('note')}")
+    assert cov["n_corpus_herb_names"] > 0
+    assert 0 < cov["coverage_by_name"] <= 1
+    assert 0 < cov["coverage_by_occurrence"] <= 1
+    assert cov["coverage_by_occurrence"] > cov["coverage_by_name"], (
+        "常用药应当比长尾覆盖得好——这个方向反了说明归一或数据出了问题"
+    )
+    assert cov["n_ontology_herbs"] != cov["n_corpus_herb_names"], (
+        "这两个数是要区分的两个分母，相等说明取错了其中一个"
+    )
+
+
+def test_verifier_metrics_separates_first_round_from_final(ont):
+    """"改了三轮才过"和"一次就过"在最终态上看起来一模一样。"""
+    bad = verify_formula(mk(["党参", "白术"], roles=["臣", "臣"]), ontology=ont)
+    good = verify_formula(mk(["党参", "白术"]), ontology=ont)
+    m = verifier_metrics([bad, good], mk(["党参"]))
+    assert m["n_rounds"] == 2 and m["revise_rounds"] == 1
+    assert m["verifier_first_pass"] is False
+    assert m["first_pass_status"] == "revise_needed"
+    assert m["final_status"] == good.status
+    assert m["statuses"] == ["revise_needed", good.status]
+
+
+def test_verifier_metrics_on_an_empty_round_list_says_none():
+    m = verifier_metrics([])
+    assert m["n_rounds"] == 0 and m["verifier_first_pass"] is False
+    assert m["first_pass_status"] is None and m["final_status"] is None
+
+
+# ---------- 轮数上限 ----------
+
+def test_max_revise_rounds_default_and_override(monkeypatch):
+    """默认只重开 1 轮：一次重开要同时改对多条判据，多留的轮次改的多半是"同一次
+    没改对的地方再试一次"，而每一轮都是一次完整的 S3 重开调用——见
+    `MAX_REVISE_ROUNDS` 的文档字符串。"""
+    monkeypatch.delenv("MAX_REVISE_ROUNDS", raising=False)
+    assert max_revise_rounds() == MAX_REVISE_ROUNDS == 1
+    monkeypatch.setenv("MAX_REVISE_ROUNDS", "0")
+    assert max_revise_rounds() == 0, "0 = 关掉闭环（做消融用）"
+    monkeypatch.setenv("MAX_REVISE_ROUNDS", "5")
+    assert max_revise_rounds() == 5
+    for bad in ("-1", "三", "3.5"):
+        monkeypatch.setenv("MAX_REVISE_ROUNDS", bad)
+        with pytest.raises(ValueError):
+            max_revise_rounds()
+
+
+# ---------- 真实本体：规则在实际覆盖率下落进哪一档 ----------
+
+def test_with_the_real_ontology_a_plain_formula_is_at_worst_partially_verified():
+    """真数据上一张普通的四君子汤：不该出违规，但会因为缺 ontology_refs 与
+    证型无寒热方向落进 partially_verified——这是预期行为：判不了不等于通过。"""
+    from core.ontology import get_ontology
+
+    ont = get_ontology()
+    if not ont.available:
+        pytest.skip("药理层数据不在")
+    r = verify_formula(mk(["党参", "白术", "茯苓", "甘草"]), ontology=ont)
+    assert r.violations == [] or r.violations == (), f"不该有违规：{r.violations}"
+    assert r.status == "partially_verified"
+    assert {u.rule for u in r.unverifiable} <= set(ALL_RULES)
+
+
+def test_with_the_real_ontology_the_missing_predicate_counts_are_reported():
+    """本体的谓词并不齐全（归经、用量等都有相当一部分药缺）——引用"符号验证通过"
+    的人必须能看到各谓词缺多少味。"""
+    from core.ontology import get_ontology
+
+    ont = get_ontology()
+    if not ont.available:
+        pytest.skip("药理层数据不在")
+    s = ont.stats()
+    missing = s["missing_predicate_counts"]
+    assert set(missing) == {"性味", "归经", "功效", "用量", "禁忌", "炮制"}
+    assert missing["归经"] > 0 and missing["用量"] > 0
+    # 缺谓词数不可能超过本草总数
+    for pred, n in missing.items():
+        assert n <= s["n_herbs"], f"{pred} 缺 {n} 条 > 本草 {s['n_herbs']} 味"

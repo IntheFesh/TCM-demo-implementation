@@ -1,0 +1,405 @@
+"""全仓扫描用户可见文本里的研究词、开发词汇与内部编号。
+
+**判据分两层，这个文件是静态那一层。**
+
+静态层（这里）：扫源码里会变成界面文字的那些串。好处是跑得快、每次 pytest
+都跑；短板是它判不出"这段文案在产品模式下到底会不会被渲染出来"。
+运行层（`scripts/screenshot_states.py --product`）：真的在产品模式下把页面
+渲染出来，扫 `document.body.innerText`。那一层才是终审。
+**两层都要**——只有静态层会漏掉运行时拼出来的字符串，只有运行层会让这条
+约束一年只被检查几次（截图不是每次提交都跑的）。
+
+## 白名单机制
+
+`internal-only` 那些块的文案**本来就该带研究词**（用药对照带就是要写"噪声
+地板"）。所以：
+  - `index.html`：解析 DOM，标了 `internal-only` 的子树整个跳过；
+  - `app.js` / `graph.js`：按顶层函数切块，含研究词的函数必须登记在
+    `INTERNAL_RENDERERS` 里，并注明它属于禁词表的哪一类。
+登记表比"整个文件豁免"严：加一个新的、没登记的产品面函数写了"ε"，这里会红。
+
+## 只看含中文的串
+
+纯 ASCII 的字符串在这个前端里几乎全是 DOM id、CSS 选择器和事件名
+（`"replay-mode-banner"`、`"hybrid"` 作为 option 的 value），它们不是界面文字。
+把它们算进来会逼着测试维护一张"这个 id 不算"的例外表，而例外表一长，
+这条约束就废了。**代价说清楚**：纯英文的界面文案（如果有）这一层扫不到，
+由运行层兜底。
+"""
+import re
+from html.parser import HTMLParser
+from pathlib import Path
+
+import pytest
+
+from tests.web_harness import load_app_js, load_html
+
+ROOT = Path(__file__).resolve().parent.parent
+
+#: 产品面禁词表：词 → 它所属的类别编号。同一类别的词出于同一个理由被禁：
+#:   3  内部运行状态（回放提示、流式遥测、内部参数名）
+#:   7  研究术语（噪声地板、分歧度等，只属于研究界面）
+#:   11 开发进度标记
+#:   12 英文技术词与报错原文
+#:   15 评测相关的词
+#:   16 试验品 / 原型措辞
+#:   17 内部文件路径、证候编码前缀与 markdown 标记
+#: 中文词直接比；ASCII 词要求它出现在**含中文的串**里（见模块文档）。
+BANNED = {
+    "噪声地板": 7, "分歧度": 7, "Jaccard": 7, "ε": 7,
+    "演示模式": 3, "评测": 15, "SDT": 15, "E3": 15, "E4": 15, "凭据记号": 15,
+    "traceback": 12, "Traceback": 12, "LLMError": 12, "exit code": 12,
+    "实验性": 16, "beta": 16, "原型": 16, "demo": 16, "Demo": 16,
+    "待跑": 11, "未做": 11, "TODO": 11, "⏳": 11,
+    # 流式遥测（帧流式、首字等）同属类别 3 的"内部运行状态"；类别 17 是裸文件路径
+    # 与证候编码前缀：这些是给代码/数据看的标识符，不是给人看的文字，出现在用户
+    # 可见文字里说明一处该走 _display_source() / isProductMode() / codes= 参数
+    # 那类清洗点的地方没接上。
+    #
+    # 刻意不收的候选词，连同没收的理由一并记下：
+    #   - "JSON"：EMR 导出面板真的有一个「复制结构化 JSON」按钮，是给 HIS
+    #     对接的技术人员看的合法产品功能，不是研究痕迹，禁了它是误伤。
+    #   - "cited_case_ids" / "physician_influences" / "count_support" /
+    #     "evidences"：这几个只在代码里当**属性名**用（`r.cited_case_ids`），
+    #     从不作为字面文字显示给用户；它们几乎总是出现在模板字符串的
+    #     `${...}` 插值表达式里，而 `chinese_strings()` 扫的是整段模板字符串
+    #     的**源码**（含 `${}` 里的表达式代码），不是渲染后的文本——按这几个
+    #     词扫会把"某个中文模板字符串里用了这个属性"全部错判成"泄漏了这个
+    #     字面词"，遍地假阳性。
+    "帧流式": 3, "首字": 3, "样本": 3, "max_rounds": 3, "λ": 3,
+    "core/": 17, "data/": 17, ".py": 17, ".jsonl": 17, ".tsv": 17,
+    "**": 17, "SP-": 17, "B04.": 17,
+}
+
+#: 形如 `R<数字>` 的内部编号（R 后跟一到两位数字）：用户可见处不许出现。
+INTERNAL_CODE_RE = re.compile(r"\bR\d{1,2}\b")
+
+#: 检索方式的名字不上产品面。它们是 option 的 value
+#: （纯 ASCII，按上面的规则本来就扫不到），这里单列是为了**中文文案里
+#: 提到它们**的情况——"当前用的是 hybrid 检索"这种句子。
+RETRIEVER_WORDS = ("hybrid", "dense", "bm25", "full_context")
+
+#: 含研究词的渲染函数登记表：函数名 → 它属于禁词表的哪一类。
+#: **登记不等于放行**。两种门控方式都算数，但登记时要写清楚是哪一种：
+#:   1. **CSS 门控**——函数渲染的 DOM 挂在 `internal-only` 的块里，那一条由
+#:      tests/test_product_mode.py 的标记表钉着（多数条目是这一种）。
+#:   2. **运行时门控**——函数内部按 `isProductMode()` 分支，产品面分支不含
+#:      研究词；这种函数的 DOM 容器本身不带 `internal-only`
+#:      （`describeProgressEvent` 写进 `#progress-log`，那是个普通 div，
+#:      不是按 CSS 类整块藏）。这一种必须有专门的测试钉住"产品面分支真的
+#:      不含研究词"，不能只靠这张登记表兜底——登记表本身证明不了运行时
+#:      分支对不对，只是告诉这条静态扫描"这里的研究词字面量是故意的，
+#:      去看对应测试"。
+INTERNAL_RENDERERS = {
+    # 类别 7：用药对照带、噪声地板、分层读数。它们渲染进 #rx-compare 与
+    # #divergence-detail，两块都标了 internal-only。
+    "rxCompareHtml": 7, "rxBandSvgHtml": 7, "epsilonLabel": 7,
+    "divergenceBannerText": 7, "layerText": 7,
+    # 类别 3：回放提示。渲染进 #replay-mode-banner；产品模式下服务若真在回放
+    # （额度用尽时降级），提示文案由服务端给，不用"演示模式"这个词。
+    "replayModeText": 3,
+    # 类别 3，运行时门控（见上面的第 2 种方式）：`帧流式`/`首字`/`思考`这几个字
+    # 只在 `!isProductMode()` 的分支里，产品面分支只说"完成"——见
+    # tests/test_ui_progress_stats.py 的
+    # test_product_mode_drops_the_telemetry_numbers。
+    "describeProgressEvent": 3,
+}
+
+CJK = re.compile(r"[一-鿿]")
+STRING_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"' + r"|'(?:[^'\\\n]|\\.)*'"
+                       + r"|`(?:[^`\\]|\\.)*`", re.DOTALL)
+
+
+def strip_js_comments(src: str) -> str:
+    r"""去掉 `//` 与 `/* */`。**这一步不能省**：这个仓库的注释里到处在解释
+    "为什么不用噪声地板这个词"，不去掉的话这条测试会红在自己的说明文字上。
+
+    **为什么是一个状态机而不是两条正则。** `(?m)^\s*//` 只去行首注释，
+    行尾的 `const x = 1; // 解释噪声地板` 留着；而放开成 `//[^\n]*` 会把
+    `"https://..."` 里的两个斜杠当注释开头，从那里一直吃到行尾——字符串
+    被截断之后，后面的引号配对全乱，扫出来的"文案"是一堆碎片。
+    所以按字符走一遍，记住自己在不在字符串里。正则在这件事上没有正确解。"""
+    out: list[str] = []
+    i, n = 0, len(src)
+    quote = ""       # 当前所在字符串的引号（空 = 不在字符串里）
+    while i < n:
+        c = src[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c in "\"'`":
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            end = src.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+class ProductTextParser(HTMLParser):
+    """收集 `internal-only` 子树**之外**的文字。
+
+    用真的 HTML 解析器而不是正则：`internal-only` 的块里嵌着别的标签，
+    正则切不准，而切不准的方向恰好是"少扫一块"——那正是这条测试最不能出
+    的错。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.depth = 0          # 当前在几层 internal-only 里
+        self.stack: list[bool] = []
+        self.text: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        cls = dict(attrs).get("class") or ""
+        internal = "internal-only" in cls
+        self.stack.append(internal)
+        if internal:
+            self.depth += 1
+
+    def handle_endtag(self, tag):
+        if self.stack:
+            if self.stack.pop():
+                self.depth -= 1
+
+    def handle_data(self, data):
+        if self.depth == 0:
+            self.text.append(data)
+
+
+def product_visible_html_text() -> str:
+    p = ProductTextParser()
+    p.feed(load_html())
+    return "\n".join(p.text)
+
+
+def js_chunks(src: str) -> dict[str, str]:
+    """按顶层 `function name(` / `async function name(` 把文件切成块。
+    切不到函数里的那部分算 `"<module>"`。
+
+    **`async` 不能漏**：正则只认裸 `function` 的话，每一个顶层
+    `async function` 的函数体会被**悄悄并进它前面那个 `function` 声明的块里**——
+    漏掉的不是"少切几块"，而是判据本身：一个 `async function` 里的违禁词
+    会被安在别的函数名下报出来，而如果那个"前面的函数"恰好登记在
+    INTERNAL_RENDERERS 里，这条测试会假绿——真正违规的那段代码被藏进了
+    一个不相干、且已经被登记豁免的名字底下。"""
+    src = strip_js_comments(src)
+    out: dict[str, str] = {}
+    marks = [(m.start(), m.group(1)) for m in
+             re.finditer(r"(?m)^(?:async\s+)?function\s+(\w+)\s*\(", src)]
+    if not marks:
+        return {"<module>": src}
+    out["<module>"] = src[: marks[0][0]]
+    for i, (pos, name) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(src)
+        out[name] = out.get(name, "") + src[pos:end]
+    return out
+
+
+def chinese_strings(chunk: str) -> list[str]:
+    return [m.group(0) for m in STRING_RE.finditer(chunk) if CJK.search(m.group(0))]
+
+
+# ---------- index.html：产品可见的文字 ----------
+
+HTML_TEXT = product_visible_html_text()
+
+
+@pytest.mark.parametrize("word", sorted(BANNED))
+def test_index_html_product_text_has_no_banned_word(word):
+    assert word not in HTML_TEXT, (
+        f"index.html 的产品可见文字里出现了禁词「{word}」"
+        f"（禁词类别 {BANNED[word]}）")
+
+
+def test_index_html_product_text_has_no_internal_code():
+    hits = INTERNAL_CODE_RE.findall(HTML_TEXT)
+    assert not hits, f"产品可见文字里有内部编号：{hits}"
+
+
+@pytest.mark.parametrize("word", RETRIEVER_WORDS)
+def test_index_html_product_text_does_not_name_a_retrieval_mode(word):
+    assert word not in HTML_TEXT
+
+
+def test_the_internal_only_subtree_is_actually_skipped():
+    """**这条测试是上面那几条的自检。** 解析器要是把 internal-only 子树也
+    收进来了，上面全会红；要是它把整个文件都跳过了，上面全会假绿。
+    所以这里正反各钉一次：研究面的词在整份 HTML 里**有**，在产品可见文字里
+    **没有**。"""
+    raw = load_html()
+    assert "噪声地板" in raw, "整份 HTML 里本来就该有研究面的措辞"
+    assert "噪声地板" not in HTML_TEXT
+    assert "推导链" in HTML_TEXT or "辨证" in HTML_TEXT, "产品可见文字被整个跳过了"
+
+
+# ---------- app.js：中文串 + 函数级白名单 ----------
+
+APP_CHUNKS = js_chunks(load_app_js())
+
+
+def _offending(chunks: dict[str, str]) -> list[str]:
+    bad = []
+    for name, chunk in chunks.items():
+        if name in INTERNAL_RENDERERS:
+            continue
+        for lit in chinese_strings(chunk):
+            for word in BANNED:
+                if word in lit:
+                    bad.append(f"{name}: 「{word}」 in {lit[:60]}")
+    return bad
+
+
+def test_app_js_product_facing_strings_have_no_banned_word():
+    bad = _offending(APP_CHUNKS)
+    assert not bad, ("这些函数的中文文案里有禁词，而它们不在 INTERNAL_RENDERERS "
+                     "登记表里：\n  " + "\n  ".join(bad))
+
+
+def test_the_whitelist_is_not_a_blanket_exemption():
+    """登记表里每一项的类别编号都必须是有效的（禁词表用到的类别，外加 2、3、7、8）。
+    写一个不存在的编号 = 拿白名单当垃圾桶。"""
+    valid = set(BANNED.values()) | {2, 3, 7, 8}
+    for fn, item in INTERNAL_RENDERERS.items():
+        assert item in valid, f"{fn} 登记的类别编号 {item} 不是有效类别"
+
+
+def test_the_whitelist_has_no_dead_entries():
+    """登记表里的函数得真的存在。函数改名之后留在表里的那一条会永远放行
+    一个不存在的名字，而真正该被扫的新函数没人登记。"""
+    names = set(APP_CHUNKS)
+    dead = [fn for fn in INTERNAL_RENDERERS if fn not in names]
+    assert not dead, f"登记表里这些函数已经不存在了：{dead}"
+
+
+def test_app_js_has_no_internal_code_in_chinese_strings():
+    bad = []
+    for name, chunk in APP_CHUNKS.items():
+        for lit in chinese_strings(chunk):
+            if INTERNAL_CODE_RE.search(lit):
+                bad.append(f"{name}: {lit[:60]}")
+    assert not bad, "中文文案里有内部编号：\n  " + "\n  ".join(bad)
+
+
+def test_the_comment_stripper_actually_strips():
+    """自检：注释里满是"噪声地板"这四个字，去不掉的话上面那条恒红。"""
+    src = 'const a = 1; // 这里解释噪声地板\n/* 也讲 ε */\nconst b = "正文";'
+    out = strip_js_comments(src)
+    assert "噪声地板" not in out and "ε" not in out and "正文" in out
+
+
+def test_the_chunker_attributes_strings_to_the_right_function():
+    chunks = js_chunks('function alpha() { return "甲"; }\nfunction beta() { return "乙"; }')
+    assert "甲" in chunks["alpha"] and "甲" not in chunks["beta"]
+    assert "乙" in chunks["beta"]
+
+
+# ---------- 后端：面向使用者的错误文案 ----------
+
+API_SRC = (ROOT / "api" / "main.py").read_text(encoding="utf-8")
+
+
+def test_http_error_details_are_chinese_not_exception_names():
+    """英文技术词与报错原文不上产品面（禁词类别 12）。
+    扫 `HTTPException(... detail=...)` 里的字面量。"""
+    bad = []
+    for m in re.finditer(r'detail=(?:_public_text\()?(["\'])(.*?)\1', API_SRC, re.DOTALL):
+        text = m.group(2)
+        if not CJK.search(text):
+            continue
+        for word in ("Traceback", "LLMError", "schema", "null", "exit code"):
+            if word in text:
+                bad.append(f"{word} in {text[:50]}")
+    assert not bad, "错误文案里有英文技术词：" + "；".join(bad)
+
+
+def test_the_product_name_has_no_demo_word():
+    from core.version import PRODUCT_NAME
+
+    assert "demo" not in PRODUCT_NAME.lower()
+    assert CJK.search(PRODUCT_NAME)
+
+
+def test_the_page_title_matches_the_product_name():
+    """页面标题与产品名统一。两处不一致时，浏览器标签页上
+    是一个名字、页脚上是另一个——那正是"拼起来的"观感。"""
+    from core.version import PRODUCT_NAME
+
+    m = re.search(r"<title>(.*?)</title>", load_html())
+    assert m and m.group(1).strip() == PRODUCT_NAME
+
+
+def test_the_h1_matches_the_product_name():
+    from core.version import PRODUCT_NAME
+
+    m = re.search(r"<h1>(.*?)</h1>", load_html())
+    assert m and m.group(1).strip() == PRODUCT_NAME
+
+
+# ---------- core/safety.py::veto_message() ----------
+#
+# 这一句直接显示给被拦截的患者——安全否决是全站最不该带研究痕迹的地方。
+#
+# 不扫整份源码（那样连函数自己的文档字符串都会被当正文，而文档字符串
+# 就是给开发者看的，里面提"评测"是正常的开发者交流，见模块里
+# `role_sees_full_reasoning_on_red_flag` 那段文档）。**直接跑一遍真实函数**，
+# 扫它的返回值——这是唯一真的会显示给用户的文字，源码扫得再全也不如
+# 跑一次准。
+
+
+def test_veto_message_has_no_banned_word():
+    from core.safety import veto_message
+
+    text = veto_message("柏油样便")
+    bad = [w for w in BANNED if w in text]
+    assert not bad, f"veto_message() 的真实返回值里有禁词：{bad}（{text!r}）"
+
+
+def test_check_safety_rejection_text_has_no_banned_word():
+    """跟上一条测的是同一份文案，但走 `check_safety()` 这条真实调用路径
+    （危重症状命中 → 拒绝理由），不是直接拼参数调 `veto_message`——万一将来
+    有人在 `check_safety` 里另外接了一段文字，这条能测到那一段。"""
+    from core.safety import check_safety
+
+    text = check_safety(["解黑色柏油样便"])
+    assert text is not None
+    bad = [w for w in BANNED if w in text]
+    assert not bad, f"check_safety() 的真实返回值里有禁词：{bad}（{text!r}）"
+
+
+# ---------- 自检：禁词表规模 + async function 切块 ----------
+
+
+def test_the_banned_word_list_has_at_least_35_entries():
+    """给禁词表设一道数值下限：低于 35 说明有人删条目删过头了，
+    得说清楚为什么。"""
+    assert len(BANNED) >= 35, f"当前只有 {len(BANNED)} 条，应 ≥35"
+
+
+def test_the_chunker_recognizes_async_functions():
+    """自检：`js_chunks` 必须认得 `async function`，否则 async 函数体会被并进
+    前一个函数的块里，违禁词会被安在别的函数名下（见 js_chunks 文档字符串）。
+    这里钉住：async 函数有自己的块，不会被前一个函数吞掉。"""
+    chunks = js_chunks(
+        'function alpha() { return "甲"; }\n'
+        'async function beta() { return "乙违禁词"; }\n'
+        'function gamma() { return "丙"; }\n'
+    )
+    assert "违禁词" in chunks["beta"]
+    assert "违禁词" not in chunks["alpha"]
+    assert "丙" in chunks["gamma"] and "违禁词" not in chunks["gamma"]
