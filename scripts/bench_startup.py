@@ -1,0 +1,333 @@
+"""启动耗时基准：`import api.main` + 预热（加载模型 / 编码语料 / 建 BM25 索引）分段计时。
+
+## 为什么要分段
+
+启动总耗时这一个数没法指导优化——不知道是模型加载慢还是编码慢。embedding 磁盘
+缓存只能省掉**编码**那一段（模型还是要加载），所以必须把这两段分开量，
+才说得清"省下的是哪一段"。
+
+四段的边界：
+
+    import        import api.main（含 FastAPI 建应用、各 core 模块 import）
+    construct     get_retriever()：读 cases.json、逐条 CaseRecord 校验、算 _case_texts
+    model_load    SentenceTransformer("BAAI/bge-small-zh-v1.5")
+    encode        model.encode(全部医案文本)
+
+`model_load` / `encode` 都在 `DenseRetriever._load()` 里面，而它是函数内 import
+（惰性加载是这个项目的硬约定），所以在**模块属性**上包一层就能把这两段分开
+——不改 `core/retrieval.py` 一行。
+
+## 冷热两次
+
+`--repeat 2` 会在同一个进程里量两次：第二次 `_embeddings` 已经就位，`construct` 之后
+三段全是 0。embedding 缓存要验的是**跨进程**的热启动，所以要分两个进程各跑一次：
+
+    python -m scripts.bench_startup                 # 冷
+    python -m scripts.bench_startup                 # 热（缓存命中）
+
+## 预热并行化对照
+
+`--warmup-compare N` 只比较串行预热与并行预热：各起 N 个新进程（本体层和检索器
+都是进程级单例，同一进程里量第二遍全是 0），取墙钟中位数；这个模式不量 import，
+也不量检索层那三段。
+
+## 自检模式
+
+缺 `cases.json` 或下载不了向量模型时（例如无法访问 Hugging Face Hub），
+`--self-test N` 造 N 条合成医案 + 一个确定性的假编码器，
+只为验证**这个脚本自己**的分段逻辑。输出里 `synthetic: true` 时那几个秒数不代表
+任何真实性能，报告里不许引用。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import tempfile
+import time
+import types
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BENCH_DIR = ROOT / "eval" / "bench"
+
+SEGMENTS = ("import", "construct", "model_load", "encode")
+
+#: 预热并行化的对照（串行 vs 并行）。**必须各起一个新进程**——本体层和检索器
+#: 都是进程级单例，同一个进程里量第二遍全是 0。
+_WARMUP_SNIPPET = """
+import json, sys, time
+sys.path.insert(0, {root!r})
+from api.warmup import WarmupTracker, run_warmup
+t0 = time.perf_counter()
+snap = run_warmup(WarmupTracker(), parallel={parallel})
+snap["wall_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+print("@@" + json.dumps(snap, ensure_ascii=False))
+"""
+
+
+def warmup_compare(*, repeat: int = 1) -> dict:
+    """串行预热 vs 并行预热，各跑 `repeat` 次新进程，取中位数。
+
+    为什么这个数值得单独量：两项预热（本体层加载、检索器编码）之间**没有依赖**，
+    并行跑省下来的是两者中较小的那一段；而"省了多少"只有真跑才说得准——
+    GIL 下两个线程并不是完全并行，本体层加载里有多少是纯 CPU（抢 GIL、省不掉）
+    取决于 jsonl 解析本身。
+    """
+    import statistics
+    import subprocess
+
+    out: dict = {"repeat": repeat, "runs": {"serial": [], "parallel": []}}
+    for mode, parallel in (("serial", "False"), ("parallel", "True")):
+        for _ in range(max(1, repeat)):
+            code = _WARMUP_SNIPPET.format(root=str(ROOT), parallel=parallel)
+            proc = subprocess.run([sys.executable, "-c", code], check=False,
+                                  capture_output=True, text=True, timeout=900)
+            line = next((ln[2:] for ln in proc.stdout.splitlines()
+                         if ln.startswith("@@")), None)
+            if line is None:
+                out["runs"][mode].append({"error": (proc.stderr or proc.stdout)[-300:]})
+                continue
+            out["runs"][mode].append(json.loads(line))
+    for mode in ("serial", "parallel"):
+        walls = [r["wall_ms"] for r in out["runs"][mode] if "wall_ms" in r]
+        out[f"{mode}_wall_ms"] = round(statistics.median(walls), 1) if walls else None
+    a, b = out.get("serial_wall_ms"), out.get("parallel_wall_ms")
+    out["saved_ms"] = round(a - b, 1) if (a and b) else None
+    out["saved_pct"] = round((a - b) / a * 100, 1) if (a and b) else None
+    return out
+
+
+class _Stopwatch:
+    """按段累计耗时。同一段被进入多次就累加（编码分批时会发生）。"""
+
+    def __init__(self) -> None:
+        self.seconds: dict[str, float] = {}
+
+    def add(self, name: str, seconds: float) -> None:
+        self.seconds[name] = round(self.seconds.get(name, 0.0) + seconds, 4)
+
+    def timed(self, name: str, fn, *args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            self.add(name, time.perf_counter() - t0)
+
+
+def instrument_encoder(watch: _Stopwatch) -> str | None:
+    """把 `sentence_transformers.SentenceTransformer` 换成一层计时壳。装不上就如实
+    返回一句话，**不崩**。
+
+    `_load()` 里是 `from sentence_transformers import SentenceTransformer`——函数内
+    import 每次都会去模块属性上取，所以在这里替换模块属性就能拦到，不需要碰
+    core/retrieval.py。
+
+    **为什么不能让 ImportError 冒出去**：这个脚本存在的意义之一就是"在什么都没装好的
+    机器上也能告诉你缺什么"。缺包时直接 ModuleNotFoundError 会连已经量到的
+    import 段也一起丢掉——那正好是它该报告而不是该崩的情形。
+    """
+    try:
+        import sentence_transformers as st
+    except ImportError as e:
+        return (f"这台机器上 import sentence_transformers 失败（{e}）："
+                "model_load / encode 两段量不到，检索层也起不来。"
+                "装了它再跑，或者用 --self-test 只验这个脚本自己。")
+
+    real_cls = st.SentenceTransformer
+
+    def timed_ctor(*args, **kwargs):
+        model = watch.timed("model_load", real_cls, *args, **kwargs)
+        real_encode = model.encode
+
+        def encode(*a, **kw):
+            return watch.timed("encode", real_encode, *a, **kw)
+
+        model.encode = encode
+        return model
+
+    st.SentenceTransformer = timed_ctor
+    return None
+
+
+def install_self_test(n_cases: int) -> Path:
+    """造 N 条合成医案 + 一个确定性假编码器，让没有数据和模型的环境也能跑通这个脚本。
+
+    假编码器按字符码点算一个 8 维向量：确定性、零依赖、不联网。它**不产生任何
+    有意义的检索结果**，只用来走通"加载 → 编码 → 发布"这条路径。
+    """
+    import numpy as np
+
+    from core import retrieval
+    from core.physicians import PHYSICIANS, physicians_enabled
+
+    cases = []
+    for pid in physicians_enabled(PHYSICIANS):
+        for i in range(n_cases):
+            cases.append({
+                "case_id": f"{pid}-bench-{i:04d}", "case_group_id": f"{pid}-bench-g{i:04d}",
+                "physician": pid, "visit_index": 0,
+                "raw": "合成医案：胃脘胀痛，嗳气泛酸，脉弦。",
+                "symptoms": ["胃脘胀痛", "嗳气"], "herbs": ["柴胡", "白芍"],
+                "raw_excerpt": "合成医案：胃脘胀痛，嗳气泛酸，脉弦。",
+            })
+    # 写临时目录不写 eval/bench/：合成语料是自检用的一次性产物，落在仓库里
+    # 迟早有人把它当成真的 cases.json。
+    path = Path(tempfile.mkdtemp(prefix="bench_startup_")) / "cases.json"
+    path.write_text(json.dumps(cases, ensure_ascii=False), encoding="utf-8")
+
+    class FakeST:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def encode(self, texts, **_kw):
+            rows = [[sum(ord(c) for c in t[i::8]) % 97 / 97.0 for i in range(8)] for t in texts]
+            return np.array(rows, dtype="float32")
+
+    stub = types.ModuleType("sentence_transformers")
+    stub.SentenceTransformer = FakeST
+    sys.modules["sentence_transformers"] = stub
+
+    # 构造函数的默认参数在 def 那一刻就绑好了，改模块里的 CASES_PATH 已经晚了，
+    # 所以这里直接把两个构造函数的默认值换掉。
+    for cls in (retrieval.DenseRetriever,):
+        cls.__init__.__defaults__ = (path,)
+    from core.retrieval_hybrid import HybridRetriever
+
+    HybridRetriever.__init__.__defaults__ = (path,)
+    # cases.json 的路径换掉之后，已经建好的单例持有的是**旧路径**加载出来的医案，
+    # 不丢掉的话这一跑量的还是旧语料，而且一声不响。
+    retrieval.reset_retriever_singleton()
+    return path
+
+
+def measure(watch: _Stopwatch, warm: bool) -> dict:
+    """量一次。warm=True 表示这是同一进程里的第二次，用来看"还剩多少是真的重复劳动"。"""
+    from core.retrieval import get_retriever
+
+    t0 = time.perf_counter()
+    retriever = watch.timed("construct", get_retriever)
+    retriever._ensure_encoded()
+    total = time.perf_counter() - t0
+    embeddings = getattr(retriever, "_embeddings", None)
+    return {
+        "warm": warm,
+        "total_s": round(total, 4),
+        "n_cases": len(getattr(retriever, "_cases", []) or []),
+        "n_embeddings": int(getattr(embeddings, "shape", [0])[0]) if embeddings is not None else 0,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--self-test", type=int, default=0, metavar="N",
+                    help="每位医家造 N 条合成医案 + 假编码器（只用来验脚本自己，数字无意义）")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="同一进程里量几次。第二次起 embeddings 已就位，用来看重复劳动还剩多少")
+    ap.add_argument("--skip-import", action="store_true",
+                    help="不量 import api.main（只想看检索层那三段时用）")
+    ap.add_argument("--out", default=None, help="默认 eval/bench/startup_<时间戳>.json")
+    ap.add_argument("--warmup-compare", type=int, default=0, metavar="N",
+                    help="只跑串行预热与并行预热的对照：各起 N 个新进程，"
+                         "取中位数。不量 import、不量检索层三段")
+    args = ap.parse_args(argv)
+
+    if args.warmup_compare:
+        cmp_report = warmup_compare(repeat=args.warmup_compare)
+        cmp_report.update({
+            "kind": "warmup_parallel_compare",
+            "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        out = Path(args.out) if args.out else \
+            BENCH_DIR / f"warmup_compare_{int(time.time())}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(cmp_report, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        print(f"  串行 {cmp_report['serial_wall_ms']} ms  →  "
+              f"并行 {cmp_report['parallel_wall_ms']} ms  "
+              f"（省 {cmp_report['saved_ms']} ms / {cmp_report['saved_pct']}%）")
+        for mode in ("serial", "parallel"):
+            for r in cmp_report["runs"][mode]:
+                if "error" in r:
+                    print(f"  ✗ {mode}: {r['error']}", file=sys.stderr)
+        print(f"→ {out}")
+        return 0
+
+    watch = _Stopwatch()
+    synthetic = args.self_test > 0
+    cases_path = install_self_test(args.self_test) if synthetic else None
+    encoder_note = instrument_encoder(watch)
+
+    # 冷启动只发生一次。同一进程里别人先建过单例，`construct`/`model_load`
+    # 这两段压根不会跑，量出来是 None——跟"没装 sentence_transformers"在报告里
+    # 长得一模一样。**先说清楚是哪一种**，再决定要不要接着量。
+    from core.retrieval import retriever_is_built
+
+    warm_singleton_note = None
+    if retriever_is_built():
+        warm_singleton_note = (
+            "进程里已经有建好的检索器单例，这一跑量到的 construct / model_load / "
+            "encode 不是冷启动。要量冷启动就换个新进程，或先调 "
+            "core.retrieval.reset_retriever_singleton()。")
+
+    import_error = None
+    if not args.skip_import:
+        try:
+            watch.timed("import", __import__, "api.main")
+        except Exception as e:  # noqa: BLE001 - import 失败也要把已量到的段写出来
+            import_error = f"{type(e).__name__}: {e}"
+
+    runs, error = [], None
+    try:
+        for i in range(max(1, args.repeat)):
+            runs.append(measure(watch, warm=i > 0))
+    except Exception as e:  # noqa: BLE001 - 没有 cases.json 时如实记录、不崩
+        error = f"{type(e).__name__}: {e}"
+
+    report = {
+        "kind": "startup",
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "synthetic": synthetic,
+        "synthetic_note": ("合成医案 + 假编码器，这些秒数只证明分段逻辑能跑，"
+                           "**不代表任何真实性能**，不许写进报告") if synthetic else None,
+        "cases_path": str(cases_path) if cases_path else None,
+        "config": {"self_test": args.self_test, "repeat": args.repeat,
+                   "skip_import": args.skip_import},
+        "encoder_note": encoder_note,
+        # 「量不到」有两种原因，报告里必须分得开：编码器装不上（encoder_note）
+        # 和单例已经是热的（warm_singleton_note）。
+        "warm_singleton_note": warm_singleton_note,
+        "segments_s": {name: watch.seconds.get(name) for name in SEGMENTS},
+        "runs": runs,
+        "import_error": import_error,
+        "error": error,
+    }
+    # 合成跑的文件名带 synthetic，被 .gitignore 挡掉——理由同 bench_consult。
+    prefix = "startup_synthetic" if synthetic else "startup_real"
+    out = Path(args.out) if args.out else BENCH_DIR / f"{prefix}_{int(time.time())}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    for name in SEGMENTS:
+        value = report["segments_s"][name]
+        print(f"  {name:12s} {'—' if value is None else f'{value}s'}")
+    for r in runs:
+        print(f"  {'热' if r['warm'] else '冷'}　总 {r['total_s']}s　"
+              f"{r['n_cases']} 条医案 / {r['n_embeddings']} 条向量")
+    if error:
+        print(f"✗ 量不到检索层：{error}", file=sys.stderr)
+    if import_error:
+        print(f"✗ import api.main 失败：{import_error}", file=sys.stderr)
+    if encoder_note:
+        print(f"✗ {encoder_note}", file=sys.stderr)
+    if warm_singleton_note:
+        print(f"✗ {warm_singleton_note}", file=sys.stderr)
+    print(f"→ {out}")
+    return 0 if (error is None and import_error is None and encoder_note is None
+                 and warm_singleton_note is None) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
