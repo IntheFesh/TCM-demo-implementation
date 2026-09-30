@@ -1,0 +1,274 @@
+"""安全否决层：危重症状拦截，必须发生在 S2（证素推断）之前（docs/ARCHITECTURE.md
+§3）。命中拦截的主诉直接返回拒绝辨证的提示，不进入 S2/S3，不产出任何方药，
+不是在结果的 note 字段里事后提一句"建议转诊"。
+
+关键词表刻意跟 core/syndrome_norm.py 的 SYNONYMS 分开维护：那张表回答的是
+"这个词属于哪个证候门类"，这里回答的是"要不要在辨证开始前拦截整个请求"，
+是两个不同的判断（docs/ARCHITECTURE.md §4 的例外：两处回答的不是同一个问题）
+——合并成一张表，以后改一边时看不出会不会连带影响另一边。
+
+纯关键词匹配，不调用 LLM：安全层必须在没有网络/API key 的情况下也能跑，
+而且必须是确定性的（同样的输入永远同样的拦截结果），不能依赖模型的不确定性。
+"""
+from __future__ import annotations
+
+import os
+import re
+
+# 覆盖本系统脾胃门范围内、临床上需要立即转诊而不是继续辨证的信号：
+# 消化道出血（呕血/黑便/柏油样便/咖啡渣样呕吐物）、意识改变（昏迷/晕厥/不省人事）、
+# 休克体征、持续剧痛。
+DANGER_KEYWORDS: list[str] = [
+    "呕血",
+    "吐血",
+    "咯血",
+    "便血",
+    "血便",
+    "黑便",
+    "柏油样便",
+    "咖啡渣",
+    "肛门出血",
+    "大量出血",
+    "昏迷",
+    "晕厥",
+    "不省人事",
+    "叫不醒",
+    "神志不清",
+    "休克",
+    "剧烈腹痛",
+    "持续剧痛",
+]
+
+# 同一件事的两种写法在拒绝文案里只该出现一次：关键词「吐血」和正则的「呕血」
+# 标签会对同一句话双双命中，dict.fromkeys 去不掉这种"不同字面、同一含义"。
+_LABEL_CANON: dict[str, str] = {
+    "吐血": "呕血", "神志不清": "意识改变", "持续剧痛": "剧烈腹痛",
+    "晕厥": "昏迷", "不省人事": "昏迷", "叫不醒": "昏迷", "血便": "便血",
+}
+
+# 口语化表述：患者不会说"吐血"，只会说"吐了血""吐了两次血"。
+# 纯子串匹配对付不了中间插字，用正则允许关键动词与宾语之间有少量字符。
+#
+# 每条正则用命名组 obj 标出「宾语」（血/黑/剧烈/不清……）。否定判断只看紧挨在 obj
+# 前面的那两三个字（见 _object_negated），不看整个间隔：
+#   - 把 不/未/无/没 整个排除出间隔，会漏掉「大便不成形发黑」这类教科书式的
+#     柏油便描述（不成形 + 发黑）；
+#   - 完全不看否定，又会把追问的阴性回答「大便不带血」「腹痛不剧烈」「意识不模糊」
+#     整链否决，parse_answer 判 no、check_safety 判拦，同一句话两处答案相反。
+# 「吐了不少血」「痛得不行」里的 不少/不行 是数量/程度词，不是否定——
+# _NEG_QUANTITY 把它们排除在否定之外。
+# 「血」后面跟 压/虚/糖/脂 的是血压/血虚/血糖/血脂，前面是「气」的是气血；
+# 「便」前面是 小/顺/即/方/随 的不是大便。这两条是排除误报的语境边界。
+_GAP = r"[^。；;！？!?]{0,6}"
+DANGER_PATTERNS: list[tuple[str, str]] = [
+    (rf"(吐|呕|咯|咳)(?!血)(?P<gap>{_GAP})(?P<obj>(?<!气)血(?![压虚糖脂]))", "呕血"),
+    (rf"(?<![小顺即方随])(大?便|拉|排|解)(?P<gap>{_GAP})(?P<obj>发黑|黑|柏油)", "黑便"),
+    (r"黑色(?P<gap>[^，。；\s]{0,2})(?P<obj>大便|便|粪|屎)", "黑便"),
+    (r"柏油(?P<gap>[^，。；\s]{0,3})(?P<obj>便|粪|屎)", "黑便"),
+    (rf"(?<![小顺即方随])(便|拉|排|解)(?P<gap>{_GAP})(?P<obj>(?<!气)血(?![压虚糖脂]))", "便血"),
+    (r"大便(?P<gap>[^，。；\s]{0,3})(?P<obj>暗红|鲜红|紫黑)", "便血"),
+    (r"痰(?P<gap>[^，。；\s]{0,2})(?P<obj>血)", "咯血"),
+    (r"(腹|肚|胃|脘)(?P<gap>[^，。；\s]{0,3})"
+     r"(?P<obj>剧烈|剧痛|绞痛|难忍|(?:痛|疼)(?:得|到)(?:不行|不了|受不了|厉害|难受|要命)|(?:痛|疼)(?:得|到)(?![不没未]))", "剧烈腹痛"),
+    (r"剧烈(?P<gap>[^，。；\s]{0,3})(?P<obj>腹痛|肚子疼|肚痛|胃痛|腹部|胃脘)", "剧烈腹痛"),
+    (r"(神志|意识)(?P<gap>[^，。；\s]{0,4})(?P<obj>不清|模糊|丧失)", "意识改变"),
+    (r"(昏|晕)(?P<obj>过去|倒|厥)", "昏迷"),
+]
+
+# 紧挨在宾语前面的否定词。「不少/不止/不断/不停/不行」是数量/程度词，排除。
+_NEG_BEFORE_OBJ = ("不带", "不出", "不见", "不是", "没有", "未见", "未曾", "没", "无", "未", "不")
+_NEG_QUANTITY = ("不少", "不止", "不断", "不停", "不行", "不了")
+# 宾语前面是这些字时说的不是大便/出血：舌苔黑、面黑、排尿黑
+_NON_STOOL_CONTEXT = ("苔", "舌", "面", "唇", "甲", "尿", "溲")
+# 望诊描述里「色黑」前面若出现这些字，说的是舌苔/面色不是大便
+_NON_STOOL_WORDS = ("舌苔", "苔色", "面色", "唇色", "甲色", "肤色", "舌质", "小便", "溲")
+
+# 紧挨在整个命中前面的否定词：「无黑便」「否认呕血」「没吐过血」「从未便血」是阴性
+# 陈述。只认前置否定，不认命中内部的（那由 _object_negated 按宾语判断）。
+_NEGATION_PREFIXES: tuple[str, ...] = (
+    "无", "否认", "没有", "没", "未见", "不见", "未曾", "从无", "从未", "从没", "不曾",
+    "从不", "无明显", "无明确", "未",
+)
+
+
+def _negated(text: str, start: int) -> bool:
+    before = text[max(0, start - 4):start]
+    return any(before.endswith(n) for n in _NEGATION_PREFIXES)
+
+
+def _object_negated(text: str, obj_start: int) -> bool:
+    """宾语（血/黑/剧烈……）紧前面是否定词或非大便语境。"""
+    before = text[max(0, obj_start - 3):obj_start]
+    if any(before.endswith(q) for q in _NEG_QUANTITY):
+        return False
+    if any(before.endswith(n) for n in _NEG_BEFORE_OBJ):
+        return True
+    if any(before.endswith(c) for c in _NON_STOOL_CONTEXT):
+        return True
+    # 「大便正常，面色黑」：obj 前是「色」，要再往前看一格才认得出「面色」
+    return any(w in text[max(0, obj_start - 5):obj_start] for w in _NON_STOOL_WORDS)
+
+
+def _keyword_context_ok(text: str, m) -> bool:
+    """关键词裸子串扫描也要守同样的语境边界：「呕吐血压偏高」里的「吐血」不是吐血。"""
+    kw = m.group(0)
+    nxt = text[m.end():m.end() + 1]
+    if kw.endswith("血") and nxt in ("压", "虚", "糖", "脂"):
+        return False
+    return not _negated(text, m.start())
+
+
+# 表里存的是字符串（读起来是表，改起来也是表），编译一次放在模块级：_scan 是
+# 每个请求都要过的热路径，还要对每个起始位置各匹配一次，在循环里反复
+# re.compile 会白白多出大量编译缓存查找。
+_DANGER_KEYWORD_RES: list[tuple[str, re.Pattern]] = [
+    (kw, re.compile(re.escape(kw))) for kw in DANGER_KEYWORDS
+]
+_DANGER_PATTERN_RES: list[tuple[re.Pattern, str]] = [
+    (re.compile(pattern), label) for pattern, label in DANGER_PATTERNS
+]
+
+
+def _scan(text: str, honor_negation: bool) -> list[str]:
+    hits: list[str] = []
+    for kw, kw_re in _DANGER_KEYWORD_RES:
+        if any(not honor_negation or _keyword_context_ok(text, m)
+               for m in kw_re.finditer(text)):
+            hits.append(_LABEL_CANON.get(kw, kw))
+    for pattern_re, label in _DANGER_PATTERN_RES:
+        # 被否定跳过的命中不能让扫描就此结束：finditer 是非重叠的，被否定跳过的
+        # 那个最左匹配会把后面真正的危重表述一起吞掉（「无便血但大便黑」若只看
+        # 最左匹配，整句放行）。所以用 overlapped 扫法——每个位置都起一次匹配。
+        for i in range(len(text)):
+            m = pattern_re.match(text, i)
+            if not m:
+                continue
+            if honor_negation and (_negated(text, m.start()) or _object_negated(text, m.start("obj"))):
+                continue
+            hits.append(label)
+            break
+    return hits
+
+
+def mentions_danger(text: str) -> str | None:
+    """文本里**提到**了危重信号（不管是肯定、否定还是提问）。返回标签或 None。
+
+    给追问用：「有没有便血？」这句问题本身含否定式问法，check_safety 会当成阴性
+    陈述放行；提问方需要知道的是"我问的是不是一个危重症状"，跟"这句话是不是在
+    陈述危重症状"是两个问题。
+    """
+    hits = _scan(text, honor_negation=False)
+    return "、".join(dict.fromkeys(hits)) if hits else None
+
+
+#: 危重命中之后，这些角色拿完整推理（不整页拦截）。**只排除 patient**——见
+#: `role_sees_full_reasoning_on_red_flag` 的文档字符串。
+ROLES_SEEING_FULL_REASONING_ON_RED_FLAG = frozenset({"doctor", "student", "researcher"})
+
+
+def role_sees_full_reasoning_on_red_flag(role: str | None) -> bool:
+    """危重信号命中之后，这个角色要不要拿到完整推理，而不是被整页拦截。
+
+    只有 patient 拦截：那道整页拦截保护的是"没有专业判断力、看到系统说
+    什么就信什么"的终端使用者——他们没有能力核实系统给的推理对不对，藏起来
+    直接让他们去看急诊是唯一安全的选择。doctor/student/researcher 都是有
+    专业判断力的人，把完整推理藏起来对他们没有保护作用，反而让他们没法核实
+    系统的判断、没法自己决定要不要采信——所以给他们完整推理 + 醒目的危重
+    提示（顶部红色警示条/方剂区水印/EMR「危重提示」段/导出二次确认，见
+    api/main.py 与 web/app.js 的 red flag 相关代码），不是整页拦截。
+
+    **复用的是 `safety_bypassed()`/`consult(eval_mode=)` 那同一套"命中后
+    继续走、但把命中原因记下来"的机制**——`EVAL_MODE` 是给离线评测脚本用
+    的（量化安全否决的代价，见 `safety_bypassed` 文档字符串），这里是给
+    api/main.py 的角色分流用的：两个入口问的是同一个问题（"命中安全规则之后
+    要不要中止链路"），答案也一样（"不中止，但把命中原因带出来"），所以复用
+    同一个开关，不是在 `check_safety` 之外另开一套判法（docs/ARCHITECTURE.md
+    §4：同一概念只有一处实现）。
+
+    这带来一个特意保留的效果：api/main.py 按这个函数给每次 HTTP 请求显式传
+    `eval_mode=`，于是服务端全局的 `EVAL_MODE` 环境变量不能通过 HTTP 接口
+    影响任何角色的拦截结果（`safety_bypassed` 的"显式参数优先"规则）。
+    `scripts/preflight_deploy.py` 把 `EVAL_MODE=1` 列为"这一项红的话不要上线"
+    的部署事故，这里让它即使误开着也伤不到走 HTTP 的 patient 请求，是加固，
+    不是收窄评测脚本的能力（离线评测不经过 api/main.py：`eval/run_eval.py`
+    直接调 `core.chain.consult()`，`eval/sdt/` 走自己的 adapter，不受这条影响）。
+
+    不认识的 role（`None`、以后新加的角色）一律落回"不在这张表里就拦截"——
+    默认站在更保守的一边，新角色要显式加进
+    `ROLES_SEEING_FULL_REASONING_ON_RED_FLAG` 才会被当成"有专业判断力"，
+    不是反过来。
+    """
+    return (role or "") in ROLES_SEEING_FULL_REASONING_ON_RED_FLAG
+
+
+def safety_bypassed(explicit: bool | None = None) -> bool:
+    """**这次调用要不要跳过"命中后中止"这个动作**——注意跳过的只是中止，
+    `check_safety()` 本身照跑、命中原因照记，不是不检测了。
+
+    唯一的判定实现，两条链路（`core.chain.consult` 和 `eval.sdt.adapter`）
+    都调它，不各写一套。判定顺序刻意是"显式参数优先，未指定才读环境变量"：
+
+    - 显式参数并发安全。同一个进程里两个请求可以各自指定，互不影响；
+      env var 是全局的，一个评测脚本设了它，同进程跑的正常问诊请求会跟着变——
+      那正是安全红线最不能出的事。
+    - 环境变量兜底是为了让整批评测（`eval/run_eval.py` 调 consult、
+      `eval/sdt/run.py` 调 solver）不必逐个调用点改签名。
+
+    形状跟 `core.react.react_enabled()` / `consult(use_react=None)` 的约定
+    一致：显式参数优先、未指定才读环境变量。
+
+    **默认关**：不设 EVAL_MODE、不传参数时返回 False，安全否决照常中止链路。
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get("EVAL_MODE", "0").lower() in ("1", "true", "yes")
+
+
+def check_safety(symptoms: list[str]) -> str | None:
+    """symptoms 是 S1 标准化后的症状列表（在 S2 之前调用）。命中任一关键词
+    就返回可以直接展示给用户的拒绝理由；没有命中则返回 None，放行进入 S2。"""
+    hits: list[str] = []
+    for text in symptoms:
+        hits.extend(_scan(text, honor_negation=True))
+    if not hits:
+        return None
+    return veto_message("、".join(dict.fromkeys(hits)))  # 去重且保持命中顺序
+
+
+def veto_message(matched: str) -> str:
+    """拒绝辨证的文案，**全项目只在这里拼一次**：check_safety、
+    danger_confirmed_by_answer 和追问兜底（core/followup.py）都调这个函数。
+    各拼一份的话，改措辞时必然漏改一处，而这几处恰恰是不能分叉的安全后门
+    （docs/ARCHITECTURE.md §4）。
+
+    这句话会原样显示给患者，所以措辞保持中性、严肃，不带任何会让人以为这是
+    玩具或测试系统的字眼（产品界面的禁词清单见 tests/test_ui_banned_terms.py，
+    veto_message 的返回值有专门的测试）。"""
+    return (
+        f"检测到危重症状信号（{matched}），本系统不适用于此类情况，"
+        "请立即就医或拨打急救电话，本次不提供辨证结果。"
+    )
+
+
+def danger_confirmed_by_answer(
+    question: str, answer_verdict: str, symptom: str | None = None
+) -> str | None:
+    """追问的第二道门：**问的本身是危重症状、患者没有明确否认** → 返回拒绝理由，
+    否则 None。回答原文里往往没有危重词（「有没有便血？」→「有」），check_safety
+    单独看回答是放行的，这条判据补的就是这个缺口。
+
+    只有明确否认（answer_verdict == "no"）才放行。yes 固然要拦，**unknown 也要拦**：
+    「时有时无」「拉过两次」既不是否认也不构成排除，按危重处理是安全侧该有的
+    非对称——漏拦一次的代价远大于多拦一次。
+
+    symptom 是提问方知道的候选症状名（追问带着它，ReAct 的 ask_user 只有问题
+    文本）。给了就先看它，再看问题原文——两个都看是取并集，比任一单独看都保守。
+    这条判据只在这里实现一次，core/chain.py（ReAct 路径）和 core/followup.py
+    （十问歌追问）都调它：两边各写一套的话，看的文本和否定语义会不一致
+    （一边 honor_negation=False、一边 True），各自单独测都对，放进同一条链
+    才看出矛盾（docs/ARCHITECTURE.md §4）。
+    """
+    asked = (mentions_danger(symptom) if symptom else None) or mentions_danger(question)
+    if asked and answer_verdict != "no":
+        return veto_message(asked)
+    return None
