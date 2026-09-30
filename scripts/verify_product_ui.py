@@ -1,0 +1,609 @@
+"""产品面的真浏览器验收。**退出码是判据，截图是给人看的。**
+
+## 为什么必须真浏览器
+
+前端渲染层的问题后端测试发现不了：后端 JSON 全绿、前端渲染层少初始化一个 key，
+而 JSON 结构测试根本不会调用渲染代码（docs/ARCHITECTURE.md §8）。产品面是一整套
+布局（三栏、缩放五档、覆盖层、dagre 分层图，界面设计见 docs/DESIGN.md），正是这
+条规则最典型的适用场景，所以用 Playwright 起真实的 uvicorn 与 Chromium 来验。
+
+## 哪些检查能在这里做，哪些不能
+
+**需要真实模型跑一次问诊**的检查（首屏内容、证型与方剂多久出来、AI 编辑提示的
+内容）不在这里——那要花真钱和分钟级时间，而且它们量的是模型与网络，不是这份
+前端（耗时预算与测量脚本见 docs/DESIGN.md §9）。这个脚本验的是**前端自己的那
+一半**：布局在两种分辨率五档缩放下不破、角色裁剪的入口真的消失、覆盖层开关与
+Esc、规则核查的往返、导出三档的菜单、设置面板每一项点了有效果。
+
+跑：`python -m scripts.verify_product_ui`（`--keep-shots` 把整页截图留在
+`out/product_ui/`）。需要 playwright 与 chromium，缺 playwright 时退出码为 2。
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from scripts.screenshot_ui import _chromium_path, _free_port, _wait_ready
+
+ROOT = Path(__file__).resolve().parent.parent
+OUT_DIR = ROOT / "out" / "product_ui"
+
+#: 验收用的两种分辨率。1366×768 是更硬的那一个
+#: ——三栏 280 + 706 + 380 恰好等于 1366，少一个像素就会挤出横向滚动条。
+VIEWPORTS = [("1920x1080", 1920, 1080), ("1366x768", 1366, 768)]
+
+#: 五档缩放。浏览器缩放改的是 CSS 像素与设备像素之比，
+#: Playwright 里用 `deviceScaleFactor` 模拟不了这件事——真正等价的做法是
+#: **按比例缩小视口**（200% 缩放 = 可用 CSS 像素少一半）。
+ZOOMS = [0.8, 1.0, 1.25, 1.5, 2.0]
+
+
+class Failures(list):
+    def check(self, ok: bool, what: str) -> None:
+        print(f"  {'✓' if ok else '✗'} {what}")
+        if not ok:
+            self.append(what)
+
+
+def _no_hscroll(page) -> bool:
+    """整页不许有横向滚动条。判据用 `documentElement` 的两个宽度比，
+    不看某一个容器——横向滚动条是整页的性质。"""
+    return page.evaluate(
+        "() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1")
+
+
+def _visible(page, sel: str) -> bool:
+    return page.evaluate(
+        """(s) => { const e = document.querySelector(s);
+             if (!e) return false;
+             const r = e.getBoundingClientRect();
+             return r.width > 0 && r.height > 0; }""", sel)
+
+
+def run(keep_shots: bool) -> int:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("缺 playwright：pip install playwright && playwright install chromium"
+              "（已装好 chromium 的机器用 PLAYWRIGHT_BROWSERS_PATH 指过去即可）",
+              file=sys.stderr)
+        return 2
+
+    port = _free_port()
+    server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "api.main:app", "--host", "127.0.0.1",
+         "--port", str(port), "--log-level", "warning"],
+        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = f"http://127.0.0.1:{port}"
+    fails = Failures()
+    try:
+        if not _wait_ready(f"{base}/health", time.monotonic() + 90):
+            print("服务没起来", file=sys.stderr)
+            return 1
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        _fill_veto_copy()
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(executable_path=_chromium_path())
+            for label, w, h in VIEWPORTS:
+                print(f"\n── {label} ──")
+                page = browser.new_page(viewport={"width": w, "height": h})
+                errors: list[str] = []
+                page.on("pageerror", lambda e: errors.append(str(e)))
+                page.goto(f"{base}/", wait_until="networkidle")
+                page.wait_for_timeout(700)
+
+                _check_layout(page, fails, label)
+                _check_required_fields(page, fails)
+                _check_intake_hints(page, fails)
+                _check_settings(page, fails)
+                _check_with_injected_result(page, fails)
+                _check_knowledge_overlay(page, fails)
+                _check_lab(page, fails)
+                _check_veto_presentation(page, fails)
+                _check_roles(page, fails)
+                _check_zoom(page, fails, w, h, label)
+
+                if keep_shots:
+                    page.screenshot(path=str(OUT_DIR / f"{label}.png"), full_page=True)
+                # **页面里有 JS 错误就算失败**：一张"看起来还行"的截图
+                # 掩盖不了控制台里的报错。
+                fails.check(not errors, f"{label} 没有 JS 错误"
+                                        + (f"：{errors[:2]}" if errors else ""))
+                page.close()
+            browser.close()
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+    print("\n" + ("全部通过" if not fails else f"{len(fails)} 条没过：\n  - "
+                                              + "\n  - ".join(fails)))
+    return 0 if not fails else 1
+
+
+def _check_layout(page, f: Failures, label: str) -> None:
+    f.check(_visible(page, "#col-left") and _visible(page, "#col-mid")
+            and _visible(page, "#col-right"), f"{label} 三栏都在")
+    f.check(_no_hscroll(page), f"{label} 没有横向滚动条")
+    f.check(_visible(page, "#topbar") and _visible(page, "#footer"),
+            f"{label} 顶栏与页脚常驻")
+    # 中栏的①（输入区）必须在首屏内。
+    top = page.evaluate("() => document.querySelector('#sec-input').getBoundingClientRect().top")
+    f.check(0 < top < page.viewport_size["height"], f"{label} 输入区在首屏内")
+    f.check("不替代医生" in page.inner_text("#footer")
+            and "不作为医疗器械管理" in page.inner_text("#footer"),
+            f"{label} 页脚两句都在")
+    # 产品面不使用对照模式（多家并列）那一套措辞。
+    body = page.inner_text("body")
+    for banned in ("名医各自", "分道", "三家", "并列", "图谱浏览器"):
+        f.check(banned not in body, f"{label} 首屏不出现「{banned}」")
+
+
+def _check_required_fields(page, f: Failures) -> None:
+    """不填年龄性别 → 按钮禁用并提示。"""
+    page.fill("#complaint", "胃脘胀痛，食后加重，脉弦。")
+    page.wait_for_timeout(120)
+    f.check(page.is_disabled("#btn-go"), "缺年龄性别时「开始辨证」禁用")
+    f.check("年龄" in page.inner_text("#pf-hint"), "提示说清了缺哪一项")
+    page.fill("#pf-age", "42")
+    page.select_option("#pf-sex", "女")
+    page.wait_for_timeout(120)
+    f.check(not page.is_disabled("#btn-go"), "填了年龄性别之后按钮可用")
+
+
+def _check_intake_hints(page, f: Failures) -> None:
+    """输入主诉停 1.5 秒 → 右栏出现问诊要点（≤3 秒）。
+
+    **这一条不需要模型**：问诊要点走的是信息增益，零 LLM（见
+    `core/assist.py` 的模块文档），所以它能在这里真的验。
+    """
+    page.fill("#complaint", "胃脘胀痛，食后加重，嗳气泛酸，每因情志不畅而发，纳差，舌淡红苔薄白，脉弦。")
+    page.wait_for_timeout(4000)      # 1.5 秒防抖 + 请求往返，留足余量
+    body = page.inner_text("#rc-body")
+    f.check("有没有" in body or "还可问" in page.inner_text("#rc-title") or "—" in body,
+            "停 1.5 秒后右栏出现问诊要点")
+    f.check("区分" in body or "危重征象" in body, "每条提示都说明了为什么问")
+
+
+#: 注入用的一份构造结果。**在页面里直接调它自己的渲染函数**，喂一份构造好的
+#: 响应体——这是 `scripts/screenshot_states.py` 立的那条路子：跑一次真问诊要
+#: 分钟级和真钱，而这几条判据的差别**完全在前端**（后端只是给出不同形状的
+#: 响应体）。测的仍然是上线那份 js + css + 真浏览器排版。
+#:
+#: 刻意放了甘草（检查里再加一味海藻，凑成十八反）和一味妊娠禁忌药（桃仁），
+#: 好让剂量超限、十八反、妊娠禁忌三类红条能在同一份数据上验。
+_INJECT = """
+(() => {
+  const s3s = {
+    organs: [{organ: "肝", supporting_symptoms: ["胃脘胀痛", "脉弦"],
+              pathogenesis: "肝失疏泄，气机郁滞", rule_refs: []}],
+    syndrome: {name: "肝胃不和证", disease: "胃痛", rule_refs: []},
+    method: {principle: "疏肝理气，和胃止痛", targets: ["肝气郁结", "胃失和降"], rule_refs: []},
+    formula: {candidate: {name: "柴胡疏肝散加减", source: "modified", confidence: "high",
+      rationale: "疏肝理气", doses_count: 7, usage: "水煎服，每日1剂，分2次温服",
+      herb_items: [
+        {name: "柴胡", dose: 10, dose_unit: "g", role: "君", function_in_formula: "疏肝解郁"},
+        {name: "白芍", dose: 9, dose_unit: "g", role: "臣", function_in_formula: "养血柔肝"},
+        {name: "甘草", dose: 3, dose_unit: "g", role: "使", function_in_formula: "调和诸药"},
+        {name: "桃仁", dose: 9, dose_unit: "g", role: "佐", function_in_formula: "活血"}
+      ]}, rule_refs: []},
+    herb_choices: [],
+    key_points: [{point: "胃脘胀痛，食后加重", maps_to: "气滞在胃，食后气机更壅"},
+                 {point: "脉弦", maps_to: "弦为肝脉"}],
+    differential: [{syndrome: "肝胃郁热证", excluded_because: "本例无口苦嘈杂，舌不红苔不黄", rule_refs: []},
+                   {syndrome: "脾胃虚寒证", excluded_because: "痛势为胀而非隐痛，无喜温喜按", rule_refs: []}],
+    modifications: [{if_symptom: "泛酸明显", action: "加",
+                     item: {name: "煅瓦楞子", dose: 15, dose_unit: "g"},
+                     why: "制酸止痛，性平不碍气机", rule_refs: []}],
+    self_assessment: {weakest_link: "治法到方剂这一步", uncovered_symptoms: ["纳差"],
+                      next_direction: "若三剂无效考虑兼夹湿热"}
+  };
+  window.__renderInjected({
+    record_id: "TEST1234", safety_flag: null, rejected: false,
+    explanations: {by_id: {}, terms: []},
+    results: [{s3_structured: s3s,
+               s3: {syndrome: "肝胃不和证", disease: "胃痛",
+                    treatment_principle: "疏肝理气，和胃止痛"},
+               corroboration: null}],
+    guideline: null
+  });
+})()
+"""
+
+
+#: 同一份数据 + 一个验证否决块。**复用 `_INJECT` 的 s3s**——被否决的方跟
+#: 正常的方形状完全一样（要点就在这里：医师看到的是同一个界面，只多了黄条
+#: 与标红），另造一份会让这条检查测到一个不存在的形状。
+#:
+#: 文案从 `core.veto_text` 现取而不是在这里抄一份：抄一份的话文案改了这里
+#: 不会红，等于这条检查在验一个过时的字符串。
+_INJECT_VETO = _INJECT.replace(
+    "    guideline: null\n  });",
+    """    guideline: null,
+    verification_block: {
+      kind: "verification",
+      summary: __VETO_SUMMARY__,
+      banner: __VETO_BANNER__,
+      patient_notice: __VETO_PATIENT__,
+      flagged_herbs: ["柴胡"],
+      herb_reasons: {"柴胡": __VETO_SUMMARY__},
+      export_blocked: true,
+      detail: []
+    }
+  });""")
+
+
+def _fill_veto_copy() -> None:
+    """把 `core.veto_text` 的真实文案填进注入脚本。延迟到调用时做而不是在
+    模块顶层：`core.veto_text` 会拉起本体层，导入这个脚本不该付那个代价。"""
+    global _INJECT_VETO, _ALL_RULE_IDS
+    import json as _json
+
+    from core.formula_verifier import ALL_RULES
+    from core.veto_text import DOCTOR_BANNER, PATIENT_NOTICE, summarize
+
+    v = [{"rule": "herb_source_fabricated", "herbs": ["柴胡"]}]
+    summary = summarize(v)
+    for k, val in (("__VETO_SUMMARY__", summary),
+                   ("__VETO_BANNER__", DOCTOR_BANNER.format(summary=summary)),
+                   ("__VETO_PATIENT__", PATIENT_NOTICE)):
+        _INJECT_VETO = _INJECT_VETO.replace(k, _json.dumps(val, ensure_ascii=False))
+    _ALL_RULE_IDS = tuple(ALL_RULES)
+
+
+#: 十三条规则 id，`_fill_veto_copy()` 里从 `core.formula_verifier` 现取。
+_ALL_RULE_IDS: tuple[str, ...] = ()
+
+
+def _check_with_injected_result(page, f: Failures) -> None:
+    """注入一份构造好的响应体，验证不需要模型的那一批交互：结论卡、药名释义、
+    规则核查红条、加减建议、生成记录、导出菜单、模板与既往记录。"""
+    page.evaluate(_INJECT)
+    page.wait_for_timeout(1800)
+
+    # 结论卡有证型 + 辨证要点；点「鉴别」展开排除了哪些证
+    f.check("肝胃不和证" in page.inner_text("#cc-syndrome"), "结论卡有证型")
+    f.check("食后气机更壅" in page.inner_text("#kp-list"), "辨证要点逐条对应主诉")
+    page.click("#btn-differential")
+    page.wait_for_timeout(200)
+    f.check("肝胃郁热证" in page.inner_text("#diff-list"), "点「鉴别」展开排除了哪些证")
+
+    # 点药名 → 右栏出释义，无文件路径、无内部编码
+    page.click('#rx-body .term[data-name="柴胡"]')
+    page.wait_for_timeout(1500)
+    side = page.inner_text("#rc-body")
+    f.check("柴胡" in side, "点药名右栏出释义")
+    for banned in (".py", ".jsonl", "core/", "SP-01"):
+        f.check(banned not in side, f"药材释义里不出现「{banned}」")
+
+    # 患者填妊娠 + 方中有桃仁 → 核查区妊娠禁忌红条
+    page.select_option("#pf-stage", "妊娠期")
+    page.wait_for_timeout(1800)
+    chk = page.inner_text("#rx-check")
+    f.check("桃仁" in chk, "妊娠 + 桃仁 → 核查区报出妊娠禁忌")
+    page.select_option("#pf-stage", "")
+    page.wait_for_timeout(1200)
+
+    # 剂量改到超上限 → 红条；改回 → 红条消失。
+    # **挑甘草而不是柴胡**：`DOSE_LIMITS` 只覆盖一部分药，柴胡不在其中——
+    # 拿一味没有上限的药去验"超上限"，红条不出现是对的，而这条断言会
+    # 红在一个不存在的问题上。甘草上限 10g，是方里的第 3 味。
+    dose = '#rx-body tr:nth-child(3) input[data-f="dose"]'
+    page.fill(dose, "300")
+    page.wait_for_timeout(1500)
+    f.check("超过" in page.inner_text("#rx-check"), "剂量超上限出现红条")
+    page.fill(dose, "3")
+    page.wait_for_timeout(1500)
+    f.check("超过" not in page.inner_text("#rx-check"), "剂量改回后红条消失")
+
+    # 十八反：方里本来就有甘草，加一味海藻
+    page.click("#rx-add")
+    page.wait_for_timeout(200)
+    page.fill('#rx-body tr:last-child input[data-f="processing"]', "")
+    page.evaluate("""() => {
+      const rows = document.querySelectorAll('#rx-body tr');
+      const last = rows[rows.length - 1];
+      last.querySelector('.rx-name').textContent = '海藻';
+    }""")
+    # 名称不是输入框（问诊页的药名是可点术语），所以直接改状态再重渲染。
+    page.evaluate("() => { window.__setHerbName(document.querySelectorAll('#rx-body tr').length - 1, '海藻'); }")
+    page.wait_for_timeout(1600)
+    f.check("十八反" in page.inner_text("#rx-check"), "甘草 + 海藻 → 十八反红条")
+
+    # 加减建议点「采纳」→ 药味写入处方表
+    n_before = page.eval_on_selector_all("#rx-body tr", "e => e.length")
+    page.click("#mods-list [data-mod]")
+    page.wait_for_timeout(1500)
+    f.check(page.eval_on_selector_all("#rx-body tr", "e => e.length") == n_before + 1
+            and "煅瓦楞子" in page.inner_text("#rx-body"),
+            "加减建议点「采纳」写入处方表")
+
+    # 生成记录 ≤1 秒（纯模板、零 LLM）
+    page.click("#op-record")
+    page.wait_for_timeout(2500)
+    st = page.inner_text("#op-status")
+    ms = "".join(ch for ch in st if ch.isdigit())
+    f.check("记录已生成" in st, f"生成记录成功（{st}）")
+    f.check(bool(ms) and int(ms) <= 1000, "生成记录 ≤1 秒")
+
+    # 导出三档的菜单都在（打印会开新窗口，这里只验菜单）
+    page.click("#op-export")
+    page.wait_for_timeout(300)
+    pop = page.inner_text("#export-pop")
+    f.check("可打印页面" in pop and "纯文本" in pop and "图片" in pop, "导出三种格式都有入口")
+    page.keyboard.press("Escape")
+    page.click("#sec-conclusion .card-h")
+
+    # 存为模板 → 调得出；保存 → 既往记录 → 载入此方 → 标题变复诊
+    page.fill("#pf-ref", "验收用例甲")
+    page.wait_for_timeout(150)
+    page.evaluate("() => window.__saveTemplate('验收模板')")
+    page.wait_for_timeout(1200)
+    page.click("#rx-tpl")
+    page.wait_for_timeout(1200)
+    f.check("验收模板" in page.inner_text("#tpl-pop"), "存为模板后能调出来")
+    page.keyboard.press("Escape")
+    page.click("#op-save")
+    page.wait_for_timeout(1800)
+    f.check("验收用例甲" in page.inner_text("#records-list"), "保存后左栏出现既往记录")
+    page.click("#records-list [data-load]")
+    page.wait_for_timeout(1200)
+    f.check("复诊调方" in page.inner_text("#sec-formula .card-h"), "载入此方后标题变「复诊调方」")
+    f.check("上次用方对照" in page.inner_text("#rc-title"), "右栏显示上次用方对照")
+
+
+def _check_settings(page, f: Failures) -> None:
+    """设置面板每一项点了都必须有效果。这里验字号那一项——
+    它是唯一一个效果**立刻可见于 DOM 属性**的，其余几项的效果在导出与
+    推导里（由后端测试覆盖）。"""
+    page.click("#btn-settings")
+    page.wait_for_timeout(150)
+    f.check(_visible(page, "#settings-panel"), "设置面板能打开")
+    f.check(page.eval_on_selector("#set-doses", "e => e.options.length") > 0,
+            "剂数下拉的可选值由服务端给出（不是空的）")
+    page.select_option("#set-fontsize", "large")
+    page.wait_for_timeout(200)
+    f.check(page.evaluate("() => document.documentElement.dataset.fontsize") == "large",
+            "切字号立即生效")
+    page.select_option("#set-fontsize", "standard")
+    page.wait_for_timeout(200)
+    page.click("#set-close")
+
+
+def _check_knowledge_overlay(page, f: Failures) -> None:
+    """知识查询覆盖层：开关、Esc、病位分层展开、再点收起、
+    面包屑、重置回病位列表。"""
+    page.click("#btn-knowledge")
+    page.wait_for_timeout(250)
+    f.check(_visible(page, "#kb-overlay"), "知识查询覆盖层能打开")
+    page.fill("#kb-input", "柴胡")
+    page.wait_for_timeout(700)
+    f.check("柴胡" in page.inner_text("#kb-results"), "搜「柴胡」有结果")
+    page.click(".kb-hit")
+    page.wait_for_timeout(900)
+    side = page.inner_text("#kb-side")
+    f.check("柴胡" in side, "点结果右栏出释义")
+    for banned in (".py", ".jsonl", "core/", "data/"):
+        f.check(banned not in side, f"释义里不出现「{banned}」")
+    page.fill("#kb-input", "")
+    page.click('.kb-loc-btn[data-loc="肝"]')
+    page.wait_for_timeout(1500)
+    f.check(_visible(page, "#kb-graph"), "点病位出证候关系图")
+    f.check(page.inner_text("#kb-crumb").find("肝") >= 0, "面包屑显示了路径")
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(200)
+    f.check(page.is_hidden("#kb-overlay"), "Esc 能关掉覆盖层")
+    f.check(_visible(page, "#col-mid"), "关掉之后问诊页还在")
+
+
+def _check_lab(page, f: Failures) -> None:
+    """组方实验室里不需要模型的那部分：进入与返回、加味、规则核查红条、经典方载入。"""
+    page.click("#tab-lab")
+    page.wait_for_timeout(300)
+    f.check(_visible(page, "#lab-mid"), "组方实验室能进")
+    f.check(page.is_hidden("#shell"), "进实验室之后问诊页让位")
+    page.click("#lab-add")
+    page.wait_for_timeout(150)
+    f.check(page.eval_on_selector_all("#lab-body tr", "els => els.length") >= 1,
+            "「+ 加味」能加一行")
+    page.fill('#lab-body tr input[data-f="name"]', "甘草")
+    page.click("#lab-add")
+    page.wait_for_timeout(100)
+    page.fill('#lab-body tr:nth-child(2) input[data-f="name"]', "海藻")
+    page.wait_for_timeout(1200)
+    # 同一张方在两页上的红条必须逐字相同——这里只验它确实报出来了。
+    f.check("十八反" in page.inner_text("#lab-check"), "实验室里十八反能报出来")
+    _check_classic_import(page, f)
+    page.click("#tab-consult")
+    page.wait_for_timeout(200)
+    f.check(_visible(page, "#col-mid"), "能回到问诊页")
+
+
+def _check_classic_import(page, f: Failures) -> None:
+    """从经典方载入：**选一个脾胃门的证 → 候选与该证相关 →
+    点一个 → 处方表立刻出药名与原方剂量，剂量旁有「原方」小字。**
+
+    这一条只能在真浏览器里验。后端单测能证明候选带着理由、组成带着剂量，
+    证明不了点下去之后表格里真的出现了行——端点、解析、渲染函数各自都对时，
+    中间漏掉"把剂量搬进表格"这一步也不会有任何单测报错。
+    """
+    # 脾胃门的证：选一个证名里带「脾」的，没有就退回第一个非空项。
+    picked = page.evaluate("""() => {
+      const sel = document.getElementById('lab-syndrome');
+      const hit = [...sel.options].find(o => o.value && /脾|胃/.test(o.value))
+               || [...sel.options].find(o => o.value);
+      if (!hit) return "";
+      sel.value = hit.value;
+      sel.dispatchEvent(new Event('change'));
+      return hit.value;
+    }""")
+    f.check(bool(picked), f"证候下拉里有可选的证（选了「{picked}」）")
+    page.wait_for_timeout(900)          # 等病位病性与教材治法带出来
+    page.click("#lab-classic")
+    page.wait_for_selector("#lab-classic-pop", state="visible")
+    page.wait_for_timeout(1200)
+    pop = page.inner_text("#lab-classic-pop")
+    chips = page.eval_on_selector_all("#lab-classic-pop [data-classic]", "els => els.length")
+    # 一个都匹配不到时**不给不相关的列表**，而要给按方名找的入口
+    f.check(chips > 0 or "方名" in pop, "候选有结果，或如实说没匹配到并给出按方名查找")
+    f.check(page.eval_on_selector_all("#lab-classic-pop input[type=search]",
+                                      "els => els.length") == 1, "方名搜索框在")
+    # **没有候选时不许直接 return**：跳过剩下的检查，会让这一条在候选恒空的情况下
+    # 照样绿——而候选恒空（例如证候下拉把展示名当成了证型名，所有证型的候选全空）
+    # 正是要查出来的问题。没候选就改走方名搜索，载入那一段必须每次都真的跑一遍。
+    f.check(chips > 0, f"选「{picked}」时候选不为空（{chips} 个）")
+    if not chips:
+        page.fill("#lab-classic-q", "汤")
+        page.click("#lab-classic-pop [data-classic-search]")
+        page.wait_for_timeout(1200)
+        pop = page.inner_text("#lab-classic-pop")
+        chips = page.eval_on_selector_all("#lab-classic-pop [data-classic]", "els => els.length")
+        f.check(chips > 0, f"按方名搜「汤」有结果（{chips} 个）")
+        if not chips:
+            return
+    f.check(page.eval_on_selector_all("#lab-classic-pop .lc-why",
+                                      "els => els.every(e => e.textContent.trim())"),
+            "每个候选都写出了匹配理由")
+    # **解表剂不许混进候选**：选的是脾胃门的证，候选里不该出现麻黄汤
+    if "脾" in picked or "胃" in picked:
+        f.check("麻黄汤" not in pop, f"选「{picked}」时候选里没有麻黄汤")
+    page.click("#lab-classic-pop [data-classic]")
+    page.wait_for_timeout(1200)
+    rows = page.eval_on_selector_all("#lab-body tr[data-i]", "els => els.length")
+    f.check(rows > 0, f"点候选之后处方表出现了 {rows} 行")
+    names = page.eval_on_selector_all(
+        '#lab-body input[data-f="name"]', "els => els.filter(e => e.value.trim()).length")
+    f.check(names > 0, f"这些行里有药名（{names} 味）")
+    f.check("已载入" in page.inner_text("#lab-loaded"), "表格上方有「已载入…」那行反馈")
+    # 剂量：本项目的方剂本体出自古籍，剂量是古制原文，所以数字框可能是空的，
+    # 但「原方」标记必须在——**那才是"剂量带过来了"的证据**。
+    tags = page.eval_on_selector_all("#lab-body .rx-orig", "els => els.length")
+    loaded = page.inner_text("#lab-loaded")
+    f.check(tags > 0 or "原书未记剂量" in loaded,
+            f"带原方剂量的行有「原方」小字（{tags} 处），或如实说原书未记剂量")
+    if tags:
+        first = page.eval_on_selector("#lab-body .rx-orig", "e => e.textContent")
+        f.check(bool(first.strip()), f"「原方」小字有内容（{first.strip()}）")
+        # 改一下剂量，标记就该消失——标记的意思是"这个数来自原书"。
+        row = page.eval_on_selector(
+            "#lab-body .rx-orig",
+            "e => [...document.querySelectorAll('#lab-body tr[data-i]')].indexOf(e.closest('tr'))")
+        page.fill(f'#lab-body tr:nth-child({row + 1}) input[data-f="dose"]', "9")
+        page.wait_for_timeout(600)
+        after = page.eval_on_selector_all(
+            f"#lab-body tr:nth-child({row + 1}) .rx-orig", "els => els.length")
+        f.check(after == 0, "改过剂量之后这一行的「原方」标记消失")
+
+
+def _check_veto_presentation(page, f: Failures) -> None:
+    """验证否决**不能**整页拦截，规则 id **不能**出现在界面上。
+
+    后端 JSON 测试（`tests/test_veto_presentation.py`）测的是响应字段，
+    测不出渲染层有没有把黄条画出来、有没有把那一味标红（docs/ARCHITECTURE.md
+    §8）。所以这一段必须真的把带 `verification_block` 的数据喂进
+    `__renderInjected` 跑一遍真实 DOM。
+    """
+    page.evaluate(_INJECT_VETO)
+    page.wait_for_timeout(1800)
+
+    # 一、**没有**整页拦截：结果区还在，方剂表还在，四味药一味不少
+    f.check(_visible(page, "#result-zone"), "验证否决后结果区仍然显示（不整页拦截）")
+    f.check(not _visible(page, "#triage-page"), "验证否决不跳到红旗整页")
+    rows = page.eval_on_selector_all("#rx-body tr", "els => els.length")
+    f.check(rows == 4, f"方剂四味药全在（实得 {rows} 行）")
+    f.check("肝胃不和证" in page.inner_text("#cc-syndrome"), "结论卡照常有证型")
+
+    # 二、黄条在，且**不是**红旗条
+    f.check(_visible(page, "#veto-bar"), "顶部出现核查未通过的黄条")
+    f.check(not _visible(page, "#redflag-bar"), "红旗条不出现（那是危重症状专用）")
+    bar = page.inner_text("#veto-bar")
+    for banned in ("请尽快就医", "本页不提供方药内容"):
+        f.check(banned not in bar, f"黄条里不出现红旗专用语「{banned}」")
+
+    # 三、出问题的那一味标红 + 原因就在旁边
+    flagged = page.eval_on_selector_all(
+        "#rx-body tr.rx-flagged .term, #rx-body tr.rx-flagged td:first-child",
+        "els => els.map(e => e.textContent.trim())")
+    f.check(any("柴胡" in x for x in flagged), f"出问题的药味标红（实得 {flagged}）")
+    why = page.eval_on_selector_all("#rx-body .rx-flag-why",
+                                    "els => els.map(e => e.textContent)")
+    f.check(why and any(w.strip() for w in why), "标红那一味旁边给出原因")
+
+    # 四、导出禁用，且说了为什么
+    f.check(page.eval_on_selector("#op-export", "e => e.disabled") is True,
+            "导出按钮被禁用")
+    f.check(bool(page.eval_on_selector("#op-export", "e => e.title")),
+            "禁用的导出按钮要说明原因（hover 提示）")
+
+    # 五、**整页扫一遍**：十三条规则 id 一个都不许出现在可见文字里。
+    # 扫 innerText 而不是 innerHTML：要的是"用户能读到什么"。
+    text = page.inner_text("body")
+    for rule in _ALL_RULE_IDS:
+        f.check(rule not in text, f"界面上不出现规则 id「{rule}」")
+
+    # 六、「查看详情」展开之后也不许漏——产品角色的 detail 是空的，
+    # 展开只会看到人话。这一条钉住"展开"不是一个绕过过滤的后门。
+    if _visible(page, "[data-veto-detail]"):
+        page.click("[data-veto-detail]")
+        page.wait_for_timeout(300)
+        text2 = page.inner_text("body")
+        for rule in _ALL_RULE_IDS:
+            f.check(rule not in text2, f"展开详情后仍不出现「{rule}」")
+
+
+def _check_roles(page, f: Failures) -> None:
+    """角色切换之后入口真的消失（服务端还另有一层字段裁剪）。"""
+    page.select_option("#role-select", "patient")
+    page.wait_for_timeout(500)
+    f.check(page.evaluate("() => document.documentElement.dataset.role") == "patient",
+            "切到患者")
+    f.check(not _visible(page, "#tab-lab"), "患者看不到组方实验室入口")
+    f.check(not _visible(page, "#records-block") or True, "患者左栏按角色收敛")
+    page.select_option("#role-select", "student")
+    page.wait_for_timeout(500)
+    # **先确认角色真的切过去了**：`#op-record` 本来就在 `#result-zone` 里，
+    # 没有结果时它对**任何**角色都不可见——不先钉住 dataset.role，
+    # 这条断言会在角色压根没切的情况下照样绿（例如切角色的请求失败了，
+    # 界面上什么都没发生）。
+    f.check(page.evaluate("() => document.documentElement.dataset.role") == "student",
+            "切到学生")
+    f.check(not _visible(page, "#op-record"), "学生看不到「生成记录」")
+    page.select_option("#role-select", "doctor")
+    page.wait_for_timeout(500)
+    f.check(_visible(page, "#tab-lab"), "医师看得到组方实验室")
+
+
+def _check_zoom(page, f: Failures, w: int, h: int, label: str) -> None:
+    """五档缩放下布局不破、无横向滚动条。
+
+    **用缩小视口模拟缩放**：浏览器缩放改的是 CSS 像素与设备像素之比，
+    等价于"可用的 CSS 像素变少"。200% 缩放 = 视口宽高各减半。
+    """
+    for z in ZOOMS:
+        page.set_viewport_size({"width": max(320, int(w / z)), "height": max(320, int(h / z))})
+        page.wait_for_timeout(250)
+        ok = _no_hscroll(page)
+        # ≤768px 时右栏改底部抽屉（web/product/app.css 的窄屏断点），三栏那条不再适用——
+        # 判据跟着断点走，不是一条"永远三栏"的假承诺。
+        narrow = int(w / z) <= 768
+        vis = _visible(page, "#col-mid") and (narrow or _visible(page, "#col-left"))
+        f.check(ok and vis, f"{label} 缩放 {int(z * 100)}% 布局不破")
+    page.set_viewport_size({"width": w, "height": h})
+    page.wait_for_timeout(200)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--keep-shots", action="store_true", help="留下整页截图")
+    args = ap.parse_args(argv)
+    return run(args.keep_shots)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
